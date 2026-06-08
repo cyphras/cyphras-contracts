@@ -1,0 +1,22 @@
+# Rust / Soroban
+target/
+**/*.rs.bk
+*.wasm
+
+# Node / circuits tooling
+node_modules/
+
+# Circuit build artifacts (large, regenerated)
+circuits/build/
+circuits/**/*.r1cs
+circuits/**/*.zkey
+circuits/**/*.ptau
+circuits/**/*_js/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store

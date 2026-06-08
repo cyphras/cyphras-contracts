@@ -1,0 +1,9 @@
+{
+  "network": "testnet",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "contracts": {
+    "verifier": null,
+    "factory": null
+  },
+  "pools": []
+}

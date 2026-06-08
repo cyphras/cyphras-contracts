@@ -1,0 +1,9 @@
+{
+  "network": "mainnet",
+  "networkPassphrase": "Public Global Stellar Network ; September 2015",
+  "contracts": {
+    "verifier": null,
+    "factory": null
+  },
+  "pools": []
+}

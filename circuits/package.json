@@ -1,0 +1,7 @@
+{
+  "name": "@cyphras/circuits",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cyphras private payments ZK circuits (Circom + Groth16 over BN254)",
+  "license": "MIT"
+}
