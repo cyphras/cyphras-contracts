@@ -6,12 +6,13 @@ target/
 # Node / circuits tooling
 node_modules/
 
-# Circuit build artifacts (large, regenerated)
-circuits/build/
-circuits/**/*.r1cs
-circuits/**/*.zkey
-circuits/**/*.ptau
-circuits/**/*_js/
+# Circuit build artifacts (large, regenerated). The public verification_key.json,
+# vk_parsed.json, and vectors.json under circuits/build/ ARE committed.
+circuits/build/*.r1cs
+circuits/build/*.sym
+circuits/build/*.zkey
+circuits/build/*.ptau
+circuits/build/withdraw_js/
 
 # Secrets and local config
 .env

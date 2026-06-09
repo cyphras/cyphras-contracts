@@ -3,5 +3,31 @@
   "version": "0.1.0",
   "private": true,
   "description": "Cyphras private payments ZK circuits (Circom + Groth16 over BN254)",
-  "license": "MIT"
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "compile": "circom src/withdraw.circom -l node_modules --r1cs --wasm --sym -o build",
+    "ptau:new": "snarkjs powersoftau new bn128 14 build/pot14_0000.ptau -v",
+    "ptau:contribute": "snarkjs powersoftau contribute build/pot14_0000.ptau build/pot14_0001.ptau --name=cyphras-testnet -v -e=cyphras-testnet-phase1",
+    "ptau:prepare": "snarkjs powersoftau prepare phase2 build/pot14_0001.ptau build/pot14_final.ptau -v",
+    "ptau:verify": "snarkjs powersoftau verify build/pot14_final.ptau",
+    "setup": "snarkjs groth16 setup build/withdraw.r1cs build/pot14_final.ptau build/withdraw_0000.zkey",
+    "contribute": "snarkjs zkey contribute build/withdraw_0000.zkey build/withdraw_final.zkey --name=cyphras-testnet-contributor -v -e=cyphras-testnet-phase2",
+    "zkey:verify": "snarkjs zkey verify build/withdraw.r1cs build/pot14_final.ptau build/withdraw_final.zkey",
+    "export-vk": "snarkjs zkey export verificationkey build/withdraw_final.zkey build/verification_key.json",
+    "parse-vk": "node scripts/parse-vk.mjs build/verification_key.json build/vk_parsed.json",
+    "vectors": "node scripts/gen-vectors.mjs build/vectors.json",
+    "build": "npm run compile && npm run ptau:new && npm run ptau:contribute && npm run ptau:prepare && npm run ptau:verify && npm run setup && npm run contribute && npm run zkey:verify && npm run export-vk && npm run parse-vk && npm run vectors",
+    "test": "mocha test/**/*.test.mjs --timeout 120000 --exit"
+  },
+  "dependencies": {
+    "circomlib": "2.0.5"
+  },
+  "devDependencies": {
+    "chai": "^5.1.2",
+    "circomlibjs": "0.1.7",
+    "ffjavascript": "^0.3.0",
+    "mocha": "^10.7.3",
+    "snarkjs": "^0.7.5"
+  }
 }
