@@ -15,6 +15,14 @@
       "denomination": "10000000",
       "generation": 0,
       "pool": "CC5MUMURD33VCAZMXD4UH2WQQEPIDMWXS4GCPGJ43XOMNGWKFUKDPV3B"
+    },
+    {
+      "token": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+      "asset": "USDC",
+      "issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+      "denomination": "10000000",
+      "generation": 0,
+      "pool": "CDTVJY5KBAMUZRKQFACUH7K4CZXD7U5NLGIZMQAOUFVOMKZFD7MFZ4NP"
     }
   ],
   "identitiesForTesting": {

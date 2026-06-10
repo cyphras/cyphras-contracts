@@ -30,7 +30,11 @@ if (!recipientG || !relayerG || !feeStr || !denomStr || !poolAddr) {
   process.exit(1);
 }
 
-const xlmSac = DEPLOY.xlmSac;
+const poolEntry = DEPLOY.pools.find((p) => p.pool === poolAddr);
+if (!poolEntry) {
+  throw new Error(`pool ${poolAddr} not found in deployments/testnet.json`);
+}
+const tokenSac = poolEntry.token;
 const denomination = BigInt(denomStr);
 const fee = BigInt(feeStr);
 if (fee < 0n || fee >= 1n << 64n) {
@@ -67,7 +71,7 @@ const H = (xs) => F.toObject(poseidon(xs));
 
 const recipientField = addressToField(recipientG);
 const relayerField = addressToField(relayerG);
-const assetIdField = addressToField(xlmSac);
+const assetIdField = addressToField(tokenSac);
 const relayerFeeField = fee; // i128 fee as field element (fee < 2^64 < r)
 
 const secret = rand31();
