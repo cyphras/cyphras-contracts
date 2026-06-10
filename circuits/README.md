@@ -11,10 +11,17 @@ src/
     merkle.circom        Merkle proof verification (DualMux + Poseidon)
 scripts/
   parse-vk.mjs           verification_key.json -> vk_parsed.json (contract format)
+  gen-vectors.mjs        Poseidon test vectors for the on-chain implementation
+  gen-proof-fixture.mjs  a real proof + vk bytes for the verifier contract test
+  integration-testnet.mjs  builds a note and proof for a deployed pool
+  ephemeral-reveal.mjs   submits a reveal via a sponsored ephemeral account
 test/
   withdraw.test.mjs      proof generation + verification (positive and negative)
 build/                   generated artifacts (gitignored)
 ```
+
+`proof_fixture.json` (consumed by the verifier contract test) is regenerated with
+`node scripts/gen-proof-fixture.mjs`.
 
 ## Circuit: withdraw
 
@@ -69,25 +76,25 @@ WARNING: the testnet setup uses a single contributor with hardcoded entropy in
 package.json. This is reproducible by anyone, which means the toxic waste is public and
 the resulting zkey can forge proofs for arbitrary withdrawals. It is fine for testnet
 (no real funds) and MUST NEVER back a pool holding value. Mainnet requires a multi-party
-ceremony with a final beacon and no recorded entropy (Issue #9). A reproducible setup is
-by definition a fully-known, forgeable setup.
+ceremony with a final beacon and no recorded entropy. A reproducible setup is by
+definition a fully-known, forgeable setup.
 
 ## Artifacts
 
 Committed: `verification_key.json`, `vk_parsed.json` (used to init the verifier
-contract), and `vectors.json` (Poseidon test vectors for Issue #3). All public and
-auditable.
+contract), and `vectors.json` (Poseidon test vectors for the on-chain implementation).
+All public and auditable.
 
 Gitignored (regenerated, large): `withdraw.wasm`, `withdraw_final.zkey`, `*.ptau`.
-The extension bundles `withdraw.wasm` and `withdraw_final.zkey` (Issue #5).
+The browser extension bundles `withdraw.wasm` and `withdraw_final.zkey`.
 
 ## Critical compatibility note
 
 The circuit uses circomlib Poseidon. The on-chain pool computes its Merkle tree with
 the Stellar Protocol 25 Poseidon host function. These MUST produce identical hashes for
 the same inputs, or on-chain roots will never match circuit roots and no proof will ever
-verify. The verifier/pool work (Issue #3) must assert this with shared test vectors
-before deployment.
+verify. The verifier and pool must assert this with the shared test vectors in
+`vectors.json` before deployment.
 
 Likewise the G2 coordinate ordering in `vk_parsed.json` must match what
 `bn254_multi_pairing_check` expects (see note in `scripts/parse-vk.mjs`).

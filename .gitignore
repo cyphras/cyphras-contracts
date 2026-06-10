@@ -2,6 +2,7 @@
 target/
 **/*.rs.bk
 *.wasm
+**/test_snapshots/
 
 # Node / circuits tooling
 node_modules/
@@ -13,6 +14,8 @@ circuits/build/*.sym
 circuits/build/*.zkey
 circuits/build/*.ptau
 circuits/build/withdraw_js/
+# transient per-run demo data
+circuits/build/integration.json
 
 # Secrets and local config
 .env

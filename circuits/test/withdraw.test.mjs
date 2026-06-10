@@ -32,7 +32,9 @@ function hash(values) {
 function random31() {
   let hex = "";
   for (let i = 0; i < 31; i++) {
-    hex += Math.floor(Math.random() * 256).toString(16).padStart(2, "0");
+    hex += Math.floor(Math.random() * 256)
+      .toString(16)
+      .padStart(2, "0");
   }
   return BigInt("0x" + hex);
 }
@@ -49,7 +51,17 @@ function buildNote(overrides = {}) {
   const amountHash = hash([amount, relayerFee, amountBlinding]);
   const commitment = hash([nullifier, secret, amountHash, assetId]);
 
-  return { secret, nullifier, amountBlinding, amount, relayerFee, assetId, nullifierHash, amountHash, commitment };
+  return {
+    secret,
+    nullifier,
+    amountBlinding,
+    amount,
+    relayerFee,
+    assetId,
+    nullifierHash,
+    amountHash,
+    commitment,
+  };
 }
 
 function buildPath(leaf) {

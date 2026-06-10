@@ -4,6 +4,7 @@ members = ["pool", "verifier", "factory"]
 
 [workspace.dependencies]
 soroban-sdk = "25.3.1"
+soroban-poseidon = "25.0.1"
 
 [profile.release]
 opt-level = "z"

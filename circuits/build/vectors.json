@@ -1,5 +1,5 @@
 {
-  "note": "circomlib Poseidon over BN254. Issue #3 must reproduce these with the Stellar host Poseidon and assert equality before any deployment.",
+  "note": "circomlib Poseidon over BN254. The on-chain Poseidon must reproduce these with the Stellar host function and assert equality before any deployment.",
   "curve": "bn254",
   "vectors": [
     {

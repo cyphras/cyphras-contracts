@@ -1,18 +1,14 @@
 import { readFileSync, writeFileSync } from "node:fs";
 
-// Converts a snarkjs Groth16 verification_key.json into the big-endian hex form
-// the Soroban verifier contract consumes at init. Each field coordinate becomes a
-// 32-byte (64 hex char) big-endian string. G1 points keep affine (x, y); G2 points
-// keep affine (x, y) where each is a pair (c0, c1).
+// Converts a snarkjs Groth16 verification_key.json into the exact byte blobs the Soroban
+// verifier contract's init_vk consumes. Output is deployment-ready hex:
+//   G1 point = x || y                         (64 bytes / 128 hex chars)
+//   G2 point = x_c1 || x_c0 || y_c1 || y_c0   (128 bytes / 256 hex chars, EIP-197 order)
 //
-// TWO FOOTGUNS the verifier contract (Issue #3) must resolve against the host
-// function, both flagged here because they cannot be settled without the contract:
-//   1. G2 coordinate ordering. This file preserves snarkjs (c0, c1). EIP-197 style
-//      pairing checks often expect (c1, c0). The contract owns the final byte order
-//      and must test against bn254_multi_pairing_check vectors.
-//   2. alpha negation / pairing-equation sign. snarkjs alpha_g1 is emitted un-negated.
-//      Depending on whether the host checks product == 1 or uses an explicit negation,
-//      the contract may need to negate alpha_g1 (or beta). Decide and test on #3.
+// Byte order for both is fixed and verified against a real proof:
+//   1. G2 ordering is (c1, c0) per coordinate (EIP-197), i.e. snarkjs (c0, c1) swapped.
+//   2. alpha_g1 is stored un-negated; the contract negates pi_a in the pairing check.
+// This matches gen-proof-fixture.mjs byte for byte.
 
 const [, , inPath, outPath] = process.argv;
 
@@ -24,9 +20,7 @@ if (!inPath || !outPath) {
 const FIELD_BYTES = 32;
 
 // BN254 base field modulus (Fq). Coordinates must be canonical (< q).
-const FQ = BigInt(
-  "21888242871839275222246405745257275088696311157297823662689037894645226208583"
-);
+const FQ = BigInt("21888242871839275222246405745257275088696311157297823662689037894645226208583");
 
 function toHexBE(dec) {
   const value = BigInt(dec);
@@ -51,17 +45,16 @@ function assertAffineG2(point) {
   }
 }
 
+// G1 = x || y
 function g1(point) {
   assertAffineG1(point);
-  return { x: toHexBE(point[0]), y: toHexBE(point[1]) };
+  return toHexBE(point[0]) + toHexBE(point[1]);
 }
 
+// G2 = x_c1 || x_c0 || y_c1 || y_c0 (swap each coordinate pair to c1, c0)
 function g2(point) {
   assertAffineG2(point);
-  return {
-    x: [toHexBE(point[0][0]), toHexBE(point[0][1])],
-    y: [toHexBE(point[1][0]), toHexBE(point[1][1])],
-  };
+  return toHexBE(point[0][1]) + toHexBE(point[0][0]) + toHexBE(point[1][1]) + toHexBE(point[1][0]);
 }
 
 const vk = JSON.parse(readFileSync(inPath, "utf-8"));
