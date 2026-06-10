@@ -1,9 +1,26 @@
 {
   "network": "testnet",
   "networkPassphrase": "Test SDF Network ; September 2015",
+  "admin": "GAMLYLIU27EYZDALU265AJQORGEHWNNJ3JMKZGWGCASJUOQFN5B2CYPH",
+  "xlmSac": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+  "poolWasmHash": "729b3057118e0ee93b227fc1683c1bf784c0e936459df79b35cfe3786660ede9",
   "contracts": {
-    "verifier": null,
-    "factory": null
+    "verifier": "CBNVPRLGXFFCR5DHIXK7RUIX6MC3ZLFYUDHNJGJUNRNP7BA2JB7EAML3",
+    "factory": "CDYDCTNDTLPRATUYJJFKACSFFS7U2C3BK5XGD4IFU3YLV7UDSNJMVTPJ"
   },
-  "pools": []
+  "pools": [
+    {
+      "token": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "asset": "XLM",
+      "denomination": "10000000",
+      "generation": 0,
+      "pool": "CC5MUMURD33VCAZMXD4UH2WQQEPIDMWXS4GCPGJ43XOMNGWKFUKDPV3B"
+    }
+  ],
+  "identitiesForTesting": {
+    "note": "Local testnet keys for end-to-end testing only. Admin (CYPH) is the deployer/trust anchor and is kept separate from sender, relayer, and recipient.",
+    "sender": "GBWGQVXGMSJB577G7D63I6Z2PCCK7STO77CVVNFMFCRHELRCI4PFOHUO",
+    "relayer": "GBTAW6R5GWAIZA5CE3MS7BA2KJTV2QQRPFTIRLRWI2JO2A3FM634W22P",
+    "recipient": "GDBMTPRYVF4GYFWATRZSWE3RORJPRHPLPJF3HZIANBPKAFXAA6CPHIY6"
+  }
 }

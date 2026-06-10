@@ -18,9 +18,12 @@
     "parse-vk": "node scripts/parse-vk.mjs build/verification_key.json build/vk_parsed.json",
     "vectors": "node scripts/gen-vectors.mjs build/vectors.json",
     "build": "npm run compile && npm run ptau:new && npm run ptau:contribute && npm run ptau:prepare && npm run ptau:verify && npm run setup && npm run contribute && npm run zkey:verify && npm run export-vk && npm run parse-vk && npm run vectors",
-    "test": "mocha test/**/*.test.mjs --timeout 120000 --exit"
+    "test": "mocha test/**/*.test.mjs --timeout 120000 --exit",
+    "format": "prettier --write \"scripts/**/*.mjs\" \"test/**/*.mjs\"",
+    "format:check": "prettier --check \"scripts/**/*.mjs\" \"test/**/*.mjs\""
   },
   "dependencies": {
+    "@stellar/stellar-sdk": "^15.1.0",
     "circomlib": "2.0.5"
   },
   "devDependencies": {
@@ -28,6 +31,7 @@
     "circomlibjs": "0.1.7",
     "ffjavascript": "^0.3.0",
     "mocha": "^10.7.3",
+    "prettier": "^3.3.3",
     "snarkjs": "^0.7.5"
   }
 }

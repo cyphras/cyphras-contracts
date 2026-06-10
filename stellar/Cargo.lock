@@ -374,6 +374,8 @@ dependencies = [
 name = "cyphras-pool"
 version = "0.1.0"
 dependencies = [
+ "num-bigint",
+ "soroban-poseidon",
  "soroban-sdk",
 ]
 
@@ -381,6 +383,8 @@ dependencies = [
 name = "cyphras-verifier"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "serde_json",
  "soroban-sdk",
 ]
 
@@ -1415,6 +1419,15 @@ dependencies = [
  "soroban-env-common",
  "soroban-env-host",
  "thiserror",
+]
+
+[[package]]
+name = "soroban-poseidon"
+version = "25.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ea4815af86664539b3665fe5d2f3f8a87a6a8bf8186f22f2976497c362d370f"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]
