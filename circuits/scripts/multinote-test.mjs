@@ -5,11 +5,12 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-// Builds one private-send note and proof for the deployed testnet XLM pool, mirroring the
-// exact field derivations the pool performs on-chain, then writes the commit and reveal
-// arguments to build/integration.json for the CLI to consume.
+// Builds a note and proof for a NON-empty pool by fetching the pool's existing leaves from the
+// relayer, inserting the new leaf at the real next index, and building the actual Merkle path and
+// root over all leaves. This exercises the production withdrawal path (a reveal at index > 0) that
+// the empty-pool integration script never covers.
 //
-// Usage: node integration-testnet.mjs <recipientG> <relayerG> <feeStroops> <denomination> <poolAddress>
+// Usage: node multinote-test.mjs <recipientG> <relayerG> <feeStroops> <denomination> <poolAddress> <relayerBaseUrl>
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BUILD = join(here, "..", "build");
@@ -22,24 +23,19 @@ const DEPLOY = JSON.parse(
 const R = BigInt("21888242871839275222246405745257275088548364400416034343698204186575808495617");
 const LEVELS = 20;
 
-const [, , recipientG, relayerG, feeStr, denomStr, poolAddr] = process.argv;
-if (!recipientG || !relayerG || !feeStr || !denomStr || !poolAddr) {
+const [, , recipientG, relayerG, feeStr, denomStr, poolAddr, relayerUrl] = process.argv;
+if (!recipientG || !relayerG || !feeStr || !denomStr || !poolAddr || !relayerUrl) {
   console.error(
-    "usage: node integration-testnet.mjs <recipientG> <relayerG> <feeStroops> <denomination> <poolAddress>",
+    "usage: node multinote-test.mjs <recipientG> <relayerG> <feeStroops> <denomination> <poolAddress> <relayerBaseUrl>",
   );
   process.exit(1);
 }
 
 const poolEntry = DEPLOY.pools.find((p) => p.pool === poolAddr);
-if (!poolEntry) {
-  throw new Error(`pool ${poolAddr} not found in deployments/testnet.json`);
-}
+if (!poolEntry) throw new Error(`pool ${poolAddr} not in deployments/testnet.json`);
 const tokenSac = poolEntry.token;
 const denomination = BigInt(denomStr);
 const fee = BigInt(feeStr);
-if (fee < 0n || fee >= 1n << 64n) {
-  throw new Error("fee must be in [0, 2^64)");
-}
 
 function be32(n) {
   const hex = n.toString(16);
@@ -51,7 +47,6 @@ function bytesToField(bytes) {
   return BigInt("0x" + Buffer.from(bytes).toString("hex")) % R;
 }
 
-// Matches the contract's address_to_field: raw ed25519 key (G) or contract hash (C) mod r.
 function addressToField(addr) {
   const raw = addr.startsWith("C")
     ? StrKey.decodeContract(addr)
@@ -69,10 +64,21 @@ const poseidon = await buildPoseidon();
 const F = poseidon.F;
 const H = (xs) => F.toObject(poseidon(xs));
 
+// The relayer's `commitment` field actually holds the tree leaf.
+const res = await fetch(`${relayerUrl}/v1/info/leaves/${poolAddr}?from=0&limit=10000`);
+if (!res.ok) throw new Error(`leaves fetch failed: ${res.status}`);
+const body = await res.json();
+const existing = body.leaves
+  .slice()
+  .sort((a, b) => a.leaf_index - b.leaf_index)
+  .map((l) => BigInt("0x" + l.commitment));
+const myIndex = existing.length;
+if (myIndex === 0)
+  throw new Error("pool is empty; use integration-testnet.mjs for an index-0 reveal");
+
 const recipientField = addressToField(recipientG);
 const relayerField = addressToField(relayerG);
 const assetIdField = addressToField(tokenSac);
-const relayerFeeField = fee; // i128 fee as field element (fee < 2^64 < r)
 
 const secret = rand31();
 const nullifier = rand31();
@@ -81,24 +87,32 @@ const amountBlinding = rand31();
 const nullifierHash = H([nullifier, secret]);
 const amountHash = H([denomination, amountBlinding]);
 const innerCommitment = H([nullifier, secret, amountHash, assetIdField]);
+const leaf = H([innerCommitment, fee]);
 
-// Leaf binds relayerFee, mirroring the circuit and the pool's commit-time recompute.
-const leaf = H([innerCommitment, relayerFeeField]);
-
-// Tree state for a leaf inserted at index 0 of an empty pool: all siblings are the cached
-// zero values, all path indices are 0 (left). Mirrors the pool's insert_leaf.
+// Pad empty slots at each level with that level's zero-subtree hash, mirroring the pool's incremental insert.
 const zeros = [0n];
 for (let i = 0; i < LEVELS; i++) zeros.push(H([zeros[i], zeros[i]]));
 
+let layer = [...existing, leaf];
+let idx = myIndex;
 const pathElements = [];
 const pathIndices = [];
-let cur = leaf;
-for (let i = 0; i < LEVELS; i++) {
-  pathElements.push(zeros[i]);
-  pathIndices.push(0);
-  cur = H([cur, zeros[i]]);
+for (let lvl = 0; lvl < LEVELS; lvl++) {
+  const isRight = idx & 1;
+  const sibIdx = isRight ? idx - 1 : idx + 1;
+  const sibling = sibIdx < layer.length ? layer[sibIdx] : zeros[lvl];
+  pathElements.push(sibling);
+  pathIndices.push(isRight);
+  const next = [];
+  for (let i = 0; i < layer.length; i += 2) {
+    const l = layer[i];
+    const r = i + 1 < layer.length ? layer[i + 1] : zeros[lvl];
+    next.push(H([l, r]));
+  }
+  layer = next;
+  idx >>= 1;
 }
-const root = cur;
+const root = layer[0];
 
 const input = {
   secret: secret.toString(),
@@ -112,7 +126,7 @@ const input = {
   nullifierHash: nullifierHash.toString(),
   recipient: recipientField.toString(),
   relayer: relayerField.toString(),
-  relayerFee: relayerFeeField.toString(),
+  relayerFee: fee.toString(),
   amountHash: amountHash.toString(),
   assetId: assetIdField.toString(),
 };
@@ -130,6 +144,7 @@ const proofHex = g1(proof.pi_a) + g2(proof.pi_b) + g1(proof.pi_c);
 
 const out = {
   pool: poolAddr,
+  leafIndex: myIndex,
   commit: { innerCommitment: be32(innerCommitment), relayerFee: fee.toString() },
   reveal: {
     proof: proofHex,
@@ -143,7 +158,6 @@ const out = {
 };
 
 writeFileSync(join(BUILD, "integration.json"), JSON.stringify(out, null, 2) + "\n", "utf-8");
-console.log(JSON.stringify(out, null, 2));
+console.log(`built proof for leaf index ${myIndex} (pool had ${existing.length} leaves)`);
 
-// snarkjs leaves worker threads alive, so exit explicitly once the proof is written.
 process.exit(0);

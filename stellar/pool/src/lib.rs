@@ -14,6 +14,19 @@ const ROOT_HISTORY_SIZE: u32 = 1000;
 // escrowed XLM can never become unspendable (no valid proof could ever match it).
 const MAX_FEE: i128 = 1i128 << 64;
 
+// The relayer fee must be a multiple of this tier (0.01 XLM). Quantizing it on-chain keeps the fee
+// from becoming a fingerprint that links a deposit to its withdrawal: within a pool every note pays
+// the same denomination, so a unique fee would otherwise single one out of the anonymity set.
+const FEE_TIER: i128 = 100_000;
+
+// BN254 scalar field modulus r, big-endian. The commitment is hashed with Poseidon, whose host
+// implementation traps on an input at or above r; reject a non-canonical value up front so an
+// invalid deposit fails with a clear error instead of an opaque host panic.
+const FR_MODULUS: [u8; 32] = [
+    0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58, 0x5d,
+    0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00, 0x00, 0x01,
+];
+
 // One instance TTL bump keeps the whole commit working set alive: config plus the zero hashes and
 // filled subtrees. Spent nullifiers are bumped when written. An off-chain keeper extends the bulk
 // persistent root state (root history and known-root flags) periodically.
@@ -38,7 +51,7 @@ enum DataKey {
 #[contractevent]
 pub struct CommitEvent {
     #[topic]
-    pub commitment: BytesN<32>,
+    pub leaf: BytesN<32>,
     pub leaf_index: u32,
     pub root: BytesN<32>,
 }
@@ -105,12 +118,19 @@ impl PoolContract {
             .set(&DataKey::KnownRoot(initial_root), &true);
     }
 
-    // Deposit a note. Transfers the fixed denomination of the asset plus the XLM fee
-    // (escrowed for the relayer) from the sender into the pool.
-    pub fn commit(env: Env, sender: Address, commitment: BytesN<32>, xlm_fee: i128) {
+    // Deposit a note: transfer the pool's fixed denomination plus the note's relayer fee (escrowed
+    // in XLM). The fee is bound into the tree leaf, so the escrowed amount is provably the fee the
+    // note pays at reveal and cannot be under-escrowed then over-withdrawn against the shared pool.
+    pub fn commit(env: Env, sender: Address, inner_commitment: BytesN<32>, relayer_fee: i128) {
         sender.require_auth();
-        if xlm_fee < 0 || xlm_fee >= MAX_FEE {
-            panic!("invalid xlm fee");
+        if relayer_fee < 0 || relayer_fee >= MAX_FEE {
+            panic!("invalid relayer fee");
+        }
+        if relayer_fee % FEE_TIER != 0 {
+            panic!("fee must be a multiple of the fee tier");
+        }
+        if inner_commitment.to_array() >= FR_MODULUS {
+            panic!("invalid commitment");
         }
 
         let denomination: i128 = env
@@ -128,14 +148,15 @@ impl PoolContract {
         token::TokenClient::new(&env, &xlm_addr).transfer(
             &sender,
             &env.current_contract_address(),
-            &xlm_fee,
+            &relayer_fee,
         );
 
-        let leaf_index = Self::insert_leaf(&env, &commitment);
+        let leaf = Self::hash_leaf(&env, &inner_commitment, relayer_fee);
+        let leaf_index = Self::insert_leaf(&env, &leaf);
         let root = Self::last_root(&env);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         CommitEvent {
-            commitment,
+            leaf,
             leaf_index,
             root,
         }
@@ -326,6 +347,23 @@ impl PoolContract {
         let l = U256::from_be_bytes(env, &left.clone().into());
         let r = U256::from_be_bytes(env, &right.clone().into());
         let inputs = vec![env, l, r];
+        poseidon_hash::<3, BnScalar>(env, &inputs)
+            .to_be_bytes()
+            .try_into()
+            .unwrap()
+    }
+
+    // The tree leaf binds the inner commitment to its relayer fee, matching the circuit's
+    // leaf = Poseidon(innerCommitment, relayerFee). relayer_fee is non-negative and < 2^64, so it
+    // is a canonical field element.
+    fn hash_leaf(env: &Env, inner: &BytesN<32>, relayer_fee: i128) -> BytesN<32> {
+        let mut fee_bytes = [0u8; 32];
+        fee_bytes[16..32].copy_from_slice(&(relayer_fee as u128).to_be_bytes());
+        let inputs = vec![
+            env,
+            U256::from_be_bytes(env, &inner.clone().into()),
+            U256::from_be_bytes(env, &Bytes::from_array(env, &fee_bytes)),
+        ];
         poseidon_hash::<3, BnScalar>(env, &inputs)
             .to_be_bytes()
             .try_into()

@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use super::{FactoryContract, FactoryContractClient};
-use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{Address, Env};
+use soroban_sdk::testutils::{Address as _, Ledger as _};
+use soroban_sdk::{Address, BytesN, Env};
 
 // The real compiled pool contract, so the factory deploys a genuine pool.
 mod pool_contract {
@@ -95,6 +95,40 @@ fn rotate_requires_full_tree() {
 fn rotate_requires_existing_pool() {
     let f = setup();
     f.factory.rotate_pool(&f.token, &DENOM);
+}
+
+#[test]
+#[should_panic(expected = "no pending pool wasm")]
+fn set_pool_wasm_requires_a_proposal() {
+    let f = setup();
+    let new_hash = BytesN::from_array(&f.env, &[9u8; 32]);
+    f.factory.set_pool_wasm(&new_hash);
+}
+
+#[test]
+#[should_panic(expected = "wasm timelock not elapsed")]
+fn set_pool_wasm_blocked_before_timelock() {
+    let f = setup();
+    let new_hash = BytesN::from_array(&f.env, &[9u8; 32]);
+    f.factory.propose_pool_wasm(&new_hash);
+    f.factory.set_pool_wasm(&new_hash);
+}
+
+#[test]
+fn set_pool_wasm_enacts_after_timelock() {
+    let f = setup();
+    let new_hash = BytesN::from_array(&f.env, &[9u8; 32]);
+    f.factory.propose_pool_wasm(&new_hash);
+    f.env.ledger().with_mut(|li| li.sequence_number += 17_280);
+    f.factory.set_pool_wasm(&new_hash);
+}
+
+#[test]
+fn set_admin_transfers_control() {
+    let f = setup();
+    let new_admin = Address::generate(&f.env);
+    f.factory.set_admin(&new_admin);
+    f.factory.create_pool(&f.token, &DENOM);
 }
 
 #[test]

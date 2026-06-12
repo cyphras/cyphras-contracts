@@ -2,7 +2,7 @@
 extern crate std;
 
 use super::{VerifierContract, VerifierContractClient};
-use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{Bytes, BytesN, Env, Vec};
 
 const FIXTURE: &str = include_str!("../tests/proof_fixture.json");
 // The actual deployment artifact produced by circuits/scripts/parse-vk.mjs.
@@ -19,31 +19,30 @@ fn decode_bytes(env: &Env, hex_str: &str) -> Bytes {
     Bytes::from_slice(env, &raw)
 }
 
-fn init_from_vk(env: &Env, client: &VerifierContractClient, vk: &serde_json::Value) {
+fn deploy_from_vk<'a>(env: &Env, vk: &serde_json::Value) -> VerifierContractClient<'a> {
     let mut ic = Vec::new(env);
     for item in vk["ic"].as_array().unwrap() {
         ic.push_back(decode::<64>(env, item.as_str().unwrap()));
     }
-    let admin = Address::generate(env);
-    client.init_vk(
-        &admin,
-        &decode::<64>(env, vk["alpha_g1"].as_str().unwrap()),
-        &decode::<128>(env, vk["beta_g2"].as_str().unwrap()),
-        &decode::<128>(env, vk["gamma_g2"].as_str().unwrap()),
-        &decode::<128>(env, vk["delta_g2"].as_str().unwrap()),
-        &ic,
+    let id = env.register(
+        VerifierContract,
+        (
+            decode::<64>(env, vk["alpha_g1"].as_str().unwrap()),
+            decode::<128>(env, vk["beta_g2"].as_str().unwrap()),
+            decode::<128>(env, vk["gamma_g2"].as_str().unwrap()),
+            decode::<128>(env, vk["delta_g2"].as_str().unwrap()),
+            ic,
+        ),
     );
+    VerifierContractClient::new(env, &id)
 }
 
 #[test]
 fn verifies_real_proof_and_rejects_tampered() {
     let env = Env::default();
-    env.mock_all_auths();
-    let id = env.register(VerifierContract, ());
-    let client = VerifierContractClient::new(&env, &id);
 
     let f: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
-    init_from_vk(&env, &client, &f["vk"]);
+    let client = deploy_from_vk(&env, &f["vk"]);
 
     let proof = decode_bytes(&env, f["proof"].as_str().unwrap());
     let ps = f["publicSignals"].as_array().unwrap();
@@ -97,16 +96,13 @@ fn verifies_real_proof_and_rejects_tampered() {
 
 #[test]
 fn verifies_with_production_vk_from_parse_vk() {
-    // Proves the deployment path: the VK bytes emitted by parse-vk.mjs feed init_vk and
+    // Proves the deployment path: the VK bytes emitted by parse-vk.mjs feed the constructor and
     // verify a real proof. Guards against a serialization mismatch between the parser and
     // the contract.
     let env = Env::default();
-    env.mock_all_auths();
-    let id = env.register(VerifierContract, ());
-    let client = VerifierContractClient::new(&env, &id);
 
     let vk: serde_json::Value = serde_json::from_str(VK_PARSED).unwrap();
-    init_from_vk(&env, &client, &vk);
+    let client = deploy_from_vk(&env, &vk);
 
     let f: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
     let proof = decode_bytes(&env, f["proof"].as_str().unwrap());
