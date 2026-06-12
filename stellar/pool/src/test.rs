@@ -185,6 +185,28 @@ fn multiple_commits_increment_index_and_change_root() {
 }
 
 #[test]
+fn fills_many_consecutive_leaves() {
+    let f = setup();
+    let sender = Address::generate(&f.env);
+    let n: u8 = 33;
+    fund(&f.env, &f.token, &sender, DENOM * n as i128);
+    fund(&f.env, &f.xlm, &sender, FEE * n as i128);
+
+    for i in 0..n {
+        let commitment = BytesN::from_array(&f.env, &[i.wrapping_add(1); 32]);
+        f.pool.commit(&sender, &commitment, &FEE);
+        assert_eq!(f.pool.next_index(), (i as u32) + 1);
+        assert!(f.pool.is_known_root(&f.pool.get_last_root()));
+    }
+
+    assert_eq!(f.pool.next_index(), n as u32);
+    assert_eq!(
+        token::TokenClient::new(&f.env, &f.token).balance(&f.pool.address),
+        DENOM * n as i128
+    );
+}
+
+#[test]
 #[should_panic(expected = "unknown root")]
 fn reveal_rejects_unknown_root() {
     let f = setup();
