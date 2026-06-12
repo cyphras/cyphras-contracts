@@ -141,3 +141,6 @@ const out = {
 
 writeFileSync(join(BUILD, "integration.json"), JSON.stringify(out, null, 2) + "\n", "utf-8");
 console.log(JSON.stringify(out, null, 2));
+
+// snarkjs leaves worker threads alive, so exit explicitly once the proof is written.
+process.exit(0);
