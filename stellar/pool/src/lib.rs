@@ -14,8 +14,9 @@ const ROOT_HISTORY_SIZE: u32 = 1000;
 // escrowed XLM can never become unspendable (no valid proof could ever match it).
 const MAX_FEE: i128 = 1i128 << 64;
 
-// TTL bumps keep instance config and spent nullifiers alive. An off-chain keeper extends
-// the TTL of the bulk persistent tree state (roots, zeros, filled subtrees) periodically.
+// One instance TTL bump keeps the whole commit working set alive: config plus the zero hashes and
+// filled subtrees. Spent nullifiers are bumped when written. An off-chain keeper extends the bulk
+// persistent root state (root history and known-root flags) periodically.
 const TTL_THRESHOLD: u32 = 100_000;
 const TTL_BUMP: u32 = 518_400;
 
@@ -82,14 +83,17 @@ impl PoolContract {
         env.storage().instance().set(&DataKey::RootIndex, &0u32);
 
         let zeros = Self::compute_zeros(&env);
+        // The zero hashes and filled subtrees are the fixed working set every commit reads. Keeping
+        // them in instance storage means a single instance TTL bump keeps the whole commit path
+        // alive, so the tree can never break by having individual structural entries archive.
         for i in 0..=MERKLE_LEVELS {
             env.storage()
-                .persistent()
+                .instance()
                 .set(&DataKey::Zero(i), &zeros.get(i).unwrap());
         }
         for i in 0..MERKLE_LEVELS {
             env.storage()
-                .persistent()
+                .instance()
                 .set(&DataKey::FilledSubtree(i), &zeros.get(i).unwrap());
         }
         let initial_root = zeros.get(MERKLE_LEVELS).unwrap();
@@ -283,13 +287,13 @@ impl PoolContract {
         for level in 0..MERKLE_LEVELS {
             let (l, r) = if current_index % 2 == 0 {
                 env.storage()
-                    .persistent()
+                    .instance()
                     .set(&DataKey::FilledSubtree(level), &current_hash);
                 (current_hash.clone(), zeros.get(level).unwrap())
             } else {
                 let l: BytesN<32> = env
                     .storage()
-                    .persistent()
+                    .instance()
                     .get(&DataKey::FilledSubtree(level))
                     .unwrap();
                 (l, current_hash.clone())
@@ -343,7 +347,7 @@ impl PoolContract {
     fn get_zeros(env: &Env) -> Vec<BytesN<32>> {
         let mut zeros = Vec::new(env);
         for i in 0..=MERKLE_LEVELS {
-            zeros.push_back(env.storage().persistent().get(&DataKey::Zero(i)).unwrap());
+            zeros.push_back(env.storage().instance().get(&DataKey::Zero(i)).unwrap());
         }
         zeros
     }
