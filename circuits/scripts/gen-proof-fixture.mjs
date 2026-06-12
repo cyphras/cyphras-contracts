@@ -38,12 +38,13 @@ const relayerFee = 100000n;
 const assetId = 123456789012345678901234567890n;
 
 const nullifierHash = hash([nullifier, secret]);
-const amountHash = hash([amount, relayerFee, amountBlinding]);
+const amountHash = hash([amount, amountBlinding]);
 const commitment = hash([nullifier, secret, amountHash, assetId]);
+const leaf = hash([commitment, relayerFee]);
 
 const pathElements = [];
 const pathIndices = [];
-let current = commitment;
+let current = leaf;
 for (let i = 0; i < LEVELS; i++) {
   const sibling = hash([BigInt(i + 1), BigInt(i * 7 + 3)]);
   const index = i % 2;
@@ -116,3 +117,6 @@ console.log(`wrote ${OUT}`);
 console.log(
   `proof: ${proofBytes.length / 2} bytes, publicSignals: ${publicSignals.length}, ic: ${fixture.vk.ic.length}`,
 );
+
+// snarkjs leaves worker threads alive, so exit explicitly once the fixture is written.
+process.exit(0);

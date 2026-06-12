@@ -26,6 +26,23 @@ fn want(env: &Env, s: &str) -> BytesN<32> {
     BytesN::from_array(env, &dec_to_bytes32(s))
 }
 
+fn poseidon2_bytes(env: &Env, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let ua = U256::from_be_bytes(env, &Bytes::from_array(env, a));
+    let ub = U256::from_be_bytes(env, &Bytes::from_array(env, b));
+    let out: BytesN<32> = poseidon_hash::<3, BnScalar>(env, &vec![env, ua, ub])
+        .to_be_bytes()
+        .try_into()
+        .unwrap();
+    out.to_array()
+}
+
+// Encodes the fee as a field element the way hash_leaf does: u128 in the low 16 bytes.
+fn fee_to_bytes(fee: i128) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    buf[16..32].copy_from_slice(&(fee as u128).to_be_bytes());
+    buf
+}
+
 #[test]
 fn poseidon_arity2_matches_circomlib() {
     let env = Env::default();
@@ -89,7 +106,7 @@ fn poseidon_arity4_matches_circomlib() {
 }
 
 const DENOM: i128 = 1000;
-const FEE: i128 = 100;
+const FEE: i128 = 100_000;
 
 struct Fixture {
     env: Env,
@@ -207,6 +224,28 @@ fn fills_many_consecutive_leaves() {
 }
 
 #[test]
+fn commit_binds_fee_into_the_leaf() {
+    let f = setup();
+    let sender = Address::generate(&f.env);
+    fund(&f.env, &f.token, &sender, DENOM);
+    fund(&f.env, &f.xlm, &sender, FEE);
+
+    let inner_dec = "12345678901234567890";
+    let inner = want(&f.env, inner_dec);
+    f.pool.commit(&sender, &inner, &FEE);
+
+    // Leaf must be Poseidon(inner, fee), not raw inner; a leaf missing the fee yields a different root.
+    let env = &f.env;
+    let mut cur = poseidon2_bytes(env, &dec_to_bytes32(inner_dec), &fee_to_bytes(FEE));
+    let mut zero = [0u8; 32];
+    for _ in 0..20 {
+        cur = poseidon2_bytes(env, &cur, &zero);
+        zero = poseidon2_bytes(env, &zero, &zero);
+    }
+    assert_eq!(f.pool.get_last_root(), BytesN::from_array(env, &cur));
+}
+
+#[test]
 #[should_panic(expected = "unknown root")]
 fn reveal_rejects_unknown_root() {
     let f = setup();
@@ -225,7 +264,7 @@ fn reveal_rejects_unknown_root() {
 }
 
 #[test]
-#[should_panic(expected = "invalid xlm fee")]
+#[should_panic(expected = "invalid relayer fee")]
 fn commit_rejects_fee_at_or_above_64_bits() {
     let f = setup();
     let sender = Address::generate(&f.env);
@@ -234,4 +273,16 @@ fn commit_rejects_fee_at_or_above_64_bits() {
     fund(&f.env, &f.xlm, &sender, huge_fee);
     let commitment = BytesN::from_array(&f.env, &[7u8; 32]);
     f.pool.commit(&sender, &commitment, &huge_fee);
+}
+
+#[test]
+#[should_panic(expected = "fee must be a multiple of the fee tier")]
+fn commit_rejects_non_tier_fee() {
+    let f = setup();
+    let sender = Address::generate(&f.env);
+    fund(&f.env, &f.token, &sender, DENOM);
+    let off_tier = FEE + 1;
+    fund(&f.env, &f.xlm, &sender, off_tier);
+    let commitment = BytesN::from_array(&f.env, &[7u8; 32]);
+    f.pool.commit(&sender, &commitment, &off_tier);
 }

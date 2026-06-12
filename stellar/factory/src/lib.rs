@@ -10,12 +10,18 @@ const MAX_LEAVES: u32 = 1 << MERKLE_LEVELS;
 const TTL_THRESHOLD: u32 = 100_000;
 const TTL_BUMP: u32 = 518_400;
 
+// Pool WASM changes wait out a timelock before they can take effect (~24h at ~5s ledgers), so users
+// have a window to react before a new, possibly malicious, pool implementation is used for deposits.
+const WASM_TIMELOCK_LEDGERS: u32 = 17_280;
+
 #[contracttype]
 enum DataKey {
     Admin,
     Verifier,
     XlmToken,
     PoolWasmHash,
+    // (proposed pool WASM hash, earliest ledger it may be enacted)
+    PendingWasm,
     // (token, denomination) -> the active (latest generation) pool address
     ActivePool(Address, i128),
     // (token, denomination) -> current generation number
@@ -43,8 +49,19 @@ pub struct PoolCreated {
 }
 
 #[contractevent]
+pub struct WasmProposed {
+    pub pool_wasm_hash: BytesN<32>,
+    pub enact_ledger: u32,
+}
+
+#[contractevent]
 pub struct WasmUpdated {
     pub pool_wasm_hash: BytesN<32>,
+}
+
+#[contractevent]
+pub struct AdminChanged {
+    pub admin: Address,
 }
 
 #[contract]
@@ -131,6 +148,32 @@ impl FactoryContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    pub fn get_pool_count(env: Env) -> u32 {
+        let list: Vec<PoolInfo> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolList)
+            .unwrap_or(Vec::new(&env));
+        list.len()
+    }
+
+    // Paginated read so callers need not load the whole registry, which grows across generations.
+    pub fn get_pools_page(env: Env, start: u32, limit: u32) -> Vec<PoolInfo> {
+        let list: Vec<PoolInfo> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolList)
+            .unwrap_or(Vec::new(&env));
+        let mut out = Vec::new(&env);
+        let end = start.saturating_add(limit).min(list.len());
+        let mut i = start;
+        while i < end {
+            out.push_back(list.get(i).unwrap());
+            i += 1;
+        }
+        out
+    }
+
     pub fn get_verifier(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Verifier).unwrap()
     }
@@ -139,13 +182,49 @@ impl FactoryContract {
         env.storage().instance().get(&DataKey::XlmToken).unwrap()
     }
 
-    // Update the pool WASM used for FUTURE deployments. Existing pools are unaffected.
+    // Propose a new pool WASM for FUTURE deployments. It cannot take effect until the timelock
+    // elapses, giving users time to react before deposits route to a new pool implementation.
+    pub fn propose_pool_wasm(env: Env, pool_wasm_hash: BytesN<32>) {
+        Self::admin(&env).require_auth();
+        let enact_ledger = env.ledger().sequence() + WASM_TIMELOCK_LEDGERS;
+        env.storage().instance().set(
+            &DataKey::PendingWasm,
+            &(pool_wasm_hash.clone(), enact_ledger),
+        );
+        WasmProposed {
+            pool_wasm_hash,
+            enact_ledger,
+        }
+        .publish(&env);
+    }
+
+    // Enact a pool WASM previously proposed, once its timelock has elapsed. The hash must match the
+    // pending proposal, so the enacted WASM is exactly the one users had a window to review.
     pub fn set_pool_wasm(env: Env, pool_wasm_hash: BytesN<32>) {
         Self::admin(&env).require_auth();
+        let (pending, enact_ledger): (BytesN<32>, u32) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingWasm)
+            .expect("no pending pool wasm");
+        if pending != pool_wasm_hash {
+            panic!("wasm does not match the pending proposal");
+        }
+        if env.ledger().sequence() < enact_ledger {
+            panic!("wasm timelock not elapsed");
+        }
         env.storage()
             .instance()
             .set(&DataKey::PoolWasmHash, &pool_wasm_hash);
+        env.storage().instance().remove(&DataKey::PendingWasm);
         WasmUpdated { pool_wasm_hash }.publish(&env);
+    }
+
+    // Lets a compromised or rotated admin key hand off control before it is abused.
+    pub fn set_admin(env: Env, new_admin: Address) {
+        Self::admin(&env).require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        AdminChanged { admin: new_admin }.publish(&env);
     }
 
     fn admin(env: &Env) -> Address {

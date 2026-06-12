@@ -48,8 +48,10 @@ function buildNote(overrides = {}) {
   const assetId = 123456789012345678901234567890n;
 
   const nullifierHash = hash([nullifier, secret]);
-  const amountHash = hash([amount, relayerFee, amountBlinding]);
+  const amountHash = hash([amount, amountBlinding]);
   const commitment = hash([nullifier, secret, amountHash, assetId]);
+  // The tree leaf binds the relayer fee, matching the circuit and the pool's hash_leaf.
+  const leaf = hash([commitment, relayerFee]);
 
   return {
     secret,
@@ -61,6 +63,7 @@ function buildNote(overrides = {}) {
     nullifierHash,
     amountHash,
     commitment,
+    leaf,
   };
 }
 
@@ -110,11 +113,11 @@ async function expectWitnessRejected(input) {
   expect(threw).to.equal(true);
 }
 
-// Generates a valid proof, bumps one public signal by 1, and expects verification to
-// fail - this is what actually binds recipient/relayer/relayerFee to the proof.
+// A public input tampered after proving must fail verification - that is what binds recipient,
+// relayer, and relayerFee to the proof, not just carries them alongside it.
 async function expectVerifyFailsWhenSignalTampered(index) {
   const note = buildNote();
-  const path = buildPath(note.commitment);
+  const path = buildPath(note.leaf);
   const { proof, publicSignals } = await prove(makeInput(note, path));
   const tampered = [...publicSignals];
   tampered[index] = (BigInt(tampered[index]) + 1n).toString();
@@ -130,14 +133,14 @@ describe("withdraw circuit", function () {
 
   it("verifies a valid proof", async () => {
     const note = buildNote();
-    const path = buildPath(note.commitment);
+    const path = buildPath(note.leaf);
     const { proof, publicSignals } = await prove(makeInput(note, path));
     expect(await snarkjs.groth16.verify(VKEY, publicSignals, proof)).to.equal(true);
   });
 
   it("exposes exactly the 7 expected public signals in order", async () => {
     const note = buildNote();
-    const path = buildPath(note.commitment);
+    const path = buildPath(note.leaf);
     const { publicSignals } = await prove(makeInput(note, path));
     expect(publicSignals.length).to.equal(7);
     expect(publicSignals[P_ROOT]).to.equal(path.root.toString());
@@ -161,7 +164,7 @@ describe("withdraw circuit", function () {
 
   it("rejects a wrong nullifierHash", async () => {
     const note = buildNote();
-    const path = buildPath(note.commitment);
+    const path = buildPath(note.leaf);
     const input = makeInput(note, path);
     input.nullifierHash = (BigInt(input.nullifierHash) + 1n).toString();
     await expectWitnessRejected(input);
@@ -169,7 +172,7 @@ describe("withdraw circuit", function () {
 
   it("rejects a commitment not in the tree", async () => {
     const note = buildNote();
-    const path = buildPath(note.commitment);
+    const path = buildPath(note.leaf);
     const input = makeInput(note, path);
     input.root = (BigInt(input.root) + 1n).toString();
     await expectWitnessRejected(input);
@@ -177,7 +180,7 @@ describe("withdraw circuit", function () {
 
   it("rejects a tampered amountHash", async () => {
     const note = buildNote();
-    const path = buildPath(note.commitment);
+    const path = buildPath(note.leaf);
     const input = makeInput(note, path);
     input.amountHash = (BigInt(input.amountHash) + 1n).toString();
     await expectWitnessRejected(input);
@@ -185,7 +188,7 @@ describe("withdraw circuit", function () {
 
   it("rejects a tampered assetId", async () => {
     const note = buildNote();
-    const path = buildPath(note.commitment);
+    const path = buildPath(note.leaf);
     const input = makeInput(note, path);
     input.assetId = (BigInt(input.assetId) + 1n).toString();
     await expectWitnessRejected(input);
@@ -193,7 +196,7 @@ describe("withdraw circuit", function () {
 
   it("rejects an out-of-range pathIndices value", async () => {
     const note = buildNote();
-    const path = buildPath(note.commitment);
+    const path = buildPath(note.leaf);
     const input = makeInput(note, path);
     input.pathIndices[0] = "2";
     await expectWitnessRejected(input);
@@ -201,13 +204,13 @@ describe("withdraw circuit", function () {
 
   it("rejects an amount that exceeds 64 bits", async () => {
     const note = buildNote({ amount: 2n ** 64n });
-    const path = buildPath(note.commitment);
+    const path = buildPath(note.leaf);
     await expectWitnessRejected(makeInput(note, path));
   });
 
   it("rejects a relayerFee that exceeds 64 bits", async () => {
     const note = buildNote({ relayerFee: 2n ** 64n });
-    const path = buildPath(note.commitment);
+    const path = buildPath(note.leaf);
     await expectWitnessRejected(makeInput(note, path));
   });
 });

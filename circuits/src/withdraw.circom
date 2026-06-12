@@ -15,9 +15,9 @@ include "lib/merkle.circom";
 // client. Do not reorder:
 //   [root, nullifierHash, recipient, relayer, relayerFee, amountHash, assetId]
 //
-// relayerFee is public so the pool can enforce that the XLM fee it pays the relayer
-// equals the fee the user committed - without this a relayer could overdraw the
-// pool's shared XLM balance.
+// relayerFee is public and bound into the tree leaf so the pool can check at commit that the
+// escrowed XLM fee equals the fee paid at reveal. Without this a depositor could escrow less than
+// they withdraw as the fee and drain the pool's shared XLM balance.
 template Withdraw(levels) {
     signal input secret;
     signal input nullifier;
@@ -47,10 +47,9 @@ template Withdraw(levels) {
     nh.inputs[1] <== secret;
     nh.out === nullifierHash;
 
-    component ah = Poseidon(3);
+    component ah = Poseidon(2);
     ah.inputs[0] <== amount;
-    ah.inputs[1] <== relayerFee;
-    ah.inputs[2] <== amountBlinding;
+    ah.inputs[1] <== amountBlinding;
     ah.out === amountHash;
 
     component cm = Poseidon(4);
@@ -59,8 +58,12 @@ template Withdraw(levels) {
     cm.inputs[2] <== ah.out;
     cm.inputs[3] <== assetId;
 
+    component leaf = Poseidon(2);
+    leaf.inputs[0] <== cm.out;
+    leaf.inputs[1] <== relayerFee;
+
     component tree = MerkleProof(levels);
-    tree.leaf <== cm.out;
+    tree.leaf <== leaf.out;
     tree.root <== root;
     for (var i = 0; i < levels; i++) {
         tree.pathElements[i] <== pathElements[i];

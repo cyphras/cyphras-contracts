@@ -3,7 +3,7 @@
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     crypto::bn254::{Bn254G1Affine, Bn254G2Affine, Fr},
-    vec, Address, Bytes, BytesN, Env, Vec,
+    vec, Bytes, BytesN, Env, Vec,
 };
 
 // Groth16 verifier over BN254 for the Cyphras withdraw circuit.
@@ -40,7 +40,6 @@ enum DataKey {
     VkGammaG2,
     VkDeltaG2,
     VkIc,
-    Admin,
 }
 
 fn is_canonical(x: &BytesN<32>) -> bool {
@@ -52,46 +51,29 @@ pub struct VerifierContract;
 
 #[contractimpl]
 impl VerifierContract {
-    pub fn init_vk(
+    // Runs once at deploy. Setting the VK atomically here means the verifier never exists in an
+    // uninitialized state that an attacker could claim with a forged key by front-running a separate
+    // init call. The VK is immutable thereafter.
+    pub fn __constructor(
         env: Env,
-        admin: Address,
         alpha_g1: BytesN<64>,
         beta_g2: BytesN<128>,
         gamma_g2: BytesN<128>,
         delta_g2: BytesN<128>,
         ic: Vec<BytesN<64>>,
     ) {
-        admin.require_auth();
-
-        if env.storage().instance().has(&DataKey::VkAlphaG1) {
-            panic!("vk already initialized");
-        }
-
         if ic.len() != NUM_PUBLIC_INPUTS + 1 {
             panic!("ic must have NUM_PUBLIC_INPUTS + 1 points");
         }
 
-        // Validate every VK point is a well-formed, on-curve, in-subgroup point now, so a
-        // malformed VK fails at deploy rather than on the first user verify (the VK is
-        // immutable after this call).
-        Bn254G1Affine::from_bytes(alpha_g1.clone());
-        Bn254G2Affine::from_bytes(beta_g2.clone());
-        Bn254G2Affine::from_bytes(gamma_g2.clone());
-        Bn254G2Affine::from_bytes(delta_g2.clone());
-        for i in 0..ic.len() {
-            Bn254G1Affine::from_bytes(ic.get(i).unwrap());
-        }
-
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        // The VK points are not curve-validated here: from_bytes only fixes the byte length, and the
+        // host validates points when they are used in verify. A malformed VK therefore fails closed
+        // (every verify traps and reverts) rather than forging proofs, and the deployer controls the VK.
         env.storage().instance().set(&DataKey::VkAlphaG1, &alpha_g1);
         env.storage().instance().set(&DataKey::VkBetaG2, &beta_g2);
         env.storage().instance().set(&DataKey::VkGammaG2, &gamma_g2);
         env.storage().instance().set(&DataKey::VkDeltaG2, &delta_g2);
         env.storage().instance().set(&DataKey::VkIc, &ic);
-    }
-
-    pub fn is_initialized(env: Env) -> bool {
-        env.storage().instance().has(&DataKey::VkAlphaG1)
     }
 
     pub fn verify(
@@ -105,10 +87,6 @@ impl VerifierContract {
         amount_hash: BytesN<32>,
         asset_id: BytesN<32>,
     ) -> bool {
-        if !env.storage().instance().has(&DataKey::VkAlphaG1) {
-            panic!("vk not initialized");
-        }
-
         if proof.len() != 256 {
             panic!("proof must be 256 bytes");
         }
