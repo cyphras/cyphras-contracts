@@ -3,8 +3,8 @@
 use soroban_poseidon::poseidon_hash;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, crypto::bn254::Fr, crypto::BnScalar,
-    token, vec, Address, Bytes, BytesN, Env, Vec, U256,
+    contract, contractevent, contractimpl, contracttype, crypto::BnScalar, token, vec, Address,
+    Bytes, BytesN, Env, Vec, U256,
 };
 
 const MERKLE_LEVELS: u32 = 20;
@@ -404,7 +404,7 @@ impl PoolContract {
             [0, 0, 0, 1] => xdr.slice(8..40).try_into().unwrap(),
             _ => panic!("unsupported address type"),
         };
-        Fr::from_bytes(raw).to_bytes()
+        BnScalar::from_bytes(raw).to_bytes()
     }
 
     fn i128_to_field(env: &Env, v: i128) -> BytesN<32> {

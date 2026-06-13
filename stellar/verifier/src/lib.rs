@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    crypto::bn254::{Bn254G1Affine, Bn254G2Affine, Fr},
+    crypto::bn254::{Bn254Fr, Bn254G1Affine, Bn254G2Affine},
     vec, Bytes, BytesN, Env, Vec,
 };
 
@@ -110,6 +110,14 @@ impl VerifierContract {
         let pi_a = Bn254G1Affine::from_bytes(pi_a_bytes);
         let pi_b = Bn254G2Affine::from_bytes(pi_b_bytes);
         let pi_c = Bn254G1Affine::from_bytes(pi_c_bytes);
+
+        let bn254 = env.crypto().bn254();
+
+        // pi_a and pi_c are attacker-supplied G1 points; reject any not on the curve before they
+        // enter the pairing. BN254 G1 has cofactor 1, so on-curve implies the prime-order subgroup.
+        if !bn254.g1_is_on_curve(&pi_a) || !bn254.g1_is_on_curve(&pi_c) {
+            return false;
+        }
         let pi_a_neg = -pi_a;
 
         let alpha_g1 = Self::g1(&env, &DataKey::VkAlphaG1);
@@ -118,24 +126,24 @@ impl VerifierContract {
         let delta_g2 = Self::g2(&env, &DataKey::VkDeltaG2);
         let ic = Self::ic(&env);
 
-        let bn254 = env.crypto().bn254();
-
         let inputs = vec![
             &env,
-            Fr::from_bytes(root),
-            Fr::from_bytes(nullifier_hash),
-            Fr::from_bytes(recipient),
-            Fr::from_bytes(relayer),
-            Fr::from_bytes(relayer_fee),
-            Fr::from_bytes(amount_hash),
-            Fr::from_bytes(asset_id),
+            Bn254Fr::from_bytes(root),
+            Bn254Fr::from_bytes(nullifier_hash),
+            Bn254Fr::from_bytes(recipient),
+            Bn254Fr::from_bytes(relayer),
+            Bn254Fr::from_bytes(relayer_fee),
+            Bn254Fr::from_bytes(amount_hash),
+            Bn254Fr::from_bytes(asset_id),
         ];
 
-        let mut vk_x = ic.get(0).unwrap();
-        for i in 0..inputs.len() {
-            let term = bn254.g1_mul(&ic.get(i + 1).unwrap(), &inputs.get(i).unwrap());
-            vk_x = bn254.g1_add(&vk_x, &term);
+        // vk_x = ic[0] + sum_i ic[i+1] * input[i]. One host MSM replaces the per-input mul + add
+        // loop: fewer host calls and a cheaper metered cost for the same result.
+        let mut ic_terms = Vec::new(&env);
+        for i in 1..ic.len() {
+            ic_terms.push_back(ic.get(i).unwrap());
         }
+        let vk_x = bn254.g1_add(&ic.get(0).unwrap(), &bn254.g1_msm(ic_terms, inputs));
 
         let g1_points = vec![&env, pi_a_neg, alpha_g1, vk_x, pi_c];
         let g2_points = vec![&env, pi_b, beta_g2, gamma_g2, delta_g2];
