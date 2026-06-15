@@ -272,6 +272,13 @@ impl PoolContract {
             .unwrap()
     }
 
+    pub fn is_nullifier_used(env: Env, nullifier_hash: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::NullifierUsed(nullifier_hash))
+            .unwrap_or(false)
+    }
+
     fn root_is_known(env: &Env, root: &BytesN<32>) -> bool {
         env.storage()
             .persistent()

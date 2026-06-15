@@ -179,6 +179,13 @@ fn commit_moves_funds_and_advances_tree() {
 }
 
 #[test]
+fn is_nullifier_used_defaults_false() {
+    let f = setup();
+    let nullifier = BytesN::from_array(&f.env, &[9u8; 32]);
+    assert!(!f.pool.is_nullifier_used(&nullifier));
+}
+
+#[test]
 fn multiple_commits_increment_index_and_change_root() {
     let f = setup();
     let sender = Address::generate(&f.env);
