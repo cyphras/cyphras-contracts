@@ -1,0 +1,22 @@
+name: gitleaks
+
+on:
+  push:
+  pull_request:
+
+# Runs the free gitleaks CLI directly. The gitleaks-action wrapper requires a paid license for
+# organization repos; the binary itself is MIT-licensed and free.
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so a secret committed in an earlier commit is still caught.
+          fetch-depth: 0
+      - name: Run gitleaks
+        run: |
+          version=8.18.4
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" detect --source . --redact --verbose

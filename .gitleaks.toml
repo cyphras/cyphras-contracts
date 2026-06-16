@@ -1,0 +1,11 @@
+# Extends the default gitleaks ruleset. Deployment manifests hold only public on-chain identifiers
+# (Stellar account and contract IDs, wasm hashes), never secrets, so they are allowlisted; every other
+# path is still scanned with the full default ruleset.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Deployment manifests are public on-chain identifiers, not secrets"
+paths = [
+  '''deployments/.*\.json$''',
+]
