@@ -36,3 +36,10 @@ See `circuits/README.md`. Requires Node.js and Circom.
 
 Deployed addresses are tracked in `deployments/<network>.json` and consumed by the
 extension and relayer - never hardcode addresses in clients.
+
+## Compliance posture
+
+v0.2.0 has no on-chain compliance gating. Association-set providers (ASP), allow/deny
+lists, and view keys are intentionally deferred: the pool is permissionless and accepts
+any valid deposit and reveal. These layers can be added later without changing the pool,
+verifier, or proof system, and the decision is revisited before serving mainnet value.
