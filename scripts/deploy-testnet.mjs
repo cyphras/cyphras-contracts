@@ -29,6 +29,17 @@ const VERIFIER_WASM = join(WASM_DIR, "cyphras_verifier.wasm");
 const POOL_WASM = join(WASM_DIR, "cyphras_pool.wasm");
 const FACTORY_WASM = join(WASM_DIR, "cyphras_factory.wasm");
 
+// This script deploys the development trusted-setup VK, which is forgeable and testnet-only. Refuse to
+// run against any non-testnet network so a copied or edited invocation can never put the dev VK on
+// mainnet. Mainnet must deploy the Phase-2 MPC ceremony VK instead; see TRUST.md.
+if (!PASSPHRASE.includes("Test SDF Network")) {
+  console.error(
+    "refusing to deploy: this script uses the development (forgeable) VK and is testnet-only. " +
+      "mainnet must deploy the MPC ceremony VK; see TRUST.md.",
+  );
+  process.exit(1);
+}
+
 const vk = JSON.parse(readFileSync(join(root, "circuits", "build", "vk_parsed.json"), "utf-8"));
 
 function run(args, opts = {}) {
