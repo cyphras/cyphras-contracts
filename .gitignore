@@ -7,15 +7,19 @@ target/
 # Node / circuits tooling
 node_modules/
 
-# Circuit build artifacts (large, regenerated). The public verification_key.json,
-# vk_parsed.json, and vectors.json under circuits/build/ ARE committed.
+# Circuit build artifacts (large, regenerated). Per-network proving keys and ptau live under
+# circuits/build/testnet/ and circuits/build/mainnet/ and are ignored; the public
+# verification_key.json and vk_parsed.json under those folders, and vectors.json at the build
+# root, ARE committed.
 circuits/build/*.r1cs
 circuits/build/*.sym
-circuits/build/*.zkey
-circuits/build/*.ptau
+circuits/build/**/*.zkey
+circuits/build/**/*.ptau
 circuits/build/withdraw_js/
 # transient per-run demo data
 circuits/build/integration.json
+# coordinator relay state (operational; the public record is ceremony/mainnet/TRANSCRIPT.md)
+circuits/build/mainnet/ceremony-state.json
 
 # Secrets and local config
 .env

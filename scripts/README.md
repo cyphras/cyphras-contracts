@@ -13,8 +13,8 @@ Prerequisites:
 - Stellar CLI installed, with an identity to sign and pay for the deploy.
 - That identity funded on testnet: `stellar keys fund <identity> --network testnet`.
 - The wasm target: `rustup target add wasm32v1-none`.
-- The trusted-setup output present at `circuits/build/vk_parsed.json` (run the
-  circuit build first if it is missing).
+- The trusted-setup output present at `circuits/build/testnet/vk_parsed.json` (run
+  the circuit build first if it is missing).
 
 Run, passing the signing identity inline:
 
