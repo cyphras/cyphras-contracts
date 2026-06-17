@@ -79,11 +79,11 @@ returned zkey against the circuit and ptau before accepting it, names files cano
 the next action. The state file is operational and gitignored; the public record is `TRANSCRIPT.md`.
 
 ```
-node coordinator.mjs init                   # after `npm run mainnet:setup`, start tracking
-node coordinator.mjs receive <file> "Name"  # verify a returned zkey, file it as the next step
-node coordinator.mjs status                 # show the chain so far and the next action
-node coordinator.mjs beacon <beaconHashHex> # apply the final beacon and verify
-node coordinator.mjs transcript             # print the filled transcript table to paste into TRANSCRIPT.md
+node ceremony/mainnet/coordinator.mjs init                   # after `npm run mainnet:setup`, start tracking
+node ceremony/mainnet/coordinator.mjs receive <file> "Name"  # verify a returned zkey, file it as the next step
+node ceremony/mainnet/coordinator.mjs status                 # show the chain so far and the next action
+node ceremony/mainnet/coordinator.mjs beacon <beaconHashHex> # apply the final beacon and verify
+node ceremony/mainnet/coordinator.mjs transcript             # print the filled transcript table to paste into TRANSCRIPT.md
 ```
 
 The numbered steps below are the underlying commands `coordinator.mjs` runs and verifies.
@@ -217,6 +217,34 @@ shasum -a 256 build/mainnet/withdraw_final.zkey build/mainnet/verification_key.j
 For more than three contributors the pattern repeats: contributor N does
 `withdraw_<N-1> -> withdraw_<N>`, the coordinator verifies between each hop, and the beacon is
 applied once to the last contribution.
+
+## Naming and attestation
+
+### Contributor name
+
+The name passed to `contribute.mjs` is recorded in the zkey and published in the transcript and the
+`verify` output permanently and publicly. Use a recognizable identity tied to a public handle, NOT a
+raw email (which would be published forever). Recommended form `Name (github: handle)`, for example
+`Fajrin (github: fxjrin)`. A bare first name works but is weak (not uniquely attributable); a
+handle matching where the attestation is posted is best.
+
+### Attestation
+
+Each contributor publishes their OWN attestation - never the coordinator on their behalf - so a real,
+identifiable party independently vouches for their contribution. After contributing, the contributor
+posts a comment on issue #9 from their own GitHub account (or a PGP-signed message linked there):
+
+```
+I contributed to the Cyphras mainnet trusted-setup ceremony.
+Name: Fajrin (github: fxjrin)
+Contribution hash (blake2b-512): <the hash contribute.mjs printed>
+Output zkey sha256: <the sha contribute.mjs printed>
+```
+
+The coordinator then puts the LINK to that comment in the attestation column of TRANSCRIPT.md. The
+coordinator, who is also a contributor, posts their own attestation the same way. Anyone verifying the
+ceremony re-derives the contribution hashes from the final zkey with `verify.mjs` and matches each to a
+named, signed attestation.
 
 ## Anyone can verify the result
 
