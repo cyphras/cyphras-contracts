@@ -1,0 +1,15 @@
+{
+  "name": "@cyphras/ceremony-mainnet",
+  "private": true,
+  "type": "module",
+  "description": "Cyphras mainnet Phase-2 trusted-setup contribution kit",
+  "license": "MIT",
+  "scripts": {
+    "contribute": "node contribute.mjs",
+    "verify": "node verify.mjs",
+    "coordinator": "node coordinator.mjs"
+  },
+  "dependencies": {
+    "snarkjs": "0.7.6"
+  }
+}

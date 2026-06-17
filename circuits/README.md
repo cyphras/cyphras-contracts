@@ -81,12 +81,23 @@ definition a fully-known, forgeable setup.
 
 ## Artifacts
 
-Committed: `verification_key.json`, `vk_parsed.json` (used to init the verifier
-contract), and `vectors.json` (Poseidon test vectors for the on-chain implementation).
-All public and auditable.
+Per-network proving keys live under `build/testnet/` and `build/mainnet/`; the
+witness generator (`withdraw.wasm`), `withdraw.r1cs`, `withdraw.sym`, and
+`vectors.json` are network-agnostic and stay at the `build/` root.
 
-Gitignored (regenerated, large): `withdraw.wasm`, `withdraw_final.zkey`, `*.ptau`.
-The browser extension bundles `withdraw.wasm` and `withdraw_final.zkey`.
+Committed (public and auditable): `build/testnet/verification_key.json`,
+`build/testnet/vk_parsed.json` (used to init the verifier contract), the matching
+files under `build/mainnet/` once the ceremony produces them, and `build/vectors.json`
+(Poseidon test vectors for the on-chain implementation).
+
+Gitignored (regenerated, large): `withdraw.wasm`, every `*.zkey`, and every `*.ptau`.
+The browser extension bundles `withdraw.wasm` (shared) and the per-network
+`withdraw_final.zkey`.
+
+The `npm run build` pipeline produces the testnet artifacts under `build/testnet/`.
+The mainnet proving key is never produced by `npm run build`; it comes from the
+multi-party ceremony, and the `mainnet:*` scripts (setup, zkey:verify, export-vk,
+parse-vk) operate on `build/mainnet/`.
 
 ## Critical compatibility note
 

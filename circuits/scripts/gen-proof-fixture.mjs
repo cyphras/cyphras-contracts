@@ -11,9 +11,11 @@ import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BUILD = join(here, "..", "build");
+const NET = process.env.NET || "testnet";
+const NETDIR = join(BUILD, NET);
 const WASM = join(BUILD, "withdraw_js", "withdraw.wasm");
-const ZKEY = join(BUILD, "withdraw_final.zkey");
-const VKEY = JSON.parse(readFileSync(join(BUILD, "verification_key.json"), "utf-8"));
+const ZKEY = join(NETDIR, "withdraw_final.zkey");
+const VKEY = JSON.parse(readFileSync(join(NETDIR, "verification_key.json"), "utf-8"));
 const OUT_DIR = join(here, "..", "..", "stellar", "verifier", "tests");
 const OUT = join(OUT_DIR, "proof_fixture.json");
 

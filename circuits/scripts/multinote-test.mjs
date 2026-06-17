@@ -14,8 +14,10 @@ import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BUILD = join(here, "..", "build");
+const NET = process.env.NET || "testnet";
+const NETDIR = join(BUILD, NET);
 const WASM = join(BUILD, "withdraw_js", "withdraw.wasm");
-const ZKEY = join(BUILD, "withdraw_final.zkey");
+const ZKEY = join(NETDIR, "withdraw_final.zkey");
 const DEPLOY = JSON.parse(
   readFileSync(join(here, "..", "..", "deployments", "testnet.json"), "utf-8"),
 );
@@ -132,7 +134,7 @@ const input = {
 };
 
 const { proof, publicSignals } = await snarkjs.groth16.fullProve(input, WASM, ZKEY);
-const vkey = JSON.parse(readFileSync(join(BUILD, "verification_key.json"), "utf-8"));
+const vkey = JSON.parse(readFileSync(join(NETDIR, "verification_key.json"), "utf-8"));
 if (!(await snarkjs.groth16.verify(vkey, publicSignals, proof))) {
   throw new Error("proof failed local verification");
 }

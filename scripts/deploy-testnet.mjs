@@ -40,7 +40,9 @@ if (!PASSPHRASE.includes("Test SDF Network")) {
   process.exit(1);
 }
 
-const vk = JSON.parse(readFileSync(join(root, "circuits", "build", "vk_parsed.json"), "utf-8"));
+const vk = JSON.parse(
+  readFileSync(join(root, "circuits", "build", "testnet", "vk_parsed.json"), "utf-8"),
+);
 
 function run(args, opts = {}) {
   console.log(`\n$ stellar ${args.join(" ")}`);
