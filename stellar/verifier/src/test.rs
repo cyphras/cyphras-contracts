@@ -6,7 +6,7 @@ use soroban_sdk::{Bytes, BytesN, Env, Vec};
 
 const FIXTURE: &str = include_str!("../tests/proof_fixture.json");
 // The actual deployment artifact produced by circuits/scripts/parse-vk.mjs.
-const VK_PARSED: &str = include_str!("../../../circuits/build/vk_parsed.json");
+const VK_PARSED: &str = include_str!("../../../circuits/build/testnet/vk_parsed.json");
 
 fn decode<const N: usize>(env: &Env, hex_str: &str) -> BytesN<N> {
     let raw = hex::decode(hex_str).unwrap();

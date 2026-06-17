@@ -40,7 +40,7 @@ The VK lives in instance storage and is kept alive by the relayer's TTL keeper.
 
 ## Trusted setup (testnet vs mainnet)
 
-The testnet VK in `circuits/build/vk_parsed.json` comes from a development trusted setup whose toxic
+The testnet VK in `circuits/build/testnet/vk_parsed.json` comes from a development trusted setup whose toxic
 waste is known. **It is forgeable and testnet-only.** Anyone with the setup output can mint proofs
 that pass verification, so testnet pools must never hold real value.
 
