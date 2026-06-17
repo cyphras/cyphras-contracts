@@ -11,11 +11,11 @@ import { argv, env, exit } from "node:process";
 // prints the next action. State lives in build/mainnet/ceremony-state.json (operational, gitignored;
 // the public record is TRANSCRIPT.md, rendered with the `transcript` command). No secrets are stored.
 //
-//   node coordinator.mjs init                       record r1cs/ptau/withdraw_0000 hashes, start tracking
-//   node coordinator.mjs receive <file> "Name"      verify a returned zkey, file it as the next step
-//   node coordinator.mjs status                     show the chain so far and the next action
-//   node coordinator.mjs beacon <beaconHashHex>     apply the final public beacon and verify
-//   node coordinator.mjs transcript                 print the filled transcript table to paste into TRANSCRIPT.md
+//   node ceremony/mainnet/coordinator.mjs init                       record r1cs/ptau/withdraw_0000 hashes, start tracking
+//   node ceremony/mainnet/coordinator.mjs receive <file> "Name"      verify a returned zkey, file it as the next step
+//   node ceremony/mainnet/coordinator.mjs status                     show the chain so far and the next action
+//   node ceremony/mainnet/coordinator.mjs beacon <beaconHashHex>     apply the final public beacon and verify
+//   node ceremony/mainnet/coordinator.mjs transcript                 print the filled transcript table to paste into TRANSCRIPT.md
 
 const here = dirname(fileURLToPath(import.meta.url));
 const CIRCUITS = resolve(here, "..", "..");
@@ -45,7 +45,7 @@ function fail(m) {
 }
 
 function loadState() {
-  if (!existsSync(STATE)) fail("no ceremony in progress. Run `node coordinator.mjs init` first.");
+  if (!existsSync(STATE)) fail("no ceremony in progress. Run `node ceremony/mainnet/coordinator.mjs init` first.");
   return JSON.parse(readFileSync(STATE, "utf8"));
 }
 
@@ -89,10 +89,10 @@ async function verifyAgainst(ptau, zkey) {
 function nextActionLine(state) {
   const last = state.contributions[state.contributions.length - 1];
   const n = state.contributions.length; // next step index
-  if (state.final) return "Ceremony finalized. Run `npm run mainnet:export-vk && npm run mainnet:parse-vk`, then `node coordinator.mjs transcript`.";
+  if (state.final) return "Ceremony finalized. Run `npm run mainnet:export-vk && npm run mainnet:parse-vk`, then `node ceremony/mainnet/coordinator.mjs transcript`.";
   return (
     `NEXT: send ${last.file} (sha256 ${last.sha256}) to contributor ${n},\n` +
-    `      or run \`node coordinator.mjs beacon <beaconHashHex>\` to finalize if contributions are done.`
+    `      or run \`node ceremony/mainnet/coordinator.mjs beacon <beaconHashHex>\` to finalize if contributions are done.`
   );
 }
 
@@ -133,7 +133,7 @@ async function cmdInit() {
 }
 
 async function cmdReceive(incoming, name, reportedHash) {
-  if (!incoming || !name) fail('usage: node coordinator.mjs receive <file.zkey> "Contributor Name" [reportedContributionHash]');
+  if (!incoming || !name) fail('usage: node ceremony/mainnet/coordinator.mjs receive <file.zkey> "Contributor Name" [reportedContributionHash]');
   if (!existsSync(incoming)) fail(`file not found: ${incoming}`);
   const state = loadState();
   if (state.final) fail("ceremony already finalized; cannot accept more contributions.");
@@ -188,7 +188,7 @@ function cmdStatus() {
 
 async function cmdBeacon(beaconHash) {
   if (!beaconHash || !/^[0-9a-f]+$/i.test(beaconHash))
-    fail("usage: node coordinator.mjs beacon <beaconHashHex>  (the announced public beacon randomness, hex)");
+    fail("usage: node ceremony/mainnet/coordinator.mjs beacon <beaconHashHex>  (the announced public beacon randomness, hex)");
   const state = loadState();
   if (state.final) fail("ceremony already finalized.");
   if (state.contributions.length < 2)
@@ -208,7 +208,7 @@ async function cmdBeacon(beaconHash) {
   console.log(`Beacon applied and final zkey verified (ZKey Ok!).`);
   console.log(`  final zkey sha256: ${state.final.sha256}\n`);
   console.log("NEXT: from circuits/, run `npm run mainnet:export-vk && npm run mainnet:parse-vk`,");
-  console.log("      then `node coordinator.mjs transcript` to render the public record.");
+  console.log("      then `node ceremony/mainnet/coordinator.mjs transcript` to render the public record.");
 }
 
 function cmdTranscript() {
@@ -246,7 +246,7 @@ switch (cmd) {
     cmdTranscript();
     break;
   default:
-    console.error("usage: node coordinator.mjs <init|receive|status|beacon|transcript> ...");
+    console.error("usage: node ceremony/mainnet/coordinator.mjs <init|receive|status|beacon|transcript> ...");
     exit(1);
 }
 
