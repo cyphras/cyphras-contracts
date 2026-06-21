@@ -105,12 +105,28 @@ async function prove(input) {
   return snarkjs.groth16.fullProve(input, WASM, ZKEY);
 }
 
+function silenceConsole() {
+  const log = console.log;
+  const error = console.error;
+  console.log = () => {};
+  console.error = () => {};
+  return () => {
+    console.log = log;
+    console.error = error;
+  };
+}
+
 async function expectWitnessRejected(input) {
   let threw = false;
+  // Witness generation prints circom's constraint-failure text to the console when an input is
+  // rejected, but that rejection is exactly what this asserts, so silence the noise during the call.
+  const restore = silenceConsole();
   try {
     await prove(input);
   } catch {
     threw = true;
+  } finally {
+    restore();
   }
   expect(threw).to.equal(true);
 }
