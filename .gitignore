@@ -14,6 +14,9 @@ node_modules/
 circuits/build/*.r1cs
 circuits/build/*.sym
 circuits/build/**/*.zkey
+# Exception: the testnet proving key is published. Its setup is single-contributor and forgeable by
+# design (testnet only), so the key is safe to commit for verifiable, reproducible builds.
+!circuits/build/testnet/withdraw_final.zkey
 circuits/build/**/*.ptau
 circuits/build/withdraw_js/
 # transient per-run demo data
