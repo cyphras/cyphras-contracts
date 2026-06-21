@@ -87,12 +87,15 @@ witness generator (`withdraw.wasm`), `withdraw.r1cs`, `withdraw.sym`, and
 
 Committed (public and auditable): `build/testnet/verification_key.json`,
 `build/testnet/vk_parsed.json` (used to init the verifier contract), the matching
-files under `build/mainnet/` once the ceremony produces them, and `build/vectors.json`
-(Poseidon test vectors for the on-chain implementation).
+files under `build/mainnet/` once the ceremony produces them, `build/vectors.json`
+(Poseidon test vectors for the on-chain implementation), and the testnet proving key
+`build/testnet/withdraw_final.zkey`. The testnet setup is single-contributor and
+forgeable by design, so its proving key is safe to publish for verifiable builds; the
+mainnet proving key from the ceremony is never committed.
 
-Gitignored (regenerated, large): `withdraw.wasm`, every `*.zkey`, and every `*.ptau`.
-The browser extension bundles `withdraw.wasm` (shared) and the per-network
-`withdraw_final.zkey`.
+Gitignored (regenerated, large): `withdraw.wasm`, every `*.ptau`, and every `*.zkey`
+except the published testnet `build/testnet/withdraw_final.zkey`. The browser extension
+bundles `withdraw.wasm` (shared) and the per-network `withdraw_final.zkey`.
 
 The `npm run build` pipeline produces the testnet artifacts under `build/testnet/`.
 The mainnet proving key is never produced by `npm run build`; it comes from the
