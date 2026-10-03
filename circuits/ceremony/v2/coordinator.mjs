@@ -32,6 +32,8 @@ const STATE = "ceremony-state.json";
 const FINAL = "transaction_final.zkey";
 const VK = "verification_key.json";
 const zkeyFile = (n) => `transaction_${String(n).padStart(4, "0")}.zkey`;
+const LEAD_HOURS = 24;
+const CLOCK_SLACK_MINUTES = 10;
 
 const USAGE = `Coordinator of the Cyphras v2 phase-2 trusted-setup ceremony. Each command
 verifies before it records anything; the record (paths and hashes, no secrets) is
@@ -56,8 +58,12 @@ Usage:
       such as 2026-10-20T12:00:00Z) and the text to announce, at least 24 hours before the
       round is produced.
   node coordinator.mjs announce <round> <link> <time>
-      Record that <round> was announced in the public post at <link>, published at <time>.
-      The round must be produced after that time and after the last accepted contribution.
+      Record that <round> was announced in the public post at <link>, published at <time>,
+      which must be within ${CLOCK_SLACK_MINUTES} minutes of this machine's clock. The round must be
+      produced at least ${LEAD_HOURS} hours after <time> and after the last accepted contribution.
+      Once an announced round is produced, no other round can be announced unless a
+      contribution was accepted after it. --dry-run-lead <seconds> lowers the lead for
+      dry-run.mjs; it needs CEREMONY_DRY_RUN=1 and marks the record as a dry run.
   node coordinator.mjs beacon <round>
       Fetch the last announced round from the drand relays, check it against the quicknet
       public key and that it was produced after the last accepted contribution, apply it with
@@ -81,6 +87,7 @@ run(USAGE, async (argv) => {
       r1cs: { type: "string" },
       ptau: { type: "string" },
       resolve: { type: "string" },
+      "dry-run-lead": { type: "string" },
     },
   });
   const [command, ...args] = positionals;
@@ -92,6 +99,9 @@ run(USAGE, async (argv) => {
   }
   if (command !== "receive" && values.resolve !== undefined) {
     throw new Error("only receive takes --resolve");
+  }
+  if (command !== "announce" && values["dry-run-lead"] !== undefined) {
+    throw new Error("only announce takes --dry-run-lead");
   }
   const dir = resolve(values.dir ?? join(CIRCUITS, "build", "ceremony-v2"));
   if (command === "init") {
@@ -105,7 +115,7 @@ run(USAGE, async (argv) => {
   } else if (command === "round") {
     roundAt(args[0]);
   } else if (command === "announce") {
-    announce(dir, ...args);
+    announce(dir, ...args, values["dry-run-lead"]);
   } else if (command === "beacon") {
     await beacon(dir, args[0]);
   } else {
@@ -291,8 +301,8 @@ function roundAt(time) {
   console.log(
     hours < 0 ? `${(-hours).toFixed(1)} hours ago.` : `${hours.toFixed(1)} hours from now.`,
   );
-  if (hours < 24) {
-    console.log("WARNING: the plan announces the round at least 24 hours before it is produced.");
+  if (hours < LEAD_HOURS) {
+    console.log(`WARNING: announce refuses a round less than ${LEAD_HOURS} hours ahead.`);
   }
   console.log(`
 Announcement:
@@ -317,12 +327,49 @@ function producedAfterLast(state, round) {
   return produced;
 }
 
-function announce(dir, roundArg, link, time) {
+function dryRunBanner(seconds) {
+  const line = "*".repeat(72);
+  console.log(`${line}\nDRY RUN ONLY: the beacon round was announced ${seconds} seconds ahead,`);
+  console.log(`not ${LEAD_HOURS} hours. A ceremony recorded this way must never be used.\n${line}`);
+}
+
+function announce(dir, roundArg, link, time, dryRunLead) {
   const round = parseRound(roundArg);
   if (!/^https:\/\/\S+$/.test(link)) throw new Error("the link must be an https:// address");
   const at = parseTime(time, "the time of the announcement");
+  // The post time is the coordinator's own word. Holding it to this machine's clock keeps a round
+  // from being announced after its value is known under an earlier time.
+  if (Math.abs(at - Date.now()) > CLOCK_SLACK_MINUTES * 60_000) {
+    throw new Error(
+      `the announcement time ${at.toISOString()} is more than ${CLOCK_SLACK_MINUTES} minutes ` +
+        `from this machine's clock, ${new Date().toISOString()}; record the announcement right ` +
+        "after posting it",
+    );
+  }
+  let lead = LEAD_HOURS * 3_600_000;
+  if (dryRunLead !== undefined) {
+    if (process.env.CEREMONY_DRY_RUN !== "1") {
+      throw new Error("--dry-run-lead is for dry-run.mjs only and needs CEREMONY_DRY_RUN=1");
+    }
+    if (!/^[1-9][0-9]*$/.test(dryRunLead)) throw new Error("--dry-run-lead takes whole seconds");
+    lead = Number(dryRunLead) * 1000;
+    dryRunBanner(dryRunLead);
+  }
   const state = load(dir);
   if (state.final) throw new Error("the ceremony is finalized");
+  // Once drand has produced an announced round that can still be applied, its value is public,
+  // and announcing another round would let the coordinator pick the beacon.
+  const previous = state.announcements.at(-1);
+  if (previous && new Date(previous.produced) <= Date.now()) {
+    const last = state.zkeys.at(-1);
+    if (new Date(last.at) < new Date(previous.produced)) {
+      throw new Error(
+        `drand round ${previous.round}, announced at ${previous.at}, was already produced at ` +
+          `${previous.produced} and no contribution was accepted after it; apply it with the ` +
+          "beacon command",
+      );
+    }
+  }
   const produced = producedAfterLast(state, round);
   if (produced <= at) {
     throw new Error(
@@ -330,10 +377,20 @@ function announce(dir, roundArg, link, time) {
         `announcement at ${at.toISOString()}`,
     );
   }
-  if (produced - at < 24 * 3_600_000) {
-    console.log("WARNING: the plan announces the round at least 24 hours before it is produced.");
+  if (produced - at < lead) {
+    const needed = dryRunLead === undefined ? `${LEAD_HOURS} hours` : `${dryRunLead} seconds`;
+    throw new Error(
+      `drand round ${round} is produced at ${produced.toISOString()}, less than ${needed} ` +
+        `after the announcement at ${at.toISOString()}`,
+    );
   }
-  state.announcements.push({ round, produced: produced.toISOString(), link, at: at.toISOString() });
+  state.announcements.push({
+    round,
+    produced: produced.toISOString(),
+    link,
+    at: at.toISOString(),
+    ...(dryRunLead !== undefined && { dryRunLead: Number(dryRunLead) }),
+  });
   save(dir, state);
   report(dir, state);
 }
@@ -357,6 +414,7 @@ async function beacon(dir, roundArg) {
     );
   }
   producedAfterLast(state, round);
+  if (announced.dryRunLead !== undefined) dryRunBanner(announced.dryRunLead);
   const { r1cs, ptau, last, lastFile } = inputs(dir, state);
   const drand = await step(`Fetching drand quicknet round ${round}`, () => fetchRound(round));
   console.log(`  produced at ${drand.time}, agreed by ${drand.relays.join(", ")}`);
@@ -440,6 +498,11 @@ function report(dir, state) {
       `  round ${a.round}, produced at ${a.produced}`,
       `    announced at ${a.at}, ${a.link}`,
     );
+    if (a.dryRunLead !== undefined) {
+      out.push(
+        `    DRY RUN ONLY: announced ${a.dryRunLead} seconds ahead, not ${LEAD_HOURS} hours`,
+      );
+    }
   }
   const b = state.beacon;
   if (b) {

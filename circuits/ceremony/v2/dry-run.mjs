@@ -38,9 +38,15 @@ const VK = "verification_key.json";
 const timings = [];
 const refusals = [];
 
-function exec(cwd, args, input) {
+// Only the steps that ask for it run with CEREMONY_DRY_RUN=1.
+function exec(cwd, args, { input, env } = {}) {
   const started = Date.now();
-  const r = spawnSync(process.execPath, args, { cwd, input, encoding: "utf8" });
+  const r = spawnSync(process.execPath, args, {
+    cwd,
+    input,
+    env: { ...process.env, CEREMONY_DRY_RUN: "", ...env },
+    encoding: "utf8",
+  });
   const seconds = (Date.now() - started) / 1000;
   const shown = args.map((a) => (/^[\w./:=-]+$/.test(a) ? a : JSON.stringify(a))).join(" ");
   console.log(`\n$ node ${shown}\n  (in ${cwd}, ${seconds.toFixed(1)} s, exit ${r.status})`);
@@ -49,16 +55,16 @@ function exec(cwd, args, input) {
   return { status: r.status, output, seconds };
 }
 
-function pass(label, cwd, args, input) {
-  const r = exec(cwd, args, input);
+function pass(label, cwd, args, options) {
+  const r = exec(cwd, args, options);
   if (r.status !== 0) throw new Error(`${label} failed`);
   timings.push([label, r.seconds]);
   return r.output;
 }
 
 // A negative check passes only if the step fails for the expected reason.
-function refuse(label, cwd, args, reason) {
-  const r = exec(cwd, args);
+function refuse(label, cwd, args, reason, options) {
+  const r = exec(cwd, args, options);
   const error = r.output.match(/ERROR: (.*)/)?.[1] ?? "";
   if (r.status === 0 || !error.includes(reason)) {
     throw new Error(`"${label}" must fail with "${reason}", got exit ${r.status}: ${error}`);
@@ -303,7 +309,7 @@ async function dryRun(root, r1cs, ptau) {
   const args2 = [...handOut(two), ...checked, "--extra-entropy"];
   args2.splice(2, 0, out2, name2);
   const label2 = "contributor 2: verify the input, contribute with piped extra entropy";
-  const h2 = attested(pass(label2, two, args2, randomBytes(32)));
+  const h2 = attested(pass(label2, two, args2, { input: randomBytes(32) }));
   const renamedFirst = tamper(
     out2,
     join(two, "renamed.zkey"),
@@ -432,35 +438,57 @@ async function dryRun(root, r1cs, ptau) {
     throw new Error("--resolve did not give #3 to its owner and keep the thief's file aside");
   }
 
-  // A real ceremony announces the round at least a day ahead; here drand produces it in seconds.
+  // A real ceremony announces the round at least a day ahead; here drand produces it seconds
+  // later, under the dry-run lead.
+  const dryRun = { env: { CEREMONY_DRY_RUN: "1" } };
+  const lead = ["--dry-run-lead", "10"];
+  const link = "https://example.invalid/cyphras-ceremony-dry-run";
+  const now = () => new Date().toISOString();
+  const announce = (dir, n, at, ...more) => [...coord(dir, "announce", `${n}`, link, at), ...more];
   const lastAccepted = new Date(record(coordinator).zkeys.at(-1).at);
   const round = firstRoundAt(new Date(Date.now() + 15_000));
   const produced = roundTime(round);
-  const link = "https://example.invalid/cyphras-ceremony-dry-run";
+  const clock = "more than 10 minutes from this machine's clock";
+  refuse(
+    "announce: a post time backdated by a day",
+    KIT,
+    announce(coordinator, round, new Date(Date.now() - 86_400_000).toISOString(), ...lead),
+    clock,
+    dryRun,
+  );
+  refuse(
+    "announce: a post time an hour ahead of the clock",
+    KIT,
+    announce(coordinator, round, new Date(Date.now() + 3_600_000).toISOString(), ...lead),
+    clock,
+    dryRun,
+  );
+  refuse(
+    "announce: a round less than 24 hours ahead",
+    KIT,
+    announce(coordinator, round, now()),
+    "less than 24 hours after the announcement",
+  );
+  refuse(
+    "announce: --dry-run-lead without CEREMONY_DRY_RUN=1",
+    KIT,
+    announce(coordinator, round, now(), ...lead),
+    "needs CEREMONY_DRY_RUN=1",
+  );
   const old = firstRoundAt(new Date(lastAccepted - 60_000));
   refuse(
     "announce: a round produced before the last accepted contribution",
     KIT,
-    coord(
-      coordinator,
-      "announce",
-      `${old}`,
-      link,
-      new Date(roundTime(old) - 86_400_000).toISOString(),
-    ),
+    announce(coordinator, old, now(), ...lead),
     "before transaction_0003.zkey was accepted",
+    dryRun,
   );
   refuse(
     "announce: a round produced before its announcement",
     KIT,
-    coord(
-      coordinator,
-      "announce",
-      `${round}`,
-      link,
-      new Date(produced.getTime() + 1000).toISOString(),
-    ),
+    announce(coordinator, round, new Date(produced.getTime() + 1000).toISOString(), ...lead),
     "before the announcement",
+    dryRun,
   );
   refuse(
     "beacon: no round announced",
@@ -470,9 +498,10 @@ async function dryRun(root, r1cs, ptau) {
   );
   pass("coordinator round", KIT, coord(coordinator, "round", produced.toISOString()));
   pass(
-    "coordinator announce",
+    "coordinator announce, dry-run lead",
     KIT,
-    coord(coordinator, "announce", `${round}`, link, new Date().toISOString()),
+    announce(coordinator, round, now(), ...lead),
+    dryRun,
   );
   refuse(
     "beacon: a round other than the announced one",
@@ -484,6 +513,13 @@ async function dryRun(root, r1cs, ptau) {
   const late = join(root, "coordinator-late");
   cpSync(coordinator, late, { recursive: true });
   await new Promise((done) => setTimeout(done, produced - Date.now() + 5_000));
+  refuse(
+    "announce: another round once the announced one is produced",
+    KIT,
+    announce(coordinator, firstRoundAt(new Date(Date.now() + 15_000)), now(), ...lead),
+    `drand round ${round}, announced at`,
+    dryRun,
+  );
   pass(
     `coordinator beacon (drand quicknet round ${round})`,
     KIT,
@@ -513,6 +549,12 @@ async function dryRun(root, r1cs, ptau) {
     KIT,
     coord(late, "beacon", `${round}`),
     "before transaction_0004.zkey was accepted",
+  );
+  pass(
+    "late copy: announce a new round after the later contribution",
+    KIT,
+    announce(late, firstRoundAt(new Date(Date.now() + 15_000)), now(), ...lead),
+    dryRun,
   );
 
   // The verifier takes the published files and the transcript's values from the coordinator, and
