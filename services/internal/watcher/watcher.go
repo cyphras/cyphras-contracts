@@ -218,9 +218,8 @@ func (w *Watcher) Apply(ctx context.Context, b follow.Batch) error {
 		// An attestation's timing is judged after the window is stored; until it is, the check
 		// stays in the database, so neither a failed read nor a restart loses it.
 		for _, n := range delta.Notices {
-			if n.Name == "attested" && n.ClosedAt+secondsPerDay >= b.LatestCloseTime {
-				a := n.Body.(chainstate.Attestation)
-				if err := w.db.addAttestCheck(ctx, tx, attestCheck{upTo: a.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: a.Covered}); err != nil {
+			if c, ok := judged(n); ok && n.ClosedAt+secondsPerDay >= b.LatestCloseTime {
+				if err := w.db.addAttestCheck(ctx, tx, c); err != nil {
 					return err
 				}
 			}
@@ -325,8 +324,9 @@ var governance = map[string]bool{
 }
 
 // notices reports governance events to the operator and the public channel, flags and requeued
-// exits as information, stranded exits, and checks every attestation against the screening
-// policy's timing. Events older than a day, met while rebuilding, are not reported again.
+// exits as information, stranded exits, and checks every attestation, and every unflag inside the
+// attested range, against the screening policy's timing. Events older than a day, met while
+// rebuilding, are not reported again.
 func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, latestClose int64) {
 	for _, n := range notices {
 		if n.ClosedAt+secondsPerDay < latestClose {
@@ -352,9 +352,9 @@ func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, late
 		case n.Name == "exit_requeued":
 			r := n.Body.(vault.ExitRequeued)
 			w.alerts.Raise(ctx, alert.Info, fmt.Sprintf("exit_requeued_%d", r.NewID), "%v of the payout and %v of the fee of stranded exit %d were queued again as exit %d", r.Payout, r.Fee, r.ID, r.NewID)
-		case n.Name == "attested":
-			a := n.Body.(chainstate.Attestation)
-			if err := w.judgeAttestation(ctx, attestCheck{upTo: a.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: a.Covered}); err != nil {
+		}
+		if c, ok := judged(n); ok {
+			if err := w.judgeAttestation(ctx, c); err != nil {
 				w.log.Warn("attestation check deferred", "ledger", n.Ledger, "error", err.Error())
 			}
 		}
@@ -377,7 +377,7 @@ func describe(body any) string {
 		return "resumed; the next halt is possible from " + time.Unix(int64(b.NextHaltAt), 0).UTC().Format(time.RFC3339)
 	case vault.DepositFlagged:
 		return fmt.Sprintf("deposit %d, reason %d", b.ID, b.Reason)
-	case vault.DepositUnflagged:
+	case chainstate.Unflag:
 		return fmt.Sprintf("deposit %d, reason %d cleared", b.ID, b.Reason)
 	}
 	return fmt.Sprintf("%+v", body)
@@ -386,6 +386,21 @@ func describe(body any) string {
 func limitsText(l vault.Limits) string {
 	return fmt.Sprintf("min_deposit %v, max_deposit %v, max_daily_per_depositor %v, tvl_cap %v, max_daily_outflow %v, max_fee %v, large_deposit_threshold %v",
 		l.MinDeposit, l.MaxDeposit, l.MaxDailyPerDepositor, l.TvlCap, l.MaxDailyOutflow, l.MaxFee, l.LargeDepositThreshold)
+}
+
+// judged is the attestation check a notice calls for: an attestation covers the deposits it
+// vouches for, and an unflag inside the attested range covers its deposit from then on, as an
+// attestation made at that moment would.
+func judged(n chainstate.Notice) (attestCheck, bool) {
+	switch b := n.Body.(type) {
+	case chainstate.Attestation:
+		return attestCheck{upTo: b.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: b.Covered}, true
+	case chainstate.Unflag:
+		if b.ID <= b.AttestedUpTo {
+			return attestCheck{upTo: b.AttestedUpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: []uint64{b.ID}}, true
+		}
+	}
+	return attestCheck{}, false
 }
 
 // attestSlack allows for ledger close times around the screening service's ten-minute window.
@@ -433,8 +448,8 @@ func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 		eligible := vault.PendingDeposit{Amount: amount, CreatedAt: createdAt, Delay: delay}.EligibleAt(inst.Config, inst.Limits)
 		if uint64(c.closedAt)+600+attestSlack < eligible {
 			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("early_attestation_%d", id),
-				"attestation up to deposit %d at ledger %d covered deposit %d %d seconds before its final-check window; the asp key may be stolen",
-				c.upTo, c.ledger, id, eligible-600-uint64(c.closedAt))
+				"deposit %d came under the attestation up to %d at ledger %d, %d seconds before its final-check window; the asp key may be stolen",
+				id, c.upTo, c.ledger, eligible-600-uint64(c.closedAt))
 		}
 	}
 	return w.db.dropAttestCheck(ctx, c.upTo, c.ledger)

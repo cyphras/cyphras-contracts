@@ -304,6 +304,13 @@ type Attestation struct {
 	Covered []uint64
 }
 
+// Unflag is the body of a deposit_unflagged notice: the unflag and the attestation it came under,
+// since a deposit unflagged inside the attested range is admitted on that attestation.
+type Unflag struct {
+	vault.DepositUnflagged
+	AttestedUpTo uint64
+}
+
 // Notice is a governance, queue or exit event, kept for the services that report them.
 type Notice struct {
 	Name     string
@@ -469,7 +476,7 @@ func (s *State) apply(tx vault.Tx, call any, d *Delta, spent map[fr.Element]bool
 		dep.Flag = nil
 		dep.FlaggedAt = 0
 		d.Updated = append(d.Updated, *dep.clone())
-		s.notice(tx, "deposit_unflagged", c, d)
+		s.notice(tx, "deposit_unflagged", Unflag{DepositUnflagged: c, AttestedUpTo: s.AttestedUpTo}, d)
 	case vault.Attested:
 		if s.halted(now) {
 			return inconsistent("an attestation while halted")

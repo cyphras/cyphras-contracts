@@ -457,3 +457,29 @@ func TestADepositNotAttestedPastItsEligibilityPages(t *testing.T) {
 		t.Fatalf("pages %v", h.pages.codes())
 	}
 }
+
+func TestAnUnflagInsideTheAttestedRangeIsJudgedAsAnAttestation(t *testing.T) {
+	for _, early := range []bool{true, false} {
+		h := newHarness(t)
+		c := h.chain
+		large := c.Shield(vaulttest.Depositor, 6_000_000_000)
+		c.NextLedger(5)
+		h.sync()
+		created := uint64(c.ClosedAt - 5)
+		h.primary.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, large)), vaulttest.Pending(large, vaulttest.Depositor, 6_000_000_000, created, 86400, nil, 0), c.Ledger, nil)
+		// A stolen asp key flags the deposit, attests past it and unflags it, all a day early. A
+		// hold lifted in the deposit's own final window is what the screening service does.
+		c.NextLedger(120)
+		c.Flag(large, 6)
+		c.Attest(large)
+		if !early {
+			c.NextLedger(86400 - 120 - 5*60)
+		}
+		c.Unflag(large, 6)
+		c.NextLedger(5)
+		h.sync()
+		if got := h.pages.has("early_attestation_1"); got != early {
+			t.Fatalf("early %v: pages %v", early, h.pages.codes())
+		}
+	}
+}

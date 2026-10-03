@@ -175,7 +175,9 @@ func (s store) addAttestCheck(ctx context.Context, tx pgx.Tx, c attestCheck) err
 	for i, id := range c.covered {
 		covered[i] = int64(id)
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO watch_attest_checks (up_to, ledger, closed_at, covered) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+	// An attestation and an unflag inside its range in one ledger are one check of both.
+	_, err := tx.Exec(ctx, `INSERT INTO watch_attest_checks (up_to, ledger, closed_at, covered) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (up_to, ledger) DO UPDATE SET covered = ARRAY(SELECT DISTINCT unnest(watch_attest_checks.covered || EXCLUDED.covered) ORDER BY 1)`,
 		int64(c.upTo), int64(c.ledger), c.closedAt, covered)
 	return err
 }
