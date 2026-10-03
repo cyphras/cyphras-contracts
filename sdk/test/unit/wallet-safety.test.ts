@@ -298,6 +298,69 @@ describe("wallet safety: cross-checks with RPC events", () => {
   });
 });
 
+describe("wallet safety: refusals before proving", () => {
+  it("refuses to spend while the vault's view leaves the tree unconfirmed", async () => {
+    const { world } = await funded();
+    let stale: string | undefined;
+    let mode: "capture" | "live" | "replay" = "capture";
+    const isView = (body: { method?: string; params?: { keys?: unknown[] } } | undefined) =>
+      body?.method === "getLedgerEntries" && body.params?.keys?.length === 3;
+    const lagging: FetchLike = async (input, init) => {
+      const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
+      if (mode === "replay" && isView(body) && stale !== undefined) {
+        return new Response(JSON.stringify({ ...JSON.parse(stale), id: body.id }), {
+          status: 200,
+        });
+      }
+      const res = await world.fetch(input, init);
+      if (mode === "capture" && isView(body)) stale = await res.clone().text();
+      return res;
+    };
+    const alice = await openWallet({ ...world, fetch: lagging }, 0);
+    await alice.sync();
+    mode = "live";
+    world.fill(1);
+    await alice.sync();
+    // A node that lags behind the wallet's own tree cannot confirm its root.
+    mode = "replay";
+    const bob = await openWallet(world, 1);
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM }),
+      isError("tree_unverified"),
+    );
+    assert.equal(world.relayer.submissions.length, 0);
+  });
+
+  it("refuses to spend while the vault is halted", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.vault.haltedUntil = world.vault.timestamp + 3_600n;
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM }),
+      isError("vault_unavailable"),
+    );
+    assert.equal(world.relayer.submissions.length, 0);
+  });
+
+  it("refuses a quote that names a fee address other than the relayer's", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.relayer.quoteFeeAddress = world.signer("someone else").publicKey;
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM }),
+      isError("quote_invalid"),
+    );
+  });
+
+  it("treats leaves that end inside an inserted pair as an indexer fault", async () => {
+    const { world } = await funded();
+    world.fill(2);
+    world.indexer.leafLimit = 3;
+    const fresh = await openWallet(world, 0);
+    await assert.rejects(fresh.sync(), isError("indexer_fault"));
+  });
+});
+
 describe("wallet safety: syncs that fail", () => {
   it("keeps nothing of a sync whose nullifiers carry a forged transaction", async () => {
     const world = await createWorld();

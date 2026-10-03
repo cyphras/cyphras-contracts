@@ -307,6 +307,8 @@ export class MockRelayer {
   fee = 1n * XLM;
   tier = 100_000n;
   ready = true;
+  // Test hook: a fee address the quote names instead of the one the health reports.
+  quoteFeeAddress: string | undefined;
   // Test hooks: errors to answer submissions with, in order.
   failures: { error: string; reason?: number }[] = [];
   inFlight = new Set<string>();
@@ -343,7 +345,7 @@ export class MockRelayer {
         tier: this.tier.toString(),
         margin_bps: 500,
         valid_until: Number(v.timestamp) + 300,
-        fee_address: this.feeAddress,
+        fee_address: this.quoteFeeAddress ?? this.feeAddress,
         vault: v.address,
         network_id: this.networkId,
       });

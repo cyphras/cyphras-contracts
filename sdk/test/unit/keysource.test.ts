@@ -185,6 +185,18 @@ describe("key sources", () => {
     }
   });
 
+  it("(b) verifies strictly: no small-order key, no key of a non-canonical encoding", () => {
+    const le = (x: bigint): Uint8Array =>
+      Uint8Array.from({ length: 32 }, (_, i) => Number((x >> BigInt(8 * i)) & 0xffn));
+    // R the identity and S zero satisfy the cofactored equation for a key of small order, for
+    // every message; ZIP 215 accepts them, RFC 8032's strict rules do not.
+    const forged = Uint8Array.from([...le(1n), ...new Uint8Array(32)]);
+    for (const y of [0n, 2n ** 255n - 19n]) {
+      const key = StrKey.encodeEd25519PublicKey(Buffer.from(le(y)));
+      assert.equal(verifySep53(key, SIGNATURE_MESSAGE, forged), false);
+    }
+  });
+
   it("(b) refuses a signature without the SEP-53 prefix", async () => {
     const raw = signer(SECRET, () => ed25519.sign(utf8(SIGNATURE_MESSAGE), SECRET));
     await rejects(keySource.signature(raw).resolve(context), "signature_invalid");
