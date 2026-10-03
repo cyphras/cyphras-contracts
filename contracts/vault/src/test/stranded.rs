@@ -531,6 +531,31 @@ fn a_vault_short_of_funds_pays_what_it_can_in_order_and_keeps_the_rest_queued() 
 }
 
 #[test]
+fn a_vault_that_runs_short_in_the_middle_of_a_batch_stops_before_the_exit_it_cannot_cover() {
+    let c = classic();
+    let s = &c.s;
+    let filler = c.holder("filler", 0);
+    let a = c.holder("a", 0);
+    let b = c.holder("b", 0);
+    fill_window(s, &filler);
+    let first = queue(s, 10 * XLM, 0, &a, &a);
+    let second = queue(s, 10 * XLM, 0, &b, &b);
+    // The vault keeps enough for either exit alone, but not for both.
+    let held = s.balance(&s.vault.address);
+    c.asset.clawback(&s.vault.address, &(held - 15 * XLM));
+    to_midnight(s);
+
+    // The balance read before the first payment is spent down, so the second exit keeps its
+    // place at the head instead of stranding on a transfer the vault cannot make.
+    assert_eq!(s.vault.release(&10), 1);
+    assert_eq!(s.balance(&a), 10 * XLM);
+    assert!(s.vault.exit(&first).is_none());
+    assert!(s.vault.exit(&second).is_some() && s.vault.stranded(&second).is_none());
+    assert_eq!(s.vault.status().exit_head, second);
+    assert_eq!(s.balance(&s.vault.address), 5 * XLM);
+}
+
+#[test]
 fn release_needs_nothing_from_the_vault_when_there_is_nothing_to_pay() {
     let c = classic();
     let s = &c.s;
