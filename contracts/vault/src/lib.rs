@@ -2,8 +2,8 @@
 
 //! The shielded pool vault for one asset on one network. It holds the asset through its Stellar
 //! Asset Contract, keeps the commitment tree and the nullifier set, verifies proofs, screens
-//! deposits through an entry queue and enforces limits. It has no upgrade path and no way to move
-//! funds other than its entry points.
+//! deposits through an entry queue, pays exits through an exit queue and enforces limits. It has
+//! no upgrade path and no way to move funds other than its entry points.
 
 mod error;
 mod events;
@@ -23,7 +23,7 @@ use soroban_sdk::{
 use types::{ExtData, TxProof};
 
 pub use error::Error;
-pub use storage::{Config, DataKey, Limits, PendingDeposit, QueuedLimits, RootRing, Status};
+pub use storage::{Config, DataKey, Exit, Limits, PendingDeposit, QueuedLimits, RootRing, Status};
 
 const DAY: u64 = 86_400;
 const HALT_DURATION: u64 = 72 * 3_600;
@@ -90,6 +90,9 @@ impl Vault {
                 attested_up_to: 0,
                 tvl: 0,
                 pending_total: 0,
+                queued_total: 0,
+                exit_head: 1,
+                exit_tail: 1,
                 outflow_day: 0,
                 outflow: 0,
             },
@@ -206,7 +209,9 @@ impl Vault {
     }
 
     /// Settles a transfer (`ext_amount == 0`) or an unshield (`ext_amount < 0`). `submitter` is
-    /// the relayer, or the user when self-relaying.
+    /// the relayer, or the user when self-relaying. The payout and the fee are paid at once when
+    /// no exit is queued and they fit what is left of today's outflow window. Otherwise the exit
+    /// joins the exit queue and `release` pays it in turn.
     pub fn transact(
         env: Env,
         proof: TxProof,
@@ -240,8 +245,21 @@ impl Vault {
 
         let payout = ext.ext_amount.checked_neg().ok_or(Error::Overflow)?;
         let outflow = payout.checked_add(ext.fee).ok_or(Error::Overflow)?;
-        let day = now / DAY;
-        let outflow_today = check_outflow(&status, &limits, day, outflow)?;
+        // Every exit fits one day's window, which never shrinks, so every queued exit can be
+        // released. Clients split larger exits.
+        if outflow > limits.max_daily_outflow {
+            return Err(Error::ExceedsDailyOutflow);
+        }
+        // Pending deposits stay claimable by their depositors and queued exits are owed already,
+        // so only the value of unspent notes can leave.
+        let notes = status
+            .tvl
+            .checked_sub(status.pending_total)
+            .and_then(|v| v.checked_sub(status.queued_total))
+            .ok_or(Error::Overflow)?;
+        if outflow > notes {
+            return Err(Error::ExceedsAdmittedValue);
+        }
 
         proof::check_shape(&env, &proof, &ext)?;
         let tree = tree::Tree::load(&env);
@@ -264,18 +282,56 @@ impl Vault {
             ext.encrypted_output1,
         );
         appender.save();
+
+        let day = now / DAY;
+        let today = outflow_today(&status, day)
+            .checked_add(outflow)
+            .ok_or(Error::Overflow)?;
+        // An exit that pays nothing takes nothing from the window. Any other exit waits behind
+        // those already queued.
+        let fits = status.exit_head == status.exit_tail && today <= limits.max_daily_outflow;
+        if outflow > 0 && !fits {
+            let id = status.exit_tail;
+            status.exit_tail = id.checked_add(1).ok_or(Error::Overflow)?;
+            status.queued_total = status
+                .queued_total
+                .checked_add(outflow)
+                .ok_or(Error::Overflow)?;
+            storage::set_exit(
+                &env,
+                id,
+                &Exit {
+                    recipient: ext.recipient.clone(),
+                    payout,
+                    relayer: ext.relayer.clone(),
+                    fee: ext.fee,
+                    queued_at: now,
+                },
+            );
+            storage::set_status(&env, &status);
+            events::ExitQueued {
+                id,
+                ext_amount: ext.ext_amount,
+                fee: ext.fee,
+                recipient: ext.recipient,
+                relayer: ext.relayer,
+            }
+            .publish(&env);
+            return Ok(());
+        }
+
         status.tvl = status.tvl.checked_sub(outflow).ok_or(Error::Overflow)?;
         status.outflow_day = day;
-        status.outflow = outflow_today;
+        status.outflow = today;
         storage::set_status(&env, &status);
         events::Settled {
             ext_amount: ext.ext_amount,
             fee: ext.fee,
             recipient: ext.recipient.clone(),
             relayer: ext.relayer.clone(),
+            exit_id: None,
         }
         .publish(&env);
-
         let token = TokenClient::new(&env, &config.token);
         let vault = env.current_contract_address();
         if payout > 0 {
@@ -285,6 +341,62 @@ impl Vault {
             token.transfer(&vault, &ext.relayer, &ext.fee);
         }
         Ok(())
+    }
+
+    /// Anyone pays queued exits from the head of the exit queue, in ID order, while each fits
+    /// what is left of today's outflow window. It stops at the first exit that does not fit,
+    /// never skipping it, or after `max` exits, and returns how many it paid. Refused while
+    /// halted; works while paused.
+    pub fn release(env: Env, max: u32) -> Result<u32, Error> {
+        let mut status = storage::status(&env);
+        let now = env.ledger().timestamp();
+        if status.halted(now) {
+            return Err(Error::Halted);
+        }
+        let max_daily_outflow = storage::limits(&env).max_daily_outflow;
+        let day = now / DAY;
+        let mut today = outflow_today(&status, day);
+        let token = TokenClient::new(&env, &storage::config(&env).token);
+        let vault = env.current_contract_address();
+        let mut count = 0;
+        while count < max && status.exit_head < status.exit_tail {
+            let id = status.exit_head;
+            let exit = storage::exit(&env, id).unwrap();
+            let outflow = exit.payout.checked_add(exit.fee).ok_or(Error::Overflow)?;
+            let after = today.checked_add(outflow).ok_or(Error::Overflow)?;
+            if after > max_daily_outflow {
+                break;
+            }
+            today = after;
+            status.tvl = status.tvl.checked_sub(outflow).ok_or(Error::Overflow)?;
+            status.queued_total = status
+                .queued_total
+                .checked_sub(outflow)
+                .ok_or(Error::Overflow)?;
+            status.exit_head = id + 1;
+            storage::remove_exit(&env, id);
+            events::Settled {
+                ext_amount: -exit.payout,
+                fee: exit.fee,
+                recipient: exit.recipient.clone(),
+                relayer: exit.relayer.clone(),
+                exit_id: Some(id),
+            }
+            .publish(&env);
+            if exit.payout > 0 {
+                token.transfer(&vault, &exit.recipient, &exit.payout);
+            }
+            if exit.fee > 0 {
+                token.transfer(&vault, &exit.relayer, &exit.fee);
+            }
+            count += 1;
+        }
+        if count > 0 {
+            status.outflow_day = day;
+            status.outflow = today;
+            storage::set_status(&env, &status);
+        }
+        Ok(count)
     }
 
     /// The ASP asserts that every unflagged deposit with an ID up to `up_to` passed screening.
@@ -403,7 +515,7 @@ impl Vault {
     pub fn cancel(env: Env, id: u64) -> Result<(), Error> {
         let deposit = storage::pending(&env, id).ok_or(Error::UnknownDeposit)?;
         deposit.depositor.require_auth();
-        release(&env, id, deposit, 0)
+        return_deposit(&env, id, deposit, 0)
     }
 
     /// Anyone returns a deposit flagged at least a day ago to its depositor. Works while halted.
@@ -413,11 +525,11 @@ impl Vault {
         if env.ledger().timestamp() < deposit.flagged_at.saturating_add(REFUND_DELAY) {
             return Err(Error::RefundTooEarly);
         }
-        release(&env, id, deposit, reason)
+        return_deposit(&env, id, deposit, reason)
     }
 
-    /// The guardian stops or resumes deposits and transfers. Unshields, cancellations and refunds
-    /// are never paused.
+    /// The guardian stops or resumes deposits and transfers. Unshields, releases of queued exits,
+    /// cancellations and refunds are never paused.
     pub fn set_pause(env: Env, deposits: bool, transfers: bool) -> Result<(), Error> {
         storage::config(&env).guardian.require_auth();
         let mut status = storage::status(&env);
@@ -432,8 +544,9 @@ impl Vault {
         Ok(())
     }
 
-    /// The guardian stops `shield`, `transact` and `admit` for 72 hours. The next halt is allowed
-    /// 7 days after this one ends, so users always get a week to exit between halts.
+    /// The guardian stops `shield`, `transact`, `admit`, `attest` and `release` for 72 hours. The
+    /// next halt is allowed 7 days after this one ends, so users always get a week to exit between
+    /// halts.
     pub fn halt(env: Env) -> Result<(), Error> {
         storage::config(&env).guardian.require_auth();
         let mut status = storage::status(&env);
@@ -586,6 +699,10 @@ impl Vault {
     pub fn pending(env: Env, id: u64) -> Option<PendingDeposit> {
         storage::pending(&env, id)
     }
+
+    pub fn exit(env: Env, id: u64) -> Option<Exit> {
+        storage::exit(&env, id)
+    }
 }
 
 fn on_mainnet(env: &Env) -> bool {
@@ -619,31 +736,13 @@ fn delay(config: &Config, limits: &Limits, amount: i128) -> u64 {
     }
 }
 
-/// Today's outflow after paying out `outflow`, if the daily window and the vault's value allow
-/// it. Pending deposits stay claimable by their depositors, so only admitted value can leave.
-fn check_outflow(status: &Status, limits: &Limits, day: u64, outflow: i128) -> Result<i128, Error> {
-    // No day's window could pay a larger exit; clients split it.
-    if outflow > limits.max_daily_outflow {
-        return Err(Error::ExceedsDailyOutflow);
-    }
-    let today = if status.outflow_day == day {
+/// The outflow paid so far on `day`; the window of a new day starts from zero.
+fn outflow_today(status: &Status, day: u64) -> i128 {
+    if status.outflow_day == day {
         status.outflow
     } else {
         0
     }
-    .checked_add(outflow)
-    .ok_or(Error::Overflow)?;
-    if today > limits.max_daily_outflow {
-        return Err(Error::OutflowLimit);
-    }
-    let admitted = status
-        .tvl
-        .checked_sub(status.pending_total)
-        .ok_or(Error::Overflow)?;
-    if outflow > admitted {
-        return Err(Error::ExceedsAdmittedValue);
-    }
-    Ok(today)
 }
 
 /// `min_deposit` may exceed `max_deposit`: a zero `max_deposit` is how deposits are stopped.
@@ -706,7 +805,7 @@ fn insert_pair(
 }
 
 /// Returns a pending deposit to the depositor recorded at `shield`, never anywhere else.
-fn release(env: &Env, id: u64, deposit: PendingDeposit, reason: u32) -> Result<(), Error> {
+fn return_deposit(env: &Env, id: u64, deposit: PendingDeposit, reason: u32) -> Result<(), Error> {
     storage::remove_pending(env, id);
     let mut status = storage::status(env);
     status.tvl = status

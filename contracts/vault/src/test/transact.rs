@@ -59,7 +59,8 @@ fn a_transfer_inserts_its_outputs_and_pays_only_the_fee() {
                 ext_amount: 0,
                 fee: 2 * XLM,
                 recipient: relayer.clone().into(),
-                relayer: relayer.clone()
+                relayer: relayer.clone(),
+                exit_id: None,
             }
             .to_xdr(&s.env, &vault),
         ]
@@ -277,23 +278,26 @@ fn the_daily_outflow_counts_payouts_and_fees_and_resets_at_midnight() {
     let ext = s.ext(-(max - 3 * XLM), 3 * XLM, &relayer, &relayer);
     assert_eq!(s.transact(&relayer, &ext), Ok(()));
     assert_eq!(s.vault.status().outflow, max);
+    // Neither a payout nor a fee fits the full window, so both wait in the exit queue.
     let ext = s.ext(-1, 0, &relayer, &relayer);
-    assert_eq!(s.transact(&relayer, &ext), Err(Error::OutflowLimit));
+    assert_eq!(s.transact(&relayer, &ext), Ok(()));
     let ext = s.ext(0, 1, &relayer, &relayer);
-    assert_eq!(s.transact(&relayer, &ext), Err(Error::OutflowLimit));
+    assert_eq!(s.transact(&relayer, &ext), Ok(()));
     // A transfer without a fee moves nothing out.
     let ext = s.ext(0, 0, &relayer, &relayer);
     assert_eq!(s.transact(&relayer, &ext), Ok(()));
+    let status = s.vault.status();
+    assert_eq!((status.outflow, status.queued_total), (max, 2));
+    assert_eq!((status.exit_head, status.exit_tail), (1, 3));
 
     let to_midnight = DAY - s.now() % DAY;
     s.advance(to_midnight - 1);
-    let ext = s.ext(-1, 0, &relayer, &relayer);
-    assert_eq!(s.transact(&relayer, &ext), Err(Error::OutflowLimit));
+    assert_eq!(s.vault.release(&10), 0);
     s.advance(1);
-    let ext = s.ext(-1, 0, &relayer, &relayer);
-    assert_eq!(s.transact(&relayer, &ext), Ok(()));
+    assert_eq!(s.vault.release(&10), 2);
     let status = s.vault.status();
-    assert_eq!((status.outflow_day, status.outflow), (s.now() / DAY, 1));
+    assert_eq!((status.outflow_day, status.outflow), (s.now() / DAY, 2));
+    assert_eq!(s.balance(&relayer), max + 2);
 }
 
 #[test]

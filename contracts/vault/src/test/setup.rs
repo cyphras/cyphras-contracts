@@ -138,11 +138,15 @@ impl Setup {
 
     /// A testnet XLM vault that verifies with the embedded testnet-forgeable key.
     pub fn real() -> Self {
-        Self::build(limits(), false)
+        Self::real_with_limits(limits())
     }
 
     pub fn with_limits(limits: Limits) -> Self {
         Self::build(limits, true)
+    }
+
+    pub fn real_with_limits(limits: Limits) -> Self {
+        Self::build(limits, false)
     }
 
     fn build(limits: Limits, trapdoor: bool) -> Self {

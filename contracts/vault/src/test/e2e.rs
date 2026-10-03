@@ -11,10 +11,11 @@ use types::TxProof;
 use verifier::VerifyingKey;
 
 use super::{
+    exits::to_midnight,
     fixtures,
-    setup::{create_account, outcome, Setup, DELAY_SMALL, XLM},
+    setup::{create_account, limits, outcome, Setup, DELAY_SMALL, XLM},
 };
-use crate::{events, Error};
+use crate::{events, Error, Limits};
 
 pub struct Flow {
     pub s: Setup,
@@ -27,7 +28,11 @@ pub struct Flow {
 
 impl Flow {
     pub fn new() -> Self {
-        let s = Setup::real();
+        Self::with_limits(limits())
+    }
+
+    pub fn with_limits(limits: Limits) -> Self {
+        let s = Setup::real_with_limits(limits);
         let env = &s.env;
         let account = |name: &str, balance: i128| {
             let address = fixtures::account(env, name);
@@ -47,11 +52,16 @@ impl Flow {
     /// A flow advanced to just before the named step.
     pub fn at(step: &str) -> Self {
         let flow = Flow::new();
+        flow.run_until(step);
+        flow
+    }
+
+    pub fn run_until(&self, step: &str) {
         for s in fixtures::proofs()["steps"].as_array().unwrap() {
             if s["name"] == step {
-                return flow;
+                return;
             }
-            flow.run(s).unwrap();
+            self.run(s).unwrap();
         }
         panic!("no fixture step {step}");
     }
@@ -296,6 +306,7 @@ fn an_unshield_to_a_muxed_address_pays_its_base_account_and_reports_the_muxed_id
                         .unwrap()
                 ),
                 relayer: flow.relayer.clone(),
+                exit_id: None,
             }
             .to_xdr(env, &vault),
         ]
@@ -309,6 +320,57 @@ fn an_unshield_to_a_muxed_address_pays_its_base_account_and_reports_the_muxed_id
         s.vault.status().outflow,
         5_000_000 + 700_000_000 + 10_000_000
     );
+}
+
+#[test]
+fn a_real_proof_exit_that_does_not_fit_waits_and_is_released_under_its_id() {
+    // A window too small for the transfer's fee and the muxed unshield on the same day.
+    let window = 710_000_000;
+    let flow = Flow::with_limits(Limits {
+        max_daily_outflow: window,
+        tvl_cap: 7 * window,
+        ..limits()
+    });
+    let s = &flow.s;
+    let env = &s.env;
+    flow.run_until("unshield_muxed");
+    let step = fixtures::step("unshield_muxed");
+    let ext = fixtures::ext(env, &step);
+    flow.run(&step).unwrap();
+
+    let vault = s.vault.address.clone();
+    let queued = events::ExitQueued {
+        id: 1,
+        ext_amount: -700_000_000,
+        fee: 10_000_000,
+        recipient: ext.recipient.clone(),
+        relayer: flow.relayer.clone(),
+    };
+    let all = env.events().all();
+    assert_eq!(
+        all.filter_by_contract(&vault).events().last(),
+        Some(&queued.to_xdr(env, &vault))
+    );
+    assert!(all.filter_by_contract(&s.token.address).events().is_empty());
+    assert_eq!(s.vault.current_root(), root_after(&flow, &step));
+    assert_eq!(s.balance(&flow.exchange), 0);
+
+    to_midnight(s);
+    assert_eq!(s.vault.release(&1), 1);
+    assert_eq!(
+        env.events().all().filter_by_contract(&vault),
+        std::vec![events::Settled {
+            ext_amount: -700_000_000,
+            fee: 10_000_000,
+            recipient: ext.recipient,
+            relayer: flow.relayer.clone(),
+            exit_id: Some(1),
+        }
+        .to_xdr(env, &vault)]
+    );
+    assert_eq!(s.balance(&flow.exchange), 700_000_000);
+    assert_eq!(s.balance(&flow.relayer), 15_000_000);
+    assert_eq!(s.balance(&vault), s.vault.status().tvl);
 }
 
 /// Whether `proof` verifies under the embedded key, with the vault's domain.

@@ -1,4 +1,6 @@
-use soroban_sdk::{contracttype, Address, Bytes, Env, IntoVal, TryFromVal, Val, Vec, U256};
+use soroban_sdk::{
+    contracttype, Address, Bytes, Env, IntoVal, MuxedAddress, TryFromVal, Val, Vec, U256,
+};
 
 // Ledgers per day at the nominal five-second close time.
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -25,6 +27,7 @@ pub enum DataKey {
     NextLeaf,
     Nullifier(U256),
     Pending(u64),
+    Exit(u64),
     DepositorDay(Address, u64),
 }
 
@@ -60,8 +63,11 @@ pub struct QueuedLimits {
     pub ready_at: u64,
 }
 
-/// `tvl` is all value the vault holds for users and `pending_total` the part of it in pending
-/// deposits. `outflow` is the total paid out on day `outflow_day`; a later day starts from zero.
+/// `tvl` is all value the vault holds for users: `pending_total` of it is in pending deposits,
+/// `queued_total` is owed to exits in the exit queue, and the rest belongs to unspent notes.
+/// `exit_head` is the ID of the oldest exit still queued and `exit_tail` the ID the next queued
+/// exit takes, so the queue is empty when they are equal. `outflow` is the total paid out on day
+/// `outflow_day`; a later day starts from zero.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Status {
@@ -73,6 +79,9 @@ pub struct Status {
     pub attested_up_to: u64,
     pub tvl: i128,
     pub pending_total: i128,
+    pub queued_total: i128,
+    pub exit_head: u64,
+    pub exit_tail: u64,
     pub outflow_day: u64,
     pub outflow: i128,
 }
@@ -99,6 +108,18 @@ pub struct PendingDeposit {
     pub delay: u64,
     pub flag: Option<u32>,
     pub flagged_at: u64,
+}
+
+/// An exit waiting in the exit queue: what `transact` owes `recipient` and `relayer`, and the time
+/// it was queued.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Exit {
+    pub recipient: MuxedAddress,
+    pub payout: i128,
+    pub relayer: Address,
+    pub fee: i128,
+    pub queued_at: u64,
 }
 
 /// The last 256 roots, one per inserted leaf pair. `newest` indexes the current root; slots not
@@ -186,6 +207,18 @@ pub fn set_pending(env: &Env, id: u64, deposit: &PendingDeposit) {
 
 pub fn remove_pending(env: &Env, id: u64) {
     env.storage().persistent().remove(&DataKey::Pending(id));
+}
+
+pub fn exit(env: &Env, id: u64) -> Option<Exit> {
+    get(env, &DataKey::Exit(id))
+}
+
+pub fn set_exit(env: &Env, id: u64, exit: &Exit) {
+    set(env, &DataKey::Exit(id), exit);
+}
+
+pub fn remove_exit(env: &Env, id: u64) {
+    env.storage().persistent().remove(&DataKey::Exit(id));
 }
 
 pub fn day_total(env: &Env, depositor: &Address, day: u64) -> i128 {

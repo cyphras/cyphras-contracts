@@ -58,9 +58,22 @@ pub struct NewNullifier {
     pub nullifier: U256,
 }
 
-/// Repeats what the token transfers of a `transact` show, so a watcher need not join them.
+/// Repeats what the token transfers of a payment show, so a watcher need not join them.
+/// `exit_id` is set when the payment is of an exit from the exit queue, and absent when
+/// `transact` paid at once.
 #[contractevent]
 pub struct Settled {
+    pub ext_amount: i128,
+    pub fee: i128,
+    pub recipient: MuxedAddress,
+    pub relayer: Address,
+    pub exit_id: Option<u64>,
+}
+
+/// An exit that waits in the exit queue; `release` pays it in turn.
+#[contractevent]
+pub struct ExitQueued {
+    pub id: u64,
     pub ext_amount: i128,
     pub fee: i128,
     pub recipient: MuxedAddress,

@@ -5,9 +5,9 @@ use soroban_sdk::{
 
 use super::{
     queue::authorizers,
-    setup::{Setup, DAY, DELAY_SMALL, XLM},
+    setup::{limits, Setup, DAY, DELAY_SMALL, XLM},
 };
-use crate::DataKey;
+use crate::{DataKey, Limits};
 
 // 30 days and one hour of five-second ledgers.
 const WRITE_TTL: u32 = 30 * 17_280 + 720;
@@ -125,4 +125,30 @@ fn each_call_writes_only_the_entries_it_changes() {
     s.advance(DAY);
     s.vault.refund(&4);
     assert_eq!(writes(), 4);
+}
+
+#[test]
+fn the_exit_queue_writes_only_the_entries_it_changes() {
+    let s = Setup::with_limits(Limits {
+        max_daily_outflow: 10 * XLM,
+        tvl_cap: 70 * XLM,
+        ..limits()
+    });
+    s.fund_pool("funder", 50 * XLM);
+    let relayer = s.account("relayer", 0);
+    let user = s.account("user", 0);
+    let writes = || s.env.cost_estimate().resources().write_entries;
+    s.transact(&relayer, &s.ext(-10 * XLM, 0, &relayer, &relayer))
+        .unwrap();
+
+    // A queued unshield writes the instance, two nullifiers, three tree entries, the exit and
+    // the submitter's nonce, and moves no balance.
+    s.transact(&relayer, &s.ext(-XLM, XLM, &user, &relayer))
+        .unwrap();
+    assert_eq!(writes(), 8);
+    assert_eq!(persistent_ttl(&s, &DataKey::Exit(1)), WRITE_TTL);
+    // Releasing it writes the instance, the exit and three balances.
+    s.advance(DAY);
+    assert_eq!(s.vault.release(&1), 1);
+    assert_eq!(writes(), 5);
 }

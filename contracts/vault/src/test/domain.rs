@@ -170,12 +170,16 @@ fn the_constructor_stores_the_configuration_and_an_empty_tree() {
             attested_up_to: 0,
             tvl: 0,
             pending_total: 0,
+            queued_total: 0,
+            exit_head: 1,
+            exit_tail: 1,
             outflow_day: 0,
             outflow: 0,
         }
     );
     assert_eq!(vault.next_leaf_index(), 0);
     assert_eq!(vault.pending(&1), None);
+    assert_eq!(vault.exit(&1), None);
     assert!(vault.is_known_root(&vault.current_root()));
     assert_eq!(tree::ROOT_HISTORY, 256);
 }

@@ -1,7 +1,7 @@
 //! A random sequence of calls against a model of the spec. After every call the vault's result
 //! must match the model's, its whole state must match, and the invariants of vault.md must hold.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use soroban_sdk::{Address, Vec, U256};
 
@@ -41,6 +41,7 @@ enum Op {
     SetLimits(Limits),
     ApplyLimits,
     CancelLimits,
+    Release(u32),
     BumpTtl,
     Advance(u64),
 }
@@ -50,6 +51,7 @@ enum Done {
     Unit,
     Id(u64),
     Ids(std::vec::Vec<u64>),
+    Count(u32),
 }
 
 #[derive(Clone)]
@@ -61,6 +63,10 @@ struct Model {
     resolved: BTreeSet<u64>,
     day_totals: BTreeMap<(usize, u64), i128>,
     notes: i128,
+    // The outflow of each queued exit, from the head of the queue.
+    exits: VecDeque<i128>,
+    // Everything paid to the relayer, which receives every payout and fee.
+    paid: i128,
     next_leaf: u64,
     highest_outflow_cap: i128,
 }
@@ -82,6 +88,14 @@ fn valid(l: &Limits) -> bool {
 impl Model {
     fn halted(&self, now: u64) -> bool {
         now < self.status.halted_until
+    }
+
+    fn outflow_today(&self, day: u64) -> i128 {
+        if self.status.outflow_day == day {
+            self.status.outflow
+        } else {
+            0
+        }
     }
 
     fn delay(&self, amount: i128) -> u64 {
@@ -171,25 +185,26 @@ impl Model {
                 if outflow > self.limits.max_daily_outflow {
                     return Err(Error::ExceedsDailyOutflow);
                 }
-                let today = if self.status.outflow_day == day {
-                    self.status.outflow
-                } else {
-                    0
-                } + outflow;
-                if today > self.limits.max_daily_outflow {
-                    return Err(Error::OutflowLimit);
-                }
-                if outflow > self.status.tvl - self.status.pending_total {
+                if outflow > self.notes {
                     return Err(Error::ExceedsAdmittedValue);
                 }
                 if reuse.is_some() {
                     return Err(Error::NullifierSpent);
                 }
                 self.notes -= outflow;
-                self.status.tvl -= outflow;
-                self.status.outflow_day = day;
-                self.status.outflow = today;
                 self.next_leaf += 2;
+                let today = self.outflow_today(day) + outflow;
+                if outflow > 0 && (!self.exits.is_empty() || today > self.limits.max_daily_outflow)
+                {
+                    self.exits.push_back(outflow);
+                    self.status.exit_tail += 1;
+                    self.status.queued_total += outflow;
+                } else {
+                    self.paid += outflow;
+                    self.status.tvl -= outflow;
+                    self.status.outflow_day = day;
+                    self.status.outflow = today;
+                }
                 Ok(Done::Unit)
             }
             Op::Attest(up_to) => {
@@ -308,6 +323,33 @@ impl Model {
                 self.queued.take().ok_or(Error::NoQueuedLimits)?;
                 Ok(Done::Unit)
             }
+            Op::Release(max) => {
+                if self.halted(now) {
+                    return Err(Error::Halted);
+                }
+                let mut today = self.outflow_today(day);
+                let mut count = 0;
+                while count < *max {
+                    let Some(&outflow) = self.exits.front() else {
+                        break;
+                    };
+                    if today + outflow > self.limits.max_daily_outflow {
+                        break;
+                    }
+                    self.exits.pop_front();
+                    today += outflow;
+                    self.paid += outflow;
+                    self.status.tvl -= outflow;
+                    self.status.queued_total -= outflow;
+                    self.status.exit_head += 1;
+                    count += 1;
+                }
+                if count > 0 {
+                    self.status.outflow_day = day;
+                    self.status.outflow = today;
+                }
+                Ok(Done::Count(count))
+            }
             Op::BumpTtl | Op::Advance(_) => Ok(Done::Unit),
         }
     }
@@ -327,8 +369,9 @@ impl Run {
             min_deposit: XLM / 10,
             max_deposit: 100 * XLM,
             max_daily_per_depositor: 250 * XLM,
-            tvl_cap: 1_000 * XLM,
-            max_daily_outflow: 200 * XLM,
+            tvl_cap: 700 * XLM,
+            // Small next to the pool, so that exits often wait in the exit queue.
+            max_daily_outflow: 100 * XLM,
             max_fee: 2 * XLM,
             large_deposit_threshold: 50 * XLM,
         };
@@ -340,16 +383,22 @@ impl Run {
             .map(|i| s.account(&std::format!("depositor {i}"), 1_000_000 * XLM))
             .collect();
         let relayer = s.account("relayer", 0);
+        // The pool starts with four days of outflow in spendable notes.
+        for i in 0..4 {
+            s.fund_pool(&std::format!("funder {i}"), 100 * XLM);
+        }
         let model = Model {
             highest_outflow_cap: limits.max_daily_outflow,
             limits,
             queued: None,
             status: s.vault.status(),
             pending: BTreeMap::new(),
-            resolved: BTreeSet::new(),
+            resolved: (1..=4).collect(),
             day_totals: BTreeMap::new(),
-            notes: 0,
-            next_leaf: 0,
+            notes: 400 * XLM,
+            exits: VecDeque::new(),
+            paid: 0,
+            next_leaf: 8,
         };
         Run {
             s,
@@ -395,19 +444,35 @@ impl Run {
         let now = s.now();
         // Some calls can only succeed in a state that random calls rarely leave the vault in.
         if m.halted(now) && s.below(4) == 0 {
-            return Op::Resume;
+            return if s.below(2) == 0 {
+                Op::Resume
+            } else {
+                Op::Release(1)
+            };
+        }
+        if let Some(&head) = m.exits.front() {
+            if s.below(4) == 0 {
+                let room = m.limits.max_daily_outflow - m.outflow_today(now / DAY);
+                return if head <= room {
+                    Op::Release(self.pick(&[1, 2, 50]))
+                } else {
+                    Op::Advance(DAY - now % DAY)
+                };
+            }
         }
         if let Some(queued) = &m.queued {
             if s.below(4) == 0 {
-                return if now >= queued.ready_at {
+                return if s.below(4) == 0 {
+                    Op::CancelLimits
+                } else if now >= queued.ready_at {
                     Op::ApplyLimits
                 } else {
                     Op::Advance(queued.ready_at - now)
                 };
             }
         }
-        match s.below(100) {
-            0..=21 => {
+        match s.below(110) {
+            0..=19 => {
                 let amount = self.pick(&[
                     1,
                     m.limits.min_deposit,
@@ -421,10 +486,10 @@ impl Run {
                 ]);
                 Op::Shield(s.below(3) as usize, amount)
             }
-            22..=39 => {
-                // A third of the attempts also spend a nullifier already in the set, in a random
+            20..=44 => {
+                // A fifth of the attempts also spend a nullifier already in the set, in a random
                 // slot, with a payout and fee small enough to pass every earlier check.
-                let reuse = (s.below(3) == 0 && !self.spent.is_empty()).then(|| s.below(2) as u32);
+                let reuse = (s.below(5) == 0 && !self.spent.is_empty()).then(|| s.below(2) as u32);
                 if reuse.is_some() {
                     let payout = if m.status.transfers_paused {
                         m.notes.min(1)
@@ -438,17 +503,21 @@ impl Run {
                     };
                 }
                 let fee = self.pick(&[0, 1, XLM, m.limits.max_fee, m.limits.max_fee + 1]);
+                let window = m.limits.max_daily_outflow;
+                let room = window - m.outflow_today(now / DAY);
                 let payout = match s.below(10) {
                     0 => m.status.tvl + 1,
                     1 => 0,
-                    _ => (m.notes - fee).max(0) * (1 + s.below(100) as i128) / 100,
+                    2 => (window - fee + self.pick(&[0, 1])).max(0),
+                    3 | 4 => (room - fee + self.pick(&[0, 1])).max(0),
+                    _ => (m.notes - fee).clamp(0, window) * (1 + s.below(50) as i128) / 100,
                 };
                 Op::Transact { payout, fee, reuse }
             }
-            40..=46 => Op::Attest(self.some_id()),
-            47..=51 => Op::Flag(self.id_where(|_| true), self.pick(&[0, 1, 2, 3, 4, 5, 99])),
-            52..=54 => Op::Unflag(self.id_where(|d| d.flag.is_some())),
-            55..=63 => {
+            45..=51 => Op::Attest(self.some_id()),
+            52..=56 => Op::Flag(self.id_where(|_| true), self.pick(&[0, 1, 2, 3, 4, 5, 99])),
+            57..=59 => Op::Unflag(self.id_where(|d| d.flag.is_some())),
+            60..=68 => {
                 let mut ids: std::vec::Vec<u64> =
                     (0..1 + s.below(4)).map(|_| self.some_id()).collect();
                 if s.below(8) != 0 {
@@ -457,12 +526,12 @@ impl Run {
                 }
                 Op::Admit(ids)
             }
-            64..=67 => Op::Cancel(self.id_where(|_| true)),
-            68..=71 => Op::Refund(self.id_where(|d| d.flag.is_some() && now >= d.flagged_at + DAY)),
-            72..=73 => Op::SetPause(s.below(4) == 0, s.below(4) == 0),
-            74..=76 => Op::Halt,
-            77..=78 => Op::Resume,
-            79..=82 => {
+            69..=72 => Op::Cancel(self.id_where(|_| true)),
+            73..=76 => Op::Refund(self.id_where(|d| d.flag.is_some() && now >= d.flagged_at + DAY)),
+            77..=78 => Op::SetPause(s.below(4) == 0, s.below(4) == 0),
+            79..=81 => Op::Halt,
+            82..=83 => Op::Resume,
+            84..=87 => {
                 let l = &m.limits;
                 let max_daily_outflow = self.scaled(l.max_daily_outflow);
                 Op::SetLimits(Limits {
@@ -477,9 +546,10 @@ impl Run {
                     large_deposit_threshold: self.scaled(l.large_deposit_threshold),
                 })
             }
-            83..=85 => Op::ApplyLimits,
-            86 => Op::CancelLimits,
-            87 => Op::BumpTtl,
+            88..=90 => Op::ApplyLimits,
+            91 => Op::CancelLimits,
+            92 => Op::BumpTtl,
+            93..=98 => Op::Release(self.pick(&[0, 1, 2, 5, 50])),
             _ => {
                 Op::Advance(self.pick(&[1, 59, 3_599, 3_600, 6 * 3_600, DAY - 1, DAY, HALT, WEEK]))
             }
@@ -539,6 +609,7 @@ impl Run {
             Op::SetLimits(l) => outcome(v.try_set_limits(l)).map(|_| Done::Unit),
             Op::ApplyLimits => outcome(v.try_apply_limits()).map(|_| Done::Unit),
             Op::CancelLimits => outcome(v.try_cancel_limits()).map(|_| Done::Unit),
+            Op::Release(max) => outcome(v.try_release(max)).map(Done::Count),
             Op::BumpTtl => {
                 v.bump_ttl(&ids(&self
                     .model
@@ -577,11 +648,14 @@ impl Run {
             );
         }
 
-        // 1. The token balance covers the TVL, which is pending deposits plus unspent notes.
+        // 1. The token balance covers the TVL, which is pending deposits, unspent notes and the
+        // exits still owed.
         let pending: i128 = m.pending.values().map(|d| d.amount).sum();
         assert_eq!(status.pending_total, pending);
-        assert_eq!(status.tvl, pending + m.notes);
+        assert_eq!(status.queued_total, m.exits.iter().sum::<i128>());
+        assert_eq!(status.tvl, pending + m.notes + status.queued_total);
         assert!(s.balance(&s.vault.address) >= status.tvl);
+        assert_eq!(s.balance(&self.relayer), m.paid);
         // 2. The next leaf index only grows, by two per inserted pair.
         let leaf = s.vault.next_leaf_index();
         assert_eq!(leaf, m.next_leaf);
@@ -663,6 +737,7 @@ fn random_sequences_keep_the_vault_equal_to_the_spec_model() {
         "SetLimits",
         "ApplyLimits",
         "CancelLimits",
+        "Release",
     ] {
         assert!(
             seen.contains_key(&std::format!("{op} ok")),

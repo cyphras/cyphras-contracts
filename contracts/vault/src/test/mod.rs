@@ -3,6 +3,7 @@ mod auth;
 mod costs;
 mod domain;
 mod e2e;
+mod exits;
 mod fixtures;
 mod guardian;
 mod invariants;
