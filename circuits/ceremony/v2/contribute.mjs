@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import * as snarkjs from "snarkjs";
 import {
@@ -14,9 +14,11 @@ import {
   parseHex,
   quiet,
   readZkey,
+  refuseExisting,
   run,
   show,
   step,
+  writeNew,
 } from "./common.mjs";
 
 const USAGE = `Adds your contribution to the Cyphras v2 phase-2 trusted-setup ceremony.
@@ -58,7 +60,7 @@ run(USAGE, async (argv) => {
   }
   const expected = parseHex(values.expect, 32, "--expect");
   if (!values.r1cs !== !values.ptau) throw new Error("give both --r1cs and --ptau, or neither");
-  if (existsSync(output)) throw new Error(`${output} already exists; refusing to overwrite it`);
+  refuseExisting(output);
 
   console.log(`Contributor: ${name}\nInput:       ${input}\nOutput:      ${output}\n`);
   const inputData = readFileSync(input);
@@ -105,13 +107,7 @@ run(USAGE, async (argv) => {
   if (c.type !== 0 || c.name !== name || c.hash !== hash) {
     throw new Error("the new zkey does not hold the contribution just made");
   }
-  const part = `${output}.part`;
-  try {
-    writeFileSync(part, data);
-    renameSync(part, output);
-  } finally {
-    rmSync(part, { force: true });
-  }
+  writeNew(output, data);
   const outputSha256 = digest(data);
 
   console.log(`

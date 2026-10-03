@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import * as snarkjs from "snarkjs";
@@ -21,6 +21,7 @@ import {
   sameContributor,
   show,
   step,
+  writeNew,
 } from "./common.mjs";
 import { QUICKNET, fetchRound, firstRoundAt, parseRound, roundTime } from "./drand.mjs";
 import { checkVerificationKey, exportVerificationKey } from "./vk.mjs";
@@ -138,16 +139,6 @@ async function zkeyVerify(r1cs, ptau, zkey, label) {
   });
 }
 
-function writeOut(path, data) {
-  const part = `${path}.part`;
-  try {
-    writeFileSync(part, data);
-    renameSync(part, path);
-  } finally {
-    rmSync(part, { force: true });
-  }
-}
-
 async function init(dir, r1csPath, ptauPath) {
   if (existsSync(join(dir, STATE))) throw new Error(`${dir} already holds a ceremony`);
   mkdirSync(dir, { recursive: true });
@@ -180,7 +171,7 @@ async function init(dir, r1csPath, ptauPath) {
   if (!(csHash instanceof Uint8Array)) throw new Error("snarkjs groth16 setup failed");
   const zkey = Buffer.from(out.data);
   await zkeyVerify(r1cs, ptau, zkey, file);
-  writeOut(join(dir, file), zkey);
+  writeNew(join(dir, file), zkey);
   state.circuitHash = Buffer.from(csHash).toString("hex");
   state.zkeys = [{ file, sha256: digest(zkey), at: new Date().toISOString() }];
   state.attestations = [];
@@ -230,7 +221,7 @@ async function receive(dir, incoming, name, attested) {
     console.log(`named ${show(name)}, with the attested hash ${c.hash}.`);
     await zkeyVerify(r1cs, ptau, data, basename(incoming));
     const file = zkeyFile(state.zkeys.length);
-    writeOut(join(dir, file), data);
+    writeNew(join(dir, file), data);
     state.zkeys.push({
       file,
       contributor: name,
@@ -354,8 +345,8 @@ async function beacon(dir, roundArg) {
   const vk = await exportVerificationKey(final);
   checkVerificationKey(vk);
   console.log(`${VK} passes the vault build's key checks.`);
-  writeOut(join(dir, FINAL), final);
-  writeOut(join(dir, VK), vk);
+  writeNew(join(dir, FINAL), final);
+  writeNew(join(dir, VK), vk);
   state.beacon = {
     ...drand,
     chain: QUICKNET.hash,

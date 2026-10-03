@@ -1,5 +1,6 @@
 import { bn254 } from "@noble/curves/bn254.js";
 import { createHash } from "node:crypto";
+import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
 
 // Contributors run the kit on its own, so it repeats the pins of scripts/circom.mjs and
 // scripts/ptau.mjs instead of importing them. The key is only valid for this exact r1cs: the
@@ -74,6 +75,26 @@ export function expectHash(data, algorithm, expected, mismatch) {
 // Every file is read once and snarkjs gets the same bytes in memory, so what is hashed and
 // parsed is exactly what is verified, contributed to or written out.
 export const mem = (data) => ({ type: "mem", data });
+
+export function refuseExisting(path) {
+  for (const p of [path, `${path}.part`]) {
+    if (existsSync(p)) throw new Error(`${p} already exists; refusing to overwrite it`);
+  }
+}
+
+// The data goes to <path>.part, created only if it does not exist yet, and is then renamed, so
+// an interrupted write never leaves a partial file under the final name.
+export function writeNew(path, data) {
+  refuseExisting(path);
+  const part = `${path}.part`;
+  try {
+    writeFileSync(part, data, { flag: "wx" });
+    renameSync(part, path);
+  } catch (e) {
+    if (e.code !== "EEXIST") rmSync(part, { force: true });
+    throw e;
+  }
+}
 
 export function parseTime(value, what) {
   const time = new Date(value);
