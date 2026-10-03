@@ -49,15 +49,18 @@ type Indexer struct {
 	chain   *chainstate.Store
 	db      store
 	archive *archive.Writer
-	alerts  *alert.Alerter
-	log     *slog.Logger
-	hub     *hub
-	now     func() time.Time
+	// archiveMu orders the archive's writers, ingest and the copy from RPC that runs even when
+	// ingest is stuck, and guards archivedTo.
+	archiveMu  sync.Mutex
+	archivedTo uint32
+	alerts     *alert.Alerter
+	log        *slog.Logger
+	hub        *hub
+	now        func() time.Time
 
 	mu         sync.RWMutex
 	state      *chainstate.State
 	cursor     uint32
-	archivedTo uint32
 	latest     uint32
 	probedAt   time.Time
 	reconciled uint32
@@ -129,25 +132,16 @@ func (ix *Indexer) Cursor() uint32 {
 // Apply implements follow.Sink: check the window against the vault's rules, archive its raw
 // events, store it, then reconcile with the chain.
 func (ix *Indexer) Apply(ctx context.Context, b follow.Batch) error {
+	// The raw events are kept before they are judged: a window that faults must still outlive RPC.
+	if err := ix.keep(b.Raw, b.From, b.To); err != nil {
+		return fmt.Errorf("archive: %w", err)
+	}
 	ix.mu.RLock()
 	next := ix.state.Clone()
 	ix.mu.RUnlock()
 	delta, err := next.Apply(b.Txs)
 	if err != nil {
 		return fmt.Errorf("%w: %w", follow.ErrFault, err)
-	}
-	if ix.archive != nil && b.To > ix.archivedTo {
-		from := max(b.From, ix.archivedTo+1)
-		var raw []vault.RawEvent
-		for _, e := range b.Raw {
-			if e.Ledger >= from {
-				raw = append(raw, e)
-			}
-		}
-		if err := ix.archive.Append(raw, from, b.To); err != nil {
-			return fmt.Errorf("archive: %w", err)
-		}
-		ix.archivedTo = b.To
 	}
 	if err := ix.chain.Commit(ctx, b.From, b.To, next, delta, nil); err != nil {
 		if errors.Is(err, chainstate.ErrInconsistent) {
@@ -355,7 +349,81 @@ func (ix *Indexer) Run(ctx context.Context, f *follow.Follower, poll time.Durati
 			}
 		}
 	}()
+	if ix.archive != nil {
+		go ix.archiveLoop(ctx, follow.RPCSource{Client: ix.rpc, Contract: ix.cfg.Vault, PageLimit: 1000}, poll)
+	}
 	f.Run(ctx, poll, func(err error) { ix.Fault(ctx, err) })
+}
+
+// keep appends the part of a window the archive does not hold yet.
+func (ix *Indexer) keep(raw []vault.RawEvent, from, to uint32) error {
+	if ix.archive == nil {
+		return nil
+	}
+	ix.archiveMu.Lock()
+	defer ix.archiveMu.Unlock()
+	if to <= ix.archivedTo {
+		return nil
+	}
+	from = max(from, ix.archivedTo+1)
+	var events []vault.RawEvent
+	for _, e := range raw {
+		if e.Ledger >= from {
+			events = append(events, e)
+		}
+	}
+	if err := ix.archive.Append(events, from, to); err != nil {
+		return err
+	}
+	ix.archivedTo = to
+	return nil
+}
+
+// ArchiveStep copies the next window of the vault's raw events from RPC into the archive, whether
+// or not ingest can apply it, and reports whether it copied one. Ledgers RPC dropped before they
+// were copied are a gap, which pages.
+func (ix *Indexer) ArchiveStep(ctx context.Context, src follow.Source) (bool, error) {
+	h, err := ix.rpc.GetHealth(ctx)
+	if err != nil {
+		return false, err
+	}
+	ix.archiveMu.Lock()
+	next := max(ix.archivedTo+1, ix.cfg.DeployLedger)
+	ix.archiveMu.Unlock()
+	if next > h.LatestLedger {
+		return false, nil
+	}
+	if next < h.OldestLedger {
+		ix.alerts.Raise(ctx, alert.Critical, "archive_gap", "ledgers %d to %d were dropped by RPC before the archive copied them", next, h.OldestLedger-1)
+		next = h.OldestLedger
+	}
+	to := min(next+archiveWindow-1, h.LatestLedger)
+	raw, err := src.Events(ctx, next, to)
+	if err != nil {
+		return false, err
+	}
+	return true, ix.keep(raw, next, to)
+}
+
+// archiveWindow is the most ledgers the archive copies at once.
+const archiveWindow = 500
+
+func (ix *Indexer) archiveLoop(ctx context.Context, src follow.Source, poll time.Duration) {
+	for ctx.Err() == nil {
+		copied, err := ix.ArchiveStep(ctx, src)
+		if err != nil {
+			ix.log.Warn("archive copy failed", "error", err.Error())
+		}
+		if copied && err == nil {
+			continue
+		}
+		t := time.NewTimer(max(poll, time.Second))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+		case <-t.C:
+		}
+	}
 }
 
 // Health is the identity and readiness of the indexer.

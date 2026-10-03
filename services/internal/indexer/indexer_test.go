@@ -566,3 +566,32 @@ func TestOnlyAFullAndRecentReconciliationMakesTheIndexerReady(t *testing.T) {
 		t.Fatalf("still ready without reconciling: %+v", got)
 	}
 }
+
+func TestTheArchiveKeepsCopyingWhileIngestIsStuck(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.chain.Tx().Emit("mint", vault.Field{Name: "amount", Value: vault.U32(1)})
+	h.chain.NextLedger(5)
+	stuckAt := h.chain.Ledger - 1
+	h.chain.Shield(vaulttest.Depositor, 10_000_000)
+	h.chain.NextLedger(5)
+	h.publish()
+	h.drain()
+	if h.ix.Cursor() >= stuckAt {
+		t.Fatalf("ingest passed the faulty ledger: %d", h.ix.Cursor())
+	}
+	src := follow.RPCSource{Client: h.fake, Contract: vaulttest.Vault, PageLimit: 10}
+	for range 20 {
+		copied, err := h.ix.ArchiveStep(context.Background(), src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !copied {
+			break
+		}
+	}
+	got, err := archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}.Events(context.Background(), 10, h.chain.Ledger)
+	if err != nil || len(got) != len(h.chain.Events) {
+		t.Fatalf("archive holds %d of %d events: %v", len(got), len(h.chain.Events), err)
+	}
+}
