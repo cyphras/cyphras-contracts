@@ -93,6 +93,27 @@ fn a_flag_refuses_a_pending_deposit_and_a_second_flag_replaces_the_reason() {
 }
 
 #[test]
+fn flagging_again_keeps_the_refund_time_but_a_flag_after_an_unflag_starts_it_anew() {
+    let s = Setup::new();
+    let depositor = s.account("depositor", 100 * XLM);
+    s.shield(&depositor, 10 * XLM).unwrap();
+    s.shield(&depositor, 10 * XLM).unwrap();
+    s.vault.flag(&1, &1);
+    s.vault.flag(&2, &1);
+    s.advance(DAY - 60);
+    s.vault.flag(&1, &5);
+    s.vault.unflag(&2);
+    s.vault.flag(&2, &5);
+    s.advance(60);
+    // The first is refundable a day after its first flag; the second's day began again.
+    assert_eq!(outcome(s.vault.try_refund(&1)), Ok(()));
+    assert_eq!(outcome(s.vault.try_refund(&2)), Err(Error::RefundTooEarly));
+    // Its depositor can still take it back at once.
+    s.vault.cancel(&2);
+    assert_eq!(s.balance(&depositor), 100 * XLM);
+}
+
+#[test]
 fn unflag_clears_a_mistaken_flag_while_the_deposit_is_pending() {
     let s = Setup::new();
     let depositor = s.account("depositor", 100 * XLM);
