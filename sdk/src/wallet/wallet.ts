@@ -30,7 +30,7 @@ import type { Prover } from "../prover.ts";
 import { type AccountLock, LeaseLock, lockName, webLock } from "../lock.ts";
 import { type KeyValueStore, SealedStore } from "../storage.ts";
 import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
-import { type Core, newId } from "./core.ts";
+import { type ChainReads, type Core, chainReads, newId } from "./core.ts";
 import {
   type DepositInfo,
   type ShieldReceipt,
@@ -329,6 +329,7 @@ export class PrivateWallet {
       prover,
       artifacts,
       state,
+      chain: undefined,
       save: () => states.save(state),
       now,
       sleep,
@@ -470,7 +471,9 @@ export class PrivateWallet {
     }
     let summary: SyncSummary;
     try {
-      summary = await this.#syncInto({ ...core, state: draft, save: async () => {} });
+      summary = await this.#syncInto({ ...core, state: draft, save: async () => {} }, (reads) => {
+        core.chain = reads;
+      });
     } catch (err) {
       this.#fault =
         err instanceof CyphrasError &&
@@ -483,7 +486,7 @@ export class PrivateWallet {
     return summary;
   }
 
-  async #syncInto(core: Core): Promise<SyncSummary> {
+  async #syncInto(core: Core, onReads: (reads: ChainReads) => void): Promise<SyncSummary> {
     const indexer = this.#indexer();
     let source: IndexerSource | RpcEventSource =
       indexer === undefined ? this.#rpcSource(core) : new IndexerSource(indexer);
@@ -535,6 +538,8 @@ export class PrivateWallet {
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
     const live = source.kind === "indexer" ? indexer : undefined;
+    // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
+    onReads({ view, stats: await live?.stats().catch(() => undefined) });
     await trackDeposits(
       core,
       await live?.deposits().catch(() => undefined),
@@ -675,7 +680,7 @@ export class PrivateWallet {
       await this.#sync(false);
       const maxFee = request.selfRelay === undefined ? request.maxFee : 0n;
       if (maxFee === undefined) fail("invalid_argument", "a relayed unshield needs maxFee");
-      const { limits } = await this.#core.services.vault.instance();
+      const { limits } = chainReads(this.#core).view.instance;
       if (request.split === true && request.amount + maxFee > limits.maxDailyOutflow) {
         return this.#startSplit(request, maxFee, limits.maxDailyOutflow - maxFee);
       }

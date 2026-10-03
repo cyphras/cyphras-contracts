@@ -735,6 +735,60 @@ describe("wallet safety: a damaged store", () => {
   });
 });
 
+describe("wallet safety: what services learn", () => {
+  // Every request the wallet makes, as "service method" lines.
+  function tapped(world: World): { fetch: FetchLike; calls: string[] } {
+    const calls: string[] = [];
+    return {
+      calls,
+      fetch: async (input, init) => {
+        const url = new URL(input);
+        if (url.origin === RPC) {
+          const body = JSON.parse(String(init?.body)) as { method: string };
+          calls.push(`rpc ${body.method}`);
+        } else {
+          calls.push(`${url.origin} ${url.pathname}`);
+        }
+        return world.fetch(input, init);
+      },
+    };
+  }
+
+  it("sends a payment with no request to RPC or the indexer beyond a sync's", async () => {
+    const { world } = await funded();
+    const bob = await openWallet(world, 1);
+    const tap = tapped(world);
+    const alice = await openWallet({ ...world, fetch: tap.fetch }, 0);
+    await alice.sync();
+    tap.calls.length = 0;
+    await alice.sync();
+    const sync = tap.calls.filter((c) => !c.includes("relayer"));
+    tap.calls.length = 0;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM });
+    const send = tap.calls.filter((c) => !c.includes("relayer"));
+    assert.deepEqual(send, sync);
+  });
+
+  it("unshields with only the destination's ledger entries read beyond a sync's", async () => {
+    const { world } = await funded();
+    const tap = tapped(world);
+    const alice = await openWallet({ ...world, fetch: tap.fetch }, 0);
+    await alice.sync();
+    tap.calls.length = 0;
+    await alice.sync();
+    const sync = tap.calls.filter((c) => !c.includes("relayer"));
+    tap.calls.length = 0;
+    await alice.unshield({
+      to: world.signer("exchange").publicKey,
+      amount: 1n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    const unshield = tap.calls.filter((c) => !c.includes("relayer"));
+    assert.deepEqual(unshield, [...sync, "rpc getLedgerEntries"]);
+  });
+});
+
 describe("wallet safety: secrets", () => {
   it("keeps keys out of errors and of the store", async () => {
     const world = await createWorld();

@@ -6,10 +6,19 @@ import type { AddressKey, SpendingKeys } from "../keys.ts";
 import { CommitmentTree } from "../merkle.ts";
 import type { Prover } from "../prover.ts";
 import type { SpendNote } from "../transaction.ts";
+import type { PoolStats } from "../net/indexer.ts";
+import type { ChainView } from "../vault/state.ts";
 import type { Services } from "./services.ts";
 import type { ScanKeys } from "./sync.ts";
 import { isActive } from "./sync.ts";
 import type { OwnedNote, WalletState } from "./state.ts";
+
+// What the last sync read of the vault and the pool. Spends use these reads instead of making
+// their own, so that the RPC and the indexer see the same requests whether or not a spend follows.
+export interface ChainReads {
+  readonly view: ChainView;
+  readonly stats: PoolStats | undefined;
+}
 
 // Everything the wallet's operations share. Spend keys are absent from a view-only wallet.
 export interface Core {
@@ -21,12 +30,19 @@ export interface Core {
   readonly prover: Prover | undefined;
   readonly artifacts: PinnedArtifacts | undefined;
   readonly state: WalletState;
+  // Set by every sync that succeeds.
+  chain: ChainReads | undefined;
   save(): Promise<void>;
   now(): number;
   sleep(ms: number): Promise<void>;
 }
 
 export const newId = (): string => bytesToHex(randomBytes(16));
+
+export function chainReads(core: Core): ChainReads {
+  if (core.chain === undefined) fail("tree_unverified", "the wallet has not synced; sync first");
+  return core.chain;
+}
 
 export function spendingKeys(core: Core): SpendingKeys {
   if (core.keys === undefined) fail("view_only", "a view-only wallet cannot spend");

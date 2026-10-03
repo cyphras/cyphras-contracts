@@ -20,7 +20,15 @@ import { proveTransaction } from "../proving.ts";
 import { buildTransaction, type BuiltTransaction, type ExtTerms } from "../transaction.ts";
 import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
 import type { VaultInstance } from "../vault/state.ts";
-import { type Core, newId, selectNotes, spendNote, spendableNotes, spendingKeys } from "./core.ts";
+import {
+  type Core,
+  chainReads,
+  newId,
+  selectNotes,
+  spendNote,
+  spendableNotes,
+  spendingKeys,
+} from "./core.ts";
 import { payoutFromEvents } from "./exits.ts";
 import { type Warning, unshieldWarnings } from "./nudges.ts";
 import type { OwnedNote, Plan, PlanState, RootCheck, Route } from "./state.ts";
@@ -286,7 +294,8 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
     fail("tree_unverified", "the local tree is not verified against the vault; sync first");
   }
 
-  const instance = await core.services.vault.instance();
+  const reads = chainReads(core);
+  const instance = reads.view.instance;
   vaultOpen(instance, intent.kind, core.now());
   const cap = intent.maxFee < instance.limits.maxFee ? intent.maxFee : instance.limits.maxFee;
 
@@ -322,7 +331,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
     let warnings: Warning[] = [];
     if (intent.kind === "unshield") {
       const spendable = spendableNotes(core.state).reduce((s, n) => s + n.value, 0n);
-      const stats = await core.services.indexers[0]?.stats().catch(() => undefined);
+      const stats = reads.stats;
       warnings = unshieldWarnings({
         to: intent.to,
         amount: intent.amount,
@@ -355,7 +364,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       });
     }
 
-    const latest = await core.services.rpc.getLatestLedger();
+    const latest = reads.view.ledger;
     const delay =
       intent.notBefore === undefined
         ? 0
