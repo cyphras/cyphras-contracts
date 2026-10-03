@@ -55,6 +55,7 @@ fn main() {
          pub(crate) const GAMMA: [u8; 128] = {};\n\
          pub(crate) const DELTA: [u8; 128] = {};\n\
          pub(crate) const IC: [[u8; 64]; {}] = [{}];\n\
+         pub(crate) const FORGEABLE: bool = {};\n\
          soroban_sdk::contractmeta!(key = \"cyphras_vk\", val = \"{label} sha256:{sha256}\");\n",
         bytes(&key.alpha),
         bytes(&key.beta),
@@ -62,6 +63,7 @@ fn main() {
         bytes(&key.delta),
         ic.len(),
         ic.join(","),
+        !mainnet,
     );
     fs::write(
         PathBuf::from(env::var("OUT_DIR").unwrap()).join("vk.rs"),

@@ -14,6 +14,9 @@ mod key {
 
 pub const PUBLIC_INPUTS: u32 = 8;
 
+/// True when the embedded key is the testnet-forgeable dev key, whose setup was not a ceremony.
+pub const FORGEABLE: bool = key::FORGEABLE;
+
 /// A Groth16 verifying key in the host's encoding. `ic0` is the constant term of `vk_x` and `ic`
 /// holds one point per public input.
 pub struct VerifyingKey {

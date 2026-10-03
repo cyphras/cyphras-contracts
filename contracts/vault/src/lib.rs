@@ -42,7 +42,8 @@ pub struct Vault;
 #[contractimpl]
 impl Vault {
     /// Runs with the deployment, so the vault never exists unconfigured. `domain` is derived from
-    /// the network and the asset contract's name rather than taken as an argument.
+    /// the network and the asset contract's name rather than taken as an argument. A build with
+    /// the testnet-forgeable key refuses to deploy on mainnet.
     pub fn __constructor(
         env: Env,
         token: Address,
@@ -52,6 +53,9 @@ impl Vault {
         delay_large: u64,
         limits: Limits,
     ) -> Result<(), Error> {
+        if verifier::FORGEABLE && on_mainnet(&env) {
+            return Err(Error::ForgeableKey);
+        }
         if delay_small > delay_large {
             return Err(Error::BadConfig);
         }
@@ -562,16 +566,19 @@ impl Vault {
     }
 }
 
+fn on_mainnet(env: &Env) -> bool {
+    env.ledger().network_id() == BytesN::from_array(env, &MAINNET_NETWORK_ID)
+}
+
 /// `OS2IP(sha256("cyphras/v2/domain/" || network || "/" || asset)) mod p`, where `network` is
 /// `mainnet` on the public network and `testnet` on any other, and `asset` is the asset
 /// contract's name: `native`, or `CODE:ISSUER`.
 fn domain(env: &Env, token: &Address) -> U256 {
-    let network: &[u8; 7] =
-        if env.ledger().network_id() == BytesN::from_array(env, &MAINNET_NETWORK_ID) {
-            b"mainnet"
-        } else {
-            b"testnet"
-        };
+    let network: &[u8; 7] = if on_mainnet(env) {
+        b"mainnet"
+    } else {
+        b"testnet"
+    };
     let mut preimage = Bytes::from_slice(env, b"cyphras/v2/domain/");
     preimage.extend_from_slice(network);
     preimage.push_back(b'/');

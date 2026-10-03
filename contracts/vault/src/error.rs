@@ -42,4 +42,5 @@ pub enum Error {
     NoQueuedLimits = 36,
     LimitsNotReady = 37,
     Overflow = 38,
+    ForgeableKey = 39,
 }

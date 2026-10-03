@@ -12,8 +12,8 @@ use super::{
     e2e::Flow,
     fixtures,
     setup::{
-        asset_contract, create_account, env, host_aborted, limits, native_asset, outcome,
-        DELAY_LARGE, DELAY_SMALL, MAINNET, TESTNET, XLM,
+        asset_contract, env, host_aborted, limits, outcome, sha256, DELAY_LARGE, DELAY_SMALL,
+        MAINNET, TESTNET,
     },
 };
 use crate::{proof, Error, Vault, VaultClient};
@@ -136,19 +136,14 @@ fn a_proof_for_another_vault_or_network_is_refused() {
         Err(Error::WrongNetwork)
     );
 
-    // The same vault address on mainnet: every testnet proof names the testnet network.
-    let env = env(MAINNET);
-    let token = native_asset(&env);
-    let vault = vault_at_fixture_address(&env, token);
-    let step = fixtures::step("shield_alice");
-    let alice = fixtures::account(&env, "alice");
-    create_account(&env, &alice, 2_000 * XLM);
-    let result = vault.try_shield(
-        &fixtures::proof(&env, &step),
-        &fixtures::ext(&env, &step),
-        &alice,
+    // The same vault seen from mainnet: every testnet proof names the testnet network.
+    let flow = Flow::new();
+    let mainnet = sha256(MAINNET.as_bytes());
+    flow.s.env.ledger().with_mut(|l| l.network_id = mainnet);
+    assert_eq!(
+        flow.run(&fixtures::step("shield_alice")),
+        Err(Error::WrongNetwork)
     );
-    assert_eq!(outcome(result), Err(Error::WrongNetwork));
 }
 
 #[test]
