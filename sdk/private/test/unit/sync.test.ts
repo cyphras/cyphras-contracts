@@ -5,6 +5,7 @@ import { StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
 import { bytesToHex, utf8 } from "../../src/bytes.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import { P } from "../../src/field.ts";
+import type { IncomingKeys } from "../../src/keys.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
 import type { Leaf } from "../../src/net/indexer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
@@ -19,7 +20,9 @@ import {
   emptyState,
 } from "../../src/wallet/state.ts";
 import {
+  type ScanKeys,
   advancePlans,
+  applyDownload,
   checkRoot,
   checkedBetween,
   recheck,
@@ -477,6 +480,57 @@ describe("unchecked ranges", () => {
     await assert.rejects(
       recheck(walletAfter(forged), [showing(forged), showing(four)], VAULT, 1),
       (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
+    );
+  });
+
+  // Keys for downloads with nothing to scan, which never use them.
+  const NO_KEYS: ScanKeys = {
+    network: "testnet",
+    incoming: {} as IncomingKeys,
+    ovk: undefined,
+    nkFold: undefined,
+  };
+
+  it("starts a new range for an unchecked sync that follows one kept as partial", () => {
+    const state = emptyState(1);
+    state.nullifierSince = 121;
+    state.unchecked = [{ from: 100, to: 120, leaves: undefined, status: "partial" }];
+    const tree = CommitmentTree.empty();
+    const data = { since: 121, completeTo: 130, horizon: 130, nullifiers: [], firstIndex: 0 };
+    applyDownload(state, NO_KEYS, { ...data, leaves: [], tree, pages: [] }, false, 1);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.from, r.to, r.status]),
+      [
+        [100, 120, "partial"],
+        [121, 130, "open"],
+      ],
+    );
+  });
+
+  it("takes no checked ledger from staged unchecked leaves that a checked sync with no new leaves applies", () => {
+    const state = emptyState(1);
+    state.tree = treeOf(4).snapshot();
+    state.nullifierSince = 120;
+    // An earlier sync staged the leaves at positions 4 to 7 while RPC could not check them, the
+    // last one labelled with a ledger far past the vault's.
+    const staged = [4, 5, 6, 7].map((i) => leafAt(i, i === 7 ? 9_999 : 60));
+    state.staging = {
+      tree: treeOf(8).snapshot(),
+      lastLeafLedger: 9_999,
+      notes: [],
+      sent: [],
+      paths: [],
+      found: [],
+      unchecked: { first: 4, ledger: 60, chunks: [chunk(staged)] },
+    };
+    const tree = treeOf(8);
+    const data = { since: 120, completeTo: 130, horizon: 130, nullifiers: [], firstIndex: 8 };
+    applyDownload(state, NO_KEYS, { ...data, leaves: [], tree, pages: [] }, true, 1);
+    assert.equal(state.tree.leafCount, 8);
+    assert.equal(state.checkedLeafLedger, 0);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.leaves?.first, r.leaves?.end, r.status]),
+      [[4, 8, "open"]],
     );
   });
 

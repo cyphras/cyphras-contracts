@@ -723,6 +723,46 @@ describe("wallet safety: a second RPC provider", () => {
     assert.equal(summary.staged, 0);
   });
 
+  it("takes no indexer for complete past the chain while only the first RPC provider lags it", async () => {
+    const world = await createWorld();
+    let stale: string | undefined;
+    let behind: number | undefined;
+    // The first provider gives its view of the vault and its events as of the ledger `behind`, while
+    // the indexer and the second provider follow the chain.
+    const first: FetchLike = async (input, init) => {
+      const body = JSON.parse(String(init?.body));
+      const view = body.method === "getLedgerEntries" && body.params.keys.length === 3;
+      if (behind !== undefined && view && stale !== undefined) {
+        return new Response(JSON.stringify({ ...JSON.parse(stale), id: body.id }));
+      }
+      const res = await world.fetch(input, init);
+      if (view && behind === undefined) stale = await res.clone().text();
+      if (behind === undefined || body.method !== "getEvents") return res;
+      const until = behind;
+      const reply = await res.json();
+      reply.result.events = reply.result.events.filter(
+        (e: { ledger: number }) => e.ledger <= until,
+      );
+      reply.result.latestLedger = until;
+      return new Response(JSON.stringify(reply));
+    };
+    const fetch: FetchLike = async (input, init) => {
+      const origin = new URL(input).origin;
+      if (origin === RPC) return first(input, init);
+      return world.fetch(origin === SECOND ? RPC : input, init);
+    };
+    const wallet = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: SECOND,
+    });
+    world.fill(1);
+    await wallet.sync();
+    behind = world.vault.ledger;
+    world.fill(1);
+    const summary = await wallet.sync();
+    assert.equal(summary.rootVerified, true);
+    assert.equal(summary.crossChecked, true);
+  });
+
   it("takes no landing from leaves past what the second RPC provider holds", async () => {
     const { world, store } = await funded();
     const bob = await openWallet(world, 1);
@@ -952,6 +992,35 @@ describe("wallet safety: a second RPC provider", () => {
     };
   }
 
+  it("finds an incoming payment the indexer hid though the first RPC provider disowns its events", async () => {
+    const { world, alice } = await funded();
+    const address = (await openWallet(world, 1)).generateAddress();
+    let hidden = new Set<number>();
+    const disowning: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (url.origin === SECOND) return world.fetch(RPC, init);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (url.origin === RPC && body?.method === "getEvents") return rpcError(body.id, -32600);
+      return world.fetch(input, init);
+    };
+    const bob = await openWallet(
+      { ...world, fetch: hiding(disowning, () => hidden) },
+      1,
+      new MemoryStore(),
+      undefined,
+      { secondRpcUrl: SECOND },
+    );
+    await bob.sync();
+    await alice.send({ to: address, amount: 10n * XLM, maxFee: 2n * XLM });
+    hidden = new Set(world.vault.leaves.slice(-2).map((l) => l.index));
+    world.fill(1);
+    await assert.rejects(bob.sync(), isError("indexer_fault"));
+    hidden = new Set();
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
   it("finds through the second RPC provider a payment the indexer hid, once the first disowns its events", async () => {
     const { world, alice } = await funded();
     const address = (await openWallet(world, 1)).generateAddress();
@@ -996,6 +1065,54 @@ describe("wallet safety: a second RPC provider", () => {
     const rescanned = await bob.rescan();
     assert.equal(rescanned.lostLeaves, 0);
     assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
+  it("asks for a decision on a refused payment while the second RPC provider lags without events", async () => {
+    const world = await createWorld();
+    let stale: string | undefined;
+    let lagging = false;
+    // The second provider serves no events, and while lagging gives the last view it gave.
+    const second: FetchLike = async (_input, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method === "getEvents") return rpcError(body.id, -32601);
+      const view = body.method === "getLedgerEntries" && body.params.keys.length === 3;
+      if (lagging && view && stale !== undefined) {
+        return new Response(JSON.stringify({ ...JSON.parse(stale), id: body.id }));
+      }
+      const res = await world.fetch(RPC, init);
+      if (view) stale = await res.clone().text();
+      return res;
+    };
+    const options = { secondRpcUrl: SECOND };
+    const fetch = viaSecond(world, second);
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, options);
+    const other = await openWallet({ ...world, fetch }, 2, undefined, undefined, options);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "refused", reason: 3 });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    // Each day the second provider is one pair behind the vault when the wallet syncs.
+    for (let day = 0; day < 2; day++) {
+      world.advance(86_400);
+      lagging = false;
+      await other.sync();
+      lagging = true;
+      world.fill(1);
+      await alice.sync();
+      const [plan] = await alice.plans();
+      assert.equal(plan?.state, "prepared");
+      assert.equal(plan?.needsUserDecision, true);
+      assert.equal((await alice.balance()).locked, 100n * XLM);
+    }
+    lagging = false;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "dead");
+    assert.equal((await alice.balance()).spendable, 100n * XLM);
   });
 
   it("refuses a tree a second RPC provider contradicts", async () => {
