@@ -1,6 +1,6 @@
 // Command indexer rebuilds one vault from its events and serves leaves, nullifiers, the entry
-// queue and the exit queue. "indexer rebuild" deletes its state so the next start ingests again from the deploy
-// ledger, out of its own event archive, the ledger-meta archive and RPC.
+// queue and the exit queue. "indexer rebuild" deletes its state so the next start ingests again
+// from the deploy ledger, out of its own event archive, the ledger-meta archive and RPC.
 package main
 
 import (
