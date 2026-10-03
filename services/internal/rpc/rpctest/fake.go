@@ -208,9 +208,23 @@ func matches(req protocol.GetEventsRequest, e protocol.EventInfo) bool {
 	if len(req.Filters) == 0 {
 		return true
 	}
+	topics := make([]xdr.ScVal, len(e.TopicXDR))
+	for i, t := range e.TopicXDR {
+		if err := xdr.SafeUnmarshalBase64(t, &topics[i]); err != nil {
+			return false
+		}
+	}
 	for _, flt := range req.Filters {
-		if len(flt.ContractIDs) == 0 || slices.Contains(flt.ContractIDs, e.ContractID) {
+		if len(flt.ContractIDs) > 0 && !slices.Contains(flt.ContractIDs, e.ContractID) {
+			continue
+		}
+		if len(flt.Topics) == 0 {
 			return true
+		}
+		for _, tf := range flt.Topics {
+			if tf.Matches(topics) {
+				return true
+			}
 		}
 	}
 	return false

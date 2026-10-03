@@ -67,7 +67,7 @@ func TestTheRPCSourceFollowsTheCursorThroughFullPages(t *testing.T) {
 	c := activity()
 	f := rpctest.New(passphrase, 100)
 	load(f, c.Events)
-	src := RPCSource{Client: f, Vault: vaulttest.Vault, PageLimit: 7}
+	src := RPCSource{Client: f, Contract: vaulttest.Vault, PageLimit: 7}
 	got, err := src.Events(context.Background(), 10, 40)
 	if err != nil {
 		t.Fatal(err)
@@ -126,7 +126,7 @@ func TestTheFollowerAppliesEveryLedgerOnceInOrder(t *testing.T) {
 	load(f, c.Events)
 	f.SetLatest(75)
 	sink := &memSink{cursor: 9}
-	fl := &Follower{RPC: f, Live: RPCSource{Client: f, Vault: vaulttest.Vault, PageLimit: 5}, Window: 7, Sink: sink}
+	fl := &Follower{RPC: f, Live: RPCSource{Client: f, Contract: vaulttest.Vault, PageLimit: 5}, Window: 7, Sink: sink}
 	drain(t, fl)
 	if sink.cursor != 75 {
 		t.Fatalf("cursor %d", sink.cursor)
@@ -151,7 +151,7 @@ func TestAnUnknownTopicIsAFaultAndNothingIsApplied(t *testing.T) {
 	f := rpctest.New(passphrase, 0)
 	load(f, c.Events)
 	sink := &memSink{cursor: 9}
-	fl := &Follower{RPC: f, Live: RPCSource{Client: f, Vault: vaulttest.Vault}, Window: 10, Sink: sink}
+	fl := &Follower{RPC: f, Live: RPCSource{Client: f, Contract: vaulttest.Vault}, Window: 10, Sink: sink}
 	if _, err := fl.Step(context.Background()); !errors.Is(err, ErrFault) || !errors.Is(err, vault.ErrUnknownTopic) {
 		t.Fatalf("unknown topic: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestOlderLedgersComeFromHistoryThenRPCTakesOver(t *testing.T) {
 	}
 	sink := &memSink{cursor: 9}
 	fl := &Follower{
-		RPC: f, Live: RPCSource{Client: f, Vault: vaulttest.Vault, PageLimit: 50},
+		RPC: f, Live: RPCSource{Client: f, Contract: vaulttest.Vault, PageLimit: 50},
 		History: []Source{archive.Reader{Dir: dir, Vault: vaulttest.Vault}}, Window: 8, Sink: sink,
 	}
 	drain(t, fl)

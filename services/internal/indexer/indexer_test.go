@@ -78,7 +78,7 @@ func (h *harness) open() {
 	}
 	ix.now = func() time.Time { return h.now }
 	h.ix = ix
-	h.f = &follow.Follower{RPC: h.fake, Live: follow.RPCSource{Client: h.fake, Vault: vaulttest.Vault, PageLimit: 10}, Window: 5, Sink: ix}
+	h.f = &follow.Follower{RPC: h.fake, Live: follow.RPCSource{Client: h.fake, Contract: vaulttest.Vault, PageLimit: 10}, Window: 5, Sink: ix}
 }
 
 func (h *harness) setInstance(attested uint64) {

@@ -149,7 +149,7 @@ func (b *Base) Follower(sink follow.Sink) (*follow.Follower, error) {
 		return nil, fmt.Errorf("WINDOW_LEDGERS %d is outside 1 to 10000", window)
 	}
 	return &follow.Follower{
-		RPC: b.RPC, Live: follow.RPCSource{Client: b.RPC, Vault: b.Vault.Vault, PageLimit: 1000},
+		RPC: b.RPC, Live: follow.RPCSource{Client: b.RPC, Contract: b.Vault.Vault, PageLimit: 1000},
 		History: b.History(), Window: uint32(window), Sink: sink,
 	}, nil
 }

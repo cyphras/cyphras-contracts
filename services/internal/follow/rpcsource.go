@@ -30,7 +30,11 @@ var (
 // there is another page.
 type RPCSource struct {
 	Client rpc.Client
-	Vault  string
+	// Contract is the contract whose events are read, the vault unless Topics narrows the read to
+	// another contract's events about it.
+	Contract string
+	// Topics, when set, keeps only events that match one of the topic filters.
+	Topics []protocol.TopicFilter
 	// PageLimit is the number of events per request.
 	PageLimit uint
 }
@@ -43,7 +47,8 @@ func (s RPCSource) Events(ctx context.Context, from, to uint32) ([]vault.RawEven
 	}
 	filter := []protocol.EventFilter{{
 		EventType:   protocol.EventTypeSet{protocol.EventTypeContract: nil},
-		ContractIDs: []string{s.Vault},
+		ContractIDs: []string{s.Contract},
+		Topics:      s.Topics,
 	}}
 	req := protocol.GetEventsRequest{
 		StartLedger: from, EndLedger: to + 1, Filters: filter,
@@ -71,7 +76,7 @@ func (s RPCSource) Events(ctx context.Context, from, to uint32) ([]vault.RawEven
 			if err != nil {
 				return nil, err
 			}
-			if raw.Contract != s.Vault {
+			if raw.Contract != s.Contract {
 				return nil, fmt.Errorf("%w: event of contract %s", vault.ErrMalformed, raw.Contract)
 			}
 			out = append(out, raw)

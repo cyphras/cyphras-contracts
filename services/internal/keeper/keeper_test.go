@@ -138,7 +138,7 @@ func newHarness(t *testing.T) *harness {
 	}
 	k.now = func() time.Time { return h.now }
 	h.k = k
-	h.f = &follow.Follower{RPC: h.fake, Live: follow.RPCSource{Client: h.fake, Vault: vaulttest.Vault}, Window: 100, Sink: k}
+	h.f = &follow.Follower{RPC: h.fake, Live: follow.RPCSource{Client: h.fake, Contract: vaulttest.Vault}, Window: 100, Sink: k}
 	return h
 }
 
