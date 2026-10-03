@@ -135,11 +135,23 @@ func (q *Queue) Put(a Alert) {
 		q.nextID--
 		q.pending = append(q.pending, delivery{id: q.nextID, channel: i, alert: a, next: q.now()})
 	}
-	if over := len(q.pending) - maxPending; over > 0 {
-		for _, d := range q.pending[:over] {
-			q.logError("alert dropped from a full queue", d.alert.Code, nil)
+	// A full queue drops its oldest copies of the lowest severity first, Info before Warning
+	// before Critical.
+	for over := len(q.pending) - maxPending; over > 0; {
+		r := 0
+		for _, d := range q.pending {
+			r = max(r, rank(d.alert.Severity))
 		}
-		q.pending = append([]delivery(nil), q.pending[over:]...)
+		kept := q.pending[:0]
+		for _, d := range q.pending {
+			if over > 0 && rank(d.alert.Severity) == r {
+				q.logError("alert dropped from a full queue", d.alert.Code, nil)
+				over--
+				continue
+			}
+			kept = append(kept, d)
+		}
+		q.pending = kept
 	}
 }
 
@@ -327,13 +339,13 @@ func (q *Queue) due(ctx context.Context, ch int, now time.Time) []delivery {
 	}
 	q.mu.Lock()
 	for _, d := range q.pending {
-		if d.channel == ch && !d.next.After(now) && len(out) < 2*laneBatch {
+		if d.channel == ch && !d.next.After(now) {
 			out = append(out, d)
 		}
 	}
 	q.mu.Unlock()
 	slices.SortStableFunc(out, func(a, b delivery) int { return rank(a.alert.Severity) - rank(b.alert.Severity) })
-	return out
+	return out[:min(len(out), 2*laneBatch)]
 }
 
 func (q *Queue) done(ctx context.Context, d delivery) {

@@ -369,3 +369,49 @@ func TestACriticalGoesBeforeEarlierWarnings(t *testing.T) {
 		t.Fatalf("the Critical waited behind the Warnings: %d sent", len(ch.sent))
 	}
 }
+
+func TestInMemoryACriticalGoesBeforeAFloodOfInfo(t *testing.T) {
+	now := time.Unix(1_728_000_000, 0)
+	ch := &recorder{}
+	q := &Queue{Name: "operator", Channels: []Channel{ch}, Now: func() time.Time { return now }}
+	for i := range 1000 {
+		q.Put(Alert{Severity: Info, Code: fmt.Sprintf("deposit_flagged_%d", i), Time: now})
+	}
+	q.Put(Alert{Severity: Critical, Code: "invariant", Time: now})
+	q.Flush(context.Background())
+	if len(ch.sent) == 0 || ch.sent[0].Code != "invariant" {
+		t.Fatalf("the Critical waited behind the Info alerts: %+v", ch.sent)
+	}
+}
+
+func TestAFullQueueDropsItsLowestSeverityFirst(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_728_000_000, 0)
+	live := &recorder{}
+	q := &Queue{Name: "operator", Channels: []Channel{live, &recorder{}}, Now: func() time.Time { return now }}
+	q.Put(Alert{Severity: Critical, Code: "invariant", Time: now})
+	q.Put(Alert{Severity: Warning, Code: "hot_balance_low", Time: now})
+	for i := range maxPending / 2 {
+		q.Put(Alert{Severity: Info, Code: fmt.Sprintf("exit_requeued_%d", i), Time: now})
+	}
+	kept := map[string]int{}
+	for _, d := range q.pending {
+		kept[d.alert.Code]++
+	}
+	if len(q.pending) != maxPending || kept["invariant"] != 2 || kept["hot_balance_low"] != 2 || kept["exit_requeued_1"] != 0 || kept["exit_requeued_2"] != 2 {
+		t.Fatalf("kept %d copies: %d of the Critical, %d of the Warning", len(q.pending), kept["invariant"], kept["hot_balance_low"])
+	}
+	q.Flush(ctx)
+	if len(live.sent) == 0 || live.sent[0].Code != "invariant" {
+		t.Fatalf("sent %+v", live.sent)
+	}
+	// With no Info to drop, the oldest Warning goes before any Critical.
+	q = &Queue{Name: "operator", Channels: []Channel{live}, Now: func() time.Time { return now }}
+	q.Put(Alert{Severity: Critical, Code: "invariant", Time: now})
+	for i := range maxPending {
+		q.Put(Alert{Severity: Warning, Code: fmt.Sprintf("exit_stranded_%d", i), Time: now})
+	}
+	if len(q.pending) != maxPending || q.pending[0].alert.Code != "invariant" || q.pending[1].alert.Code != "exit_stranded_1" {
+		t.Fatalf("kept %d copies, from %s", len(q.pending), q.pending[0].alert.Code)
+	}
+}
