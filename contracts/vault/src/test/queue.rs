@@ -181,6 +181,32 @@ fn the_delay_follows_the_current_large_deposit_threshold() {
 }
 
 #[test]
+fn a_loosened_threshold_does_not_shorten_the_delay_of_a_waiting_deposit() {
+    let s = Setup::new();
+    let depositor = s.account("depositor", 10_000 * XLM);
+    let threshold = s.vault.limits().large_deposit_threshold;
+    // A higher threshold is queued, and a large deposit is made just before it applies.
+    let mut looser = s.vault.limits();
+    looser.large_deposit_threshold = 2 * threshold;
+    s.vault.set_limits(&looser);
+    s.advance(7 * DAY - 60);
+    let id = s.shield(&depositor, threshold).unwrap();
+    let eligible_at = s.now() + DELAY_LARGE;
+    assert_eq!(s.vault.pending(&id).unwrap().delay, DELAY_LARGE);
+    s.vault.attest(&id);
+    s.advance(60);
+    s.vault.apply_limits();
+
+    // Under the new threshold the amount is small, but the deposit still waits the long delay.
+    s.advance(DELAY_SMALL);
+    assert_eq!(s.vault.admit(&ids(&s, &[id])), ids(&s, &[]));
+    s.advance(eligible_at - s.now() - 1);
+    assert_eq!(s.vault.admit(&ids(&s, &[id])), ids(&s, &[]));
+    s.advance(1);
+    assert_eq!(s.vault.admit(&ids(&s, &[id])), ids(&s, &[id]));
+}
+
+#[test]
 fn admit_inserts_each_deposit_as_one_pair_in_id_order() {
     let s = Setup::new();
     let depositor = s.account("depositor", 10_000 * XLM);

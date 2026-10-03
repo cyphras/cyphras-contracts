@@ -3,7 +3,7 @@ use soroban_sdk::{
     vec, Event, IntoVal, MuxedAddress, Symbol,
 };
 
-use super::setup::{outcome, Setup, DAY, XLM};
+use super::setup::{outcome, Setup, DAY, DELAY_SMALL, XLM};
 use crate::{events, proof::CIPHERTEXT_LEN, DataKey, Error, PendingDeposit};
 
 #[test]
@@ -71,6 +71,7 @@ fn a_shield_queues_the_deposit_and_pulls_the_funds() {
             encrypted_output0: ext.encrypted_output0.clone(),
             encrypted_output1: ext.encrypted_output1.clone(),
             created_at: s.now(),
+            delay: DELAY_SMALL,
             flag: None,
             flagged_at: 0,
         })

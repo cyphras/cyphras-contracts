@@ -16,6 +16,7 @@ struct Deposit {
     depositor: usize,
     amount: i128,
     created_at: u64,
+    delay: u64,
     flag: Option<u32>,
     flagged_at: u64,
 }
@@ -81,13 +82,17 @@ impl Model {
         now < self.status.halted_until
     }
 
+    fn delay(&self, amount: i128) -> u64 {
+        if amount >= self.limits.large_deposit_threshold {
+            DELAY_LARGE
+        } else {
+            DELAY_SMALL
+        }
+    }
+
     fn eligible(&self, id: u64, now: u64) -> bool {
         self.pending.get(&id).is_some_and(|d| {
-            let delay = if d.amount >= self.limits.large_deposit_threshold {
-                DELAY_LARGE
-            } else {
-                DELAY_SMALL
-            };
+            let delay = d.delay.max(self.delay(d.amount));
             d.flag.is_none() && id <= self.status.attested_up_to && now >= d.created_at + delay
         })
     }
@@ -139,6 +144,7 @@ impl Model {
                     depositor: *depositor,
                     amount: *amount,
                     created_at: now,
+                    delay: self.delay(*amount),
                     flag: None,
                     flagged_at: 0,
                 };

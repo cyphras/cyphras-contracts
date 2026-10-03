@@ -172,6 +172,7 @@ impl Vault {
                 encrypted_output0: ext.encrypted_output0,
                 encrypted_output1: ext.encrypted_output1,
                 created_at: now,
+                delay: delay(&config, &limits, amount),
                 flag: None,
                 flagged_at: 0,
             },
@@ -357,11 +358,9 @@ impl Vault {
             let Some(deposit) = storage::pending(&env, id) else {
                 continue;
             };
-            let delay = if deposit.amount >= limits.large_deposit_threshold {
-                config.delay_large
-            } else {
-                config.delay_small
-            };
+            // The longer of the delays at shield time and now: a loosened threshold cannot shorten
+            // the wait of a deposit already queued, and a tightened one still applies.
+            let delay = deposit.delay.max(delay(&config, &limits, deposit.amount));
             if deposit.flag.is_some()
                 || id > status.attested_up_to
                 || now < deposit.created_at.saturating_add(delay)
@@ -606,6 +605,16 @@ fn domain(env: &Env, token: &Address) -> U256 {
     preimage.append(&TokenClient::new(env, token).name().to_bytes());
     let digest = env.crypto().sha256(&preimage);
     U256::from_be_bytes(env, &Bytes::from(digest.to_bytes())).rem_euclid(&poseidon2::modulus(env))
+}
+
+/// The wait before admission: `delay_large` for an amount at or above the large-deposit
+/// threshold, `delay_small` below it.
+fn delay(config: &Config, limits: &Limits, amount: i128) -> u64 {
+    if amount >= limits.large_deposit_threshold {
+        config.delay_large
+    } else {
+        config.delay_small
+    }
 }
 
 fn check_limits(limits: &Limits) -> Result<(), Error> {
