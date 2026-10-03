@@ -19,20 +19,29 @@ import type { Deposit, WalletState } from "./state.ts";
  * review may still clear the deposit, which is then admitted, and one still held a day after the
  * hold is refunded. "refused_by_reviewer" (5) is a reviewer's refusal. "legal_hold" (100) holds the
  * deposit under a written order from an authority: no service refunds it, though its depositor can
- * still take it back. "cancelled" (0) is the depositor's own taking back. Every other code refuses
- * the deposit.
+ * still take it back. "refused" is a refusal of the screening policy: a sanctioned address (1), an
+ * exploit (2), frozen funds (3), a fraud report (4) or another reason a person gave (99).
+ * "cancelled" (0) is the depositor's own taking back. "unknown" is a code this release does not
+ * know, which says nothing of whether the deposit may still be admitted.
  */
 export type ScreeningKind =
   | "held_for_review"
   | "refused_by_reviewer"
   | "legal_hold"
+  | "refused"
   | "cancelled"
-  | "refused";
+  | "unknown";
 
 function screeningKind(reason: number): ScreeningKind {
   switch (reason) {
     case 0:
       return "cancelled";
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 99:
+      return "refused";
     case 5:
       return "refused_by_reviewer";
     case 6:
@@ -40,7 +49,7 @@ function screeningKind(reason: number): ScreeningKind {
     case 100:
       return "legal_hold";
     default:
-      return "refused";
+      return "unknown";
   }
 }
 

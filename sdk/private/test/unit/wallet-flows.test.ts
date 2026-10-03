@@ -228,6 +228,25 @@ describe("wallet: screening", () => {
     assert.equal(deposits.get(ordered.depositId)?.state, "cancelled");
     assert.equal(deposits.get(ordered.depositId)?.refundKind, "cancelled");
   });
+
+  it("presents every refusal code of the policy as a refusal, and a code it does not know as unknown", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("alice depositor");
+    const codes = [1, 2, 3, 4, 99, 7, 101];
+    const ids: number[] = [];
+    for (const [i, code] of codes.entries()) {
+      const { depositId } = await alice.shield({ amount: 10n * XLM, signer: depositor });
+      world.rpc.run(String(i).padStart(64, "f"), () => world.vault.flag(depositId, code));
+      ids.push(depositId);
+    }
+    await alice.sync();
+    const kinds = new Map((await alice.deposits()).map((d) => [d.id, d.flag?.kind]));
+    assert.deepEqual(
+      ids.map((id) => kinds.get(id)),
+      ["refused", "refused", "refused", "refused", "refused", "unknown", "unknown"],
+    );
+  });
 });
 
 describe("wallet: spends", () => {
