@@ -1,3 +1,4 @@
+import { bn254 } from "@noble/curves/bn254.js";
 import { createHash } from "node:crypto";
 
 // Contributors run the kit on its own, so it repeats the pins of scripts/circom.mjs and
@@ -136,13 +137,43 @@ const MONTGOMERY_INV = modPow(2n ** 256n % Q, Q - 2n, Q);
 function coordinate(bytes) {
   const v = littleEndian(bytes);
   if (v >= Q) throw new Error("a zkey point has a coordinate outside the field");
-  return Buffer.from(((v * MONTGOMERY_INV) % Q).toString(16).padStart(64, "0"), "hex");
+  return (v * MONTGOMERY_INV) % Q;
 }
 
-// The uncompressed encodings snarkjs hashes: big-endian coordinates, and for G2 each Fq2 element
-// as its c1 half before its c0 half.
-const g1 = (p) => Buffer.concat([0, 32].map((at) => coordinate(p.subarray(at, at + 32))));
-const g2 = (p) => Buffer.concat([32, 0, 96, 64].map((at) => coordinate(p.subarray(at, at + 32))));
+const bigEndian = (v) => Buffer.from(v.toString(16).padStart(64, "0"), "hex");
+
+// noble reads (0, 0) as the point at infinity and lets it pass assertValidity, but no key or
+// zkey point may be the identity.
+export function validPoint(point, error) {
+  try {
+    point.assertValidity();
+  } catch {
+    throw new Error(error);
+  }
+  if (point.is0()) throw new Error(error);
+  return point;
+}
+
+// snarkjs checks the chain with pairings, which hold only for points in the prime-order groups,
+// yet it reads zkey points without checking them, so each one is checked here. The bytes
+// returned are the uncompressed encoding snarkjs hashes: big-endian coordinates, and for G2 each
+// Fq2 element as its c1 half before its c0 half.
+function g1(bytes) {
+  const [x, y] = [0, 32].map((at) => coordinate(bytes.subarray(at, at + 32)));
+  validPoint(bn254.G1.Point.fromAffine({ x, y }), "a zkey G1 point is not in G1");
+  return Buffer.concat([x, y].map(bigEndian));
+}
+
+function g2(bytes) {
+  const [x0, x1, y0, y1] = [0, 32, 64, 96].map((at) => coordinate(bytes.subarray(at, at + 32)));
+  const { Fp2 } = bn254.fields;
+  const point = bn254.G2.Point.fromAffine({
+    x: Fp2.fromBigTuple([x0, x1]),
+    y: Fp2.fromBigTuple([y0, y1]),
+  });
+  validPoint(point, "a zkey G2 point is not in G2");
+  return Buffer.concat([x1, x0, y1, y0].map(bigEndian));
+}
 
 function readContribution(c) {
   const start = c.at;
@@ -186,7 +217,8 @@ function readContribution(c) {
 }
 
 // Reads what the ceremony tracks in a zkey: the circuit hash and every contribution in the order
-// they were made. It parses and hashes the points; snarkjs zkey verify is what checks them.
+// they were made, with each point checked on its own. How the points relate to each other is what
+// snarkjs zkey verify checks.
 export function readZkey(data, label) {
   const file = cursor(data, label);
   if (file.take(4).toString("latin1") !== "zkey" || file.u32() !== 1) {
@@ -208,6 +240,10 @@ export function readZkey(data, label) {
   const header = cursor(section(2), `${label} header`);
   const prime = () => (header.u32() === 32 ? littleEndian(header.take(32)) : 0n);
   if (prime() !== Q || prime() !== R) throw new Error(`${label} is not over BN254`);
+  header.take(12); // nVars, nPublic and domainSize, which snarkjs zkey verify checks
+  // alpha1, beta1, beta2, gamma2, delta1 and delta2
+  for (const point of [g1, g1, g2, g2, g1, g2]) point(header.take(point === g1 ? 64 : 128));
+  if (header.left !== 0) throw new Error(`${label} header has trailing bytes`);
 
   const mpc = cursor(section(10), `${label} contributions`);
   const csHash = Buffer.from(mpc.take(64));

@@ -1,6 +1,6 @@
 import { bn254 } from "@noble/curves/bn254.js";
 import * as snarkjs from "snarkjs";
-import { PUBLIC_INPUTS, mem, quiet } from "./common.mjs";
+import { PUBLIC_INPUTS, mem, quiet, validPoint } from "./common.mjs";
 
 // Byte for byte what `snarkjs zkey export verificationkey` writes: one-space indentation and no
 // trailing newline. The vault build pins the SHA-256 of exactly these bytes.
@@ -30,27 +30,16 @@ function affine(p, one) {
   }
 }
 
-function checked(point, error) {
-  try {
-    point.assertValidity();
-  } catch {
-    throw new Error(error);
-  }
-  // noble reads (0, 0) as the point at infinity and accepts it; the vault build rejects it.
-  if (point.is0()) throw new Error(error);
-  return point;
-}
-
 function g1(p) {
   affine(p, "1");
   const point = bn254.G1.Point.fromAffine({ x: fq(p[0]), y: fq(p[1]) });
-  return checked(point, "a G1 point is not on the curve");
+  return validPoint(point, "a G1 point is not on the curve");
 }
 
 function g2(p) {
   affine(p, ["1", "0"]);
   const point = bn254.G2.Point.fromAffine({ x: fq2(p[0]), y: fq2(p[1]) });
-  return checked(point, "a G2 point is not in G2");
+  return validPoint(point, "a G2 point is not in G2");
 }
 
 // The rules the vault build applies before it compiles a key in (check.rs in the verifier), so a
