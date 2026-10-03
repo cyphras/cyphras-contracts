@@ -44,6 +44,7 @@ const VAULT_ERRORS: Readonly<Record<number, string>> = {
   41: "ExceedsAdmittedValue",
   42: "DepositTooSmall",
   43: "ExceedsDailyOutflow",
+  44: "NotStranded",
 };
 
 export function vaultErrorName(code: number): string | undefined {

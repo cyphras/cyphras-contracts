@@ -47,4 +47,5 @@ pub enum Error {
     ExceedsAdmittedValue = 41,
     DepositTooSmall = 42,
     ExceedsDailyOutflow = 43,
+    NotStranded = 44,
 }

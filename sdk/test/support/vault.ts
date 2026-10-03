@@ -1,7 +1,6 @@
 // A model of contracts/vault on the contracts branch: the entry points the SDK calls, their
 // checks in the vault's order, the state they change and the events they emit. Proofs are
-// verified for real against the trapdoor key. The exit queue follows the interface announced for
-// the vault; it is off unless a test turns it on.
+// verified for real against the trapdoor key. The exit queue is off unless a test turns it on.
 import { Address, MuxedAccount, StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
 import { bytesToHex, hexToBytes } from "../../src/bytes.ts";
 import {

@@ -11,6 +11,7 @@ import { SorobanRpc } from "../../src/net/rpc.ts";
 import { vaultErrorName } from "../../src/vault/errors.ts";
 import { parseVaultErrors } from "../../scripts/vault-errors.ts";
 import { SDK_ROOT } from "../helpers.ts";
+import { ERROR } from "../support/vault.ts";
 
 const reply =
   (status: number, body: unknown): FetchLike =>
@@ -28,6 +29,10 @@ describe("vault errors", () => {
     assert.equal(vaultErrorName(4), "Halted");
     assert.equal(vaultErrorName(42), "DepositTooSmall");
     assert.equal(vaultErrorName(9999), undefined);
+  });
+
+  it("agree with the codes the vault model refuses with", () => {
+    for (const [name, code] of Object.entries(ERROR)) assert.equal(vaultErrorName(code), name);
   });
 });
 
