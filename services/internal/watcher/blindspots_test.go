@@ -425,3 +425,35 @@ func TestAnAlertChannelThatRefusesEverythingStopsTheHeartbeat(t *testing.T) {
 		t.Fatalf("a channel failing for 11 minutes: %d beats, %v", beats, err)
 	}
 }
+
+func TestADepositNotAttestedPastItsEligibilityPages(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	id := h.chain.Shield(vaulttest.Depositor, 10_000_000)
+	h.chain.NextLedger(5)
+	h.sync()
+	h.primary.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)), vaulttest.Pending(id, vaulttest.Depositor, 10_000_000, uint64(h.chain.ClosedAt-5), 3600, nil, 0), h.chain.Ledger, nil)
+	h.primary.CloseTime = h.chain.ClosedAt + 3600 + 11*60
+	if err := h.w.CheckAdmissions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !h.pages.has("attestation_late") || h.pages.has("admission_late") {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+	// A flagged deposit waits for nothing.
+	h.chain.NextLedger(5)
+	h.chain.Flag(id, 6)
+	h.chain.NextLedger(5)
+	h.sync()
+	h.primary.CloseTime = h.chain.ClosedAt + 3600 + 11*60
+	if err := h.w.CheckAdmissions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolved := false
+	for _, a := range h.pages.alerts {
+		resolved = resolved || a.Code == "attestation_late_resolved"
+	}
+	if !resolved {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+}
