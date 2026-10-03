@@ -667,3 +667,74 @@ func TestStoredCopiesFollowTheirChannelWhereverTheConfigurationPutsIt(t *testing
 		t.Fatalf("the old copy went to %+v", c.sent)
 	}
 }
+
+func TestAStoredRerouteIsKeptBeforeTheRefusedCopyGoes(t *testing.T) {
+	ctx := context.Background()
+	store := outboxStore(t)
+	now := time.Unix(1_728_000_000, 0)
+	refusing, other := &hook{status: http.StatusBadRequest, refusals: -1}, &hook{status: http.StatusServiceUnavailable, refusals: -1}
+	sr, so := httptest.NewServer(refusing), httptest.NewServer(other)
+	defer sr.Close()
+	defer so.Close()
+	channels := []Channel{Webhook{Format: "discord", URL: sr.URL, HTTP: sr.Client()}, Webhook{Format: "discord", URL: so.URL, HTTP: so.Client()}}
+	q := &Queue{Name: "operator", Store: store, Now: func() time.Time { return now }, Channels: channels}
+	codes := func() map[string]int {
+		rows, err := store.Pool.Query(ctx, `SELECT name, alert->>'code' FROM alert_outbox`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]int{}
+		for rows.Next() {
+			var name, code string
+			if err := rows.Scan(&name, &code); err != nil {
+				t.Fatal(err)
+			}
+			out[name+" "+code]++
+		}
+		return out
+	}
+	q.Put(Alert{Severity: Critical, Code: "invariant", Time: now})
+	q.flushLane(ctx, 0)
+	// The refused copy is gone and the other channel holds the reroute beside its own copy, which
+	// it could not take yet.
+	got := codes()
+	if len(got) != 2 || got[q.channelName(1)+" invariant"] != 1 || got[q.channelName(1)+" invariant_rerouted"] != 1 {
+		t.Fatalf("outbox %v", got)
+	}
+	// When the store cannot keep the reroute, it waits in memory and the refused copy still goes.
+	if _, err := store.Pool.Exec(ctx, `DELETE FROM alert_outbox`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Pool.Exec(ctx, `ALTER TABLE alert_outbox ADD CONSTRAINT no_reroutes CHECK (alert->>'code' NOT LIKE '%_rerouted')`); err != nil {
+		t.Fatal(err)
+	}
+	q.Put(Alert{Severity: Critical, Code: "invariant_2", Time: now})
+	q.flushLane(ctx, 0)
+	if got := codes(); got[q.channelName(0)+" invariant_2"] != 0 || got[q.channelName(1)+" invariant_2"] != 1 {
+		t.Fatalf("outbox %v", got)
+	}
+	q.mu.Lock()
+	kept := len(q.pending) == 1 && q.pending[0].channel == 1 && q.pending[0].alert.Code == "invariant_2_rerouted"
+	q.pending = nil
+	q.mu.Unlock()
+	if !kept {
+		t.Fatalf("in memory %+v", q.pending)
+	}
+	// The reroute and the drop are one transaction: a drop that fails takes the stored reroute
+	// back with it.
+	for _, stmt := range []string{
+		`DELETE FROM alert_outbox`, `ALTER TABLE alert_outbox DROP CONSTRAINT no_reroutes`,
+		`CREATE FUNCTION keep_rows() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'kept'; END $$`,
+		`CREATE TRIGGER keep_rows BEFORE DELETE ON alert_outbox FOR EACH ROW EXECUTE FUNCTION keep_rows()`,
+	} {
+		if _, err := store.Pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q.Put(Alert{Severity: Critical, Code: "invariant_3", Time: now})
+	q.flushLane(ctx, 0)
+	if got := codes(); got[q.channelName(1)+" invariant_3_rerouted"] != 0 {
+		t.Fatalf("a reroute outlived its failed drop: %v", got)
+	}
+}
