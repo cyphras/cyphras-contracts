@@ -1,9 +1,51 @@
 {
   "network": "mainnet",
   "networkPassphrase": "Public Global Stellar Network ; September 2015",
+  "admin": "GBKOZAN5NQ75GRFTO3WWOLZRYUSA3N3LFVBL33XEMY6GI2QSRK7VHRAS",
+  "deployer": "GAHNS5PMYQKO7KHHIFRCFQ3XJ5ZPDUBXJLKDZEA66S6FS3AC3BOPCYPH",
+  "xlmSac": "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA",
+  "poolWasmHash": "ed0d122cdcc2c61250c5f63c49cc9516775912adca0acca588df5f2901b77dc7",
+  "vkSha256": "5da51c49a584670b9dd83073931e06966fbe0c16758d6a3b6165a5c98869082b",
+  "indexerStartLedger": 63173208,
   "contracts": {
-    "verifier": null,
-    "factory": null
+    "verifier": "CDKVFZL7H4FQAY32G5B7RSDQMQST2FBCHTKKZEERMZOEXDAVTXLBBEED",
+    "factory": "CBMBKXI7YNMJYLLHP7CVKMRWUMVPJ4MTVOEP3UKDMA7FIPTD3QLJQ227"
   },
-  "pools": []
+  "pools": [
+    {
+      "asset": "XLM",
+      "token": "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA",
+      "denomination": "1000000",
+      "generation": 0,
+      "pool": "CC2SYHPYVRQ24IS6BQVA5WUYWDR3GK46W5ADY2UASC2D4IH6J5AXSEQ5"
+    },
+    {
+      "asset": "XLM",
+      "token": "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA",
+      "denomination": "10000000",
+      "generation": 0,
+      "pool": "CBW5U6EYEVEE5AB37BQW5AXIQOUZBNKYJAK6S5SWCL4QJCPHZ2W2RHWF"
+    },
+    {
+      "asset": "XLM",
+      "token": "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA",
+      "denomination": "100000000",
+      "generation": 0,
+      "pool": "CA5FSBAIIBFTWTXP4VEVKPJFYJLHSJMC5B2QF6JTFT6CIXZVGHAZAYXM"
+    },
+    {
+      "asset": "XLM",
+      "token": "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA",
+      "denomination": "1000000000",
+      "generation": 0,
+      "pool": "CCGSDFN2CNEA6NMDSJJIK4FM7HDE3YBQHRPLPNPE2YSFCYXBEK44BTWX"
+    },
+    {
+      "asset": "XLM",
+      "token": "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA",
+      "denomination": "10000000000",
+      "generation": 0,
+      "pool": "CBFIP6J7MBW5HT52CAGV4S4F3YUNGDYITP7QYKAWCRSC6VOUW2UE7NHC"
+    }
+  ]
 }
