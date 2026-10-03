@@ -126,6 +126,16 @@ func (q *quotes) publish(now time.Time, fee *big.Int) {
 }
 
 // lowest returns the lowest fee quoted within the lifetime, or nil.
+// newest returns the latest quote published since a time.
+func (q *quotes) newest(since time.Time) *big.Int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if n := len(q.history); n > 0 && !q.history[n-1].at.Before(since) {
+		return q.history[n-1].fee
+	}
+	return nil
+}
+
 func (q *quotes) lowest(now time.Time) *big.Int {
 	q.mu.Lock()
 	defer q.mu.Unlock()

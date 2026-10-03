@@ -478,8 +478,13 @@ func TestHealthAndQuoteReportIdentity(t *testing.T) {
 	if health["ready"] != true || health["fee_address"] != feeAddress || health["ready_channels"].(float64) != 2 || health["network_id"] != "cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472" || health["max_daily_outflow"] != "1000000000000" {
 		t.Fatalf("health %v", health)
 	}
+	before := h.fake.CallCount("getFeeStats")
 	_, quote := h.get("/v1/quote")
 	if quote["fee"] != "1100000" || quote["tier"] != "100000" || quote["margin_bps"].(float64) != 500 || quote["vault"] != vaulttest.Vault {
 		t.Fatalf("quote %v", quote)
+	}
+	h.get("/v1/quote")
+	if h.fake.CallCount("getFeeStats") != before {
+		t.Fatal("a client's quote request reached the RPC")
 	}
 }

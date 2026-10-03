@@ -142,6 +142,15 @@ func (r *Relayer) Refresh(ctx context.Context) error {
 // price right now.
 var ErrNoQuote = errors.New("relayer: no quote")
 
+// CurrentQuote serves the quote Refresh published in the last 15 seconds, so a client's request
+// for a quote costs no RPC call, and prices anew only when there is none.
+func (r *Relayer) CurrentQuote(ctx context.Context) (*big.Int, error) {
+	if fee := r.quotes.newest(r.now().Add(-15 * time.Second)); fee != nil {
+		return fee, nil
+	}
+	return r.Quote(ctx)
+}
+
 // Quote prices one relayed transaction now and remembers the price for QuoteLifetime.
 func (r *Relayer) Quote(ctx context.Context) (*big.Int, error) {
 	inclusion, err := r.engine.InclusionFee(ctx)

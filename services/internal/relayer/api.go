@@ -37,7 +37,7 @@ func (r *Relayer) Handler() http.Handler {
 			httpapi.Fail(w, http.StatusTooManyRequests, CodeRateLimited)
 			return
 		}
-		fee, err := r.Quote(req.Context())
+		fee, err := r.CurrentQuote(req.Context())
 		if err != nil {
 			httpapi.Fail(w, http.StatusServiceUnavailable, CodeUnavailable)
 			return

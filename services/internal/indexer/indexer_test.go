@@ -504,3 +504,26 @@ func TestPagesStopAtTheLedgerTheyReport(t *testing.T) {
 		}
 	}
 }
+
+func TestBulkResponsesAreServedFromMemoryForAFewSeconds(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.publish()
+	h.drain()
+	h.ix.Probe(context.Background())
+	_, body := h.get("/v1/stats")
+	pending := body["pending_deposits"].(float64)
+	// A row the cached answer does not know about.
+	if _, err := h.store.Pool.Exec(context.Background(), `INSERT INTO deposits (id, depositor, amount, commitment0, commitment1, created_at, created_ledger, created_tx)
+		VALUES (999, $1, 1, '\x00', '\x00', 0, 10, 'x')`, vaulttest.Depositor); err != nil {
+		t.Fatal(err)
+	}
+	if _, body = h.get("/v1/stats"); body["pending_deposits"].(float64) != pending {
+		t.Fatalf("the second request read the database: %v", body)
+	}
+	h.now = h.now.Add(memoAge)
+	h.ix.Probe(context.Background())
+	if _, body = h.get("/v1/stats"); body["pending_deposits"].(float64) != pending+1 {
+		t.Fatalf("a stale copy was served: %v", body)
+	}
+}

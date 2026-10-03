@@ -69,6 +69,9 @@ type Indexer struct {
 	// roots holds the tree's recent roots by leaf count, as the vault's root ring does.
 	roots     map[uint64]fr.Element
 	rootOrder []uint64
+
+	memoMu sync.Mutex
+	memos  map[string]*memoEntry
 }
 
 // rootHistory is how many recent roots the indexer keeps to compare with the vault's.
@@ -90,7 +93,7 @@ func (ix *Indexer) keepRoot(r chainstate.RootAt) {
 func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.Store, alerts *alert.Alerter, log *slog.Logger) (*Indexer, error) {
 	ix := &Indexer{
 		cfg: cfg, rpc: client, chain: chain, db: store{chain.Pool}, alerts: alerts, log: log,
-		hub: newHub(1000), now: time.Now, delays: map[uint64]uint64{},
+		hub: newHub(1000), now: time.Now, delays: map[uint64]uint64{}, memos: map[string]*memoEntry{},
 	}
 	state, cursor, err := chain.Load(ctx, cfg.Vault, cfg.DeployLedger)
 	if err != nil {
