@@ -136,11 +136,7 @@ func (q *Queue) Run(ctx context.Context) {
 // Flush attempts every copy that is due and returns how long until the next one is.
 func (q *Queue) Flush(ctx context.Context) time.Duration {
 	now := q.now()
-	due, err := q.due(ctx, now)
-	if err != nil {
-		q.logError("alert outbox read failed", "", err)
-		return 5 * time.Second
-	}
+	due := q.due(ctx, now)
 	var wg sync.WaitGroup
 	results := make([]error, len(due))
 	for i, d := range due {
@@ -172,12 +168,14 @@ func (q *Queue) Flush(ctx context.Context) time.Duration {
 
 var errDropped = errors.New("alert: dropped")
 
-func (q *Queue) due(ctx context.Context, now time.Time) ([]delivery, error) {
+// due lists the copies due now: those in the store, and those kept in memory, which are the ones
+// the store could not take, so a store that fails never holds them back.
+func (q *Queue) due(ctx context.Context, now time.Time) []delivery {
 	var out []delivery
 	if q.Store != nil {
 		stored, err := q.Store.due(ctx, q.Name, now, 100)
 		if err != nil {
-			return nil, err
+			q.logError("alert outbox read failed", "", err)
 		}
 		out = append(out, stored...)
 	}
@@ -188,7 +186,7 @@ func (q *Queue) due(ctx context.Context, now time.Time) ([]delivery, error) {
 		}
 	}
 	q.mu.Unlock()
-	return out, nil
+	return out
 }
 
 func (q *Queue) done(ctx context.Context, d delivery) {

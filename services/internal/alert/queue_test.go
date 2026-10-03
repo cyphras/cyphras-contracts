@@ -121,6 +121,31 @@ func TestUndeliveredAlertsSurviveARestart(t *testing.T) {
 	}
 }
 
+func TestAlertsAreDeliveredWhileTheirDatabaseIsDown(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, testdb.URL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	store := &Store{Pool: pool}
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	working := &flaky{}
+	q := &Queue{Name: "operator", Channels: []Channel{working}, Store: store}
+	// The database goes away: neither writing nor reading the outbox works.
+	pool.Close()
+	q.Put(Alert{Code: "invariant", Message: "tvl", Time: time.Now()})
+	q.Flush(ctx)
+	if working.count() != 1 || working.sent[0].Message != "tvl" {
+		t.Fatalf("delivered %+v", working.sent)
+	}
+	if n := len(q.pending); n != 0 {
+		t.Fatalf("%d copies still wait in memory", n)
+	}
+}
+
 func TestARepeatWithinTheCooldownIsStillLogged(t *testing.T) {
 	var logs bytes.Buffer
 	a := &Alerter{Service: "keeper", Log: slog.New(slog.NewTextHandler(&logs, nil)), Cooldown: time.Hour}
