@@ -91,17 +91,17 @@ func (r *Relayer) Handler() http.Handler {
 		}
 		httpapi.JSON(w, http.StatusOK, s)
 	})
-	mux.HandleFunc("GET /v1/held/{nullifier}", func(w http.ResponseWriter, req *http.Request) {
+	mux.HandleFunc("GET /v1/held/{id}", func(w http.ResponseWriter, req *http.Request) {
 		if !statusLimit.Allow() {
 			httpapi.Fail(w, http.StatusTooManyRequests, CodeRateLimited)
 			return
 		}
-		nf, err := field(req.PathValue("nullifier"))
-		if err != nil {
+		id := req.PathValue("id")
+		if _, err := lowerHex(id, 16); err != nil {
 			httpapi.Fail(w, http.StatusBadRequest, CodeBadRequest)
 			return
 		}
-		s, hash, ok := r.HeldStatus(req.Context(), nf)
+		s, hash, reason, ok := r.HeldStatus(req.Context(), id)
 		if !ok {
 			httpapi.Fail(w, http.StatusNotFound, "not_found")
 			return
@@ -112,6 +112,9 @@ func (r *Relayer) Handler() http.Handler {
 		}
 		if s.Code != "" {
 			body["code"] = s.Code
+		}
+		if reason != nil {
+			body["reason"] = *reason
 		}
 		if s.ExitID != nil {
 			body["exit_id"] = *s.ExitID

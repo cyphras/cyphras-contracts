@@ -23,6 +23,8 @@ import (
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
+	"github.com/cyphras/cyphras-contracts/services/internal/fr"
+	"github.com/cyphras/cyphras-contracts/services/internal/groth16"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc/rpctest"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
@@ -37,6 +39,43 @@ const (
 )
 
 // fixture returns the request body of one of the vault's real-proof fixture steps.
+// fixtureChain returns the domain the fixture proofs are bound to and every root they prove
+// against, which the test vault then knows.
+func fixtureChain(t *testing.T) (fr.Element, []fr.Element) {
+	t.Helper()
+	raw, err := os.ReadFile("../vault/testdata/proofs.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Domain string `json:"domain"`
+		Steps  []struct {
+			Proof struct {
+				Root string `json:"root"`
+			} `json:"proof"`
+		} `json:"steps"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	domain, err := fr.SetHex(strings.TrimPrefix(f.Domain, "0x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roots []fr.Element
+	for _, s := range f.Steps {
+		if s.Proof.Root == "" {
+			continue
+		}
+		root, err := fr.SetHex(strings.TrimPrefix(s.Proof.Root, "0x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, root)
+	}
+	return domain, roots
+}
+
 func fixture(t *testing.T, name string) map[string]any {
 	t.Helper()
 	raw, err := os.ReadFile("../vault/testdata/proofs.json")
@@ -104,6 +143,7 @@ type harness struct {
 	sent   int
 	status protocol.GetTransactionResponse
 	simErr string
+	domain fr.Element
 }
 
 func success(resource int64) protocol.GetTransactionResponse {
@@ -119,9 +159,12 @@ func newHarness(t *testing.T, status vault.Status) *harness {
 	h := &harness{t: t, fake: rpctest.New(passphrase, 1000), screen: &screenStub{allow: true}, now: time.Unix(1_728_000_000, 0), status: success(900_000)}
 	h.fake.CloseTime = h.now.Unix()
 	h.fake.FeeStats.SorobanInclusionFee.P90 = 100
+	domain, roots := fixtureChain(t)
+	h.domain = domain
 	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Vault)), vaulttest.Instance(vaulttest.InstanceOptions{
-		DelaySmall: 3600, DelayLarge: 86400, Limit: 1_000_000_000_000, Large: 5_000_000_000, Status: status,
+		DelaySmall: 3600, DelayLarge: 86400, Limit: 1_000_000_000_000, Large: 5_000_000_000, Status: status, Domain: domain,
 	}), 10, nil)
+	h.fake.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), vaulttest.Roots(roots...), 10, nil)
 	var channels []*submit.Account
 	for range 2 {
 		kp := keypair.MustRandom()
@@ -155,9 +198,17 @@ func newHarness(t *testing.T, status vault.Status) *harness {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, Validity: time.Minute, Poll: time.Millisecond, Now: h.clock}
+	rawKey, err := os.ReadFile("../groth16/testdata/testnet-forgeable.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := groth16.ParseKey(rawKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	r, err := New(ctx, Config{
 		Vault: vaulttest.Vault, NetworkID: rpc.NetworkID(passphrase), Asset: "native", FeeAddress: feeAddress,
-		Pricing: Pricing{Native: true, MarginBps: 500, Tier: big.NewInt(100_000)}, LedgerSeconds: 5, MaxHeld: 10,
+		Pricing: Pricing{Native: true, MarginBps: 500, Tier: big.NewInt(100_000)}, LedgerSeconds: 5, MaxHeld: 10, Key: key,
 	}, h.fake, engine, channels, h.screen, NewStore(pool), 1_000_000, &alert.Alerter{Service: "relayer"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -440,18 +491,25 @@ func TestADelayedRequestIsHeldThenSent(t *testing.T) {
 	notBefore := h.now.Unix() + 2
 	body["not_before"] = notBefore
 	code, out := h.post(body)
-	if code != http.StatusAccepted || out["held"] != true || out["hash"] != nil {
+	id, _ := out["id"].(string)
+	if code != http.StatusAccepted || out["held"] != true || out["hash"] != nil || len(id) != 32 {
 		t.Fatalf("held request: %d %v", code, out)
 	}
 	if code, out := h.post(fixture(t, "transfer")); code != http.StatusConflict {
 		t.Fatalf("its notes stay in flight: %d %v", code, out)
 	}
-	nf := body["proof"].(map[string]any)["input_nullifiers"].([]any)[0].(string)
-	if _, st := h.get("/v1/held/" + nf); st["status"] != "held" || st["hash"] != nil {
+	if _, st := h.get("/v1/held/" + id); st["status"] != "held" || st["hash"] != nil {
 		t.Fatalf("held status %v", st)
 	}
-	if code, _ := h.get("/v1/held/" + strings.Repeat("0", 63) + "1"); code != http.StatusNotFound {
-		t.Fatalf("an unknown nullifier answered %d", code)
+	nf := body["proof"].(map[string]any)["input_nullifiers"].([]any)[0].(string)
+	if code, _ := h.get("/v1/held/" + nf); code != http.StatusBadRequest {
+		t.Fatalf("a lookup by nullifier answered %d", code)
+	}
+	if code, _ := h.get("/v1/held/" + strings.Repeat("0", 31) + "1"); code != http.StatusNotFound {
+		t.Fatalf("an unknown ID answered %d", code)
+	}
+	if len(h.screen.asked) != 0 {
+		t.Fatal("a held request was screened before it was due")
 	}
 	h.mu.Lock()
 	h.now = h.now.Add(2 * time.Second)
@@ -462,7 +520,7 @@ func TestADelayedRequestIsHeldThenSent(t *testing.T) {
 		h.mu.Unlock()
 		if sent == 1 {
 			h.waitIdle()
-			if _, st := h.get("/v1/held/" + nf); st["status"] != "success" || st["hash"] == nil {
+			if _, st := h.get("/v1/held/" + id); st["status"] != "success" || st["hash"] == nil {
 				t.Fatalf("status once sent %v", st)
 			}
 			return
@@ -513,4 +571,29 @@ func TestARelaySentBeforeARestartIsFollowedToItsOutcome(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("the pending relay was never completed")
+}
+
+func TestForgedOrSpentProofsAreRefusedBeforeAnything(t *testing.T) {
+	h := newHarness(t, vault.Status{})
+	forged := fixture(t, "unshield_muxed")
+	proof := forged["proof"].(map[string]any)
+	a := []byte(proof["a"].(string))
+	a[10] ^= 1
+	proof["a"] = string(a)
+	if code, out := h.post(forged); code != http.StatusUnprocessableEntity || out["error"] != CodeRejected {
+		t.Fatalf("forged proof: %d %v", code, out)
+	}
+	// A valid proof whose notes are already spent.
+	body := fixture(t, "unshield_muxed")
+	nf, err := fr.SetHex(body["proof"].(map[string]any)["input_nullifiers"].([]any)[0].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.fake.SetContractData(mustKey(vault.NullifierKey(vaulttest.Vault, nf.Bytes())), xdr.ScVal{Type: xdr.ScValTypeScvVoid}, 10, nil)
+	if code, out := h.post(body); code != http.StatusUnprocessableEntity || out["error"] != CodeRejected {
+		t.Fatalf("spent notes: %d %v", code, out)
+	}
+	if len(h.screen.asked) != 0 || h.fake.CallCount("simulateTransaction") != 0 {
+		t.Fatal("a refused proof reached screening or simulation")
+	}
 }

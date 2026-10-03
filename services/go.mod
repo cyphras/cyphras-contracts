@@ -5,6 +5,7 @@ go 1.27.0
 toolchain go1.27.1
 
 require (
+	github.com/consensys/gnark-crypto v0.22.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/klauspost/compress v1.17.6
 	github.com/stellar/go-stellar-sdk v0.7.3
@@ -12,6 +13,7 @@ require (
 )
 
 require (
+	github.com/bits-and-blooms/bitset v1.25.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/creachadair/jrpc2 v1.2.0 // indirect
 	github.com/creachadair/mds v0.13.4 // indirect

@@ -3,6 +3,8 @@ package relayer
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
+	"github.com/cyphras/cyphras-contracts/services/internal/groth16"
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
@@ -51,6 +54,9 @@ type Config struct {
 	MaxHeld int
 	// Jitter is the window after not_before in which a delayed request is sent.
 	Jitter time.Duration
+	// Key is the verifying key of the vault's verifier, so a forged or garbled proof is refused
+	// before it costs anything.
+	Key *groth16.Key
 }
 
 // Screener answers whether an unshield destination may be paid.
@@ -81,13 +87,14 @@ type Relayer struct {
 	statuses map[string]txStatus
 	order    []string
 	held     int
-	// heldBy follows each held request by its first input nullifier, which the client knows, since
-	// a held request has no transaction hash until it is sent.
-	heldBy    map[fr.Element]heldRequest
-	heldOrder []fr.Element
+	// heldBy follows each held request by the random ID its reply carried, since a held request
+	// has no transaction hash until it is sent.
+	heldBy    map[string]heldRequest
+	heldOrder []string
 
 	chainMu     sync.RWMutex
 	inst        *vault.Instance
+	roots       map[fr.Element]bool
 	latest      uint32
 	latestClose int64
 }
@@ -117,7 +124,7 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		cfg: cfg, rpc: client, engine: engine, channels: newChannelPool(channels), costs: NewCosts(bootstrapCost, samples),
 		screen: screen, db: db, alerts: alerts, log: log, now: time.Now, ctx: ctx,
 		submitLimit: httpapi.NewLimiter(120, 20), simulateLimit: httpapi.NewLimiter(60, 10),
-		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[fr.Element]heldRequest{},
+		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[string]heldRequest{},
 	}, nil
 }
 
@@ -134,8 +141,97 @@ func (r *Relayer) Refresh(ctx context.Context) error {
 	r.chainMu.Lock()
 	r.inst, r.latest, r.latestClose = &inst, h.LatestLedger, h.LatestLedgerCloseTime
 	r.chainMu.Unlock()
+	if err := r.readRoots(ctx); err != nil {
+		return err
+	}
 	_, err = r.Quote(ctx)
 	return err
+}
+
+// readRoots reads the vault's root history.
+func (r *Relayer) readRoots(ctx context.Context) error {
+	key, err := vault.RootsKey(r.cfg.Vault)
+	if err != nil {
+		return err
+	}
+	e, _, err := rpc.One(ctx, r.rpc, key)
+	if err != nil {
+		return err
+	}
+	v, err := rpc.ContractValue(e)
+	if err != nil {
+		return err
+	}
+	ring, err := vault.DecodeRootRing(v)
+	if err != nil {
+		return err
+	}
+	roots := make(map[fr.Element]bool, len(ring.Roots))
+	for _, root := range ring.Roots {
+		if !root.IsZero() {
+			roots[root] = true
+		}
+	}
+	r.chainMu.Lock()
+	r.roots = roots
+	r.chainMu.Unlock()
+	return nil
+}
+
+// knownRoot reports whether the vault still accepts a root, reading the root history again when
+// the root is newer than the last refresh.
+func (r *Relayer) knownRoot(ctx context.Context, root fr.Element) bool {
+	r.chainMu.RLock()
+	known := r.roots[root]
+	r.chainMu.RUnlock()
+	if known || r.readRoots(ctx) != nil {
+		return known
+	}
+	r.chainMu.RLock()
+	defer r.chainMu.RUnlock()
+	return r.roots[root]
+}
+
+// spent reports whether either nullifier is already spent.
+func (r *Relayer) spent(ctx context.Context, nfs [2]fr.Element) (bool, error) {
+	keys := make([]xdr.LedgerKey, 2)
+	for i, nf := range nfs {
+		k, err := vault.NullifierKey(r.cfg.Vault, nf.Bytes())
+		if err != nil {
+			return false, err
+		}
+		keys[i] = k
+	}
+	entries, _, err := rpc.Entries(ctx, r.rpc, keys)
+	if err != nil {
+		return false, err
+	}
+	return len(entries) > 0, nil
+}
+
+// verified checks the proof off chain against the vault's key and domain, and that its root is
+// one the vault knows and its notes are unspent. Each of these costs less than what a request
+// costs afterwards: a simulation, a screening lookup, a held slot.
+func (r *Relayer) verified(ctx context.Context, req Request) *failure {
+	inst, _, _ := r.view()
+	if inst == nil {
+		return fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	p := req.Proof
+	inputs := [groth16.PublicInputs]fr.Element{
+		p.Root, p.PublicAmount, p.ExtDataHash, inst.Config.Domain, p.Nullifiers[0], p.Nullifiers[1], p.Commitments[0], p.Commitments[1],
+	}
+	if !r.cfg.Key.Verify(p.A, p.B, p.C, inputs) || !r.knownRoot(ctx, p.Root) {
+		return fail(http.StatusUnprocessableEntity, CodeRejected)
+	}
+	spent, err := r.spent(ctx, p.Nullifiers)
+	if err != nil {
+		return fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	if spent {
+		return fail(http.StatusUnprocessableEntity, CodeRejected)
+	}
+	return nil
 }
 
 // ErrNoQuote reports that the quote would exceed the vault's fee cap, or that the relayer cannot
@@ -299,12 +395,12 @@ func (r *Relayer) screenDestination(ctx context.Context, e vault.ExtData) *failu
 	return nil
 }
 
-// Accepted is the answer to an accepted submission: the hash, or for a delayed request nothing,
-// because the transaction is built only when it is sent; GET /v1/held/{nullifier} follows it by
-// its first input nullifier.
+// Accepted is the answer to an accepted submission: the hash, or for a delayed request, which has
+// none until it is sent, a random ID that GET /v1/held/{id} follows it by.
 type Accepted struct {
 	Hash string `json:"hash,omitempty"`
 	Held bool   `json:"held,omitempty"`
+	ID   string `json:"id,omitempty"`
 }
 
 // Submit runs the submission steps in order and stops at the first failure.
@@ -312,15 +408,20 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	if f := r.check(req); f != nil {
 		return Accepted{}, f
 	}
+	if f := r.verified(ctx, req); f != nil {
+		return Accepted{}, f
+	}
 	if !r.claim(req.Proof.Nullifiers) {
 		return Accepted{}, fail(http.StatusConflict, CodeDuplicate)
+	}
+	// A held request is screened only when it is sent, so a screening source never learns its
+	// destination at the moment of the request, which the delay is meant to hide.
+	if req.NotBefore != nil && *req.NotBefore > r.now().Unix() {
+		return r.hold(req)
 	}
 	if f := r.screenDestination(ctx, req.Ext); f != nil {
 		r.unclaim(req.Proof.Nullifiers)
 		return Accepted{}, f
-	}
-	if req.NotBefore != nil && *req.NotBefore > r.now().Unix() {
-		return r.hold(req)
 	}
 	hash, f := r.send(ctx, req)
 	if f != nil {
@@ -331,44 +432,45 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 }
 
 // heldRequest is a held request's progress: held until sent, then the hash of its transaction,
-// or the code it failed with before it was sent.
+// or the code it failed with before it was sent, with the reason of a screening refusal.
 type heldRequest struct {
-	hash string
-	code string
+	hash   string
+	code   string
+	reason *uint32
 }
 
-func (r *Relayer) setHeld(nf fr.Element, h heldRequest) {
+func (r *Relayer) setHeld(id string, h heldRequest) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.heldBy[nf]; !ok {
-		r.heldOrder = append(r.heldOrder, nf)
+	if _, ok := r.heldBy[id]; !ok {
+		r.heldOrder = append(r.heldOrder, id)
 		if len(r.heldOrder) > maxStatuses {
 			delete(r.heldBy, r.heldOrder[0])
 			r.heldOrder = r.heldOrder[1:]
 		}
 	}
-	r.heldBy[nf] = h
+	r.heldBy[id] = h
 }
 
-// HeldStatus reports a held request by its first input nullifier: held, or once sent, the status
-// of its transaction with the hash.
-func (r *Relayer) HeldStatus(ctx context.Context, nf fr.Element) (txStatus, string, bool) {
+// HeldStatus reports a held request by its ID: held, or once sent, the status of its transaction
+// with the hash.
+func (r *Relayer) HeldStatus(ctx context.Context, id string) (txStatus, string, *uint32, bool) {
 	r.mu.Lock()
-	h, ok := r.heldBy[nf]
+	h, ok := r.heldBy[id]
 	r.mu.Unlock()
 	switch {
 	case !ok:
-		return txStatus{}, "", false
+		return txStatus{}, "", nil, false
 	case h.code != "":
-		return txStatus{Status: "failed", Code: h.code}, "", true
+		return txStatus{Status: "failed", Code: h.code}, "", h.reason, true
 	case h.hash == "":
-		return txStatus{Status: "held"}, "", true
+		return txStatus{Status: "held"}, "", nil, true
 	}
 	s, found := r.Status(ctx, h.hash)
 	if !found {
 		s = txStatus{Status: "pending"}
 	}
-	return s, h.hash, true
+	return s, h.hash, nil, true
 }
 
 func (r *Relayer) hold(req Request) (Accepted, *failure) {
@@ -380,8 +482,10 @@ func (r *Relayer) hold(req Request) (Accepted, *failure) {
 	}
 	r.held++
 	r.mu.Unlock()
-	nf := req.Proof.Nullifiers[0]
-	r.setHeld(nf, heldRequest{})
+	var raw [16]byte
+	_, _ = crand.Read(raw[:])
+	id := hex.EncodeToString(raw[:])
+	r.setHeld(id, heldRequest{})
 	// A random moment in the window keeps the inclusion time from following the request time.
 	at := time.Unix(*req.NotBefore, 0)
 	if r.cfg.Jitter > 0 {
@@ -399,20 +503,20 @@ func (r *Relayer) hold(req Request) (Accepted, *failure) {
 		}
 		if f := r.screenDestination(r.ctx, req.Ext); f != nil {
 			r.unclaim(req.Proof.Nullifiers)
-			r.setHeld(nf, heldRequest{code: f.code})
+			r.setHeld(id, heldRequest{code: f.code, reason: f.reason})
 			r.log.Info("held request dropped at screening", "code", f.code)
 			return
 		}
 		hash, f := r.send(r.ctx, req)
 		if f != nil {
 			r.unclaim(req.Proof.Nullifiers)
-			r.setHeld(nf, heldRequest{code: f.code})
+			r.setHeld(id, heldRequest{code: f.code})
 			r.log.Info("held request not sent", "code", f.code)
 			return
 		}
-		r.setHeld(nf, heldRequest{hash: hash})
+		r.setHeld(id, heldRequest{hash: hash})
 	})
-	return Accepted{Held: true}, nil
+	return Accepted{Held: true, ID: id}, nil
 }
 
 func (r *Relayer) transact(req Request, channel string) (txnbuild.Operation, error) {

@@ -283,13 +283,19 @@ type InstanceOptions struct {
 	Status                 vault.Status
 	Queued                 *xdr.ScVal
 	WasmHash               [32]byte
+	// Domain is the vault's domain, 5 when zero.
+	Domain fr.Element
 }
 
 // Instance encodes the vault's contract instance entry value.
 func Instance(o InstanceOptions) xdr.ScVal {
+	domain := o.Domain
+	if domain.IsZero() {
+		domain = fr.SetUint64(5)
+	}
 	cfg := vault.Struct(
 		vault.Field{Name: "token", Value: addr(Token)},
-		vault.Field{Name: "domain", Value: Field(fr.SetUint64(5))},
+		vault.Field{Name: "domain", Value: Field(domain)},
 		vault.Field{Name: "guardian", Value: addr(Guardian)},
 		vault.Field{Name: "asp", Value: addr(Asp)},
 		vault.Field{Name: "delay_small", Value: vault.U64(o.DelaySmall)},
@@ -394,4 +400,16 @@ func (c *Chain) Transfer(to string, amount int64) {
 		Value:  b64(data),
 	})
 	c.index++
+}
+
+// Roots encodes a root ring holding the given roots, the last of them current.
+func Roots(roots ...fr.Element) xdr.ScVal {
+	ring := make([]xdr.ScVal, vault.RootHistory)
+	for i := range ring {
+		ring[i] = Field(fr.Element{})
+	}
+	for i, r := range roots {
+		ring[i] = Field(r)
+	}
+	return vault.Struct(vault.Field{Name: "roots", Value: vault.Vec(ring...)}, vault.Field{Name: "newest", Value: vault.U32(uint32(len(roots) - 1))})
 }

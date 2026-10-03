@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
+	"github.com/cyphras/cyphras-contracts/services/internal/groth16"
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/relayer"
 	"github.com/cyphras/cyphras-contracts/services/internal/service"
@@ -114,9 +116,21 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	if err != nil {
 		return nil, err
 	}
+	keyPath, err := config.Required("VERIFICATION_KEY_FILE")
+	if err != nil {
+		return nil, err
+	}
+	rawKey, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	key, err := groth16.ParseKey(rawKey)
+	if err != nil {
+		return nil, err
+	}
 	return relayer.New(ctx, relayer.Config{
 		Vault: base.Vault.Vault, NetworkID: base.NetworkID, Asset: base.Vault.Asset, FeeAddress: feeAddress,
-		Pricing: pricing, LedgerSeconds: 5, MaxHeld: 1000, Jitter: 10 * time.Minute,
+		Pricing: pricing, LedgerSeconds: 5, MaxHeld: 1000, Jitter: 10 * time.Minute, Key: key,
 	}, base.RPC, engine, channels,
 		relayer.ScreeningClient{URL: screenURL, Token: token, HTTP: &http.Client{Timeout: 5 * time.Second}},
 		relayer.NewStore(pool), bootstrap, base.Alerts, base.Log)
