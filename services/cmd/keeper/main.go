@@ -64,7 +64,7 @@ func main() {
 		service.Fatal(log, "config", err)
 	}
 	k, err := keeper.New(ctx, keeper.Config{
-		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, Asset: base.Vault.Asset, MaxAdmissions: 17, MaxExtensions: 50,
+		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, Asset: base.Vault.Asset, MaxAdmissions: 16, MaxExtensions: 50,
 		MaxReleases: int(releases), RefundDelay: 24 * time.Hour, HoldReasons: hold, BalanceFloor: floor,
 	}, base.RPC, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(key.Address(), key), base.Alerts, log)
 	if err != nil {

@@ -166,7 +166,7 @@ func newHarness(t *testing.T) *harness {
 	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, Validity: time.Minute, Poll: time.Millisecond, Now: func() time.Time { return h.now }}
 	alerts := &alert.Alerter{Service: "keeper", Channels: []alert.Channel{h}, Cooldown: time.Hour, Now: func() time.Time { return h.now }}
 	k, err := New(context.Background(), Config{
-		Vault: vaulttest.Vault, DeployLedger: 10, Asset: "native", MaxAdmissions: 17, MaxExtensions: 50, MaxReleases: 10, RefundDelay: 24 * time.Hour,
+		Vault: vaulttest.Vault, DeployLedger: 10, Asset: "native", MaxAdmissions: 16, MaxExtensions: 50, MaxReleases: 10, RefundDelay: 24 * time.Hour,
 		HoldReasons: map[uint32]bool{99: true}, BalanceFloor: 1_000_000_000,
 	}, h.fake, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(kp.Address(), kp), alerts, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -265,7 +265,7 @@ func TestEligibleDepositsAreAdmittedInBatchesThatFit(t *testing.T) {
 	if err := h.k.Admit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"admit [1,2,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18]", "admit [19,20]"}
+	want := []string{"admit [1,2,4,5,6,7,8,9,10,11,12,13,14,15,16,17]", "admit [18,19,20]"}
 	if got := h.take(); !equal(got, want) {
 		t.Fatalf("admissions %v", got)
 	}

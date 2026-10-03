@@ -31,8 +31,8 @@ type Config struct {
 	DeployLedger uint32
 	// Asset is the vault's asset as its asset contract names it: native, or CODE:ISSUER.
 	Asset string
-	// MaxAdmissions is the most deposits one admit call carries; the event size limit of a
-	// transaction allows 17.
+	// MaxAdmissions is the most deposits one admit call carries. The event size limit of a
+	// transaction allows 17; one fewer keeps a margin should an event grow.
 	MaxAdmissions int
 	// MaxExtensions is the most entries one footprint extension carries.
 	MaxExtensions int
