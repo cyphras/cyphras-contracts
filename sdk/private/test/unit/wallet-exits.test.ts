@@ -470,6 +470,67 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal(owedTo(world, destination), 90n * XLM);
   });
 
+  it("blocks a split whose dead part's note was spent elsewhere rather than send it again", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const { alice } = await withNotes(world);
+    const destination = world.signer("exchange").publicKey;
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: destination,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+    );
+    world.advance(3600);
+    world.fill(1);
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "dead");
+    // The same account on another device spends the dead part's note, which the wallet then
+    // learns from RPC alone, the indexer being down: no checked event shows whose spend it was.
+    const other = await openWallet(world, 0, new MemoryStore());
+    await other.sync();
+    const bob = await openWallet(world, 1);
+    await other.send({ to: bob.generateAddress(), amount: 50n * XLM, maxFee: 2n * XLM });
+    world.indexer.down = true;
+    const sent = world.relayer.submissions.length;
+    const [view] = await alice.continueOperations();
+    assert.equal((await alice.plans())[0]?.state, "dead");
+    assert.equal(view?.state, "blocked");
+    assert.equal(world.relayer.submissions.length, sent);
+    assert.equal(owedTo(world, destination), 0n);
+  });
+
+  it("blocks a split whose part a payment of the wallet shares notes with that did not land", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const { alice, store } = await withNotes(world);
+    const destination = world.signer("exchange").publicKey;
+    await alice.unshield({
+      to: destination,
+      amount: 90n * XLM,
+      maxFee: 2n * XLM,
+      split: true,
+      confirm: confirmAll,
+    });
+    await alice.sync();
+    // An earlier reading took the part, which landed, for dead; and the wallet holds another
+    // payment, which never landed, of the same notes.
+    const sealed = new SealedStore(store, storeKeyOf(0));
+    const state = (await loadState(sealed)) as WalletState;
+    const part = state.plans[0] as Plan;
+    Object.assign(part, { state: "dead", evidence: [] });
+    state.plans.push({ ...part, id: "ee".repeat(16), operationId: undefined, state: "prepared" });
+    await saveState(sealed, state);
+    const reopened = await openWallet(world, 0, store);
+    world.advance(7 * 3600);
+    const [view] = await reopened.continueOperations();
+    assert.equal(view?.state, "blocked");
+    assert.equal(view?.plans.length, 1);
+    assert.equal(owedTo(world, destination), 48n * XLM);
+  });
+
   it("goes on with a blocked split once its part turns out to have landed", async () => {
     const world = await createWorld({ limits: SPLIT });
     const { alice, store } = await withNotes(world);

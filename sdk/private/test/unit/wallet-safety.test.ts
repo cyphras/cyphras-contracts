@@ -477,6 +477,53 @@ describe("wallet safety: an RPC that lies about the vault's events", () => {
     assert.equal((await bob.balance()).spendable, 10n * XLM);
   });
 
+  it("never takes a live payment for superseded on the events of a lone RPC while the indexer is down", async () => {
+    const { world, store } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 3600;
+    const plain = await openWallet(world, 0, store);
+    await plain.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
+    const [spent] = (await storedPlan(store)).inputs;
+    // A real pair from someone else, which the lying RPC passes off as a transaction that also
+    // spent the held payment's note.
+    world.fill(1);
+    const pair = world.vault.leaves.at(-1)?.txHash;
+    const relabelled = "ab".repeat(32);
+    world.indexer.down = true;
+    const lying: FetchLike = async (input, init) => {
+      const res = await world.fetch(input, init);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (new URL(input).origin !== RPC || body?.method !== "getEvents") return res;
+      const reply = await res.json();
+      const events = reply.result.events as { txHash: string; id: string; ledger: number }[];
+      const mine = events.filter((e) => e.txHash === pair);
+      for (const e of mine) e.txHash = relabelled;
+      const first = mine[0];
+      if (first !== undefined) {
+        events.push({
+          ...first,
+          id: first.id.replace(/-\d+$/, "-00000999"),
+          topic: [xdr.ScVal.scvSymbol("new_nullifier").toXDR("base64")],
+          value: map([["nullifier", u256(spent?.nf as bigint)]]).toXDR("base64"),
+        } as never);
+      }
+      return new Response(JSON.stringify(reply), { status: 200 });
+    };
+    const alice = await openWallet({ ...world, fetch: lying }, 0, store);
+    assert.equal((await alice.sync()).source, "rpc");
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    assert.equal(plan?.mustRetry, true);
+    world.advance(4_300);
+    world.relayer.releaseHeld();
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
   it("starts over on rescan a payment an earlier reading took for landed though its note is unspent", async () => {
     const { world, alice, store } = await funded();
     const bob = await openWallet(world, 1);
