@@ -14,7 +14,7 @@ export type {
 export type { ConfirmSpend, SpendReview, Submission } from "./wallet/spend.ts";
 export type { Warning, WarningCode } from "./wallet/nudges.ts";
 export type { Balance, HistoryEntry, HistoryKind } from "./wallet/history.ts";
-export type { DepositInfo, ShieldReceipt } from "./wallet/deposits.ts";
+export type { DepositInfo, ScreeningKind, ShieldReceipt } from "./wallet/deposits.ts";
 export type { DisclosureCheck, PaymentDisclosure } from "./wallet/disclosure.ts";
 export type { ExitPosition } from "./wallet/exits.ts";
 export type { Verification, ServiceState } from "./wallet/services.ts";

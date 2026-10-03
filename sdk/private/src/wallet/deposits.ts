@@ -14,6 +14,36 @@ import type { DepositEvent } from "./sources.ts";
 import { checkedBetween } from "./sync.ts";
 import type { Deposit, WalletState } from "./state.ts";
 
+/**
+ * What the screening's reason code on a deposit means. "held_for_review" (6) is no refusal: a
+ * review may still clear the deposit, which is then admitted, and one still held a day after the
+ * hold is refunded. "refused_by_reviewer" (5) is a reviewer's refusal. "legal_hold" (100) holds the
+ * deposit under a written order from an authority: no service refunds it, though its depositor can
+ * still take it back. "cancelled" (0) is the depositor's own taking back. Every other code refuses
+ * the deposit.
+ */
+export type ScreeningKind =
+  | "held_for_review"
+  | "refused_by_reviewer"
+  | "legal_hold"
+  | "cancelled"
+  | "refused";
+
+function screeningKind(reason: number): ScreeningKind {
+  switch (reason) {
+    case 0:
+      return "cancelled";
+    case 5:
+      return "refused_by_reviewer";
+    case 6:
+      return "held_for_review";
+    case 100:
+      return "legal_hold";
+    default:
+      return "refused";
+  }
+}
+
 /** A deposit made by this wallet, as it moves through the vault's entry queue. */
 export interface DepositInfo {
   readonly id: number | undefined;
@@ -24,10 +54,18 @@ export interface DepositInfo {
   readonly attested: boolean | undefined;
   // Unix seconds.
   readonly earliestAdmission: number | undefined;
-  readonly flag: { readonly reason: number; readonly flaggedAt: number | undefined } | undefined;
-  // Unix seconds from which anyone may claim the refund of a flagged deposit.
+  readonly flag:
+    | {
+        readonly reason: number;
+        readonly kind: ScreeningKind;
+        readonly flaggedAt: number | undefined;
+      }
+    | undefined;
+  // Unix seconds from which anyone may claim the refund of a flagged deposit, and from which a
+  // deposit still held for review is refunded.
   readonly refundableAt: number | undefined;
   readonly refundReason: number | undefined;
+  readonly refundKind: ScreeningKind | undefined;
 }
 
 // Anyone may refund a flagged deposit only a day after it was flagged; the depositor can cancel
@@ -43,10 +81,11 @@ export function depositInfo(d: Deposit): DepositInfo {
     txHash: d.txHash,
     attested: d.attested,
     earliestAdmission: d.earliestAdmission,
-    flag: d.flag,
+    flag: d.flag === undefined ? undefined : { ...d.flag, kind: screeningKind(d.flag.reason) },
     refundableAt:
       d.flag?.flaggedAt === undefined ? undefined : d.flag.flaggedAt + REFUND_DELAY_SECONDS,
     refundReason: d.refundReason,
+    refundKind: d.refundReason === undefined ? undefined : screeningKind(d.refundReason),
   };
 }
 

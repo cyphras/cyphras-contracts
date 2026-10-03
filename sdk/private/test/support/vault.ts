@@ -682,6 +682,17 @@ export class MockVault {
     ]);
   }
 
+  unflag(id: number): void {
+    const deposit = this.pending.get(id) ?? refuse(ERROR.UnknownDeposit);
+    const reason = deposit.flag ?? refuse(ERROR.NotFlagged);
+    deposit.flag = undefined;
+    deposit.flaggedAt = 0n;
+    this.#emit("deposit_unflagged", [
+      ["id", u64(id)],
+      ["reason", xdr.ScVal.scvU32(reason)],
+    ]);
+  }
+
   admit(ids: readonly number[]): number[] {
     const admitted: number[] = [];
     for (const id of ids) {
