@@ -21,7 +21,7 @@ jobs:
       - run: cargo build --target wasm32v1-none --release
       - run: cargo test
 
-  circuits-format:
+  circuits:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -30,6 +30,36 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
+          cache: npm
+          cache-dependency-path: circuits/package-lock.json
+      - name: Install circom 2.2.3
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL -o "$RUNNER_TEMP/bin/circom" \
+            https://github.com/iden3/circom/releases/download/v2.2.3/circom-linux-amd64
+          echo "85342c7ff332d948df7c0c50ecf201e6129349aef550ce873f3c811b79fe53a3  $RUNNER_TEMP/bin/circom" \
+            | sha256sum --check
+          chmod +x "$RUNNER_TEMP/bin/circom"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: test "$(circom --version)" = "circom compiler 2.2.3"
       - run: npm ci
       - run: npm run format:check
+      # Compiles with --O2 and fails unless the r1cs has the frozen constraint count and SHA-256.
+      - run: npm run compile
+      - id: ptau
+        run: |
+          node --input-type=module -e 'import { PTAU_BLAKE2B } from "./scripts/ptau.mjs"; console.log(`blake2b=${PTAU_BLAKE2B}`)' >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: circuits/build/ptau
+          key: ptau-${{ steps.ptau.outputs.blake2b }}
+      - run: npm run ptau
+      - run: npm test
+      - run: npm run check:o2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/circomspect
+          key: circomspect-0.9.0-${{ runner.os }}
+      - run: command -v circomspect || cargo install circomspect --version 0.9.0 --locked
+      - run: npm run circomspect

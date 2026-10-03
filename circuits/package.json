@@ -9,6 +9,7 @@
     "compile": "node scripts/compile.mjs",
     "info": "snarkjs r1cs info build/transaction.r1cs",
     "check:o2": "node scripts/check-o2.mjs",
+    "circomspect": "node scripts/circomspect.mjs",
     "ptau": "node scripts/ptau.mjs",
     "setup:testnet-forgeable": "bash scripts/setup-testnet-forgeable.sh",
     "vectors": "node scripts/gen-vectors.mjs",
