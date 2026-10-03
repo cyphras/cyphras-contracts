@@ -22,7 +22,6 @@ pub enum DataKey {
     Status,
     Roots,
     Frontier,
-    Zeros,
     NextLeaf,
     Nullifier(U256),
     Pending(u64),
@@ -203,12 +202,7 @@ pub fn bump(env: &Env, pending_ids: &Vec<u64>) {
     let max = env.storage().max_ttl();
     env.storage().instance().extend_ttl(max, max);
     let storage = env.storage().persistent();
-    for key in [
-        DataKey::Roots,
-        DataKey::Frontier,
-        DataKey::Zeros,
-        DataKey::NextLeaf,
-    ] {
+    for key in [DataKey::Roots, DataKey::Frontier, DataKey::NextLeaf] {
         storage.extend_ttl(&key, max, max);
     }
     for id in pending_ids.iter() {

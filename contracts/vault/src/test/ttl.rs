@@ -29,12 +29,7 @@ fn max_ttl(s: &Setup) -> u32 {
         .as_contract(&s.vault.address, || s.env.storage().max_ttl())
 }
 
-const TREE: [DataKey; 4] = [
-    DataKey::Roots,
-    DataKey::Frontier,
-    DataKey::Zeros,
-    DataKey::NextLeaf,
-];
+const TREE: [DataKey; 3] = [DataKey::Roots, DataKey::Frontier, DataKey::NextLeaf];
 
 #[test]
 fn every_write_keeps_its_entry_alive_for_thirty_days() {
@@ -66,11 +61,9 @@ fn every_write_keeps_its_entry_alive_for_thirty_days() {
     s.vault.attest(&1);
     s.vault.admit(&Vec::from_slice(&s.env, &[1]));
     assert_eq!(instance_ttl(&s), WRITE_TTL);
-    for key in [DataKey::Roots, DataKey::Frontier, DataKey::NextLeaf] {
-        assert_eq!(persistent_ttl(&s, &key), WRITE_TTL);
+    for key in &TREE {
+        assert_eq!(persistent_ttl(&s, key), WRITE_TTL);
     }
-    // Zeros is never written after construction, so only the keeper extends it.
-    assert_eq!(persistent_ttl(&s, &DataKey::Zeros), WRITE_TTL - 5 * 17_280);
 }
 
 #[test]

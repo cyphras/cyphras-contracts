@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     storage::{self, DataKey},
-    tree::{Appender, Tree, DEPTH, ROOT_HISTORY},
+    tree::{zero, Appender, Tree, DEPTH, ROOT_HISTORY},
     Error, RootRing,
 };
 
@@ -46,24 +46,37 @@ pub fn append(s: &Setup, pairs: &[(U256, U256)]) {
 }
 
 #[test]
-fn an_empty_tree_matches_the_reference_zeros() {
-    let s = Setup::new();
-    let env = &s.env;
+fn every_zero_hash_is_the_host_compression_of_the_one_below() {
+    let env = Env::default();
+    let hasher = Compressor::new(&env);
     let notes = fixtures::notes();
     assert_eq!(notes["merkle"]["levels"].as_u64(), Some(DEPTH as u64));
-    let zeros = notes["merkle"]["zeros"].as_array().unwrap();
-    assert_eq!(
-        s.vault.current_root(),
-        fixtures::field(env, &zeros[DEPTH as usize])
-    );
+    let vectors = notes["merkle"]["zeros"].as_array().unwrap();
+    assert_eq!(vectors.len(), DEPTH as usize + 1);
+
+    let mut node = U256::from_u32(&env, 0);
+    for (height, vector) in vectors.iter().enumerate() {
+        if height > 0 {
+            node = hasher.compress(&node, &node);
+        }
+        assert_eq!(zero(&env, height as u32), node, "height {height}");
+        assert_eq!(node, fixtures::field(&env, vector), "height {height}");
+    }
+}
+
+#[test]
+fn an_empty_tree_has_the_empty_root() {
+    let s = Setup::new();
+    let env = &s.env;
+    assert_eq!(s.vault.current_root(), zero(env, DEPTH));
     assert_eq!(s.vault.current_root(), reference_root(env, &[]));
     assert_eq!(s.vault.current_root(), s.empty_root);
-    let stored: Vec<U256> = s.env.as_contract(&s.vault.address, || {
-        storage::get(env, &DataKey::Zeros).unwrap()
+    let frontier: Vec<U256> = s.env.as_contract(&s.vault.address, || {
+        storage::get(env, &DataKey::Frontier).unwrap()
     });
-    assert_eq!(stored.len(), DEPTH + 1);
-    for (i, zero) in stored.iter().enumerate() {
-        assert_eq!(zero, fixtures::field(env, &zeros[i]));
+    assert_eq!(frontier.len(), DEPTH);
+    for (height, node) in frontier.iter().enumerate() {
+        assert_eq!(node, zero(env, height as u32));
     }
     assert!(!s.vault.is_known_root(&U256::from_u32(env, 0)));
     assert_eq!(s.vault.next_leaf_index(), 0);
