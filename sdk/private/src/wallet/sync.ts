@@ -377,11 +377,78 @@ export function applyDownload(
 // Joins a range to the last one when they touch, so a run of unchecked syncs is one range.
 function addUnchecked(state: WalletState, from: number, to: number): void {
   const last = state.unchecked[state.unchecked.length - 1];
-  if (last !== undefined && last.to + 1 >= from) {
-    state.unchecked[state.unchecked.length - 1] = { from: last.from, to: Math.max(last.to, to) };
+  if (last !== undefined && !last.lost && last.to + 1 >= from) {
+    state.unchecked[state.unchecked.length - 1] = {
+      from: last.from,
+      to: Math.max(last.to, to),
+      lost: false,
+    };
   } else {
-    state.unchecked.push({ from, to });
+    state.unchecked.push({ from, to, lost: false });
   }
+}
+
+// Checks what the wallet kept from the oldest range of ledgers a sync took unchecked, against the
+// vault's own events for them while RPC still holds them: the wallet's notes and outgoing outputs,
+// found again by trial decryption, with the transaction and ledger of each, and the spends of its
+// notes. A difference is the indexer's. Returns the events of the ledgers checked, which leave the
+// range; a range RPC no longer holds is kept, as lost.
+export async function recheck(
+  state: WalletState,
+  keys: ScanKeys,
+  rpc: SorobanRpc,
+  vault: string,
+  maxPages: number,
+): Promise<VaultEvents | undefined> {
+  const at = state.unchecked.findIndex((r) => !r.lost);
+  const range = state.unchecked[at];
+  if (range === undefined) return undefined;
+  let events: VaultEvents;
+  try {
+    events = await new RpcEventSource(rpc, vault, range.from, maxPages).events();
+  } catch (err) {
+    if (!(err instanceof CyphrasError)) throw err;
+    // A busy RPC is asked again in the next sync.
+    if (err.code === "history_unavailable") state.unchecked[at] = { ...range, lost: true };
+    return undefined;
+  }
+  const to = Math.min(range.to, events.latest);
+  const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
+    xs.filter((x) => x.ledger >= range.from && x.ledger <= to);
+  const differ = (): never =>
+    fail("indexer_fault", "the vault's events contradict what an unchecked sync took");
+  const leaves = within(events.leaves);
+  const found: WalletState = { ...state, notes: [], sent: [] };
+  const cache = new AddressCache(keys.incoming);
+  for (const leaf of leaves) scanLeaf(found, leaf, keys, cache);
+  const where = (x: { pos: number; txHash: string; ledger: number }): string =>
+    `${x.pos}/${x.txHash}/${x.ledger}`;
+  const positions = new Set(leaves.map((l) => l.index));
+  for (const [kept, chain] of [
+    [state.notes, found.notes],
+    [state.sent, found.sent],
+  ] as const) {
+    const ours = kept.filter((x) => positions.has(x.pos)).map(where);
+    const theirs = chain.map(where);
+    if (ours.length !== theirs.length || ours.some((x) => !theirs.includes(x))) differ();
+  }
+  const spends = new Map(within(events.nullifiers).map((n) => [n.nullifier, n]));
+  for (const note of state.notes) {
+    if (note.nf === undefined) continue;
+    const chain = spends.get(note.nf);
+    const kept =
+      note.spent !== undefined && note.spent.ledger >= range.from && note.spent.ledger <= to;
+    if (chain === undefined ? kept : chain.txHash !== note.spent?.txHash) differ();
+  }
+  state.unchecked.splice(at, 1, ...(to < range.to ? [{ ...range, from: to + 1 }] : []));
+  return {
+    ...events,
+    leaves,
+    nullifiers: within(events.nullifiers),
+    deposits: within(events.deposits),
+    exits: within(events.exits),
+    latest: to,
+  };
 }
 
 // Whether every spend of the ledgers from `from` to `to` was cross-checked.

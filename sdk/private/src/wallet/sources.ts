@@ -156,7 +156,8 @@ export class RpcEventSource implements ChainSource {
           limit: EVENT_PAGE,
         });
       } catch (err) {
-        if (err instanceof CyphrasError && cursor === undefined) {
+        // RPC refuses a start ledger outside the range it holds as an invalid request.
+        if (err instanceof CyphrasError && cursor === undefined && err.details["code"] === -32600) {
           fail("history_unavailable", "RPC no longer holds the vault events this wallet needs");
         }
         throw err;

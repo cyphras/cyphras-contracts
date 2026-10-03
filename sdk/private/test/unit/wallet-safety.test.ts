@@ -913,6 +913,120 @@ describe("wallet safety: payments seen through held-back or unchecked syncs", ()
   });
 });
 
+describe("wallet safety: unchecked ledgers", () => {
+  it("cross-checks an unchecked sync's ledgers in the next sync RPC can serve", async () => {
+    const { world, store } = await funded();
+    const rpc = flakyEvents(world);
+    const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, store);
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    rpc.down = true;
+    const unchecked = await alice.sync();
+    assert.equal(unchecked.crossChecked, false);
+    assert.ok(unchecked.uncheckedLedgers > 0);
+    rpc.down = false;
+    world.fill(1);
+    const next = await alice.sync();
+    assert.equal(next.crossChecked, true);
+    assert.equal(next.uncheckedLedgers, 0);
+  });
+
+  it("finds a spend an indexer hid while RPC could not check it", async () => {
+    const { world, store } = await funded();
+    const rpc = flakyEvents(world);
+    let hiding = true;
+    const lying = rewritingFetch(
+      { ...world, fetch: rpc.fetch },
+      {
+        "/v1/nullifiers": (body) => (hiding ? { ...body, nullifiers: [] } : body),
+      },
+    );
+    const alice = await openWallet({ ...world, fetch: lying }, 0, store);
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    rpc.down = true;
+    await alice.sync();
+    rpc.down = false;
+    hiding = false;
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    assert.equal(alice.treeStatus().fault, true);
+  });
+
+  it("finds a note an indexer hid while RPC could not check it", async () => {
+    const { world, store } = await funded();
+    const rpc = flakyEvents(world);
+    const bob = await openWallet(world, 1);
+    const alice = await openWallet(world, 0, store);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    let hiding = true;
+    const lying = rewritingFetch(
+      { ...world, fetch: rpc.fetch },
+      {
+        "/v1/leaves": (body) => {
+          const leaves = body["leaves"] as Record<string, unknown>[];
+          const swap = (l: Record<string, unknown>, i: number) =>
+            hiding ? { ...l, ciphertext: leaves[(i + 1) % leaves.length]?.["ciphertext"] } : l;
+          return { ...body, leaves: leaves.map(swap) };
+        },
+      },
+    );
+    const fooled = await openWallet({ ...world, fetch: lying }, 1);
+    rpc.down = true;
+    await fooled.sync();
+    assert.equal((await fooled.balance()).spendable, 0n);
+    rpc.down = false;
+    hiding = false;
+    await assert.rejects(fooled.sync(), isError("indexer_fault"));
+  });
+
+  it("keeps ledgers RPC no longer holds as unchecked, without asking for them again", async () => {
+    const { world, store } = await funded();
+    const rpc = flakyEvents(world);
+    const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, store);
+    world.fill(1);
+    rpc.down = true;
+    const unchecked = (await alice.sync()).uncheckedLedgers;
+    rpc.down = false;
+    // RPC now holds only the ledgers after that sync.
+    world.rpc.oldestLedger = world.vault.ledger + 1;
+    world.fill(1);
+    assert.equal((await alice.sync()).uncheckedLedgers, unchecked);
+    const asked = world.rpc.calls.filter((m) => m === "getEvents").length;
+    world.fill(1);
+    assert.equal((await alice.sync()).uncheckedLedgers, unchecked);
+    // one page for the sync's own ledgers, none for the lost ones
+    assert.equal(world.rpc.calls.filter((m) => m === "getEvents").length, asked + 1);
+  });
+
+  it("asks for a decision on a payment past its deadline whose fate it cannot tell yet", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
+    );
+    assert.equal((await alice.plans())[0]?.needsUserDecision, false);
+    world.advance(121 * 5);
+    world.indexer.leafLimit = world.vault.leaves.length;
+    world.indexer.completeTo = world.vault.ledger;
+    world.fill(2);
+    await alice.sync();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "prepared");
+    assert.equal(plan?.needsUserDecision, true);
+    // The safe choice: a retry spends the same notes, so at most one of the two pays.
+    world.indexer.leafLimit = undefined;
+    world.indexer.completeTo = undefined;
+    const retried = await alice.retry(plan?.planId as string, { maxFee: 2n * XLM });
+    await alice.sync();
+    const states = Object.fromEntries((await alice.plans()).map((p) => [p.planId, p]));
+    assert.equal(states[retried.planId]?.state, "settled");
+    assert.equal(states[plan?.planId as string]?.needsUserDecision, false);
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 5n * XLM);
+  });
+});
+
 describe("wallet safety: instances sharing a store", () => {
   async function shared() {
     const world = await createWorld();

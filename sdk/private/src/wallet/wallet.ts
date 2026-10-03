@@ -79,6 +79,7 @@ import {
   crossCheck,
   downloadChain,
   isActive,
+  recheck,
   recordEvents,
   resetUnlanded,
   stageDownload,
@@ -132,6 +133,9 @@ export interface SyncSummary {
   readonly rootVerified: boolean;
   // The indexer's new data matched the vault's RPC events for the same ledgers.
   readonly crossChecked: boolean;
+  // Ledgers whose spends came from the indexer alone: later syncs check them against the vault's
+  // events while RPC still holds them.
+  readonly uncheckedLedgers: number;
 }
 
 /** A shielded payment through a relayer. */
@@ -197,6 +201,9 @@ export interface PlanView extends Submission {
   // The payment may still land, or failed by the wallet's last reading of the chain only: paying
   // it again must go through retry, which spends the same notes, never through a new send.
   readonly mustRetry: boolean;
+  // Its deadline has passed, and the wallet cannot tell yet whether it landed, as it lacks part of
+  // the vault's tree. The safe choice is retry: both spend the same notes, so at most one pays.
+  readonly needsUserDecision: boolean;
 }
 
 const VIEWING_KEY_WARNING =
@@ -590,15 +597,22 @@ export class PrivateWallet {
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
     if (events !== undefined) recordEvents(core.state.plans, events);
+    const rechecked = await recheck(
+      core.state,
+      core.scan,
+      core.services.rpc,
+      core.deployment.vault,
+      limits.eventPages,
+    );
+    if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
     if (check.state === "verified") advancePlans(core.state, view);
     const live = source.kind === "indexer" ? indexer : undefined;
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
     onReads({ view, stats: await live?.stats().catch(() => undefined) });
-    await trackDeposits(
-      core,
-      await live?.deposits().catch(() => undefined),
-      events?.deposits ?? [],
-    );
+    await trackDeposits(core, await live?.deposits().catch(() => undefined), [
+      ...(events?.deposits ?? []),
+      ...(rechecked?.deposits ?? []),
+    ]);
     applyExits(
       core.state,
       events === undefined
@@ -617,6 +631,7 @@ export class PrivateWallet {
       source: source.kind,
       rootVerified: core.state.rootCheck.state === "verified",
       crossChecked,
+      uncheckedLedgers: core.state.unchecked.reduce((n, r) => n + r.to - r.from + 1, 0),
     };
   }
 
@@ -680,6 +695,7 @@ export class PrivateWallet {
       operationId: p.operationId,
       relayerStatus: p.relayerStatus,
       mustRetry: isActive(p) || p.state === "dead",
+      needsUserDecision: isActive(p) && (this.#core.state.rootCheck?.ledger ?? 0) >= p.deadline,
     }));
   }
 

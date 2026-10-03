@@ -200,10 +200,12 @@ export interface FoundLeaf {
   readonly txHash: string;
 }
 
-// Ledgers whose spends a sync took from the indexer while RPC could not confirm them.
+// Ledgers whose spends a sync took from the indexer while RPC could not confirm them; `lost` once
+// RPC no longer holds them, so that nothing can check them any more.
 export interface LedgerRange {
   readonly from: number;
   readonly to: number;
+  readonly lost: boolean;
 }
 
 export interface RootCheck {
