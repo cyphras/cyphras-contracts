@@ -58,10 +58,10 @@ export interface RelayedTx {
 /**
  * A request the relayer holds until its not_before: held, then once sent, the status of its
  * transaction with the hash; or failed before it was sent, with the screening's reason code when
- * the screening refused it.
+ * the screening refused it; or cancelled by its client, never to be sent.
  */
 export interface HeldRequest {
-  readonly status: "held" | "pending" | "success" | "failed";
+  readonly status: "held" | "cancelled" | "pending" | "success" | "failed";
   readonly hash: string | undefined;
   readonly code: RelayerError | undefined;
   readonly reason: number | undefined;
@@ -189,9 +189,16 @@ export class RelayerClient {
       });
     }
     const f = Fields.of(body, "service_rejected", "held request");
-    const state = oneOf(f, "status", ["held", "pending", "success", "failed"] as const);
+    const state = oneOf(f, "status", [
+      "held",
+      "cancelled",
+      "pending",
+      "success",
+      "failed",
+    ] as const);
     const hash = f.has("hash") ? f.hash("hash") : undefined;
-    if ((state === "held") !== (hash === undefined) && state !== "failed") {
+    const unsent = state === "held" || state === "cancelled";
+    if (unsent !== (hash === undefined) && state !== "failed") {
       f.fault("a held request has a hash only once it is sent");
     }
     return {

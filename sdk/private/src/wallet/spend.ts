@@ -479,7 +479,8 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
 // A request the relayer holds until its not_before lives in the relayer's memory only. Once sent,
 // it has a hash, which the plan takes; the chain's evidence still decides whether it landed. A
 // relayer that restarted no longer knows the request, so the same proof goes to it again while
-// its deadline, past `latest`, allows; one that failed before it was sent is followed no further.
+// its deadline, past `latest`, allows; one that failed before it was sent, or was cancelled, is
+// followed no further.
 export async function followHeld(
   core: Core,
   plan: Plan,
@@ -492,7 +493,9 @@ export async function followHeld(
     plan.relayerStatus = held.status;
     if (held.hash !== undefined) plan.txHash = held.hash;
     if (held.status === "failed") plan.error = held.code ?? "unknown";
-    if (held.hash !== undefined || held.status === "failed") plan.heldId = undefined;
+    if (held.hash !== undefined || held.status === "failed" || held.status === "cancelled") {
+      plan.heldId = undefined;
+    }
     return;
   }
   if (latest >= plan.deadline) return;

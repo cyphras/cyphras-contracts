@@ -536,10 +536,13 @@ describe("relayer client", () => {
       hash,
       code: "rejected",
     });
+    // cancelled by its client before it was due
+    assert.deepEqual(await held(200, { status: "cancelled" }), { ...none, status: "cancelled" });
     // a relayer that restarted no longer knows the request
     assert.equal(await held(404, { error: "not_found" }), undefined);
     for (const body of [
       { status: "held", hash },
+      { status: "cancelled", hash },
       { status: "pending" },
       { status: "success" },
       { status: "sent", hash },

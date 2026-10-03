@@ -343,7 +343,12 @@ export class MockRelayer {
   // releaseHeld sends them.
   readonly heldRequests = new Map<
     string,
-    { hash: string | undefined; failure?: { code: string; reason: number } }
+    {
+      hash: string | undefined;
+      failure?: { code: string; reason: number };
+      cancelled?: boolean;
+      claimed?: string[];
+    }
   >();
   held: (() => void)[] = [];
   // Test hook: the screening refuses held requests when they are due, with this reason.
@@ -392,6 +397,7 @@ export class MockRelayer {
     if (url.pathname.startsWith("/v1/held/")) {
       const request = this.heldRequests.get(url.pathname.slice("/v1/held/".length));
       if (request === undefined) return json(404, { error: "not_found" });
+      if (request.cancelled === true) return json(200, { status: "cancelled" });
       if (request.failure !== undefined) return json(200, { status: "failed", ...request.failure });
       if (request.hash === undefined) return json(200, { status: "held" });
       return json(200, { ...this.#txStatus(request.hash), hash: request.hash });
@@ -417,6 +423,15 @@ export class MockRelayer {
   // still holds them and their claims.
   forgetIds(): void {
     this.heldRequests.clear();
+  }
+
+  // Cancels every request still held, as DELETE /v1/held/{id} does, freeing its notes.
+  cancelHeld(): void {
+    for (const request of this.heldRequests.values()) {
+      if (request.hash !== undefined || request.failure !== undefined) continue;
+      request.cancelled = true;
+      for (const nf of request.claimed ?? []) this.inFlight.delete(nf);
+    }
   }
 
   // Held requests live in memory only, so a restart forgets them and their claims.
@@ -476,8 +491,9 @@ export class MockRelayer {
         .slice(0, 32);
       const claimed = proof.inputNullifiers.map(String);
       for (const nf of claimed) this.inFlight.add(nf);
-      this.heldRequests.set(id, { hash: undefined });
+      this.heldRequests.set(id, { hash: undefined, claimed });
       this.held.push(() => {
+        if (this.heldRequests.get(id)?.cancelled === true) return;
         for (const nf of claimed) this.inFlight.delete(nf);
         if (this.refuseHeld !== undefined) {
           const failure = { code: "refused", reason: this.refuseHeld };

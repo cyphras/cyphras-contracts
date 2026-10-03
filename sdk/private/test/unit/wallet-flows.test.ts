@@ -386,6 +386,24 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 2);
   });
 
+  it("stops following a held payment that was cancelled, and never sends it again", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    world.relayer.cancelHeld();
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.relayerStatus, "cancelled");
+    world.relayer.restart();
+    world.advance(700);
+    world.relayer.releaseHeld();
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.relayerStatus, "cancelled");
+    assert.equal(world.relayer.submissions.length, 1);
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 0n);
+  });
+
   it("stops following a held payment the relayer dropped when it was due", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
