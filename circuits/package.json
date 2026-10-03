@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Cyphras private payments v2 circuit (Circom + Groth16 over BN254)",
-  "license": "MIT",
+  "license": "GPL-3.0",
   "type": "module",
   "scripts": {
     "compile": "node scripts/compile.mjs",
