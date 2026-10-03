@@ -177,6 +177,11 @@ run(USAGE, async (argv) => {
   if (last.type !== 1 || last.beaconHash !== randomness) {
     throw new Error(`the zkey must end with the beacon ${randomness}, but it does not`);
   }
+  // The label is not covered by the contribution hash, so it is checked against the round too.
+  const label = `drand quicknet round ${round}`;
+  if (last.name !== label) {
+    throw new Error(`the beacon is labeled ${show(last.name)}, not ${show(label)}`);
+  }
   if (last.iterationsExp !== BEACON_ITERATIONS_EXP) {
     throw new Error(`the beacon must use numIterationsExp ${BEACON_ITERATIONS_EXP}`);
   }
