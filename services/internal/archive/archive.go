@@ -58,7 +58,17 @@ func path(dir string, start uint32) string {
 // Writer appends to the archive in dir.
 type Writer struct {
 	Dir string
+	// TooLarge, when set, is told of each event left out of a write for being larger than a line
+	// of the archive may be.
+	TooLarge func(vault.RawEvent)
 }
+
+// maxLine is the longest line a write puts in a file, well below what the reader takes, so one
+// event no vault can emit, served by a faulty RPC, never makes a file unreadable.
+const maxLine = 1 << 20
+
+// maxRead is the longest line the reader takes.
+const maxRead = 4 << 20
 
 // Append records the events of ledgers [from, to] and that the range is complete. It returns
 // only once the data is on disk. A later write of the same ledgers replaces an earlier one. A
@@ -86,7 +96,7 @@ func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 		if err != nil {
 			return err
 		}
-		if err := appendWrite(f, write, events, lo, hi); err != nil {
+		if err := appendWrite(f, write, events, lo, hi, w.TooLarge); err != nil {
 			f.Close()
 			return err
 		}
@@ -103,12 +113,12 @@ func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 
 // appendWrite writes the events of ledgers [lo, hi] and the record that closes the write, and
 // syncs them. On a failure it truncates the file to where the write began.
-func appendWrite(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint32) error {
+func appendWrite(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint32, tooLarge func(vault.RawEvent)) error {
 	info, err := f.Stat()
 	if err != nil {
 		return err
 	}
-	if err := writeLines(f, write, events, lo, hi); err != nil {
+	if err := writeLines(f, write, events, lo, hi, tooLarge); err != nil {
 		if cut := f.Truncate(info.Size()); cut != nil {
 			return errors.Join(err, cut)
 		}
@@ -117,7 +127,7 @@ func appendWrite(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint3
 	return nil
 }
 
-func writeLines(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint32) error {
+func writeLines(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint32, tooLarge func(vault.RawEvent)) error {
 	buf := bufio.NewWriter(f)
 	if err := terminateTornLine(f, buf); err != nil {
 		return err
@@ -128,6 +138,12 @@ func writeLines(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint32
 			b, err := json.Marshal(line{Write: write, Event: &events[i]})
 			if err != nil {
 				return err
+			}
+			if len(b) >= maxLine {
+				if tooLarge != nil {
+					tooLarge(events[i])
+				}
+				continue
 			}
 			b = append(b, '\n')
 			sum.Write(b)
@@ -271,7 +287,7 @@ func (r Reader) file(name string) ([]finished, error) {
 	}
 	torn := false
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxRead)
 	for n := 1; scanner.Scan(); n++ {
 		var l line
 		if err := json.Unmarshal(scanner.Bytes(), &l); err != nil {
@@ -335,7 +351,7 @@ func LastCovered(dir string) (uint32, error) {
 	defer f.Close()
 	var last uint32
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxRead)
 	for scanner.Scan() {
 		var l line
 		if json.Unmarshal(scanner.Bytes(), &l) == nil && l.Covered != nil {

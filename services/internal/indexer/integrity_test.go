@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -537,5 +538,29 @@ func TestAWindowAcrossWhatWasArchivedKeepsTheGoodCopy(t *testing.T) {
 		if !critical {
 			t.Fatalf("straddle %v: pages %+v", straddle, h.pages.alerts)
 		}
+	}
+}
+
+// oversized serves an event larger than any the vault emits for the first ledger asked.
+type oversized struct{}
+
+func (oversized) Events(_ context.Context, from, _ uint32) ([]vault.RawEvent, error) {
+	return []vault.RawEvent{{Ledger: from, Contract: vaulttest.Vault, TxHash: strings.Repeat("ab", 32), Topics: []string{"t"}, Value: strings.Repeat("A", 2<<20)}}, nil
+}
+
+func TestAnEventTooLargeForTheArchivePages(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.ready()
+	h.fake.SetLatest(h.chain.Ledger + 5)
+	first := h.ix.archivedTo + 1
+	if _, err := h.ix.ArchiveStep(context.Background(), oversized{}); err != nil {
+		t.Fatal(err)
+	}
+	if !h.paged(fmt.Sprintf("archive_event_too_large_%d", first)) {
+		t.Fatalf("pages %+v", h.pages.alerts)
+	}
+	if _, err := (archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}).Events(context.Background(), 10, h.ix.archivedTo); err != nil {
+		t.Fatalf("the archive cannot be read: %v", err)
 	}
 }

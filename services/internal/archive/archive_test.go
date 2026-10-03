@@ -188,3 +188,25 @@ func TestARangeThatEndsBeforeItStartsIsRefused(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 }
+
+func TestAnEventTooLargeToReadIsLeftOutOfTheWrite(t *testing.T) {
+	dir := t.TempDir()
+	const v = "CVAULT"
+	var tooLarge []uint32
+	w := Writer{Dir: dir, TooLarge: func(e vault.RawEvent) { tooLarge = append(tooLarge, e.Ledger) }}
+	if err := w.Append([]vault.RawEvent{{Ledger: 100, Tx: 1, Contract: v, TxHash: "a", Topics: []string{"t"}, Value: "x"}}, 100, 100); err != nil {
+		t.Fatal(err)
+	}
+	big := vault.RawEvent{Ledger: 101, Tx: 1, Contract: v, TxHash: "b", Topics: []string{"t"}, Value: strings.Repeat("A", 5<<20)}
+	fits := vault.RawEvent{Ledger: 101, Tx: 2, Contract: v, TxHash: "c", Topics: []string{"t"}, Value: "y"}
+	if err := w.Append([]vault.RawEvent{big, fits}, 101, 101); err != nil {
+		t.Fatal(err)
+	}
+	if len(tooLarge) != 1 || tooLarge[0] != 101 {
+		t.Fatalf("left out %v", tooLarge)
+	}
+	got, err := (Reader{Dir: dir, Vault: v}).Events(context.Background(), 100, 101)
+	if err != nil || len(got) != 2 || got[1].TxHash != "c" {
+		t.Fatalf("read %+v: %v", got, err)
+	}
+}

@@ -128,7 +128,10 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 		return nil, err
 	}
 	if cfg.ArchiveDir != "" {
-		ix.archive = &archive.Writer{Dir: cfg.ArchiveDir}
+		ix.archive = &archive.Writer{Dir: cfg.ArchiveDir, TooLarge: func(e vault.RawEvent) {
+			ix.alerts.Raise(context.Background(), alert.Critical, fmt.Sprintf("archive_event_too_large_%d", e.Ledger),
+				"an event of ledger %d, larger than any the vault emits, was left out of the archive; the RPC that served it is not to be trusted", e.Ledger)
+		}}
 		if ix.archivedTo, err = archive.LastCovered(cfg.ArchiveDir); err != nil {
 			return nil, err
 		}
