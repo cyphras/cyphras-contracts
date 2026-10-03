@@ -43,9 +43,11 @@ type harness struct {
 	sentHook func(string)
 	// chainFail makes the sent transactions it matches fail on chain.
 	chainFail func(string) bool
-	last      string
-	status    vault.Status
-	limit     int64
+	// footprints holds the footprint of each sent transaction.
+	footprints []xdr.LedgerFootprint
+	last       string
+	status     vault.Status
+	limit      int64
 	// outflows holds the outflow of each queued exit by ID.
 	outflows map[uint64]int64
 	// partial makes the simulated vault pay the head exit in part when it does not fit whole.
@@ -133,12 +135,7 @@ func newHarness(t *testing.T) *harness {
 	kp := keypair.MustRandom()
 	key, _ := vault.AccountKey(kp.Address())
 	h.fake.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{AccountId: key.MustAccount().AccountId, SeqNum: 1, Balance: 500_000_000}}, 1, nil)
-	h.fake.SetEntry(vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingStateArchival), xdr.LedgerEntryData{
-		Type: xdr.LedgerEntryTypeConfigSetting,
-		ConfigSetting: &xdr.ConfigSettingEntry{
-			ConfigSettingId: xdr.ConfigSettingIdConfigSettingStateArchival, StateArchivalSettings: &xdr.StateArchivalSettings{MaxEntryTtl: 3_110_400},
-		},
-	}, 1, nil)
+	h.fake.SetSettings(rpctest.Mainnet)
 	h.fake.Simulate = func(req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
 		var env xdr.TransactionEnvelope
 		_ = xdr.SafeUnmarshalBase64(req.Transaction, &env)
@@ -174,6 +171,9 @@ func newHarness(t *testing.T) *harness {
 		h.mu.Lock()
 		h.sent = append(h.sent, describe(env))
 		h.last = describe(env)
+		if data := env.V1.Tx.Ext.SorobanData; data != nil {
+			h.footprints = append(h.footprints, data.Resources.Footprint)
+		}
 		hook := h.sentHook
 		h.mu.Unlock()
 		if hook != nil {

@@ -316,7 +316,7 @@ func TestAResourceFeeAboveTheCapIsRefused(t *testing.T) {
 func TestALedgerBoundStopsInclusionAtTheDeadline(t *testing.T) {
 	h := newHarness(t)
 	h.sendStatuses("PENDING")
-	p, err := h.engine.PrepareUntil(context.Background(), h.account, invoke(), 1_020)
+	p, err := h.engine.PrepareUntil(context.Background(), h.account, invoke(), 1_020, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,20 +397,12 @@ func TestAFailedCallNamesTheErrorClosestToItsCause(t *testing.T) {
 	}
 }
 
-// ledgerCostSettings publishes the network's fees for read and written bytes.
+// ledgerCostSettings publishes mainnet's settings with the given fees and limits for read and
+// written bytes.
 func (h *harness) ledgerCostSettings(read1KB, write1KB int64, maxRead, maxWrite uint32) {
-	h.fake.SetEntry(vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostV0), xdr.LedgerEntryData{
-		Type: xdr.LedgerEntryTypeConfigSetting, ConfigSetting: &xdr.ConfigSettingEntry{
-			ConfigSettingId: xdr.ConfigSettingIdConfigSettingContractLedgerCostV0,
-			ContractLedgerCost: &xdr.ConfigSettingContractLedgerCostV0{
-				FeeDiskRead1Kb: xdr.Int64(read1KB), TxMaxDiskReadBytes: xdr.Uint32(maxRead), TxMaxWriteBytes: xdr.Uint32(maxWrite),
-			},
-		}}, 1, nil)
-	h.fake.SetEntry(vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostExtV0), xdr.LedgerEntryData{
-		Type: xdr.LedgerEntryTypeConfigSetting, ConfigSetting: &xdr.ConfigSettingEntry{
-			ConfigSettingId:       xdr.ConfigSettingIdConfigSettingContractLedgerCostExtV0,
-			ContractLedgerCostExt: &xdr.ConfigSettingContractLedgerCostExtV0{FeeWrite1Kb: xdr.Int64(write1KB)},
-		}}, 1, nil)
+	s := rpctest.Mainnet
+	s.DiskRead1KB, s.Write1KB, s.MaxDiskReadBytes, s.MaxWriteBytes = read1KB, write1KB, maxRead, maxWrite
+	h.fake.SetSettings(s)
 }
 
 func TestTheClassicEntriesACallTouchesGetRoomToGrow(t *testing.T) {
@@ -471,4 +463,101 @@ func sorobanData(t *testing.T, p *Prepared) xdr.SorobanTransactionData {
 		t.Fatal("no Soroban data")
 	}
 	return data
+}
+
+func TestAnotherPathsEntriesAndResourcesArePaidFor(t *testing.T) {
+	h := newHarness(t)
+	h.engine.ResourceMarginPct = 0
+	h.fake.SetSettings(rpctest.Mainnet)
+	const vaultID = "CBYJTWEOBJL52FA7J7JNDVM65TW64PXO2EIQBF5YVEE3OROZSBVMP2N5"
+	key := func(k xdr.LedgerKey, err error) xdr.LedgerKey {
+		if err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	payee, newcomer := keypair.MustRandom().Address(), keypair.MustRandom().Address()
+	exit, next := key(vault.ExitKey(vaultID, 7)), key(vault.ExitKey(vaultID, 8))
+	account, fresh := key(vault.AccountKey(payee)), key(vault.AccountKey(newcomer))
+	trustline := key(vault.TrustlineKey(payee, "USDC:"+keypair.MustRandom().Address()))
+	instance, balance := key(vault.InstanceKey(vaultID)), key(vault.BalanceKey(vaultID, vaultID))
+	h.fake.Simulate = func(protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		data := xdr.SorobanTransactionData{Resources: xdr.SorobanResources{
+			Footprint:    xdr.LedgerFootprint{ReadOnly: []xdr.LedgerKey{account, trustline, instance}, ReadWrite: []xdr.LedgerKey{exit}},
+			Instructions: 1_000_000, DiskReadBytes: 500, WriteBytes: 300,
+		}}
+		encoded, _ := xdr.MarshalBase64(data)
+		return protocol.SimulateTransactionResponse{TransactionDataXDR: encoded, MinResourceFee: 100_000, Results: []protocol.SimulateHostFunctionResult{{}}}, nil
+	}
+	extra := Extra{ReadWrite: []xdr.LedgerKey{exit, next, account, balance, fresh}, Instructions: 1_000_000, WriteBytes: 656,
+		NewBytes: 656, RentLedgers: 519_120, EventBytes: 512}
+	var seen xdr.LedgerFootprint
+	p, err := h.engine.PrepareUntil(context.Background(), h.account, invoke(), 0, func(_ context.Context, fp xdr.LedgerFootprint) (Extra, error) {
+		seen = fp
+		return extra, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seen.ReadWrite) != 1 {
+		t.Fatalf("extend saw %d written entries", len(seen.ReadWrite))
+	}
+	res := sorobanData(t, p).Resources
+	names := func(keys []xdr.LedgerKey) []string {
+		var out []string
+		for _, k := range keys {
+			b, _ := k.MarshalBinary()
+			out = append(out, string(b))
+		}
+		return out
+	}
+	if want := names([]xdr.LedgerKey{exit, next, balance, fresh, account}); !equalStrings(names(res.Footprint.ReadWrite), want) {
+		t.Fatal("written entries are not the simulated, added and promoted ones")
+	}
+	if want := names([]xdr.LedgerKey{trustline, instance}); !equalStrings(names(res.Footprint.ReadOnly), want) {
+		t.Fatal("a promoted entry is still read only")
+	}
+	// Four entries written more, one more read from disk, a million instructions, 656 bytes
+	// written, 232 bytes of keys sent, and the rent of 656 new bytes for mainnet's least TTL of
+	// a new persistent entry with its TTL entry, and 512 bytes of events.
+	want := int64(4*2_500 + 1_563 + 700 + (817 - 257) + 92 + 920 + 1_093_334 + 2_500 + 42 + 2_500)
+	if p.ExtraFee != want || res.Instructions != 2_000_000 || res.WriteBytes != 300+656+2*2048 {
+		t.Fatalf("extra fee %d, want %d; instructions %d, write bytes %d", p.ExtraFee, want, res.Instructions, res.WriteBytes)
+	}
+	// The classic entries are padded as written or read: two written, three read.
+	if res.DiskReadBytes != 500+3*2048 || p.ResourceFee != 100_000+perKB(3*2048, 447)+perKB(2*2048, 875)+want {
+		t.Fatalf("read bytes %d, resource fee %d", res.DiskReadBytes, p.ResourceFee)
+	}
+	// The network's limit on written entries stops the additions in their order.
+	limited := rpctest.Mainnet
+	limited.MaxWriteEntries = 3
+	h.fake.SetSettings(limited)
+	h.engine.costs = ledgerCosts{}
+	if p, err = h.engine.PrepareUntil(context.Background(), h.account, invoke(), 0, func(context.Context, xdr.LedgerFootprint) (Extra, error) {
+		return extra, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := sorobanData(t, p).Resources.Footprint.ReadWrite; !equalStrings(names(got), names([]xdr.LedgerKey{exit, next, account})) {
+		t.Fatalf("%d written entries past the limit", len(got))
+	}
+	// The cap bounds the fee with its padding.
+	h.engine.MaxResourceFee = 1_000_000
+	if _, err := h.engine.PrepareUntil(context.Background(), h.account, invoke(), 0, func(context.Context, xdr.LedgerFootprint) (Extra, error) {
+		return extra, nil
+	}); !errors.Is(err, ErrSimulation) {
+		t.Fatalf("a padded fee above the cap: %v", err)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

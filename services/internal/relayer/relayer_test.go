@@ -207,6 +207,7 @@ func newHarness(t *testing.T, status vault.Status, mutate ...func(*Config)) *har
 	h := &harness{t: t, fake: rpctest.New(passphrase, 1000), screen: &screenStub{allow: true}, now: time.Unix(1_728_000_000, 0), status: success(900_000)}
 	h.fake.CloseTime = h.now.Unix()
 	h.fake.FeeStats.SorobanInclusionFee.P90 = 100
+	h.fake.SetSettings(rpctest.Mainnet)
 	domain, roots := fixtureChain(t)
 	h.domain = domain
 	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Vault)), vaulttest.Instance(vaulttest.InstanceOptions{

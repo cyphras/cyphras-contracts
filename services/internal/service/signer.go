@@ -86,6 +86,16 @@ func CheckHotSigner(ctx context.Context, c rpc.Client, account string, key *keyp
 	return nil
 }
 
+// ExitKeys reads EXIT_KEYS, how many exits queued or released ahead of a call on the exit queue in
+// the ledger it lands in still leave its footprint room: 1 to 32, 4 when unset.
+func ExitKeys() (uint32, error) {
+	n, err := config.Int("EXIT_KEYS", 4)
+	if err == nil && (n < 1 || n > 32) {
+		err = errors.New("EXIT_KEYS must be 1 to 32")
+	}
+	return uint32(n), err
+}
+
 // Engine builds the submission engine from INCLUSION_FEE_CAP and RESOURCE_FEE_CAP, in stroops,
 // and the defaults the services share.
 func Engine(c rpc.Client, passphrase string) (*submit.Engine, error) {

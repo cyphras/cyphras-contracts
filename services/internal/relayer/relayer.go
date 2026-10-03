@@ -84,6 +84,9 @@ type Config struct {
 	// a request is accepted and again before it is sent, so its root still has insertions to spare
 	// when the transaction lands; 200 of the 256 the vault keeps when unset.
 	FreshRoots uint32
+	// ExitKeys is how many exits queued ahead of a relayed exit in the ledger it lands in still
+	// leave its footprint room for it to queue; 4 when unset.
+	ExitKeys uint32
 }
 
 func (c *Config) defaults() {
@@ -116,6 +119,9 @@ func (c *Config) defaults() {
 	}
 	if c.FreshRoots == 0 {
 		c.FreshRoots = 200
+	}
+	if c.ExitKeys == 0 {
+		c.ExitKeys = 4
 	}
 }
 
@@ -987,7 +993,7 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	}
 	// The bound stops at the deadline itself: a ledger bound excludes its own ledger, so the
 	// transaction can never land where the vault would answer Expired.
-	prepared, err := r.engine.PrepareUntil(ctx, ch, op, req.Ext.Deadline)
+	prepared, err := r.engine.PrepareUntil(ctx, ch, op, req.Ext.Deadline, r.exitRoom(req))
 	if err != nil {
 		if errors.Is(err, submit.ErrSimulation) {
 			return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
@@ -1026,6 +1032,46 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	r.following.Add(1)
 	go r.follow(signed, ch, req.Proof.Nullifiers, rec)
 	return signed.Hash, nil
+}
+
+// exitRoom gives a relayed transaction that pays anything the entries of the exit queue's other
+// path, as vault.TransactRoom names them, with the resources that path may take. The queue's tail
+// is the one the simulation wrote an exit at, or the vault's tail now when it paid at once.
+func (r *Relayer) exitRoom(req Request) submit.Extend {
+	return func(ctx context.Context, fp xdr.LedgerFootprint) (submit.Extra, error) {
+		if req.Ext.ExtAmount.Sign() == 0 && req.Ext.Fee.Sign() == 0 {
+			return submit.Extra{}, nil
+		}
+		inst, _, _ := r.view()
+		tail, ok := vault.QueuedExit(r.cfg.Vault, fp)
+		if !ok || inst == nil {
+			fresh, _, _, err := rpc.VaultInstance(ctx, r.rpc, r.cfg.Vault)
+			if err != nil {
+				return submit.Extra{}, err
+			}
+			inst = &fresh
+			if !ok {
+				tail = fresh.Status.ExitTail
+			}
+		}
+		keys, err := vault.TransactRoom(r.cfg.Vault, inst.Config.Token, r.cfg.Asset, req.Ext, tail, r.cfg.ExitKeys)
+		if err != nil {
+			return submit.Extra{}, err
+		}
+		token, err := vault.ScAddress(inst.Config.Token)
+		if err != nil {
+			return submit.Extra{}, err
+		}
+		// Queueing writes an exit, and paying at once the balances the asset contract keeps.
+		newBytes := uint32(vault.ExitEntryBytes)
+		for _, k := range keys {
+			if k.Type == xdr.LedgerEntryTypeContractData && k.ContractData.Contract.Equals(token) {
+				newBytes += vault.BalanceEntryBytes
+			}
+		}
+		return submit.Extra{ReadWrite: keys, Instructions: vault.SwitchInstructions, WriteBytes: newBytes, NewBytes: newBytes,
+			RentLedgers: vault.EntryTTL, EventBytes: vault.SwitchEventBytes}, nil
+	}
 }
 
 func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, nfs [2]fr.Element, rec Record) {

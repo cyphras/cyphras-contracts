@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -71,12 +72,17 @@ type Engine struct {
 	costs  ledgerCosts
 }
 
-// ledgerCosts are the network's fees and limits for the bytes a call reads and writes, read with
-// the time they were read.
+// ledgerCosts are the network's Soroban fees and limits, read with the time they were read. Fees
+// are in stroops: per 10,000 instructions, per entry and per 1 KiB.
 type ledgerCosts struct {
-	at                      time.Time
-	read1KB, write1KB       int64
-	maxReadBytes, maxWrites uint32
+	at                                    time.Time
+	instruction, readEntry, writeEntry    int64
+	read1KB, write1KB, historical1KB      int64
+	txSize1KB, events1KB, rent1KB         int64
+	rentDenominator                       int64
+	minPersistentTTL, maxInstructions     uint32
+	maxReadEntries, maxWriteEntries       uint32
+	maxFootprint, maxReadBytes, maxWrites uint32
 }
 
 // classicPad is the room added to the bytes a call may read and write for each classic entry it
@@ -85,27 +91,78 @@ type ledgerCosts struct {
 // out of the bytes the simulation measured. An account entry holds at most about 2 KB.
 const classicPad = 2048
 
-// ledgerCosts reads the network's fees for read and written bytes, at most once an hour.
+// ledgerCosts reads the network's Soroban fees and limits, at most once an hour.
 func (e *Engine) ledgerCosts(ctx context.Context) (ledgerCosts, error) {
 	e.costMu.Lock()
 	defer e.costMu.Unlock()
 	if !e.costs.at.IsZero() && e.now().Sub(e.costs.at) < time.Hour {
 		return e.costs, nil
 	}
-	base, ext := vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostV0), vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostExtV0)
-	entries, _, err := rpc.Entries(ctx, e.RPC, []xdr.LedgerKey{base, ext})
+	ids := []xdr.ConfigSettingId{
+		xdr.ConfigSettingIdConfigSettingContractComputeV0, xdr.ConfigSettingIdConfigSettingContractLedgerCostV0,
+		xdr.ConfigSettingIdConfigSettingContractLedgerCostExtV0, xdr.ConfigSettingIdConfigSettingContractHistoricalDataV0,
+		xdr.ConfigSettingIdConfigSettingContractEventsV0, xdr.ConfigSettingIdConfigSettingContractBandwidthV0,
+		xdr.ConfigSettingIdConfigSettingStateArchival, xdr.ConfigSettingIdConfigSettingLiveSorobanStateSizeWindow,
+	}
+	keys := make([]xdr.LedgerKey, len(ids))
+	for i, id := range ids {
+		keys[i] = vault.ConfigSettingKey(id)
+	}
+	entries, _, err := rpc.Entries(ctx, e.RPC, keys)
 	if err != nil {
 		return ledgerCosts{}, fmt.Errorf("ledger costs: %w", err)
 	}
-	b, x := entries[mustKeyString(base)].Data.ConfigSetting, entries[mustKeyString(ext)].Data.ConfigSetting
-	if b == nil || b.ContractLedgerCost == nil || x == nil || x.ContractLedgerCostExt == nil {
+	s := map[xdr.ConfigSettingId]*xdr.ConfigSettingEntry{}
+	for _, k := range keys {
+		if c := entries[mustKeyString(k)].Data.ConfigSetting; c != nil {
+			s[c.ConfigSettingId] = c
+		}
+	}
+	compute, cost, ext := s[ids[0]], s[ids[1]], s[ids[2]]
+	historical, events, bandwidth, archival, state := s[ids[3]], s[ids[4]], s[ids[5]], s[ids[6]], s[ids[7]]
+	if compute == nil || compute.ContractCompute == nil || cost == nil || cost.ContractLedgerCost == nil || ext == nil || ext.ContractLedgerCostExt == nil ||
+		historical == nil || historical.ContractHistoricalData == nil || events == nil || events.ContractEvents == nil ||
+		bandwidth == nil || bandwidth.ContractBandwidth == nil || archival == nil || archival.StateArchivalSettings == nil ||
+		state == nil || state.LiveSorobanStateSizeWindow == nil || len(*state.LiveSorobanStateSizeWindow) == 0 {
 		return ledgerCosts{}, errors.New("ledger costs: the network's settings are missing")
 	}
+	c, a := cost.ContractLedgerCost, archival.StateArchivalSettings
+	var size uint64
+	for _, n := range *state.LiveSorobanStateSizeWindow {
+		size += uint64(n)
+	}
+	size /= uint64(len(*state.LiveSorobanStateSizeWindow))
 	e.costs = ledgerCosts{
-		at: e.now(), read1KB: int64(b.ContractLedgerCost.FeeDiskRead1Kb), write1KB: int64(x.ContractLedgerCostExt.FeeWrite1Kb),
-		maxReadBytes: uint32(b.ContractLedgerCost.TxMaxDiskReadBytes), maxWrites: uint32(b.ContractLedgerCost.TxMaxWriteBytes),
+		at: e.now(), instruction: int64(compute.ContractCompute.FeeRatePerInstructionsIncrement),
+		readEntry: int64(c.FeeDiskReadLedgerEntry), writeEntry: int64(c.FeeWriteLedgerEntry),
+		read1KB: int64(c.FeeDiskRead1Kb), write1KB: int64(ext.ContractLedgerCostExt.FeeWrite1Kb),
+		historical1KB: int64(historical.ContractHistoricalData.FeeHistorical1Kb), txSize1KB: int64(bandwidth.ContractBandwidth.FeeTxSize1Kb),
+		events1KB:       int64(events.ContractEvents.FeeContractEvents1Kb),
+		rent1KB:         rentPerKB(int64(size), int64(c.RentFee1KbSorobanStateSizeLow), int64(c.RentFee1KbSorobanStateSizeHigh), int64(c.SorobanStateTargetSizeBytes), int64(c.SorobanStateRentFeeGrowthFactor)),
+		rentDenominator: int64(a.PersistentRentRateDenominator), minPersistentTTL: uint32(a.MinPersistentTtl),
+		maxInstructions: uint32(compute.ContractCompute.TxMaxInstructions),
+		maxReadEntries:  uint32(c.TxMaxDiskReadEntries), maxWriteEntries: uint32(c.TxMaxWriteLedgerEntries),
+		maxFootprint: uint32(ext.ContractLedgerCostExt.TxMaxFootprintEntries),
+		maxReadBytes: uint32(c.TxMaxDiskReadBytes), maxWrites: uint32(c.TxMaxWriteBytes),
 	}
 	return e.costs, nil
+}
+
+// rentPerKB is the network's rent for 1 KiB of persistent state over a rent period, which grows
+// with the size of the Soroban state as the host computes it.
+func rentPerKB(size, low, high, target, growth int64) int64 {
+	target = max(target, 1)
+	var fee int64
+	if size < target {
+		fee = ceilDiv((high-low)*size, target) + low
+	} else {
+		fee = high + ceilDiv((high-low)*(size-target)*growth, target)
+	}
+	return max(fee, 1000)
+}
+
+func ceilDiv(a, b int64) int64 {
+	return (a + b - 1) / b
 }
 
 func mustKeyString(k xdr.LedgerKey) string {
@@ -151,6 +208,115 @@ func perKB(bytes uint64, rate int64) int64 {
 	return int64((bytes*uint64(rate) + 1023) / 1024)
 }
 
+// Extra is what a call may need beyond its simulation, when the ledger it lands in can lead it
+// down another path than the state it was simulated against did: the entries that path writes,
+// and the instructions, written bytes, new persistent bytes and event bytes it may add.
+type Extra struct {
+	// ReadWrite are entries added to the footprint as read-write, or moved there from read-only,
+	// in the order they are added while the network's limits allow.
+	ReadWrite    []xdr.LedgerKey
+	Instructions uint32
+	WriteBytes   uint32
+	// NewBytes is the size of persistent entries the other path may create, whose rent is set
+	// aside for RentLedgers ledgers, or the network's least for a new entry if that is longer.
+	NewBytes    uint32
+	RentLedgers uint32
+	EventBytes  uint32
+}
+
+// Extend computes a call's Extra from the footprint its simulation found.
+type Extend func(ctx context.Context, footprint xdr.LedgerFootprint) (Extra, error)
+
+// ttlEntryBytes is the size of the TTL entry the network writes with a persistent entry's rent.
+const ttlEntryBytes = 48
+
+// addExtra adds x to the simulated transaction data and returns the fee it adds: the network's fee
+// for the entries, instructions, written bytes and transaction size it adds, all non-refundable,
+// and the rent and event fee the other path may need, which is refunded when it goes unused.
+func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData, x Extra) (int64, error) {
+	c, err := e.ledgerCosts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	before, err := data.MarshalBinary()
+	if err != nil {
+		return 0, err
+	}
+	fp := &data.Resources.Footprint
+	keyOf := func(k xdr.LedgerKey) string {
+		b, _ := k.MarshalBinary()
+		return string(b)
+	}
+	written := map[string]bool{}
+	for _, k := range fp.ReadWrite {
+		written[keyOf(k)] = true
+	}
+	read := map[string]int{}
+	for i, k := range fp.ReadOnly {
+		read[keyOf(k)] = i
+	}
+	reads := uint32(0)
+	for _, k := range append(slices.Clone(fp.ReadOnly), fp.ReadWrite...) {
+		if classic(k) {
+			reads++
+		}
+	}
+	var promoted []int
+	writes, newReads := int64(0), int64(0)
+	for _, k := range x.ReadWrite {
+		name := keyOf(k)
+		if written[name] {
+			continue
+		}
+		if uint32(len(fp.ReadWrite)+len(promoted)) >= c.maxWriteEntries {
+			break
+		}
+		if i, ok := read[name]; ok {
+			promoted = append(promoted, i)
+		} else {
+			if uint32(len(fp.ReadOnly)+len(fp.ReadWrite)) >= c.maxFootprint || (classic(k) && reads >= c.maxReadEntries) {
+				break
+			}
+			fp.ReadWrite = append(fp.ReadWrite, k)
+			if classic(k) {
+				reads++
+				newReads++
+			}
+		}
+		written[name] = true
+		writes++
+	}
+	slices.Sort(promoted)
+	for j, i := range promoted {
+		fp.ReadWrite = append(fp.ReadWrite, fp.ReadOnly[i-j])
+		fp.ReadOnly = slices.Delete(fp.ReadOnly, i-j, i-j+1)
+	}
+	res := &data.Resources
+	instructions := min(uint64(res.Instructions)+uint64(x.Instructions), uint64(max(c.maxInstructions, uint32(res.Instructions))))
+	writeBytes := min(uint64(res.WriteBytes)+uint64(x.WriteBytes), uint64(max(c.maxWrites, uint32(res.WriteBytes))))
+	fee := writes*c.writeEntry + newReads*c.readEntry +
+		ceilDiv(int64(instructions)*c.instruction, 10_000) - ceilDiv(int64(res.Instructions)*c.instruction, 10_000) +
+		perKB(writeBytes, c.write1KB) - perKB(uint64(res.WriteBytes), c.write1KB)
+	res.Instructions, res.WriteBytes = xdr.Uint32(instructions), xdr.Uint32(writeBytes)
+	after, err := data.MarshalBinary()
+	if err != nil {
+		return 0, err
+	}
+	grown := uint64(len(after) - len(before))
+	fee += perKB(grown, c.txSize1KB) + perKB(grown, c.historical1KB)
+	if x.NewBytes > 0 {
+		ledgers := int64(max(x.RentLedgers, c.minPersistentTTL))
+		fee += ceilDiv(int64(x.NewBytes)*c.rent1KB*ledgers, 1024*max(c.rentDenominator, 1)) + c.writeEntry + perKB(ttlEntryBytes, c.write1KB)
+	}
+	fee += perKB(uint64(x.EventBytes), c.events1KB)
+	return fee, nil
+}
+
+// classic reports an entry of an account or a trustline, which the network reads from disk.
+func classic(k xdr.LedgerKey) bool {
+	return k.Type == xdr.LedgerEntryTypeAccount || k.Type == xdr.LedgerEntryTypeTrustline
+}
+
 func (e *Engine) now() time.Time {
 	if e.Now != nil {
 		return e.Now()
@@ -190,6 +356,8 @@ type Prepared struct {
 	Return *xdr.ScVal
 	// SimulatedAt is the ledger the simulation read the chain at.
 	SimulatedAt uint32
+	// ExtraFee is the part of ResourceFee the call's Extra added.
+	ExtraFee int64
 }
 
 func (e *Engine) loadSequence(ctx context.Context, a *Account) error {
@@ -230,13 +398,14 @@ func (o restoreOp) setExt(ext xdr.TransactionExt) { o.Ext = ext }
 // Prepare simulates op from the account and returns the assembled transaction. The account must
 // be locked by the caller.
 func (e *Engine) Prepare(ctx context.Context, a *Account, op txnbuild.Operation) (*Prepared, error) {
-	return e.PrepareUntil(ctx, a, op, 0)
+	return e.PrepareUntil(ctx, a, op, 0, nil)
 }
 
 // PrepareUntil is Prepare for a transaction the network may include only in a ledger below
 // maxLedger, such as a call that stops being valid at a ledger: past that ledger the network
-// drops it for free instead of including it to fail. A maxLedger of 0 sets no bound.
-func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Operation, maxLedger uint32) (*Prepared, error) {
+// drops it for free instead of including it to fail. A maxLedger of 0 sets no bound. A non-nil
+// extend adds what the call may need beyond its simulation.
+func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Operation, maxLedger uint32, extend Extend) (*Prepared, error) {
 	var sop sorobanOp
 	switch o := op.(type) {
 	case *txnbuild.InvokeHostFunction:
@@ -296,14 +465,26 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 	if err := xdr.SafeUnmarshalBase64(sim.TransactionDataXDR, &data); err != nil {
 		return nil, fmt.Errorf("simulation data: %w", err)
 	}
-	if e.MaxResourceFee > 0 && sim.MinResourceFee > e.MaxResourceFee {
-		return nil, fmt.Errorf("%w: a resource fee of %d stroops is above the cap", ErrSimulation, sim.MinResourceFee)
+	var extra int64
+	if extend != nil {
+		x, err := extend(ctx, data.Resources.Footprint)
+		if err != nil {
+			return nil, err
+		}
+		if extra, err = e.addExtra(ctx, &data, x); err != nil {
+			return nil, err
+		}
 	}
 	padding, err := e.padClassic(ctx, &data.Resources)
 	if err != nil {
 		return nil, err
 	}
-	resource := sim.MinResourceFee + sim.MinResourceFee*e.ResourceMarginPct/100 + padding
+	resource := sim.MinResourceFee + sim.MinResourceFee*e.ResourceMarginPct/100 + padding + extra
+	// The padding's fees come from the network's settings as the RPC reports them, so the cap
+	// bounds the whole fee.
+	if e.MaxResourceFee > 0 && resource > e.MaxResourceFee {
+		return nil, fmt.Errorf("%w: a resource fee of %d stroops is above the cap", ErrSimulation, resource)
+	}
 	data.ResourceFee = xdr.Int64(resource)
 	sop.setExt(xdr.TransactionExt{V: 1, SorobanData: &data})
 	var ret *xdr.ScVal
@@ -333,7 +514,7 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 		return nil, err
 	}
 	return &Prepared{Account: a, Tx: tx, Seq: a.seq + 1, InclusionFee: inclusion, ResourceFee: resource, MaxTime: maxTime, MaxLedger: maxLedger, Return: ret,
-		SimulatedAt: uint32(sim.LatestLedger)}, nil
+		SimulatedAt: uint32(sim.LatestLedger), ExtraFee: extra}, nil
 }
 
 // Signed is a transaction accepted for inclusion.
@@ -616,6 +797,11 @@ func (e *Engine) Do(ctx context.Context, a *Account, build func() (txnbuild.Oper
 
 // DoWorth is Do for a call that is sent only when worth accepts its simulated return value.
 func (e *Engine) DoWorth(ctx context.Context, a *Account, build func() (txnbuild.Operation, error), attempts int, worth func(*xdr.ScVal) bool) (Result, error) {
+	return e.DoExtended(ctx, a, build, attempts, worth, nil)
+}
+
+// DoExtended is DoWorth for a call that may need extend beyond its simulation.
+func (e *Engine) DoExtended(ctx context.Context, a *Account, build func() (txnbuild.Operation, error), attempts int, worth func(*xdr.ScVal) bool, extend Extend) (Result, error) {
 	a.Lock()
 	defer a.Unlock()
 	backoff := time.Second
@@ -625,7 +811,7 @@ func (e *Engine) DoWorth(ctx context.Context, a *Account, build func() (txnbuild
 		if err != nil {
 			return Result{}, err
 		}
-		p, err := e.Prepare(ctx, a, op)
+		p, err := e.PrepareUntil(ctx, a, op, 0, extend)
 		if err == nil && worth != nil && !worth(p.Return) {
 			return Result{}, ErrNotWorth
 		}

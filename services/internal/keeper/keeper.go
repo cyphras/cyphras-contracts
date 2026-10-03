@@ -46,6 +46,9 @@ type Config struct {
 	HoldReasons map[uint32]bool
 	// BalanceFloor is the keeper account's balance, in stroops, below which it alerts.
 	BalanceFloor int64
+	// ExitKeys is how many exits queued, or released, ahead of a claim or release in the ledger it
+	// lands in still leave its footprint room; 4 when unset.
+	ExitKeys uint32
 }
 
 // Keeper follows the vault and runs the upkeep.
@@ -72,6 +75,9 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 	state, cursor, err := chain.Load(ctx, cfg.Vault, cfg.DeployLedger)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.ExitKeys == 0 {
+		cfg.ExitKeys = 4
 	}
 	return &Keeper{
 		cfg: cfg, rpc: client, chain: chain, engine: engine, account: account, alerts: alerts, log: log, now: time.Now,
@@ -131,12 +137,13 @@ func (k *Keeper) invoke(fn string, args ...xdr.ScVal) (txnbuild.Operation, error
 
 // call runs one keeper transaction to its outcome and alerts when it still fails after retries.
 func (k *Keeper) call(ctx context.Context, what string, build func() (txnbuild.Operation, error)) (submit.Result, error) {
-	return k.callWorth(ctx, what, build, nil)
+	return k.callWorth(ctx, what, build, nil, nil)
 }
 
-// callWorth is call for a transaction sent only when worth accepts its simulated return value.
-func (k *Keeper) callWorth(ctx context.Context, what string, build func() (txnbuild.Operation, error), worth func(*xdr.ScVal) bool) (submit.Result, error) {
-	res, err := k.attempt(ctx, what, build, worth)
+// callWorth is call for a transaction sent only when worth accepts its simulated return value,
+// given what extend adds beyond its simulation.
+func (k *Keeper) callWorth(ctx context.Context, what string, build func() (txnbuild.Operation, error), worth func(*xdr.ScVal) bool, extend submit.Extend) (submit.Result, error) {
+	res, err := k.attempt(ctx, what, build, worth, extend)
 	if err != nil && !errors.Is(err, submit.ErrSimulation) && !errors.Is(err, submit.ErrNotWorth) {
 		k.alerts.Raise(ctx, alert.Critical, "call_failed", "%s failed after retries: %v", what, err)
 	}
@@ -144,8 +151,8 @@ func (k *Keeper) callWorth(ctx context.Context, what string, build func() (txnbu
 }
 
 // attempt is callWorth without the alert, for a caller that judges a failure itself.
-func (k *Keeper) attempt(ctx context.Context, what string, build func() (txnbuild.Operation, error), worth func(*xdr.ScVal) bool) (submit.Result, error) {
-	res, err := k.engine.DoWorth(ctx, k.account, build, 5, worth)
+func (k *Keeper) attempt(ctx context.Context, what string, build func() (txnbuild.Operation, error), worth func(*xdr.ScVal) bool, extend submit.Extend) (submit.Result, error) {
+	res, err := k.engine.DoExtended(ctx, k.account, build, 5, worth, extend)
 	if err == nil && res.Outcome != submit.Success {
 		err = fmt.Errorf("%s %s: %s", what, res.Outcome, res.Code)
 	}
@@ -246,7 +253,7 @@ func (k *Keeper) Admit(ctx context.Context) error {
 		}
 		_, err := k.callWorth(ctx, fmt.Sprintf("admit of %d deposits", n), func() (txnbuild.Operation, error) {
 			return k.invoke("admit", vault.Vec(ids...))
-		}, admittedAny)
+		}, admittedAny, nil)
 		if errors.Is(err, submit.ErrSimulation) && n > 1 {
 			// A batch over the transaction's limits fails in simulation; try a smaller one.
 			batch = n / 2
@@ -291,7 +298,7 @@ func (k *Keeper) Refund(ctx context.Context) error {
 		what := fmt.Sprintf("refund of deposit %d", id)
 		res, err := k.attempt(ctx, what, func() (txnbuild.Operation, error) {
 			return k.invoke("refund", vault.U64(id))
-		}, nil)
+		}, nil, nil)
 		switch {
 		case err == nil:
 		case errors.Is(err, submit.ErrSimulation):

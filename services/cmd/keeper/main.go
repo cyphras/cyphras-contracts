@@ -59,9 +59,13 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
+	exitKeys, err := service.ExitKeys()
+	if err != nil {
+		service.Fatal(log, "config", err)
+	}
 	k, err := keeper.New(ctx, keeper.Config{
 		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, Asset: base.Vault.Asset, MaxAdmissions: 16, MaxExtensions: 50,
-		MaxReleases: int(releases), RefundDelay: 24 * time.Hour, HoldReasons: hold, BalanceFloor: floor,
+		MaxReleases: int(releases), RefundDelay: 24 * time.Hour, HoldReasons: hold, BalanceFloor: floor, ExitKeys: exitKeys,
 	}, base.RPC, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(key.Address(), key), base.Alerts, log)
 	if err != nil {
 		service.Fatal(log, "load", err)
