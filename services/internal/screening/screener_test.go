@@ -59,6 +59,15 @@ type harness struct {
 	attest  uint64
 	// flags are the reasons the landed flags carry, by deposit.
 	flags map[uint64]uint32
+	// deposits are what the Pending entries hold, by deposit.
+	deposits map[uint64]pendingEntry
+}
+
+type pendingEntry struct {
+	depositor        string
+	amount           int64
+	createdAt, delay uint64
+	flaggedAt        uint64
 }
 
 func (h *harness) Send(_ context.Context, a alert.Alert) error {
@@ -68,7 +77,8 @@ func (h *harness) Send(_ context.Context, a alert.Alert) error {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{t: t, fake: rpctest.New(passphrase, 9), chain: vaulttest.New(10, 1_728_000_000), now: time.Unix(1_728_000_000, 0), funders: funderMap{}}
+	h := &harness{t: t, fake: rpctest.New(passphrase, 9), chain: vaulttest.New(10, 1_728_000_000), now: time.Unix(1_728_000_000, 0), funders: funderMap{},
+		deposits: map[uint64]pendingEntry{}}
 	pool, err := chainstate.Open(context.Background(), testdb.URL(t), Schema)
 	if err != nil {
 		t.Fatal(err)
@@ -91,6 +101,7 @@ func newHarness(t *testing.T) *harness {
 		h.mu.Lock()
 		h.calls = append(h.calls, call{string(inv.FunctionName), inv.Args})
 		h.effects = append(h.effects, call{string(inv.FunctionName), inv.Args})
+		h.pend(string(inv.FunctionName), inv.Args)
 		h.mu.Unlock()
 		return protocol.SendTransactionResponse{Status: "PENDING"}, nil
 	}
@@ -128,6 +139,31 @@ func (h *harness) setVault(attested uint64) {
 		DelaySmall: 3600, DelayLarge: 86400, Limit: 1_000_000_000_000, Large: 5_000_000_000,
 		Status: vault.Status{AttestedUpTo: attested, NextDepositID: h.chain.NextID},
 	}), 10, nil)
+}
+
+// pend rewrites a deposit's Pending entry as a flag or unflag that lands leaves it; a second flag
+// keeps the time of the first.
+func (h *harness) pend(fn string, args []xdr.ScVal) {
+	if fn != "flag" && fn != "unflag" {
+		return
+	}
+	id := uint64(*args[0].U64)
+	d, ok := h.deposits[id]
+	if !ok {
+		return
+	}
+	var flag *uint32
+	if fn == "flag" {
+		reason := uint32(*args[1].U32)
+		flag = &reason
+		if d.flaggedAt == 0 {
+			d.flaggedAt = uint64(h.now.Unix())
+		}
+	} else {
+		d.flaggedAt = 0
+	}
+	h.deposits[id] = d
+	h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)), vaulttest.Pending(id, d.depositor, d.amount, d.createdAt, d.delay, flag, d.flaggedAt), h.chain.Ledger, nil)
 }
 
 // land puts the calls the screener sent on chain, as the vault would.
@@ -171,6 +207,9 @@ func (h *harness) shield(depositor string, amount int64) uint64 {
 		delay = 86400
 	}
 	h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)), vaulttest.Pending(id, depositor, amount, uint64(h.chain.ClosedAt), delay, nil, 0), h.chain.Ledger, nil)
+	h.mu.Lock()
+	h.deposits[id] = pendingEntry{depositor: depositor, amount: amount, createdAt: uint64(h.chain.ClosedAt), delay: delay}
+	h.mu.Unlock()
 	h.chain.NextLedger(5)
 	return id
 }
@@ -306,10 +345,10 @@ func TestALargeDepositNeedsAReview(t *testing.T) {
 	if err != nil || len(reviews) != 1 || reviews[0].ID != big {
 		t.Fatalf("reviews %v %v", reviews, err)
 	}
-	// Unreviewed when its final check comes, it is refused with reason 5.
+	// Unreviewed when its final check comes, it is held for the review with reason 6.
 	h.now = h.now.Add(24*time.Hour - 9*time.Minute)
 	h.tick()
-	if got := h.sent(); !equal(got, []string{"flag 1 5"}) {
+	if got := h.sent(); !equal(got, []string{"flag 1 6"}) {
 		t.Fatalf("unreviewed deposit: %v", got)
 	}
 
@@ -327,7 +366,7 @@ func TestALargeDepositNeedsAReview(t *testing.T) {
 	}
 }
 
-func TestAnAttestedDepositThatCannotBeRecheckedIsRefused(t *testing.T) {
+func TestAnAttestedDepositThatCannotBeRecheckedIsHeld(t *testing.T) {
 	h := newHarness(t)
 	h.shield(clean, 10_000_000)
 	h.tick()
@@ -338,7 +377,7 @@ func TestAnAttestedDepositThatCannotBeRecheckedIsRefused(t *testing.T) {
 	h.now = h.now.Add(59 * time.Minute)
 	h.sources.set(map[string]Hit{}, "1", h.now.Add(-2*time.Hour))
 	h.tick()
-	if got := h.sent(); !equal(got, []string{"flag 1 5"}) {
+	if got := h.sent(); !equal(got, []string{"flag 1 6"}) {
 		t.Fatalf("blind final check: %v", got)
 	}
 }
@@ -414,7 +453,7 @@ func TestTheCandidateNeverVouchesForAnUnflaggedRefusal(t *testing.T) {
 		}
 		return out
 	}
-	four, five := uint32(4), uint32(5)
+	four, six := uint32(4), uint32(6)
 	cases := []struct {
 		rows []row
 		want uint64
@@ -427,21 +466,34 @@ func TestTheCandidateNeverVouchesForAnUnflaggedRefusal(t *testing.T) {
 		{[]row{r(1, "pass", "refuse"), r(2, "pass", "pass")}, 0},
 		// A deposit under review ends the run until it is cleared and re-checked, or flagged.
 		{[]row{{id: 1, firstCheck: "refer", review: "needed"}, r(2, "pass", "pass")}, 0},
-		{[]row{{id: 1, firstCheck: "refer", review: "needed", flag: &five, flagKind: "review_timeout"}, r(2, "pass", "pass")}, 2},
+		{[]row{{id: 1, firstCheck: "refer", review: "needed", flag: &six, flagKind: "hold"}, r(2, "pass", "pass")}, 2},
+		// A lifted hold counts as unflagged before the follower sees the unflag land.
+		{[]row{{id: 1, firstCheck: "refer", review: "cleared", flag: &six, flagKind: "lifted"}, r(2, "pass", "pass")}, 0},
 		{[]row{{id: 1, firstCheck: "refer", review: "cleared", recheck: "pass", recheckAt: &at}, r(2, "pass", "pass")}, 2},
 		{[]row{{id: 1, firstCheck: "pass", needsFlag: true}, r(2, "pass", "pass")}, 0},
 	}
+	never := func(*row) bool { return false }
 	for i, c := range cases {
-		if got := attestCandidate(c.rows, 0, at+60, 600); got != c.want {
+		if got, holds := attestCandidate(c.rows, 0, at+60, 600, never); got != c.want || len(holds) != 0 {
 			t.Fatalf("case %d: %d, want %d", i, got, c.want)
 		}
 	}
-	if got := attestCandidate([]row{r(1, "", ""), r(2, "pass", "pass")}, 1, at+60, 600); got != 2 {
+	if got, _ := attestCandidate([]row{r(1, "", ""), r(2, "pass", "pass")}, 1, at+60, 600, never); got != 2 {
 		t.Fatal("attested deposits do not block")
 	}
 	// A final check that passed too long ago vouches for nothing.
-	if got := attestCandidate([]row{r(1, "pass", "pass")}, 0, at+601, 600); got != 0 {
+	if got, _ := attestCandidate([]row{r(1, "pass", "pass")}, 0, at+601, 600, never); got != 0 {
 		t.Fatal("a stale final check was attested")
+	}
+	// A deposit that can be held is passed once it is, but only for a deposit behind it; one whose
+	// flag is not sent yet never is.
+	always := func(*row) bool { return true }
+	rows := []row{r(1, "pass", ""), r(2, "", ""), r(3, "pass", "pass"), r(4, "pass", "")}
+	if got, holds := attestCandidate(rows, 0, at+60, 600, always); got != 3 || len(holds) != 2 || holds[0].id != 1 || holds[1].id != 2 {
+		t.Fatalf("with holds: %d %v", got, holds)
+	}
+	if got, holds := attestCandidate([]row{{id: 1, firstCheck: "refuse", needsFlag: true}, r(2, "pass", "pass")}, 0, at+60, 600, always); got != 0 || len(holds) != 0 {
+		t.Fatalf("an unsent refusal was held: %d %v", got, holds)
 	}
 }
 
@@ -502,7 +554,7 @@ type countingFunders struct {
 	calls int
 }
 
-func (c *countingFunders) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, bool, error) {
+func (c *countingFunders) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, Gap, error) {
 	c.mu.Lock()
 	c.calls++
 	c.mu.Unlock()
@@ -548,8 +600,8 @@ func TestFunderLookupsAreCachedBriefly(t *testing.T) {
 	counter := &countingFunders{funderMap: funderMap{clean: {funder}}}
 	c := &CachedInflows{Inner: counter, TTL: 10 * time.Minute, Now: func() time.Time { return now }}
 	for range 3 {
-		got, complete, err := c.Inflows(context.Background(), clean, now.Add(-FunderWindow))
-		if err != nil || !complete || len(got) != 1 {
+		got, gap, err := c.Inflows(context.Background(), clean, now.Add(-FunderWindow))
+		if err != nil || gap != 0 || len(got) != 1 {
 			t.Fatalf("funders %v %v", got, err)
 		}
 	}

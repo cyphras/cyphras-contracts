@@ -139,15 +139,15 @@ func static(name string, fetched time.Time, entries map[string]Hit) *staticSourc
 // funderMap gives each account its funders, each having sent 100 XLM, enough to matter.
 type funderMap map[string][]string
 
-func (f funderMap) Inflows(_ context.Context, account string, _ time.Time) ([]Inflow, bool, error) {
+func (f funderMap) Inflows(_ context.Context, account string, _ time.Time) ([]Inflow, Gap, error) {
 	if account == "unreachable" {
-		return nil, false, errors.New("down")
+		return nil, 0, errors.New("down")
 	}
 	var out []Inflow
 	for _, from := range f[account] {
 		out = append(out, Inflow{From: from, Asset: "native", Amount: big.NewInt(1_000_000_000)})
 	}
-	return out, true, nil
+	return out, 0, nil
 }
 
 func TestTheCheckerFollowsFunders(t *testing.T) {
@@ -186,12 +186,12 @@ func TestTheCheckerFollowsFunders(t *testing.T) {
 
 // inflowList answers every account with the same inflows.
 type inflowList struct {
-	inflows  []Inflow
-	complete bool
+	inflows []Inflow
+	gap     Gap
 }
 
-func (l inflowList) Inflows(context.Context, string, time.Time) ([]Inflow, bool, error) {
-	return l.inflows, l.complete, nil
+func (l inflowList) Inflows(context.Context, string, time.Time) ([]Inflow, Gap, error) {
+	return l.inflows, l.gap, nil
 }
 
 func TestASelfReportNeverReachesThePayeesOfTheReportedKey(t *testing.T) {
@@ -206,7 +206,7 @@ func TestASelfReportNeverReachesThePayeesOfTheReportedKey(t *testing.T) {
 		"dust":        {{From: attacker, Asset: "native", Amount: big.NewInt(1)}, {From: funder, Asset: "native", Amount: big.NewInt(1_000_000_000)}},
 		"a real gift": {{From: attacker, Asset: "native", Amount: big.NewInt(50_000_000_000)}},
 	} {
-		c := &Checker{Sources: []Source{reports, fraud}, Inflows: inflowList{inflows, true}, MaxFunders: 25, Now: func() time.Time { return now },
+		c := &Checker{Sources: []Source{reports, fraud}, Inflows: inflowList{inflows, 0}, MaxFunders: 25, Now: func() time.Time { return now },
 			Dust: Dust{ShareBps: 100, Floors: map[string]*big.Int{"native": big.NewInt(100_000_000)}}}
 		v, err := c.Check(context.Background(), honest, 1, now.Add(-FunderWindow))
 		if err != nil || !v.Clear() {
@@ -214,7 +214,7 @@ func TestASelfReportNeverReachesThePayeesOfTheReportedKey(t *testing.T) {
 		}
 	}
 	// A victim's report about a funder sends the payee to review, never to a public reason 4.
-	c := &Checker{Sources: []Source{reports, fraud}, Inflows: inflowList{[]Inflow{{From: thief, Asset: "native", Amount: big.NewInt(1_000_000_000)}}, true},
+	c := &Checker{Sources: []Source{reports, fraud}, Inflows: inflowList{[]Inflow{{From: thief, Asset: "native", Amount: big.NewInt(1_000_000_000)}}, 0},
 		MaxFunders: 25, Now: func() time.Time { return now }}
 	if v, _ := c.Check(context.Background(), honest, 1, now.Add(-FunderWindow)); v.Refused || !v.Refer {
 		t.Fatalf("a reported funder: %+v", v)
@@ -258,13 +258,13 @@ func TestAHistoryNotReadInFullNeverPasses(t *testing.T) {
 	}
 	// The listed funder comes last, past the cap, as the oldest of a newest-first history.
 	inflows = append(inflows, Inflow{From: listed, Asset: "native", Amount: big.NewInt(1_000_000_000)})
-	c := &Checker{Sources: []Source{src}, Inflows: inflowList{inflows, true}, MaxFunders: 25, Now: func() time.Time { return now }}
+	c := &Checker{Sources: []Source{src}, Inflows: inflowList{inflows, 0}, MaxFunders: 25, Now: func() time.Time { return now }}
 	v, err := c.Check(context.Background(), clean, 1, now.Add(-FunderWindow))
 	if err != nil || v.Clear() || !v.Incomplete || !strings.Contains(v.Detail, "25 of the 26 funders") {
 		t.Fatalf("over the cap: %+v %v", v, err)
 	}
-	c.Inflows = inflowList{inflows[:3], false}
-	if v, _ := c.Check(context.Background(), clean, 1, now.Add(-FunderWindow)); v.Clear() || !v.Incomplete || !strings.Contains(v.Detail, "read only in part") {
+	c.Inflows = inflowList{inflows[:3], GapVolume}
+	if v, _ := c.Check(context.Background(), clean, 1, now.Add(-FunderWindow)); v.Clear() || !v.Incomplete || !strings.Contains(v.Detail, "longer than a check reads") {
 		t.Fatalf("a partial history: %+v", v)
 	}
 	c.Exempt = map[string]bool{clean: true}

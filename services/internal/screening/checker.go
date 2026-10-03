@@ -20,10 +20,19 @@ const FunderWindow = 30 * 24 * time.Hour
 // Inflow is value an address received, with its sender when one can be named.
 type Inflow = horizon.Inflow
 
+// Gap names what a lookup left unread.
+type Gap = horizon.Gap
+
+// The gaps a lookup reports.
+const (
+	GapVolume  = horizon.GapVolume
+	GapUnnamed = horizon.GapUnnamed
+)
+
 // Inflows finds what an account received since a time; horizon.Client is one.
 type Inflows interface {
-	// Inflows returns what the account received and whether its history was read in full.
-	Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, bool, error)
+	// Inflows returns what the account received and what of its history it could not read.
+	Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, Gap, error)
 }
 
 // ErrUnavailable reports that a check could not run: a source is stale or unreachable. Screening
@@ -41,6 +50,9 @@ type Verdict struct {
 	// Incomplete is set when not every funder that matters could be checked: the history was read
 	// only in part, or more funders mattered than are checked. Screening never allows on it.
 	Incomplete bool
+	// Volume is set when every gap is one of volume, a history longer than a check reads or more
+	// funders than it checks, which anyone can cause by sending the address many small payments.
+	Volume bool
 	// Findings name each match and each gap, so a later check can tell what is new.
 	Findings []string
 	Detail   string
@@ -50,6 +62,12 @@ type Verdict struct {
 // Clear reports a verdict that lets the address through on its own.
 func (v Verdict) Clear() bool {
 	return !v.Refused && !v.Refer && !v.Incomplete
+}
+
+// OnlyVolume reports a verdict held back by volume alone: nothing it read matched a list, and
+// every gap is one of volume.
+func (v Verdict) OnlyVolume() bool {
+	return !v.Refused && !v.Refer && v.Incomplete && v.Volume
 }
 
 // Dust decides which funders are too small to matter. A funder is left out when, for every asset
@@ -215,19 +233,24 @@ func (c *Checker) Check(ctx context.Context, address string, hops int, since tim
 		note("address:"+h.Source, fmt.Sprintf("the address matched %s: %s", h.Source, h.Detail))
 	}
 	level, checked := []string{account}, map[string]bool{account: true}
+	volume := true
 	for hop := 1; hop <= hops; hop++ {
 		var next []string
 		for _, a := range level {
 			if !strkey.IsValidEd25519PublicKey(a) || c.Exempt[a] {
 				continue
 			}
-			inflows, complete, err := c.Inflows.Inflows(ctx, a, since)
+			inflows, gap, err := c.Inflows.Inflows(ctx, a, since)
 			if err != nil {
 				return Verdict{}, fmt.Errorf("%w: %v", ErrUnavailable, err)
 			}
-			if !complete {
+			if gap&GapVolume != 0 {
 				v.Incomplete = true
-				note("partial:"+a, fmt.Sprintf("the history of %s was read only in part", a))
+				note("partial:"+a, fmt.Sprintf("the history of %s is longer than a check reads", a))
+			}
+			if gap&GapUnnamed != 0 {
+				v.Incomplete, volume = true, false
+				note("unnamed:"+a, fmt.Sprintf("a sender of value to %s could not be named", a))
 			}
 			funders := c.Dust.matter(inflows)
 			if len(funders) > c.MaxFunders {
@@ -253,6 +276,7 @@ func (c *Checker) Check(ctx context.Context, address string, hops int, since tim
 		}
 		level = next
 	}
+	v.Volume = v.Incomplete && volume
 	v.Detail = strings.Join(notes, "; ")
 	return v, nil
 }

@@ -127,12 +127,32 @@ type row struct {
 	// recheckAt is when the final check ran; a pass vouches for the deposit only for a while.
 	recheckAt *uint64
 	flagSent  *uint32
-	// firstFindings are what the first check found, which a cleared review accepted.
-	firstFindings []string
-	// flagKind is the kind of decision behind this service's flag, such as review_timeout.
+	// findings are what a review is asked to clear: what the first check found, or what a later
+	// check found since.
+	findings []string
+	// flagKind is the kind of decision behind this service's flag, such as hold, or lifted once a
+	// hold is lifted.
 	flagKind string
 	// needsFlag marks a refusal whose flag has not been sent yet.
 	needsFlag bool
+}
+
+// reason is the deposit's flag: the one this service sent last, which counts before the follower
+// sees it land, or else the chain's.
+func (r *row) reason() *uint32 {
+	switch {
+	case r.flagSent != nil:
+		return r.flagSent
+	case r.flagKind == "lifted":
+		return nil
+	}
+	return r.flag
+}
+
+// awaitsReview reports a deposit that waits for a person, held or not.
+func (r *row) awaitsReview() bool {
+	f := r.reason()
+	return r.review == "needed" && (f == nil || *f == ReasonHeld)
 }
 
 func (s store) pending(ctx context.Context) ([]row, error) {
@@ -162,7 +182,7 @@ func (s store) pending(ctx context.Context) ([]row, error) {
 			r.recheckAt = &at
 		}
 		if findings != "" {
-			r.firstFindings = strings.Split(findings, "\n")
+			r.findings = strings.Split(findings, "\n")
 		}
 		r.id, r.createdAt = uint64(id), uint64(created)
 		r.flag, r.refuseReason, r.flagSent = u32p(flag), u32p(refuseReason), u32p(flagSent)

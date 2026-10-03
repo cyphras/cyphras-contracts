@@ -37,7 +37,11 @@ const (
 	ReasonFrozen    = 3
 	ReasonFraud     = 4
 	ReasonReview    = 5
-	ReasonOther     = 99
+	// ReasonHeld holds a deposit that waits for a person or for its own final check. It is not a
+	// refusal: the hold is lifted once the deposit clears, and replaced by the refusal's reason when
+	// it is refused. The keeper refunds a deposit still held a day after the hold.
+	ReasonHeld  = 6
+	ReasonOther = 99
 	// ReasonCourtOrder refuses a deposit a written order from an authority concerns. The keeper
 	// never refunds it; the depositor still can.
 	ReasonCourtOrder = 100

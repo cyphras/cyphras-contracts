@@ -176,7 +176,7 @@ func checker(sources []screening.Source) (*screening.Checker, error) {
 	if err != nil {
 		return nil, err
 	}
-	maxPages, err := config.Int("FUNDER_MAX_PAGES", 10)
+	maxPages, err := config.Int("FUNDER_MAX_PAGES", 50)
 	if err != nil {
 		return nil, err
 	}

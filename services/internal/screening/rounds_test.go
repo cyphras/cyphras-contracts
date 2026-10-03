@@ -16,8 +16,6 @@ import (
 	"github.com/stellar/go-stellar-sdk/keypair"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
-	"github.com/cyphras/cyphras-contracts/services/internal/vault"
-	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 )
 
 func TestAttestationNeverCoversADepositUnderReview(t *testing.T) {
@@ -26,41 +24,43 @@ func TestAttestationNeverCoversADepositUnderReview(t *testing.T) {
 		{id: 1, firstCheck: "refer", review: "needed"},
 		{id: 2, firstCheck: "pass", recheck: "pass", recheckAt: &at},
 	}
-	if got := attestCandidate(rows, 0, at, 600); got != 0 {
+	if got, _ := attestCandidate(rows, 0, at, 600, func(*row) bool { return false }); got != 0 {
 		t.Fatalf("attest(%d) would cover a deposit still under review", got)
+	}
+	// Only a deposit that is held first is passed.
+	if got, holds := attestCandidate(rows, 0, at, 600, func(*row) bool { return true }); got != 2 || len(holds) != 1 || holds[0].id != 1 {
+		t.Fatalf("attest(%d) holding %v", got, holds)
 	}
 }
 
-func TestADepositUnderReviewHoldsBackLaterOnes(t *testing.T) {
+func TestADepositUnderReviewIsHeldSoLaterOnesAreAdmittedOnTime(t *testing.T) {
 	h := newHarness(t)
 	h.shield(clean, 6_000_000_000)
 	h.shield(clean, 10_000_000)
 	h.tick()
-	// The small deposit passes its final check, but the large one before it is still under review.
+	// The small deposit passes its final check while the large one before it is still under
+	// review: the large one is held, and the small one attested on time.
 	h.now = h.now.Add(55 * time.Minute)
 	h.tick()
-	if got := h.sent(); len(got) != 0 {
-		t.Fatalf("attested past a deposit under review: %v", got)
+	if got := h.sent(); !equal(got, []string{"flag 1 6", "attest 2"}) {
+		t.Fatalf("in the small deposit's final window: %v", got)
+	}
+	if reviews, _ := h.s.Reviews(context.Background()); len(reviews) != 1 || reviews[0].ID != 1 {
+		t.Fatalf("the held deposit left the review list: %v", reviews)
 	}
 	if err := h.s.DecideReview(context.Background(), 1, "reviewer", true); err != nil {
 		t.Fatal(err)
 	}
-	// Cleared, the large deposit still waits for its own final check; the small one's check is
-	// done again then, since the one from a day before no longer vouches for it.
+	// Cleared, the large deposit waits for its own final check, and its hold is lifted once that
+	// passes, before it is eligible.
 	h.now = h.now.Add(24*time.Hour - 64*time.Minute)
 	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
 	h.tick()
-	if got := h.sent(); !equal(got, []string{"attest 2"}) {
+	if got := h.sent(); !equal(got, []string{"unflag 1"}) {
 		t.Fatalf("in the large deposit's final window: %v, decisions %v", got, h.decisions())
 	}
-	got := h.decisions()
-	rechecks := 0
-	for _, d := range got {
-		if strings.HasPrefix(d, "recheck pass") {
-			rechecks++
-		}
-	}
-	if rechecks != 3 {
+	want := []string{"first_check refer -", "first_check pass -", "recheck pass -", "hold flag 6", "attest attest -", "review cleared -", "recheck pass -", "unflag unflag 6"}
+	if got := h.decisions(); !equal(got, want) {
 		t.Fatalf("decisions %v", got)
 	}
 }
@@ -69,12 +69,12 @@ func TestALateReviewFlagIsLiftedOnceTheReviewClearsIt(t *testing.T) {
 	h := newHarness(t)
 	big := h.shield(clean, 6_000_000_000)
 	h.tick()
-	// The final window opens with the review unfinished: the deposit is flagged with reason 5 so it
+	// The final window opens with the review unfinished: the deposit is held with reason 6 so it
 	// cannot be admitted unreviewed.
 	h.now = h.now.Add(24*time.Hour - 9*time.Minute)
 	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
 	h.tick()
-	if got := h.sent(); !equal(got, []string{"flag 1 5"}) {
+	if got := h.sent(); !equal(got, []string{"flag 1 6"}) {
 		t.Fatalf("at the review deadline: %v", got)
 	}
 	if reviews, _ := h.s.Reviews(context.Background()); len(reviews) != 1 || reviews[0].ID != big {
@@ -83,29 +83,67 @@ func TestALateReviewFlagIsLiftedOnceTheReviewClearsIt(t *testing.T) {
 	if err := h.s.DecideReview(context.Background(), big, "reviewer", true); err != nil {
 		t.Fatal(err)
 	}
+	// Its final check runs, the hold is lifted, and the attestation covers it on that check.
 	h.tick()
-	if got := h.sent(); !equal(got, []string{"unflag 1"}) {
+	if got := h.sent(); !equal(got, []string{"unflag 1", "attest 1"}) {
 		rows, _ := h.s.db.pending(context.Background())
 		t.Fatalf("after the review cleared it: %v, decisions %v, rows %+v", got, h.decisions(), rows)
 	}
-	// Unflagged, it is checked again before an attestation covers it.
 	h.tick()
-	if got := h.sent(); !equal(got, []string{"attest 1"}) {
-		t.Fatalf("after its final check: %v", got)
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("a lifted hold was lifted again: %v", got)
 	}
 }
 
-func TestAReferralAtTheFinalCheckIsReasonFive(t *testing.T) {
+func TestAReferralAtTheFinalCheckHoldsTheDepositForAPerson(t *testing.T) {
 	h := newHarness(t)
 	h.shield(clean, 10_000_000)
 	h.funders[clean] = []string{funder}
 	h.tick()
-	// Before the final check, the funder is tagged unsafe: no review fits in the time left.
+	// Before the final check, the funder is tagged unsafe: the deposit is held, not refused, until
+	// a person decides.
 	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}, funder: {Source: "exploits", Refer: true}}, "2", h.now.Add(55*time.Minute))
 	h.now = h.now.Add(55 * time.Minute)
 	h.tick()
-	if got := h.sent(); !equal(got, []string{"flag 1 5"}) {
+	if got := h.sent(); !equal(got, []string{"flag 1 6"}) {
 		t.Fatalf("a referral at the final check: %v", got)
+	}
+	if reviews, _ := h.s.Reviews(context.Background()); len(reviews) != 1 {
+		t.Fatalf("not sent to review: %v", reviews)
+	}
+	if err := h.s.DecideReview(context.Background(), 1, "reviewer", true); err != nil {
+		t.Fatal(err)
+	}
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"unflag 1", "attest 1"}) {
+		t.Fatalf("after the review cleared it: %v", got)
+	}
+}
+
+func TestAReviewTheReviewerRefusesReplacesTheHold(t *testing.T) {
+	h := newHarness(t)
+	h.shield(clean, 6_000_000_000)
+	h.tick()
+	h.now = h.now.Add(24*time.Hour - 9*time.Minute)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 6"}) {
+		t.Fatalf("at the review deadline: %v", got)
+	}
+	heldAt := uint64(h.now.Unix())
+	if err := h.s.DecideReview(context.Background(), 1, "reviewer", false); err != nil {
+		t.Fatal(err)
+	}
+	h.now = h.now.Add(time.Hour)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 5"}) {
+		t.Fatalf("a refused review: %v", got)
+	}
+	if h.deposits[1].flaggedAt != heldAt {
+		t.Fatal("the refusal moved the time of the first flag")
+	}
+	h.tick()
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("a refusal was acted on again: %v", got)
 	}
 }
 
@@ -146,8 +184,8 @@ func TestDeadlineWorkComesFirstAndAFailingCheckBacksOff(t *testing.T) {
 
 type unreachable struct{}
 
-func (unreachable) Inflows(context.Context, string, time.Time) ([]Inflow, bool, error) {
-	return nil, false, errors.New("horizon down")
+func (unreachable) Inflows(context.Context, string, time.Time) ([]Inflow, Gap, error) {
+	return nil, 0, errors.New("horizon down")
 }
 
 func TestQueuedOperatorDecisionsAreCarriedOutByTheService(t *testing.T) {
@@ -269,16 +307,14 @@ func TestALiftWaitsForAReviewOfWhatTheCheckFoundSince(t *testing.T) {
 	h.chain.ClosedAt = h.now.Unix()
 	small := h.shield(keypair.MustRandom().Address(), 10_000_000)
 	h.tick()
-	// The large deposit's final window opens with its review unfinished: it is flagged with reason 5.
+	// The large deposit's final window opens with its review unfinished: it is held with reason 6.
 	h.now = h.now.Add(21 * time.Minute)
 	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
 	h.tick()
-	if got := h.sent(); !equal(got, []string{"flag 1 5"}) {
+	if got := h.sent(); !equal(got, []string{"flag 1 6"}) {
 		t.Fatalf("at the review deadline: %v", got)
 	}
-	five := uint32(5)
-	h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, big)), vaulttest.Pending(big, clean, 6_000_000_000, 1_728_000_000, 86400, &five, uint64(h.now.Unix())), h.chain.Ledger, nil)
-	// The small deposit is attested past the flagged large one.
+	// The small deposit is attested past the held large one.
 	h.now = h.now.Add(45 * time.Minute)
 	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "3", h.now)
 	h.tick()
