@@ -17,6 +17,7 @@ import {
   quiet,
   readZkey,
   run,
+  sameContributor,
   show,
   step,
 } from "./common.mjs";
@@ -38,9 +39,12 @@ Usage:
       Check the frozen r1cs and the Hermez ptau, run snarkjs powersoftau verify (about 20
       minutes), create transaction_0000.zkey with snarkjs groth16 setup and verify it.
   node coordinator.mjs receive <zkey> "<name>" <contribution hash>
-      Accept a returned zkey only if it extends the last accepted one by exactly one
-      contribution named <name>, whose hash is the one in the contributor's attestation, and
-      snarkjs zkey verify passes. It is filed as the next transaction_NNNN.zkey.
+      Run it only after checking that the signed attestation was posted from the
+      contributor's own account and states this name and contribution hash. It refuses a
+      hash already in the chain or attested under another name, and a contributor already in
+      the chain. It then accepts the zkey only if it extends the last accepted one by exactly
+      one contribution with this name and hash and snarkjs zkey verify passes, and files it as
+      the next transaction_NNNN.zkey. Every call is logged in the record.
   node coordinator.mjs round <time>
       Print the first drand quicknet round produced at or after <time> (ISO 8601 with a zone,
       such as 2026-10-20T12:00:00Z), to announce at least 24 hours before it is produced.
@@ -172,8 +176,27 @@ async function init(dir, r1csPath, ptauPath) {
   writeOut(join(dir, file), zkey);
   state.circuitHash = Buffer.from(csHash).toString("hex");
   state.zkeys = [{ file, sha256: digest(zkey) }];
+  state.attestations = [];
   save(dir, state);
   report(dir, state);
+}
+
+// A name is not covered by the contribution hash, so anyone holding a contributor's file could
+// rename the contribution and claim it. Once a file has shown a hash under one name, that hash
+// is refused under any other, and one person cannot contribute twice.
+function checkAttestation(state, name, hash) {
+  state.zkeys.forEach((z, i) => {
+    if (z.contributionHash === hash) {
+      throw new Error(`contribution hash ${hash} is already in the chain as #${i}`);
+    }
+    if (i > 0 && sameContributor(z.contributor, name)) {
+      throw new Error(`${show(name)} is the contributor of #${i}, ${show(z.contributor)}`);
+    }
+  });
+  const earlier = state.attestations.find((a) => a.matched && a.hash === hash && a.name !== name);
+  if (earlier) {
+    throw new Error(`contribution hash ${hash} was already shown under ${show(earlier.name)}`);
+  }
 }
 
 async function receive(dir, incoming, name, attested) {
@@ -181,23 +204,34 @@ async function receive(dir, incoming, name, attested) {
   const claimed = parseHex(attested, 64, "the attested contribution hash");
   const state = load(dir);
   if (state.final) throw new Error("the ceremony is finalized");
-  const { r1cs, ptau, last, lastFile } = inputs(dir, state);
-  const data = readFileSync(incoming);
-  const c = newContribution(readZkey(last, lastFile), readZkey(data, incoming));
-  if (c.type !== 0) throw new Error("the new contribution is a beacon");
-  if (c.name !== name) {
-    throw new Error(`the contribution is named ${show(c.name)}, not ${show(name)}`);
+  const entry = { at: new Date().toISOString(), name, hash: claimed, file: basename(incoming) };
+  try {
+    checkAttestation(state, name, claimed);
+    const { r1cs, ptau, last, lastFile } = inputs(dir, state);
+    const data = readFileSync(incoming);
+    const c = newContribution(readZkey(last, lastFile), readZkey(data, incoming));
+    if (c.type !== 0) throw new Error("the new contribution is a beacon");
+    if (c.name !== name) {
+      throw new Error(`the contribution is named ${show(c.name)}, not ${show(name)}`);
+    }
+    if (c.hash !== claimed) {
+      throw new Error(`the contribution hash is ${c.hash}, not the attested ${claimed}`);
+    }
+    entry.matched = true;
+    console.log(`${basename(incoming)} extends ${lastFile} by one contribution,`);
+    console.log(`named ${show(name)}, with the attested hash ${c.hash}.`);
+    await zkeyVerify(r1cs, ptau, data, basename(incoming));
+    const file = zkeyFile(state.zkeys.length);
+    writeOut(join(dir, file), data);
+    state.zkeys.push({ file, contributor: name, contributionHash: c.hash, sha256: digest(data) });
+    entry.result = `accepted as #${state.zkeys.length - 1}`;
+  } catch (e) {
+    entry.result = `refused: ${e.message}`;
+    throw e;
+  } finally {
+    state.attestations.push(entry);
+    save(dir, state);
   }
-  if (c.hash !== claimed) {
-    throw new Error(`the contribution hash is ${c.hash}, not the attested ${claimed}`);
-  }
-  console.log(`${basename(incoming)} extends ${lastFile} by one contribution,`);
-  console.log(`named ${show(name)}, with the attested hash ${c.hash}.`);
-  await zkeyVerify(r1cs, ptau, data, basename(incoming));
-  const file = zkeyFile(state.zkeys.length);
-  writeOut(join(dir, file), data);
-  state.zkeys.push({ file, contributor: name, contributionHash: c.hash, sha256: digest(data) });
-  save(dir, state);
   report(dir, state);
 }
 
@@ -300,6 +334,10 @@ function report(dir, state) {
     if (i > 0) out.push(`  contribution hash ${z.contributionHash}`);
     out.push(`  sha256 ${z.sha256}`);
   });
+  if (state.attestations.length > 0) out.push("", "Attestations given to receive:");
+  for (const a of state.attestations) {
+    out.push(`  ${a.at} ${show(a.name)}, ${a.file}`, `    hash ${a.hash}`, `    ${a.result}`);
+  }
   const b = state.beacon;
   if (b) {
     out.push("", `beacon: drand quicknet round ${b.round}, produced at ${b.time}`);
