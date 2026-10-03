@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
 	"github.com/cyphras/cyphras-contracts/services/internal/follow"
@@ -290,4 +294,79 @@ func TestAnRPCWhoseOldestLedgerIsPastItsLatestIsRefused(t *testing.T) {
 	if got := digests(nil, 4_294_967_294, 4_294_967_295); len(got) != 2 {
 		t.Fatalf("digests at the end of the ledger range: %d", len(got))
 	}
+}
+
+func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.ready()
+	base := h.ix.state.Clone()
+	from := h.chain.Ledger + 1
+	h.chain.NextLedger(5)
+	h.chain.Shield(vaulttest.Depositor, 10_000_000)
+	h.chain.NextLedger(5)
+	to := h.chain.Ledger
+	var good []vault.RawEvent
+	for _, e := range h.chain.Events {
+		if e.Ledger >= from {
+			good = append(good, e)
+		}
+	}
+	if err := h.ix.keep(good, from, to); err != nil {
+		t.Fatal(err)
+	}
+	// A different history that applies as well: the same deposit, made by someone else.
+	other := slices.Clone(good)
+	for i, e := range other {
+		ev, err := vault.Decode(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := ev.Body.(vault.DepositPending); ok {
+			other[i].TxHash = strings.Repeat("ee", 32)
+		}
+	}
+	if err := h.ix.confirm(context.Background(), base, other, from, to); err != nil {
+		t.Fatal(err)
+	}
+	kept, err := archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}.Events(context.Background(), from, to)
+	if err != nil || !maps.Equal(digests(kept, from, to), digests(good, from, to)) {
+		t.Fatalf("the archive gave up its copy: %v", err)
+	}
+	if !h.paged("archive_disagrees") {
+		t.Fatalf("pages %+v", h.pages.alerts)
+	}
+	// A copy that does not apply is replaced, and the operator told.
+	bogus := append(slices.Clone(good), vault.RawEvent{Ledger: to, ClosedAt: h.chain.ClosedAt, TxHash: strings.Repeat("ab", 32), Tx: 9, Contract: vaulttest.Vault,
+		Topics: []string{mustB64(t, vault.Symbol("attested"))}, Value: mustB64(t, vault.Struct(vault.Field{Name: "up_to", Value: vault.U64(999)}))})
+	if err := h.ix.archive.Append(bogus, from, to); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ix.confirm(context.Background(), base, good, from, to); err != nil {
+		t.Fatal(err)
+	}
+	if kept, err = (archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}).Events(context.Background(), from, to); err != nil || !maps.Equal(digests(kept, from, to), digests(good, from, to)) {
+		t.Fatalf("the archive kept a copy that does not apply: %v", err)
+	}
+	if !h.paged("archive_replaced") {
+		t.Fatalf("pages %+v", h.pages.alerts)
+	}
+}
+
+func (h *harness) paged(code string) bool {
+	for _, a := range h.pages.alerts {
+		if a.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func mustB64(t *testing.T, v xdr.ScVal) string {
+	t.Helper()
+	s, err := xdr.MarshalBase64(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }
