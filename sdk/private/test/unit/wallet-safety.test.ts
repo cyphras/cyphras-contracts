@@ -1453,9 +1453,32 @@ describe("wallet safety: a damaged store", () => {
       sleep: async () => {},
       resetUnreadableState: true,
     });
+    assert.equal(fresh.stateReset()?.reason, "unreadable");
     assert.equal((await fresh.balance()).spendable, 0n);
     await fresh.sync();
     assert.equal((await fresh.balance()).spendable, 100n * XLM);
+  });
+
+  it("starts afresh from a rolled-back store only when asked, and warns that its records are lost", async () => {
+    const { world, store } = await funded();
+    // The state record is gone while the record of its revision stays, as a rollback leaves it.
+    await new SealedStore(store, storeKeyOf(0)).remove("state");
+    await assert.rejects(openWallet(world, 0, store), isError("state_conflict"));
+    await assert.rejects(
+      openWallet(world, 0, store, undefined, { resetUnreadableState: true }),
+      isError("state_conflict"),
+    );
+    const fresh = await openWallet(world, 0, store, undefined, { resetRolledBackState: true });
+    const reset = fresh.stateReset();
+    assert.equal(reset?.reason, "rolled_back");
+    assert.match(reset?.warning ?? "", /no longer followed/);
+    assert.equal((await fresh.balance()).spendable, 0n);
+    await fresh.sync();
+    assert.equal((await fresh.balance()).spendable, 100n * XLM);
+    // The fresh state is the store's from now on.
+    const again = await openWallet(world, 0, store);
+    assert.equal(again.stateReset(), undefined);
+    assert.equal((await again.balance()).spendable, 100n * XLM);
   });
 
   it("finds a deposit whose submission was cut off by its commitments, and fails one that never landed", async () => {

@@ -113,8 +113,12 @@ export interface ConnectionOptions {
   readonly syncLimits?: Partial<SyncLimits>;
   // Starts from a fresh state when the stored one cannot be read, instead of refusing to open. The
   // first sync then rebuilds notes and history from the chain; local records of submissions and
-  // deposits that were only in the lost state are gone.
+  // deposits that were only in the lost state are gone, as stateReset() warns.
   readonly resetUnreadableState?: boolean;
+  // Starts from a fresh state, in the same way, when the stored one is older than the last one
+  // saved or missing while its record remains, as a restore from an old backup or a lost write
+  // leaves it, instead of refusing to open with state_conflict.
+  readonly resetRolledBackState?: boolean;
   // The caller's guarantee that no other wallet instance uses this store, needed where the
   // platform has no Web Locks API. Instances that share a store, such as an extension's popup and
   // its service worker, rely on Web Locks to run one operation at a time; without it two of them
@@ -227,6 +231,19 @@ export interface PlanView extends Submission {
   readonly needsUserDecision: boolean;
 }
 
+/** Why the wallet opened on a fresh state in place of the stored one, and what was lost with it. */
+export interface StateReset {
+  readonly reason: "unreadable" | "rolled_back";
+  readonly warning: string;
+}
+
+const STATE_RESET_WARNING =
+  "The stored state was replaced by a fresh one, which the next sync rebuilds from the chain. " +
+  "Records that only the lost state held are gone: a payment or split unshield in flight is no " +
+  "longer followed and may still land, its notes look spendable until the chain shows them " +
+  "spent, and a deposit being submitted is no longer tracked. Before paying again, wait until " +
+  "any such payment has landed or its deadline has passed.";
+
 const VIEWING_KEY_WARNING =
   "A viewing key reveals the whole history and future of this private account to whoever holds " +
   "it, and cannot be revoked. To prove a single payment, use disclosePayment instead.";
@@ -298,6 +315,7 @@ export class PrivateWallet {
   readonly #lock: AccountLock;
   readonly #limits: SyncLimits;
   #verification: Verification;
+  readonly #reset: StateReset | undefined;
   #queue: Promise<unknown> = Promise.resolve();
   // The last sync found data that contradicts the chain; nothing of it was kept.
   #fault = false;
@@ -309,6 +327,7 @@ export class PrivateWallet {
     lock: AccountLock,
     limits: SyncLimits,
     verification: Verification,
+    reset: StateReset | undefined,
   ) {
     this.#core = core;
     this.#fetch = fetchFn;
@@ -316,6 +335,7 @@ export class PrivateWallet {
     this.#lock = lock;
     this.#limits = limits;
     this.#verification = verification;
+    this.#reset = reset;
   }
 
   /** Derives the keys, checks the pinned deployment and loads the local state. */
@@ -393,18 +413,21 @@ export class PrivateWallet {
     const store = new SealedStore(options.storage, storeKey);
     const states = new StateStore(store);
     let state: WalletState;
+    let reset: StateReset | undefined;
     try {
       state = (await states.load()) ?? emptyState(deployment.deployLedger);
     } catch (err) {
-      if (
-        !(err instanceof CyphrasError) ||
-        err.code !== "storage_unreadable" ||
-        options.resetUnreadableState !== true
-      ) {
-        throw err;
-      }
+      const code = err instanceof CyphrasError ? err.code : undefined;
+      const reason =
+        code === "storage_unreadable" && options.resetUnreadableState === true
+          ? "unreadable"
+          : code === "state_conflict" && options.resetRolledBackState === true
+            ? "rolled_back"
+            : undefined;
+      if (reason === undefined) throw err;
       await states.discard();
       state = emptyState(deployment.deployLedger);
+      reset = { reason, warning: STATE_RESET_WARNING };
     }
     const now = options.clock ?? (() => Date.now());
     const sleep =
@@ -434,7 +457,7 @@ export class PrivateWallet {
     };
     const { verification } = await verify(services);
     const limits = { ...DEFAULT_SYNC_LIMITS, ...options.syncLimits };
-    return new PrivateWallet(core, fetchFn, states, lock, limits, verification);
+    return new PrivateWallet(core, fetchFn, states, lock, limits, verification, reset);
   }
 
   /**
@@ -501,6 +524,11 @@ export class PrivateWallet {
   /** What the checks of the pinned deployment found; shields and spends need "verified". */
   verification(): Verification {
     return this.#verification;
+  }
+
+  /** Set when opening replaced the stored state with a fresh one, with a warning to show the user. */
+  stateReset(): StateReset | undefined {
+    return this.#reset;
   }
 
   /** The local tree's size and whether its root was last found in the vault's history. */
