@@ -556,6 +556,10 @@ func TestTheKeeperLearnsWhichDepositsAQueuedUnflagWaitsFor(t *testing.T) {
 	if _, err := h.s.QueueUnflag(ctx, dirty, "reviewer", "false positive"); err != nil {
 		t.Fatal(err)
 	}
+	// A queued flag holds no refund back.
+	if _, err := h.s.QueueFlag(ctx, 2, ReasonFraud, "reviewer", "report 3"); err != nil {
+		t.Fatal(err)
+	}
 	eligible := h.deposits[dirty].createdAt + 86_400
 	if code, got := ask("keeper"); code != http.StatusOK || len(got) != 1 || got[0].ID != dirty || got[0].Until != eligible {
 		t.Fatalf("with an unflag queued: %d %v", code, got)
