@@ -13,7 +13,7 @@ export interface NoteCore {
   readonly rcm: bigint;
 }
 
-export function isValue(value: bigint): boolean {
+function isValue(value: bigint): boolean {
   return value >= 0n && value <= MAX_VALUE;
 }
 

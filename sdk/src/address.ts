@@ -12,7 +12,7 @@ import {
   viewingKeysFromPoints,
 } from "./keys.ts";
 
-export const VERSION = 0x02;
+const VERSION = 0x02;
 const ADDRESS_LENGTH = 1 + DIVERSIFIER_LENGTH + 32;
 const IVK_LENGTH = 65;
 const FVK_LENGTH = 129;

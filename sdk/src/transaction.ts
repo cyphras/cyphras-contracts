@@ -20,7 +20,7 @@ export interface TransactionRandomness {
 const uniform = (bytes: number, modulus: bigint): bigint =>
   bytesToBigIntBE(randomBytes(bytes)) % modulus;
 
-export const systemRandomness: TransactionRandomness = {
+const systemRandomness: TransactionRandomness = {
   fieldElement: () => uniform(64, P),
   scalar: () => {
     for (;;) {

@@ -35,12 +35,12 @@ export function isMuxedAccountId(value: string): boolean {
 }
 
 // The vault's ExtData.relayer is an Address: an account or a contract.
-export function isAddress(value: string): boolean {
+function isAddress(value: string): boolean {
   return isAccountId(value) || isContractId(value);
 }
 
 // The vault's ExtData.recipient is a MuxedAddress: an account, a muxed account or a contract.
-export function isMuxedAddress(value: string): boolean {
+function isMuxedAddress(value: string): boolean {
   return isAddress(value) || isMuxedAccountId(value);
 }
 
