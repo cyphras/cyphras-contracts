@@ -14,6 +14,7 @@ import {
   mem,
   newContribution,
   parseHex,
+  parseTime,
   quiet,
   readZkey,
   run,
@@ -47,11 +48,15 @@ Usage:
       the next transaction_NNNN.zkey. Every call is logged in the record.
   node coordinator.mjs round <time>
       Print the first drand quicknet round produced at or after <time> (ISO 8601 with a zone,
-      such as 2026-10-20T12:00:00Z), to announce at least 24 hours before it is produced.
+      such as 2026-10-20T12:00:00Z) and the text to announce, at least 24 hours before the
+      round is produced.
+  node coordinator.mjs announce <round> <link> <time>
+      Record that <round> was announced in the public post at <link>, published at <time>.
+      The round must be produced after that time and after the last accepted contribution.
   node coordinator.mjs beacon <round>
-      Fetch the announced round from the drand relays, check it against the quicknet public
-      key, apply it to the last contribution with numIterationsExp ${BEACON_ITERATIONS_EXP},
-      verify ${FINAL}, then export and check ${VK}.
+      Fetch the last announced round from the drand relays, check it against the quicknet
+      public key and that it was produced after the last accepted contribution, apply it with
+      numIterationsExp ${BEACON_ITERATIONS_EXP}, verify ${FINAL}, then export and check ${VK}.
   node coordinator.mjs status
       Recompute and print every recorded hash, and the next step.
 
@@ -60,7 +65,7 @@ Options:
   --r1cs <file>  init only (default: circuits/build/transaction.r1cs)
   --ptau <file>  init only (default: circuits/build/ptau/${PTAU_NAME})`;
 
-const ARITY = { init: 0, receive: 3, round: 1, beacon: 1, status: 0 };
+const ARITY = { init: 0, receive: 3, round: 1, announce: 3, beacon: 1, status: 0 };
 
 run(USAGE, async (argv) => {
   const { values, positionals } = parseArgs({
@@ -85,7 +90,9 @@ run(USAGE, async (argv) => {
   } else if (command === "receive") {
     await receive(dir, ...args);
   } else if (command === "round") {
-    announce(args[0]);
+    roundAt(args[0]);
+  } else if (command === "announce") {
+    announce(dir, ...args);
   } else if (command === "beacon") {
     await beacon(dir, args[0]);
   } else {
@@ -175,8 +182,9 @@ async function init(dir, r1csPath, ptauPath) {
   await zkeyVerify(r1cs, ptau, zkey, file);
   writeOut(join(dir, file), zkey);
   state.circuitHash = Buffer.from(csHash).toString("hex");
-  state.zkeys = [{ file, sha256: digest(zkey) }];
+  state.zkeys = [{ file, sha256: digest(zkey), at: new Date().toISOString() }];
   state.attestations = [];
+  state.announcements = [];
   save(dir, state);
   report(dir, state);
 }
@@ -223,7 +231,13 @@ async function receive(dir, incoming, name, attested) {
     await zkeyVerify(r1cs, ptau, data, basename(incoming));
     const file = zkeyFile(state.zkeys.length);
     writeOut(join(dir, file), data);
-    state.zkeys.push({ file, contributor: name, contributionHash: c.hash, sha256: digest(data) });
+    state.zkeys.push({
+      file,
+      contributor: name,
+      contributionHash: c.hash,
+      sha256: digest(data),
+      at: new Date().toISOString(),
+    });
     entry.result = `accepted as #${state.zkeys.length - 1}`;
   } catch (e) {
     entry.result = `refused: ${e.message}`;
@@ -235,12 +249,8 @@ async function receive(dir, incoming, name, attested) {
   report(dir, state);
 }
 
-function announce(time) {
-  const date = new Date(time);
-  if (!/(Z|[+-]\d\d:\d\d)$/.test(time) || Number.isNaN(date.getTime())) {
-    throw new Error(`give the time in ISO 8601 with a zone, such as 2026-10-20T12:00:00Z`);
-  }
-  const round = firstRoundAt(date);
+function roundAt(time) {
+  const round = firstRoundAt(parseTime(time, "the time"));
   const at = roundTime(round);
   const hours = (at.getTime() - Date.now()) / 3_600_000;
   console.log(`drand quicknet round ${round} is produced at ${at.toISOString()},`);
@@ -254,7 +264,44 @@ function announce(time) {
 Announcement:
   The beacon of the Cyphras v2 ceremony is drand quicknet (chain ${QUICKNET.hash})
   round ${round}, produced at ${at.toISOString()}. It is applied to the last verified
-  contribution with snarkjs zkey beacon and numIterationsExp ${BEACON_ITERATIONS_EXP}.`);
+  contribution with snarkjs zkey beacon and numIterationsExp ${BEACON_ITERATIONS_EXP}.
+
+Once it is posted: node coordinator.mjs announce ${round} <link to the post> <time of the post>`);
+}
+
+// A beacon is unpredictable to every contributor only if drand produced it after the last
+// contribution was accepted.
+function producedAfterLast(state, round) {
+  const produced = roundTime(round);
+  const last = state.zkeys.at(-1);
+  if (produced <= new Date(last.at)) {
+    throw new Error(
+      `drand round ${round} was produced at ${produced.toISOString()}, before ` +
+        `${last.file} was accepted at ${last.at}; announce a later round`,
+    );
+  }
+  return produced;
+}
+
+function announce(dir, roundArg, link, time) {
+  const round = parseRound(roundArg);
+  if (!/^https:\/\/\S+$/.test(link)) throw new Error("the link must be an https:// address");
+  const at = parseTime(time, "the time of the announcement");
+  const state = load(dir);
+  if (state.final) throw new Error("the ceremony is finalized");
+  const produced = producedAfterLast(state, round);
+  if (produced <= at) {
+    throw new Error(
+      `drand round ${round} was produced at ${produced.toISOString()}, before the ` +
+        `announcement at ${at.toISOString()}`,
+    );
+  }
+  if (produced - at < 24 * 3_600_000) {
+    console.log("WARNING: the plan announces the round at least 24 hours before it is produced.");
+  }
+  state.announcements.push({ round, produced: produced.toISOString(), link, at: at.toISOString() });
+  save(dir, state);
+  report(dir, state);
 }
 
 async function beacon(dir, roundArg) {
@@ -267,6 +314,15 @@ async function beacon(dir, roundArg) {
       `the beacon needs ${MIN_CONTRIBUTIONS} contributions first, there are ${contributions}`,
     );
   }
+  const announced = state.announcements.at(-1);
+  if (announced?.round !== round) {
+    throw new Error(
+      announced
+        ? `the last announced round is ${announced.round}, not ${round}`
+        : "no round is announced yet; record the announcement with the announce command",
+    );
+  }
+  producedAfterLast(state, round);
   const { r1cs, ptau, last, lastFile } = inputs(dir, state);
   const drand = await step(`Fetching drand quicknet round ${round}`, () => fetchRound(round));
   console.log(`  produced at ${drand.time}, agreed by ${drand.relays.join(", ")}`);
@@ -332,11 +388,18 @@ function report(dir, state) {
   state.zkeys.forEach((z, i) => {
     out.push(i === 0 ? `#0 ${z.file}, groth16 setup` : `#${i} ${z.file}, ${show(z.contributor)}`);
     if (i > 0) out.push(`  contribution hash ${z.contributionHash}`);
-    out.push(`  sha256 ${z.sha256}`);
+    out.push(`  sha256 ${z.sha256}`, `  ${i === 0 ? "created" : "accepted"} at ${z.at}`);
   });
   if (state.attestations.length > 0) out.push("", "Attestations given to receive:");
   for (const a of state.attestations) {
     out.push(`  ${a.at} ${show(a.name)}, ${a.file}`, `    hash ${a.hash}`, `    ${a.result}`);
+  }
+  if (state.announcements.length > 0) out.push("", "Beacon announcements:");
+  for (const a of state.announcements) {
+    out.push(
+      `  round ${a.round}, produced at ${a.produced}`,
+      `    announced at ${a.at}, ${a.link}`,
+    );
   }
   const b = state.beacon;
   if (b) {
@@ -358,8 +421,8 @@ function report(dir, state) {
   console.log(`\nNEXT: send ${last.file} with its sha256 ${last.sha256}`);
   console.log(`to contributor ${n}, then: node coordinator.mjs receive <zkey> "<name>" <hash>`);
   if (n - 1 >= MIN_CONTRIBUTIONS) {
-    console.log(
-      "Or, once the announced drand round is produced: node coordinator.mjs beacon <round>",
-    );
+    console.log("Or finish: node coordinator.mjs round <time>, post the announcement, record it");
+    console.log("with node coordinator.mjs announce, and once the round is produced, run");
+    console.log("node coordinator.mjs beacon <round>.");
   }
 }

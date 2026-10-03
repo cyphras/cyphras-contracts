@@ -75,6 +75,14 @@ export function expectHash(data, algorithm, expected, mismatch) {
 // parsed is exactly what is verified, contributed to or written out.
 export const mem = (data) => ({ type: "mem", data });
 
+export function parseTime(value, what) {
+  const time = new Date(value);
+  if (!/^\d{4}-\d\d-\d\dT[0-9:.]+(Z|[+-]\d\d:\d\d)$/.test(value) || Number.isNaN(time.getTime())) {
+    throw new Error(`${what} must be an ISO 8601 time with a zone, such as 2026-10-20T12:00:00Z`);
+  }
+  return time;
+}
+
 export function parseHex(value, bytes, what) {
   const hex = String(value ?? "")
     .trim()

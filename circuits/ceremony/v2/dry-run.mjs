@@ -19,19 +19,19 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import * as snarkjs from "snarkjs";
 import { BEACON_ITERATIONS_EXP, PTAU_NAME, mem, quiet, readZkey, run } from "./common.mjs";
-import { fetchRound, firstRoundAt, parseRound, roundTime } from "./drand.mjs";
+import { fetchRound, firstRoundAt, roundTime } from "./drand.mjs";
 import { checkVerificationKey } from "./vk.mjs";
 
 const USAGE = `Runs the whole ceremony on this machine and checks that the kit refuses bad input.
 
 Usage:
-  node dry-run.mjs [--r1cs <file>] [--ptau <file>] [--round <n>]
+  node dry-run.mjs [--r1cs <file>] [--ptau <file>]
 
 A coordinator initializes the ceremony, three contributors each install the kit with npm ci and
-contribute from their own directory, a past drand quicknet round is applied as the beacon
-(default: the first round of the current UTC day) and a verifier checks the result. Then every
-negative check must fail. Everything is written to a temporary directory that is deleted at the
-end: one machine made all of it, so none of it may ever be used.`;
+contribute from their own directory, the coordinator announces a drand quicknet round a few
+seconds ahead and applies it as the beacon once drand has produced it, and a verifier checks the
+result. Then every negative check must fail. Everything is written to a temporary directory that
+is deleted at the end: one machine made all of it, so none of it may ever be used.`;
 
 const KIT = import.meta.dirname;
 const CIRCUITS = resolve(KIT, "..", "..");
@@ -155,7 +155,7 @@ function refuseBadKeys(vk) {
   }
 }
 
-async function dryRun(root, r1cs, ptau, round) {
+async function dryRun(root, r1cs, ptau) {
   const names = ["contributor-1", "contributor-2", "contributor-3", "mallory", "verifier"];
   const people = await timed("npm ci in 5 separate kit copies", () =>
     names.map((name) => person(root, name, r1cs, ptau)),
@@ -223,12 +223,18 @@ async function dryRun(root, r1cs, ptau, round) {
         KIT,
         coord("receive", join(people[0], "transaction_0001.zkey"), name1.join(" "), hash1),
       );
-      refuse("beacon: only 2 contributions", KIT, coord("beacon", String(round)));
+      refuse("beacon: only 2 contributions", KIT, coord("beacon", "1"));
     }
     pass(`coordinator receive #${i}`, KIT, coord("receive", returned, name, hash));
   }
 
-  pass("coordinator round", KIT, coord("round", roundTime(round).toISOString()));
+  // A real ceremony announces the round at least a day ahead; here it is produced in seconds.
+  const round = firstRoundAt(new Date(Date.now() + 15_000));
+  const produced = roundTime(round);
+  pass("coordinator round", KIT, coord("round", produced.toISOString()));
+  const link = "https://example.invalid/cyphras-ceremony-dry-run";
+  pass("coordinator announce", KIT, coord("announce", `${round}`, link, new Date().toISOString()));
+  await new Promise((done) => setTimeout(done, produced - Date.now() + 5_000));
   pass(`coordinator beacon (drand quicknet round ${round})`, KIT, coord("beacon", String(round)));
   pass("coordinator status", KIT, coord("status"));
 
@@ -354,17 +360,15 @@ async function dryRun(root, r1cs, ptau, round) {
 run(USAGE, async (argv) => {
   const { values } = parseArgs({
     args: argv,
-    options: { r1cs: { type: "string" }, ptau: { type: "string" }, round: { type: "string" } },
+    options: { r1cs: { type: "string" }, ptau: { type: "string" } },
   });
   const r1cs = resolve(values.r1cs ?? join(CIRCUITS, "build", "transaction.r1cs"));
   const ptau = resolve(values.ptau ?? join(CIRCUITS, "build", "ptau", PTAU_NAME));
-  const today = new Date(`${new Date().toISOString().slice(0, 10)}T00:00:00Z`);
-  const round = parseRound(values.round ?? firstRoundAt(today));
 
   const root = mkdtempSync(join(tmpdir(), "cyphras-ceremony-dry-run-"));
   console.log(`Dry run in ${root}, deleted at the end.`);
   try {
-    await dryRun(root, r1cs, ptau, round);
+    await dryRun(root, r1cs, ptau);
   } finally {
     rmSync(root, { recursive: true, force: true });
     console.log(`\nDeleted ${root} and everything in it.`);

@@ -12,6 +12,7 @@ import {
   expectHash,
   mem,
   parseHex,
+  parseTime,
   quiet,
   readZkey,
   run,
@@ -28,7 +29,8 @@ recomputed here rather than read from a published hash, and any mismatch exits n
 Usage:
   node verify.mjs <transaction.r1cs> <${PTAU_NAME}> <transaction_final.zkey>
       --contributions <file> --vk <verification_key.json> --drand-round <n>
-      [--drand-signature <hex>] [--beacon <hex>] [--vk-sha256 <hex>] [--zkey-sha256 <hex>]
+      [--drand-signature <hex>] [--beacon <hex>] [--not-before <time>] [--vk-sha256 <hex>]
+      [--zkey-sha256 <hex>]
 
   --contributions <file>  one line per signed attestation, in contribution order: the contribution
                           hash, a space and the contributor's name exactly as attested; blank
@@ -41,6 +43,8 @@ Usage:
   --drand-signature <hex> the round's signature from the transcript, to check the beacon
                           offline; its SHA-256 is the round's randomness
   --beacon <hex>          the beacon randomness from the transcript, which must equal it
+  --not-before <time>     the time the last contribution was accepted, from the transcript; a
+                          beacon round drand produced earlier is refused
   --vk-sha256 <hex>       the SHA-256 the vault build pins (MAINNET_SHA256 in the verifier's
                           build/check.rs), compared with the one recomputed here
   --zkey-sha256 <hex>     the SHA-256 of the final zkey in the transcript, compared with the one
@@ -91,6 +95,7 @@ run(USAGE, async (argv) => {
       "drand-round": { type: "string" },
       "drand-signature": { type: "string" },
       beacon: { type: "string" },
+      "not-before": { type: "string" },
       "vk-sha256": { type: "string" },
       "zkey-sha256": { type: "string" },
     },
@@ -105,6 +110,7 @@ run(USAGE, async (argv) => {
   const attested = readAttested(values.contributions);
   const round = parseRound(values["drand-round"]);
   const beacon = values.beacon && parseHex(values.beacon, 32, "--beacon");
+  const notBefore = values["not-before"] && parseTime(values["not-before"], "--not-before");
   const pin = values["vk-sha256"] && parseHex(values["vk-sha256"], 32, "--vk-sha256");
   const zkeyPin = values["zkey-sha256"] && parseHex(values["zkey-sha256"], 32, "--zkey-sha256");
 
@@ -130,7 +136,11 @@ run(USAGE, async (argv) => {
   }
 
   let randomness;
-  console.log(`drand quicknet round ${round}, produced at ${roundTime(round).toISOString()}`);
+  const produced = roundTime(round);
+  console.log(`drand quicknet round ${round}, produced at ${produced.toISOString()}`);
+  if (notBefore && produced < notBefore) {
+    throw new Error(`drand round ${round} was produced before ${notBefore.toISOString()}`);
+  }
   if (values["drand-signature"] !== undefined) {
     const signature = parseHex(values["drand-signature"], 48, "--drand-signature");
     randomness = digest(Buffer.from(signature, "hex"));
