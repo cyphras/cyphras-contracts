@@ -1,0 +1,69 @@
+# A watcher for one vault on a host other than the one the services run on, so that an outage of
+# that host still pages someone. It needs only the two RPC providers, Horizon and the webhooks, and
+# holds no keys. It reads the indexer and the services' health through their public URLs, which
+# env/watcher.env names in INDEXER_URL and HEALTH_URLS, and pings HEARTBEAT_URL after every healthy
+# round, so a monitor elsewhere notices when this host goes quiet too.
+#
+#   NETWORK=mainnet ASSET=xlm WATCHER_IMAGE=ghcr.io/cyphras/cyphras-contracts/watcher@sha256:... \
+#   docker compose -p cyphras-watch-mainnet-xlm -f watcher.compose.yaml up -d
+#
+# verify-images.sh checks WATCHER_IMAGE first, as on the services host. Secrets are files in
+# secrets/<network>/<asset>/, each mode 0400 and owned by uid 10005, or 999 for the database
+# password. Governance events are posted to the public channel by the watcher on the services host
+# only, so each is posted once.
+
+x-service: &service
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  pids_limit: 256
+  mem_limit: 512m
+  logging:
+    driver: json-file
+    options: {max-size: "20m", max-file: "7"}
+
+services:
+  watcher:
+    <<: *service
+    image: ${WATCHER_IMAGE:?set WATCHER_IMAGE to the released image with its digest}
+    user: "10005:10005"
+    env_file: env/watcher.env
+    environment:
+      DEPLOYMENT_FILE: /etc/cyphras/deployment.json
+      DATABASE_URL_FILE: /run/secrets/watcher_database_url
+      ALERT_WEBHOOKS_FILE: /run/secrets/watcher_alert_webhooks
+      HEARTBEAT_URL_FILE: /run/secrets/watcher_heartbeat_url
+      HOT_ACCOUNTS_FILE: /etc/cyphras/hot-accounts
+    volumes:
+      - ../../deployments/${NETWORK:?}.json:/etc/cyphras/deployment.json:ro
+      - ./hot-accounts/${NETWORK}-${ASSET:?}:/etc/cyphras/hot-accounts:ro
+    secrets: [watcher_database_url, watcher_alert_webhooks, watcher_heartbeat_url]
+    networks: [egress, watcher_db]
+    depends_on: [watcher_db]
+
+  watcher_db:
+    image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+    restart: unless-stopped
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    security_opt: ["no-new-privileges:true"]
+    shm_size: 128m
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "7"}
+    environment: {POSTGRES_USER: watcher, POSTGRES_DB: watcher, POSTGRES_PASSWORD_FILE: /run/secrets/watcher_db_password}
+    volumes: ["./data/${NETWORK}/${ASSET}/watcher_db:/var/lib/postgresql/data"]
+    secrets: [watcher_db_password]
+    networks: [watcher_db]
+
+networks:
+  egress: {}
+  watcher_db: {internal: true}
+
+secrets:
+  watcher_database_url: {file: "./secrets/${NETWORK}/${ASSET}/watcher_database_url"}
+  watcher_alert_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/watcher_alert_webhooks"}
+  watcher_heartbeat_url: {file: "./secrets/${NETWORK}/${ASSET}/watcher_heartbeat_url"}
+  watcher_db_password: {file: "./secrets/${NETWORK}/${ASSET}/watcher_db_password"}

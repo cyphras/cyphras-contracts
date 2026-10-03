@@ -1,0 +1,8 @@
+# One line per account that should only pay its own transaction fees: a name, the account and the
+# balance floor in stroops below which the watcher alerts, 0 for none.
+channel-1 G... 100000000
+channel-2 G... 100000000
+channel-3 G... 100000000
+channel-4 G... 100000000
+keeper G... 500000000
+asp-signer G... 100000000

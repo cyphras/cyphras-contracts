@@ -1,0 +1,6 @@
+# Binaries a local go build leaves in this directory; images are built by CI only.
+/indexer
+/relayer
+/keeper
+/screening
+/watcher
