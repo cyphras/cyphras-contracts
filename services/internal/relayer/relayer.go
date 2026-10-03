@@ -13,6 +13,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -472,8 +473,50 @@ func (r *Relayer) fresh(ctx context.Context, req Request) *failure {
 		if !ok {
 			return settledFail(http.StatusUnprocessableEntity, CodeRejected)
 		}
+		lapsing, err := r.balanceLapses(ctx, req.Ext.Recipient, h.LatestLedger)
+		if err != nil {
+			return fail(http.StatusServiceUnavailable, CodeUnavailable)
+		}
+		if lapsing {
+			// Its owner may extend the entry, after which the request is taken.
+			return fail(http.StatusUnprocessableEntity, CodeRejected)
+		}
 	}
 	return nil
+}
+
+// balanceMargin is how many ledgers a contract destination's balance entry must stay live past
+// the latest one: a relay may land a while after its checks, and one whose destination's entry
+// archived in between fails with ENTRY_ARCHIVED.
+const balanceMargin = 500
+
+// balanceLapses reports a contract destination whose balance in the asset contract archives within
+// balanceMargin ledgers of latest. A contract without a balance entry gets a new one when paid.
+func (r *Relayer) balanceLapses(ctx context.Context, address string, latest uint32) (bool, error) {
+	if !contractAddress(address) {
+		return false, nil
+	}
+	inst, _, _ := r.view()
+	if inst == nil {
+		return false, errors.New("relayer: the vault is not read yet")
+	}
+	key, err := vault.BalanceKey(inst.Config.Token, address)
+	if err != nil {
+		return false, err
+	}
+	e, _, err := rpc.One(ctx, r.rpc, key)
+	if errors.Is(err, rpc.ErrMissing) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return e.LiveUntil != nil && uint64(*e.LiveUntil) < uint64(latest)+balanceMargin, nil
+}
+
+// contractAddress reports a contract's address; a muxed address is an account's.
+func contractAddress(address string) bool {
+	return strings.HasPrefix(address, "C")
 }
 
 // guard refuses while relaying is paused, and refuses the notes and destination of a relay that
@@ -1273,6 +1316,13 @@ func (r *Relayer) classify(res submit.Result, sent Record) cause {
 		case xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped:
 		case xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded:
 			return r.resourceCause(ctx, sent)
+		case xdr.InvokeHostFunctionResultCodeInvokeHostFunctionEntryArchived:
+			// Only contract data archives, and the keeper keeps the vault's alive: with a contract
+			// destination, its own balance in the asset contract is the entry its owner let lapse.
+			if contractAddress(sent.Destination) {
+				return causeReceive
+			}
+			return causeRelayer
 		default:
 			return causeRelayer
 		}

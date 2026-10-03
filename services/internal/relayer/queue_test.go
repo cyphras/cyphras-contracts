@@ -2,6 +2,7 @@ package relayer
 
 import (
 	"context"
+	"math/big"
 	"testing"
 	"time"
 
@@ -164,4 +165,56 @@ func TestTheRelayerQueuesOneExitAtATime(t *testing.T) {
 	if h.sends() != 2 || h.fake.CallCount("simulateTransaction") != 3 {
 		t.Fatalf("%d sent after %d simulations", h.sends(), h.fake.CallCount("simulateTransaction"))
 	}
+}
+
+// failedArchived is a relay whose call touched an archived entry.
+func failedArchived() protocol.GetTransactionResponse {
+	r, _ := xdr.MarshalBase64(xdr.TransactionResult{FeeCharged: 900_100, Result: xdr.TransactionResultResult{
+		Code: xdr.TransactionResultCodeTxFailed,
+		Results: &[]xdr.OperationResult{{Code: xdr.OperationResultCodeOpInner, Tr: &xdr.OperationResultTr{
+			Type: xdr.OperationTypeInvokeHostFunction, InvokeHostFunctionResult: &xdr.InvokeHostFunctionResult{Code: xdr.InvokeHostFunctionResultCodeInvokeHostFunctionEntryArchived},
+		}}},
+	}})
+	return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusFailed, ResultXDR: r, Ledger: 1001}}
+}
+
+func TestAContractDestinationWhoseBalanceArchivedIsRestedNotTheRelayersFault(t *testing.T) {
+	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
+	h.setTxStatus(failedArchived())
+	req := h.lose(t, func() Request { return h.forged(t, vaulttest.Token, -20_000_000, 5_000_000) })
+	now := h.clock().Unix()
+	if h.r.brk.open(h.clock()) || !h.r.cool.cooling(now, destinationKey(vaulttest.Token)) || !h.r.cool.cooling(now, nullifierKey(req.Proof.Nullifiers[0].Hex())) {
+		t.Fatal("a contract destination's archived balance was taken for the relayer's fault")
+	}
+	if _, f := h.r.Submit(context.Background(), h.forged(t, vaulttest.Token, -20_000_000, 5_000_000)); f == nil || f.code != CodeRejected {
+		t.Fatalf("the rested destination again: %v", f)
+	}
+	// An account's entries never archive: the vault's did, which the keeper keeps alive.
+	h = newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
+	h.setTxStatus(failedArchived())
+	dest := keypair.MustRandom().Address()
+	h.fund(dest)
+	h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
+	if !h.r.brk.open(h.clock()) {
+		t.Fatal("an archived entry of the vault was not the relayer's to answer for")
+	}
+}
+
+func TestAContractDestinationWhoseBalanceIsAboutToArchiveIsRefused(t *testing.T) {
+	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t) })
+	key := mustKey(vault.BalanceKey(vaulttest.Token, vaulttest.Token))
+	latest := h.fake.Latest
+	live := func(until uint32) {
+		h.fake.SetContractData(key, vaulttest.Balance(big.NewInt(0), true), 10, &until)
+	}
+	live(latest + balanceMargin - 1)
+	if _, f := h.r.Submit(context.Background(), h.forged(t, vaulttest.Token, -20_000_000, 5_000_000)); f == nil || f.code != CodeRejected {
+		t.Fatalf("a balance archiving within the margin: %v", f)
+	}
+	// Extended by its owner, the same destination is taken.
+	live(latest + balanceMargin)
+	if _, f := h.r.Submit(context.Background(), h.forged(t, vaulttest.Token, -20_000_000, 5_000_000)); f != nil {
+		t.Fatalf("a balance live past the margin: %v", f)
+	}
+	h.waitIdle()
 }
