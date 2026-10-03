@@ -273,3 +273,68 @@ func TestAnAttestationCheckOutlivesAFailedReadAndARestart(t *testing.T) {
 		t.Fatalf("a judged check stayed: %v", checks)
 	}
 }
+
+func TestALargerSpikeWithinTheCooldownStillPages(t *testing.T) {
+	h := newHarness(t)
+	h.limit = 100_000_000
+	c := h.chain
+	c.Shield(vaulttest.Depositor, 90_000_000)
+	c.NextLedger(5)
+	c.Attest(1)
+	c.Admit(1)
+	pay := func(n int) {
+		for range n {
+			c.NextLedger(5)
+			c.Transact(-7_000_000, 0, vaulttest.Relayer)
+			c.Transfer(vaulttest.Relayer, 7_000_000)
+		}
+		h.sync()
+	}
+	// 21 of a window of 100 within an hour is a spike; 42 is twice as far past the bound.
+	pay(3)
+	pay(3)
+	if !h.pages.has("outflow_spike_x1") || !h.pages.has("outflow_spike_x2") {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+}
+
+func TestTwoFlagsInOneLedgerAreBothReported(t *testing.T) {
+	h := newHarness(t)
+	c := h.chain
+	c.Shield(vaulttest.Depositor, 10_000_000)
+	c.Shield(vaulttest.Depositor, 10_000_000)
+	c.NextLedger(5)
+	c.Flag(1, 4)
+	c.Flag(2, 4)
+	c.NextLedger(5)
+	h.sync()
+	flags := 0
+	for _, a := range h.pages.alerts {
+		if strings.HasPrefix(a.Code, "deposit_flagged") {
+			flags++
+		}
+	}
+	if flags != 2 {
+		t.Fatalf("%d flags reported: %v", flags, h.pages.codes())
+	}
+}
+
+func TestAPaymentToTheAssetsIssuerIsNoMismatch(t *testing.T) {
+	const issuer = "GA53HZCSOZI5ZUDYCMYXXUGHO7XEZSM3BYW4M5FGSTYGKWMGVL7QLFB3"
+	h := newHarness(t)
+	c := h.chain
+	c.Shield(vaulttest.Depositor, 10_000_000)
+	c.NextLedger(5)
+	c.Attest(1)
+	c.Admit(1)
+	c.NextLedger(5)
+	c.Transact(-4_000_000, 100_000, issuer)
+	// The asset contract reports a payment to its issuer as a burn.
+	c.Burn("USDC:"+issuer, 4_000_000)
+	c.Transfer(vaulttest.Relayer, 100_000)
+	c.NextLedger(5)
+	h.sync()
+	if h.pages.has("outflow_mismatch") {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+}

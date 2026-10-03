@@ -37,6 +37,19 @@ func TestTransfersAndBalancesDecode(t *testing.T) {
 	if _, err := DecodeTransfer(raw); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("mint: %v", err)
 	}
+	// A payment to the issuer is a burn, naming the asset in place of a destination.
+	issued := xdr.ScString("USDC:" + testDepositor)
+	burn := RawEvent{
+		Topics: []string{b64(Symbol("burn")), b64(addr(t, testRelayer)), b64(xdr.ScVal{Type: xdr.ScValTypeScvString, Str: &issued})},
+		Value:  b64(i128(t, 40)),
+	}
+	if tr, err = DecodeBurn(burn); err != nil || tr.From != testRelayer || tr.To != testDepositor || tr.Amount.Int64() != 40 {
+		t.Fatalf("burn %+v, %v", tr, err)
+	}
+	burn.Topics[2] = b64(xdr.ScVal{Type: xdr.ScValTypeScvString, Str: &asset})
+	if _, err := DecodeBurn(burn); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("a burn of the native asset: %v", err)
+	}
 	n, authorized, err := DecodeBalance(Struct(Field{"amount", i128(t, 12)}, Field{"authorized", Bool(true)}, Field{"clawback", Bool(false)}))
 	if err != nil || n.Int64() != 12 || !authorized {
 		t.Fatalf("balance %v, %v", n, err)

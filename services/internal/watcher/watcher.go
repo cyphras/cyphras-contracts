@@ -337,7 +337,7 @@ func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, late
 			w.alerts.Raise(ctx, severity, code, "%s", msg)
 			w.public.Raise(ctx, alert.Info, code, "%s", msg)
 		case n.Name == "deposit_flagged" || n.Name == "deposit_unflagged":
-			w.alerts.Raise(ctx, alert.Info, fmt.Sprintf("%s_%d", n.Name, n.Ledger), "%s at ledger %d: %s", n.Name, n.Ledger, describe(n.Body))
+			w.alerts.Raise(ctx, alert.Info, fmt.Sprintf("%s_%.16s_%d", n.Name, n.TxHash, n.Index), "%s at ledger %d: %s", n.Name, n.Ledger, describe(n.Body))
 		case n.Name == "exit_stranded":
 			s := n.Body.(vault.ExitStranded)
 			w.alerts.Raise(ctx, alert.Warning, fmt.Sprintf("exit_stranded_%d", s.ID), "exit %d was released with %v of its payout and %v of its fee unpaid; claim queues them again once the parties can receive", s.ID, s.Payout, s.Fee)
@@ -478,16 +478,17 @@ func (w *Watcher) activityChecks(ctx context.Context, b follow.Batch, s *chainst
 	if today := s.OutflowOn(uint64(now) / secondsPerDay); today.Cmp(limits.MaxDailyOutflow) > 0 {
 		w.alerts.Raise(ctx, alert.Critical, "outflow_over_cap", "today's outflow %v exceeds max_daily_outflow %v", today, limits.MaxDailyOutflow)
 	}
-	for _, st := range d.Settlements {
+	for i, st := range d.Settlements {
 		if payout := new(big.Int).Neg(st.ExtAmount); payout.Cmp(limits.MaxDeposit) > 0 {
-			w.alerts.Raise(ctx, alert.Warning, fmt.Sprintf("large_unshield_%d", st.Ledger), "an unshield of %v in ledger %d exceeds max_deposit %v", payout, st.Ledger, limits.MaxDeposit)
+			w.alerts.Raise(ctx, alert.Warning, fmt.Sprintf("large_unshield_%.16s_%d", st.TxHash, i), "an unshield of %v in ledger %d exceeds max_deposit %v", payout, st.Ledger, limits.MaxDeposit)
 		}
 	}
 	hour, err := w.db.outflowSince(ctx, now-3600)
 	if err != nil {
 		w.log.Warn("outflow check incomplete", "error", err.Error())
 	} else if share := new(big.Int).Div(new(big.Int).Mul(limits.MaxDailyOutflow, big.NewInt(20)), big.NewInt(100)); hour.Cmp(share) > 0 {
-		w.alerts.Raise(ctx, alert.Warning, "outflow_spike", "%v left the vault within one hour, above 20 percent of max_daily_outflow %v", hour, limits.MaxDailyOutflow)
+		times, _ := new(big.Float).Quo(new(big.Float).SetInt(hour), new(big.Float).SetInt(share)).Float64()
+		w.alerts.Raise(ctx, alert.Warning, "outflow_spike"+escalation(times), "%v left the vault within one hour, above 20 percent of max_daily_outflow %v", hour, limits.MaxDailyOutflow)
 	}
 	recent, day, err := w.db.transacts(ctx, now-600, now-secondsPerDay)
 	if err != nil {
@@ -496,8 +497,18 @@ func (w *Watcher) activityChecks(ctx context.Context, b follow.Batch, s *chainst
 	}
 	bound := max(float64(w.cfg.BurstFloor), w.cfg.BurstMultiple*float64(day)/144)
 	if float64(recent) > bound {
-		w.alerts.Raise(ctx, alert.Warning, "nullifier_burst", "%d transact calls within 10 minutes, above %.0f from a trailing day of %d", recent, bound, day)
+		w.alerts.Raise(ctx, alert.Warning, "nullifier_burst"+escalation(float64(recent)/bound), "%d transact calls within 10 minutes, above %.0f from a trailing day of %d", recent, bound, day)
 	}
+}
+
+// escalation names how far a reading is past its bound, in doublings, so a reading twice as far
+// past it raises an alert of its own rather than repeating one the cooldown holds back.
+func escalation(times float64) string {
+	n := 1
+	for n < 1<<20 && float64(2*n) <= times {
+		n *= 2
+	}
+	return fmt.Sprintf("_x%d", n)
 }
 
 // checkTransfers compares the asset transfers out of the vault in the window with the payments and
@@ -551,6 +562,10 @@ func (w *Watcher) checkTransfers(ctx context.Context, b follow.Batch, d chainsta
 	got := map[string]*big.Int{}
 	for _, e := range events {
 		t, err := vault.DecodeTransfer(e)
+		if err != nil {
+			// A payment to the asset's issuer is a burn.
+			t, err = vault.DecodeBurn(e)
+		}
 		if err != nil || t.From != w.cfg.Vault {
 			continue
 		}
@@ -566,15 +581,18 @@ func (w *Watcher) checkTransfers(ctx context.Context, b follow.Batch, d chainsta
 }
 
 // transferFilters match an asset contract's transfer events sent by the vault, with three topics
-// as SEP-41 has them or four as the Stellar Asset Contract has them.
+// as SEP-41 has them or four as the Stellar Asset Contract has them, and the Stellar Asset
+// Contract's burn events from the vault, which a payment to the asset's issuer emits.
 func transferFilters(vaultID string) []protocol.TopicFilter {
-	sym := xdr.ScSymbol("transfer")
-	name := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &sym}
+	transfer, burn := xdr.ScSymbol("transfer"), xdr.ScSymbol("burn")
+	name := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &transfer}
+	burned := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &burn}
 	from, _ := vault.Address(vaultID)
 	one := protocol.WildCardExactOne
 	return []protocol.TopicFilter{
 		{{ScVal: &name}, {ScVal: &from}, {Wildcard: &one}},
 		{{ScVal: &name}, {ScVal: &from}, {Wildcard: &one}, {Wildcard: &one}},
+		{{ScVal: &burned}, {ScVal: &from}, {Wildcard: &one}},
 	}
 }
 

@@ -2,7 +2,9 @@ package vault
 
 import (
 	"math/big"
+	"strings"
 
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
@@ -78,4 +80,43 @@ func DecodeTransfer(raw RawEvent) (Transfer, error) {
 		return Transfer{}, malformed("negative transfer")
 	}
 	return Transfer{From: from, To: to, Amount: amount}, nil
+}
+
+// DecodeBurn reads a Stellar Asset Contract burn event, which a payment to the asset's issuer emits
+// in place of a transfer: its topics are the name, the sender and the asset as CODE:ISSUER, and its
+// data the amount. The issuer is reported as the destination.
+func DecodeBurn(raw RawEvent) (Transfer, error) {
+	if len(raw.Topics) != 3 {
+		return Transfer{}, malformed("burn with %d topics", len(raw.Topics))
+	}
+	var topics [3]xdr.ScVal
+	for i := range topics {
+		if err := xdr.SafeUnmarshalBase64(raw.Topics[i], &topics[i]); err != nil {
+			return Transfer{}, malformed("burn topic: %v", err)
+		}
+	}
+	if name, ok := symbolOf(topics[0]); !ok || name != "burn" {
+		return Transfer{}, malformed("not a burn event")
+	}
+	from, err := addressOf(topics[1])
+	if err != nil {
+		return Transfer{}, err
+	}
+	asset, ok := topics[2].GetStr()
+	_, issuer, found := strings.Cut(string(asset), ":")
+	if !ok || !found || !strkey.IsValidEd25519PublicKey(issuer) {
+		return Transfer{}, malformed("burn of an asset without an issuer")
+	}
+	var data xdr.ScVal
+	if err := xdr.SafeUnmarshalBase64(raw.Value, &data); err != nil {
+		return Transfer{}, malformed("burn data: %v", err)
+	}
+	amount, err := i128Of(data)
+	if err != nil {
+		return Transfer{}, err
+	}
+	if amount.Sign() < 0 {
+		return Transfer{}, malformed("negative burn")
+	}
+	return Transfer{From: from, To: issuer, Amount: amount}, nil
 }

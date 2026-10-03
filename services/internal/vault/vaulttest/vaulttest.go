@@ -416,6 +416,18 @@ func (c *Chain) Transfer(to string, amount int64) {
 	c.index++
 }
 
+// Burn emits the Stellar Asset Contract's burn of amount from the vault, as a payment to the
+// issuer of asset, CODE:ISSUER, reports it.
+func (c *Chain) Burn(asset string, amount int64) {
+	str := xdr.ScString(asset)
+	c.Events = append(c.Events, vault.RawEvent{
+		Ledger: c.Ledger, ClosedAt: c.ClosedAt, TxHash: c.hash, Tx: c.tx, Op: 0, Index: c.index, Contract: Token,
+		Topics: []string{b64(vault.Symbol("burn")), b64(addr(Vault)), b64(xdr.ScVal{Type: xdr.ScValTypeScvString, Str: &str})},
+		Value:  b64(i128(big.NewInt(amount))),
+	})
+	c.index++
+}
+
 // Roots encodes a root ring holding the given roots, the last of them current.
 func Roots(roots ...fr.Element) xdr.ScVal {
 	ring := make([]xdr.ScVal, vault.RootHistory)
