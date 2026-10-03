@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { mnemonicToSeedSync } from "@scure/bip39";
+import { StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
+import { CyphrasError } from "../../src/errors.ts";
 import { P } from "../../src/field.ts";
+import { deriveSpendingKeys } from "../../src/keys.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
+import { SorobanRpc } from "../../src/net/rpc.ts";
 import type { ChainView, RootHistory } from "../../src/vault/state.ts";
 import {
   type Evidence,
@@ -10,8 +15,16 @@ import {
   type WalletState,
   emptyState,
 } from "../../src/wallet/state.ts";
-import { advancePlans, checkRoot, recordEvents } from "../../src/wallet/sync.ts";
-import { testScalar } from "../helpers.ts";
+import {
+  type ScanKeys,
+  advancePlans,
+  checkRoot,
+  checkedBetween,
+  recheck,
+  recordEvents,
+} from "../../src/wallet/sync.ts";
+import { MNEMONIC, testScalar } from "../helpers.ts";
+import { map } from "../support/vault.ts";
 
 const leaf = (i: number): bigint => testScalar("sync/leaf", i, P);
 
@@ -313,5 +326,70 @@ describe("plan fate", () => {
     state.plans.push(retry);
     advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "superseded");
+  });
+});
+
+describe("unchecked ranges", () => {
+  const VAULT = StrKey.encodeContract(Buffer.alloc(32, 9));
+  const spending = deriveSpendingKeys(mnemonicToSeedSync(MNEMONIC), "testnet", 0);
+  const keys: ScanKeys = {
+    network: "testnet",
+    incoming: spending,
+    ovk: spending.ovk,
+    nkFold: spending.nkFold,
+  };
+
+  // An RPC whose getEvents shows the vault adding leaves at these positions, all in ledger 60.
+  function showing(indices: readonly number[]): SorobanRpc {
+    const events = indices.map((index, i) => ({
+      type: "contract",
+      ledger: 60,
+      ledgerClosedAt: "2026-10-04T00:00:00Z",
+      contractId: VAULT,
+      id: `${String(60).padStart(12, "0")}-${String(i).padStart(8, "0")}`,
+      txHash: "ab".repeat(32),
+      inSuccessfulContractCall: true,
+      topic: [xdr.ScVal.scvSymbol("new_commitment").toXDR("base64")],
+      value: map([
+        ["index", xdr.ScVal.scvU64(new xdr.Uint64(BigInt(index)))],
+        ["commitment", nativeToScVal(leaf(index), { type: "u256" })],
+        ["encrypted_output", xdr.ScVal.scvBytes(Buffer.alloc(181, index))],
+      ]).toXDR("base64"),
+    }));
+    return new SorobanRpc("http://rpc", async (_input, init) => {
+      const { id } = JSON.parse(String(init?.body));
+      const result = { events, latestLedger: 70, oldestLedger: 1 };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    });
+  }
+
+  // A wallet that took the leaves at positions 4 to 7 unchecked, the first of them added at
+  // ledger 50, in a sync whose spends, from ledger 100 on, were checked.
+  function walletAfterUncheckedLeaves(): WalletState {
+    const state = emptyState(1);
+    state.nullifierSince = 120;
+    state.unchecked = [
+      { from: 100, to: 99, leaves: { first: 4, end: 8, ledger: 50 }, lost: false },
+    ];
+    return state;
+  }
+
+  it("counts a range of leaves alone as no unchecked ledger", () => {
+    const state = walletAfterUncheckedLeaves();
+    assert.equal(checkedBetween(state, 50, 110), true);
+  });
+
+  it("checks the leaves of a range by position and clears it", async () => {
+    const state = walletAfterUncheckedLeaves();
+    await recheck(state, keys, showing([4, 5, 6, 7]), VAULT, 1);
+    assert.deepEqual(state.unchecked, []);
+  });
+
+  it("refuses leaves RPC shows with a gap after the range's first", async () => {
+    const state = walletAfterUncheckedLeaves();
+    await assert.rejects(
+      recheck(state, keys, showing([6, 7]), VAULT, 1),
+      (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
+    );
   });
 });
