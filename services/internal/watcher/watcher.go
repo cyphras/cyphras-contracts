@@ -44,6 +44,9 @@ type HotAccount struct {
 	Address string
 	// Floor is the balance in stroops below which the watcher alerts; 0 checks none.
 	Floor int64
+	// AssetFloor is the balance of the vault's asset, when that is not lumens, below which the
+	// watcher alerts, in the asset's smallest unit; 0 checks none.
+	AssetFloor int64
 }
 
 // Config sets what the watcher watches and its thresholds.
@@ -57,6 +60,8 @@ type Config struct {
 	HotAccounts []HotAccount
 	// Lumens is the contract of the native asset, whose transfers out of a hot account page.
 	Lumens string
+	// Asset is the vault's asset, "native" or CODE:ISSUER.
+	Asset string
 	// ServiceAccounts are checked against CAP-77 freezes, with the vault, its code and its asset.
 	ServiceAccounts []string
 	// BurstMultiple and BurstFloor bound transact calls within 10 minutes: alert above the
@@ -626,21 +631,33 @@ func transferFilters(vaultID string) []protocol.TopicFilter {
 	}
 }
 
-// checkHotTransfers pages on any transfer of lumens out of a hot account in the window, whoever
-// sent the transaction: a hot account only pays its own fees, which the native asset reports as
-// fee events, never as transfers.
+// checkHotTransfers pages on any transfer of lumens or of the vault's asset out of a hot account
+// in the window, and on any burn of the vault's asset from one, whoever sent the transaction: a
+// hot account only pays its own fees, which the native asset reports as fee events, never as
+// transfers.
 func (w *Watcher) checkHotTransfers(ctx context.Context, b follow.Batch) error {
-	if w.cfg.Lumens == "" {
-		return nil
+	w.mu.RLock()
+	inst := w.inst
+	w.mu.RUnlock()
+	type watched struct {
+		contract string
+		burns    bool
 	}
-	transfer := xdr.ScSymbol("transfer")
-	name := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &transfer}
+	var contracts []watched
+	if w.cfg.Lumens != "" {
+		contracts = append(contracts, watched{contract: w.cfg.Lumens})
+	}
+	if inst != nil && inst.Config.Token != w.cfg.Lumens {
+		contracts = append(contracts, watched{contract: inst.Config.Token, burns: true})
+	}
+	transfer, burn := xdr.ScSymbol("transfer"), xdr.ScSymbol("burn")
+	sent := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &transfer}
+	burned := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &burn}
 	one := protocol.WildCardExactOne
-	// A request takes at most five topic filters.
-	for group := range slices.Chunk(w.cfg.HotAccounts, 5) {
+	sender := map[string]HotAccount{}
+	for _, c := range contracts {
 		var topics []protocol.TopicFilter
-		sender := map[string]HotAccount{}
-		for _, h := range group {
+		for _, h := range w.cfg.HotAccounts {
 			from, err := vault.Address(h.Address)
 			if err != nil {
 				return err
@@ -650,30 +667,38 @@ func (w *Watcher) checkHotTransfers(ctx context.Context, b follow.Batch) error {
 				return err
 			}
 			sender[topic] = h
-			topics = append(topics, protocol.TopicFilter{{ScVal: &name}, {ScVal: &from}, {Wildcard: &one}, {Wildcard: &one}})
-		}
-		src := follow.RPCSource{Client: w.rpc, Contract: w.cfg.Lumens, Topics: topics, PageLimit: 1000}
-		events, err := src.Events(ctx, b.From, b.To)
-		if errors.Is(err, follow.ErrRetention) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("hot account transfers: %w", err)
-		}
-		for _, e := range events {
-			if len(e.Topics) < 2 {
-				continue
+			topics = append(topics, protocol.TopicFilter{{ScVal: &sent}, {ScVal: &from}, {Wildcard: &one}, {Wildcard: &one}})
+			if c.burns {
+				topics = append(topics, protocol.TopicFilter{{ScVal: &burned}, {ScVal: &from}, {Wildcard: &one}})
 			}
-			h, ok := sender[e.Topics[1]]
-			if !ok {
-				continue
+		}
+		// A request takes at most five topic filters.
+		for group := range slices.Chunk(topics, 5) {
+			src := follow.RPCSource{Client: w.rpc, Contract: c.contract, Topics: group, PageLimit: 1000}
+			events, err := src.Events(ctx, b.From, b.To)
+			if errors.Is(err, follow.ErrRetention) {
+				return nil
 			}
-			what := "lumens"
-			if t, err := vault.DecodeTransfer(e); err == nil {
-				what = fmt.Sprintf("%v stroops to %s", t.Amount, t.To)
+			if err != nil {
+				return fmt.Errorf("hot account transfers: %w", err)
 			}
-			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("hot_account_transfer_%.16s_%d", e.TxHash, e.Index),
-				"the %s account %s sent %s in ledger %d, which only a stolen key does", h.Name, h.Address, what, e.Ledger)
+			for _, e := range events {
+				if len(e.Topics) < 2 {
+					continue
+				}
+				h, ok := sender[e.Topics[1]]
+				if !ok {
+					continue
+				}
+				what := "funds of contract " + c.contract
+				if t, err := vault.DecodeTransfer(e); err == nil {
+					what = fmt.Sprintf("%v units of contract %s to %s", t.Amount, c.contract, t.To)
+				} else if t, err := vault.DecodeBurn(e); err == nil {
+					what = fmt.Sprintf("%v units of contract %s, burned", t.Amount, c.contract)
+				}
+				w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("hot_account_transfer_%.16s_%d", e.TxHash, e.Index),
+					"the %s account %s sent %s in ledger %d, which only a stolen key does", h.Name, h.Address, what, e.Ledger)
+			}
 		}
 	}
 	return nil

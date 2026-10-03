@@ -62,10 +62,42 @@ func (w *Watcher) checkHot(ctx context.Context, h HotAccount) error {
 			w.alerts.Clear(ctx, code, "the %s account is above its floor again", h.Name)
 		}
 	}
+	if h.AssetFloor > 0 && w.cfg.Asset != "native" {
+		if err := w.checkAssetFloor(ctx, h); err != nil {
+			return err
+		}
+	}
 	if w.horizon == nil {
 		return nil
 	}
 	return w.operations(ctx, h)
+}
+
+// checkAssetFloor pages when a hot account holds less of the vault's asset than its floor, a
+// missing trustline included.
+func (w *Watcher) checkAssetFloor(ctx context.Context, h HotAccount) error {
+	keys, err := vault.ReceiveKeys(w.cfg.Asset, h.Address)
+	if err != nil {
+		return err
+	}
+	code := "hot_asset_low_" + h.Address
+	balance := int64(0)
+	if len(keys) == 2 {
+		e, _, err := rpc.One(ctx, w.rpc, keys[1])
+		switch {
+		case errors.Is(err, rpc.ErrMissing):
+		case err != nil:
+			return err
+		case e.Data.TrustLine != nil:
+			balance = int64(e.Data.TrustLine.Balance)
+		}
+	}
+	if balance < h.AssetFloor {
+		w.alerts.Raise(ctx, alert.Warning, code, "the %s account %s holds %d of %s, below its floor of %d", h.Name, h.Address, balance, w.cfg.Asset, h.AssetFloor)
+	} else {
+		w.alerts.Clear(ctx, code, "the %s account holds its floor of %s again", h.Name, w.cfg.Asset)
+	}
+	return nil
 }
 
 // operations reads the account's new operations from its stored cursor. Each page is judged
@@ -136,8 +168,9 @@ func (w *Watcher) judgeOperations(ctx context.Context, h HotAccount, list []hori
 		h.Name, h.Address, strings.Join(parts, ", "), newest)
 }
 
-// ParseHotAccounts reads one "name address floor" line per hot account, the floor in stroops;
-// blank lines and lines starting with # are skipped.
+// ParseHotAccounts reads one "name address floor [asset_floor]" line per hot account, the floor in
+// stroops and the optional floor of the vault's asset in its smallest unit; blank lines and lines
+// starting with # are skipped.
 func ParseHotAccounts(data []byte) ([]HotAccount, error) {
 	var out []HotAccount
 	sc := bufio.NewScanner(bytes.NewReader(data))
@@ -147,14 +180,20 @@ func ParseHotAccounts(data []byte) ([]HotAccount, error) {
 			continue
 		}
 		fields := strings.Fields(line)
-		if len(fields) != 3 {
-			return nil, fmt.Errorf("hot accounts line %d is not \"name address floor\"", n)
+		if len(fields) != 3 && len(fields) != 4 {
+			return nil, fmt.Errorf("hot accounts line %d is not \"name address floor [asset_floor]\"", n)
 		}
 		floor, err := strconv.ParseInt(fields[2], 10, 64)
 		if err != nil || floor < 0 || !strkey.IsValidEd25519PublicKey(fields[1]) {
 			return nil, fmt.Errorf("hot accounts line %d has a bad address or floor", n)
 		}
-		out = append(out, HotAccount{Name: fields[0], Address: fields[1], Floor: floor})
+		h := HotAccount{Name: fields[0], Address: fields[1], Floor: floor}
+		if len(fields) == 4 {
+			if h.AssetFloor, err = strconv.ParseInt(fields[3], 10, 64); err != nil || h.AssetFloor < 0 {
+				return nil, fmt.Errorf("hot accounts line %d has a bad asset floor", n)
+			}
+		}
+		out = append(out, h)
 	}
 	return out, sc.Err()
 }

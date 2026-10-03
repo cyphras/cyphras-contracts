@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/stellar/go-stellar-sdk/keypair"
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/horizon"
@@ -231,7 +233,102 @@ func TestALumenTransferOutOfAHotAccountPages(t *testing.T) {
 			got = append(got, a.Message)
 		}
 	}
-	if len(got) != 1 || !strings.Contains(got[0], "990000000 stroops to "+thief) {
+	if len(got) != 1 || !strings.Contains(got[0], "990000000 units of contract "+vaulttest.Token+" to "+thief) {
 		t.Fatalf("pages %v", got)
+	}
+}
+
+func TestTheVaultsAssetLeavingAHotAccountPages(t *testing.T) {
+	lumens := strkey.MustEncode(strkey.VersionByteContract, make([]byte, 32))
+	h := newHarness(t, func(c *Config) {
+		c.HotAccounts = []HotAccount{{Name: "channel-1", Address: hotAccount}}
+		c.Lumens = lumens
+	})
+	h.activity()
+	h.sync()
+	issuer := keypair.MustRandom().Address()
+	asset := xdr.ScString("USDC:" + issuer)
+	assetTopic := xdr.ScVal{Type: xdr.ScValTypeScvString, Str: &asset}
+	// What others burn is nothing to the watcher; a burn or a transfer from the hot account pages.
+	h.emit(vaulttest.Token, "burn", address(t, thief), assetTopic)
+	h.sync()
+	if h.pages.has("hot_account_transfer") {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+	h.emit(vaulttest.Token, "burn", address(t, hotAccount), assetTopic)
+	h.emit(vaulttest.Token, "transfer", address(t, hotAccount), address(t, thief), assetTopic)
+	h.sync()
+	var got []string
+	for _, a := range h.pages.alerts {
+		if strings.HasPrefix(a.Code, "hot_account_transfer_") {
+			got = append(got, a.Message)
+		}
+	}
+	if len(got) != 2 || !strings.Contains(got[0], "burned") || !strings.Contains(got[1], "to "+thief) {
+		t.Fatalf("pages %v", got)
+	}
+}
+
+// emit puts an event of a contract in a ledger of its own.
+func (h *harness) emit(contract, name string, topics ...xdr.ScVal) {
+	h.t.Helper()
+	c := h.chain
+	c.NextLedger(5)
+	sym := xdr.ScSymbol(name)
+	var encoded []string
+	for _, v := range append([]xdr.ScVal{{Type: xdr.ScValTypeScvSymbol, Sym: &sym}}, topics...) {
+		s, err := xdr.MarshalBase64(v)
+		if err != nil {
+			h.t.Fatal(err)
+		}
+		encoded = append(encoded, s)
+	}
+	amount, err := vault.I128(big.NewInt(5_000_000))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	value, err := xdr.MarshalBase64(amount)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	c.Events = append(c.Events, vault.RawEvent{
+		Ledger: c.Ledger, ClosedAt: c.ClosedAt, TxHash: strings.Repeat(fmt.Sprintf("%02x", c.Ledger%256), 32), Contract: contract, Topics: encoded, Value: value,
+	})
+	c.NextLedger(5)
+}
+
+func TestAHotAccountsBalanceOfTheVaultsAssetHasAFloor(t *testing.T) {
+	accounts, err := ParseHotAccounts([]byte("channel-1 " + hotAccount + " 100 5000\n"))
+	if err != nil || len(accounts) != 1 || accounts[0].AssetFloor != 5000 {
+		t.Fatalf("%+v %v", accounts, err)
+	}
+	issuer := keypair.MustRandom().Address()
+	h := newHarness(t, func(c *Config) {
+		c.HotAccounts = accounts
+		c.Asset = "USDC:" + issuer
+	})
+	key := mustKey(vault.AccountKey(hotAccount))
+	h.primary.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{AccountId: key.MustAccount().AccountId, Balance: 1_000}}, 1, nil)
+	ctx := context.Background()
+	// No trustline holds nothing.
+	if err := h.w.CheckHotAccounts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !h.pages.has("hot_asset_low_" + hotAccount) {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+	trust := mustKey(vault.TrustlineKey(hotAccount, "USDC:"+issuer))
+	h.primary.SetEntry(trust, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeTrustline, TrustLine: &xdr.TrustLineEntry{
+		AccountId: key.MustAccount().AccountId, Asset: trust.TrustLine.Asset, Balance: 5_000,
+	}}, 1, nil)
+	if err := h.w.CheckHotAccounts(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolved := false
+	for _, a := range h.pages.alerts {
+		resolved = resolved || a.Code == "hot_asset_low_"+hotAccount+"_resolved"
+	}
+	if !resolved {
+		t.Fatalf("pages %v", h.pages.codes())
 	}
 }

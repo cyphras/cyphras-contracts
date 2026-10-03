@@ -1,5 +1,6 @@
 # One line per account that should only pay its own transaction fees: a name, the account and the
-# balance floor in stroops below which the watcher alerts, 0 for none.
+# balance floor in stroops below which the watcher alerts, 0 for none. For a vault of another asset
+# than XLM, a fourth field may give the floor of that asset's balance, in its smallest unit.
 channel-1 G... 100000000
 channel-2 G... 100000000
 channel-3 G... 100000000
