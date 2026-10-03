@@ -170,3 +170,47 @@ fn a_g2_point_outside_the_subgroup_is_refused() {
     v["vk_beta_2"] = g2_json(point);
     rejects(&v, "G2 point is not in G2");
 }
+
+#[test]
+fn every_coordinate_must_be_a_canonical_decimal() {
+    let valid = synthetic_key(17);
+    let x = valid["vk_alpha_1"][0].as_str().unwrap().to_string();
+    for spelling in [
+        format!("+{x}"),
+        format!("0{x}"),
+        format!("00{x}"),
+        format!("{}_{}", &x[..3], &x[3..]),
+        format!(" {x}"),
+        format!("{x} "),
+        format!("-{x}"),
+        format!("0x{x}"),
+        "00".to_string(),
+        "-0".to_string(),
+        String::new(),
+    ] {
+        let mut v = valid.clone();
+        v["vk_alpha_1"][0] = json!(spelling);
+        rejects(&v, "not a canonical decimal string");
+    }
+    // The same holds inside G2 points and the IC list.
+    let mut v = valid.clone();
+    let c = v["vk_beta_2"][1][0].as_str().unwrap().to_string();
+    v["vk_beta_2"][1][0] = json!(format!("0{c}"));
+    rejects(&v, "not a canonical decimal string");
+    let mut v = valid.clone();
+    v["IC"][8][1] = json!(1);
+    rejects(&v, "not a canonical decimal string");
+}
+
+#[test]
+fn a_canonical_decimal_has_no_sign_no_leading_zero_and_no_separator() {
+    for s in ["0", "1", "10", "9", "1234567890"] {
+        assert!(check::canonical_decimal(s), "{s}");
+    }
+    for s in [
+        "", "00", "01", "007", "+1", "-1", "-0", "+0", "1_0", "_1", "1_", " 1", "1 ", "0x1", "1e3",
+        "1.0",
+    ] {
+        assert!(!check::canonical_decimal(s), "{s}");
+    }
+}

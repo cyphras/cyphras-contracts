@@ -94,11 +94,20 @@ pub fn parse(json: &[u8]) -> Result<Key, String> {
     })
 }
 
+/// Whether `s` is the one spelling of its value, `^(0|[1-9][0-9]*)$`: no sign, no leading zero,
+/// no digit separator, so every tool that reads the key reads the same numbers.
+pub fn canonical_decimal(s: &str) -> bool {
+    s == "0" || (!s.starts_with('0') && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn fq(v: &Value) -> Result<Fq, String> {
-    let n: BigUint = v
+    let s = v
         .as_str()
-        .and_then(|s| s.parse().ok())
-        .ok_or("a coordinate is not a decimal string")?;
+        .filter(|s| canonical_decimal(s))
+        .ok_or("a coordinate is not a canonical decimal string")?;
+    let n: BigUint = s
+        .parse()
+        .map_err(|_| "a coordinate is not a canonical decimal string")?;
     if n >= BigUint::from(Fq::MODULUS) {
         return Err("a coordinate is not below the field modulus".into());
     }
