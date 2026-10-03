@@ -119,6 +119,8 @@ export interface Plan {
   readonly operationId: string | undefined;
   readonly retryOf: string | undefined;
   txHash: string | undefined;
+  // The relayer's ID of a request it holds until not_before, until the request has a hash.
+  heldId: string | undefined;
   ledger: number | undefined;
   // Keyed by transaction: the plan is confirmed only when one transaction carries both its
   // nullifiers and both its commitments.

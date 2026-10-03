@@ -282,6 +282,62 @@ describe("wallet: spends", () => {
     );
   });
 
+  it("follows a held payment by its ID, sends it again to a relayer that restarted, and takes its hash", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 3_600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    await alice.sync();
+    let [plan] = await alice.plans();
+    assert.equal(plan?.relayerStatus, "held");
+    // A restarted relayer has forgotten the request: the same proof goes to it again, still held.
+    world.relayer.restart();
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    assert.equal(plan?.relayerStatus, "held");
+    const [first, again] = world.relayer.submissions;
+    assert.equal(world.relayer.submissions.length, 2);
+    assert.deepEqual(again?.proof, first?.proof);
+    assert.equal(again?.notBefore, notBefore);
+    // Once sent, the request has a hash, which the plan takes before the chain shows it landed.
+    world.advance(3_700);
+    world.relayer.releaseHeld();
+    world.indexer.completeTo = world.vault.ledger - 1;
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    assert.equal(plan?.relayerStatus, "success");
+    assert.match(plan?.txHash ?? "", /^[0-9a-f]{64}$/);
+    world.indexer.completeTo = undefined;
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    assert.equal(world.relayer.submissions.length, 2);
+  });
+
+  it("stops following a held payment the relayer dropped when it was due", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    world.relayer.refuseHeld = 2;
+    world.advance(700);
+    world.relayer.releaseHeld();
+    await alice.sync();
+    let [plan] = await alice.plans();
+    // The relayer saw the proof, so its notes stay with the plan until its deadline.
+    assert.equal(plan?.state, "submitted");
+    assert.equal(plan?.relayerStatus, "failed");
+    assert.equal(plan?.mustRetry, true);
+    // A request that failed is not sent again, even to a relayer that forgot it.
+    world.relayer.restart();
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.relayerStatus, "failed");
+    assert.equal(world.relayer.submissions.length, 1);
+  });
+
   it("refuses a destination that does not exist unless the payout can create it, and the vault itself", async () => {
     const { world, alice } = await funded();
     const missing = keypairFor("nobody yet").publicKey();

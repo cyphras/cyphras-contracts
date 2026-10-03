@@ -325,11 +325,19 @@ export class MockRelayer {
   quoteFeeAddress: string | undefined;
   // Test hooks: errors to answer submissions with, in order.
   failures: { error: string; reason?: number }[] = [];
+  // The nullifiers of requests held in memory, which a second submission may not claim.
   inFlight = new Set<string>();
   submissions: { proof: TxProofJson; ext: ExtDataJson; notBefore: number | undefined }[] = [];
   status = new Map<string, string>();
-  // Requests held until their not_before; releaseHeld sends them.
+  // Requests held until their not_before, by the ID the reply gave, with the hash once sent;
+  // releaseHeld sends them.
+  readonly heldRequests = new Map<
+    string,
+    { hash: string | undefined; failure?: { code: string; reason: number } }
+  >();
   held: (() => void)[] = [];
+  // Test hook: the screening refuses held requests when they are due, with this reason.
+  refuseHeld: number | undefined;
 
   constructor(rpc: MockRpc, networkId: string, feeAddress: string) {
     this.rpc = rpc;
@@ -366,14 +374,40 @@ export class MockRelayer {
     }
     if (url.pathname === "/v1/submit") return this.#submit(body as Record<string, unknown>);
     if (url.pathname.startsWith("/v1/tx/")) {
-      const status = this.status.get(url.pathname.slice("/v1/tx/".length));
-      return status === undefined ? json(404, { error: "not_found" }) : json(200, { status });
+      const hash = url.pathname.slice("/v1/tx/".length);
+      return this.status.has(hash)
+        ? json(200, this.#txStatus(hash))
+        : json(404, { error: "not_found" });
+    }
+    if (url.pathname.startsWith("/v1/held/")) {
+      const request = this.heldRequests.get(url.pathname.slice("/v1/held/".length));
+      if (request === undefined) return json(404, { error: "not_found" });
+      if (request.failure !== undefined) return json(200, { status: "failed", ...request.failure });
+      if (request.hash === undefined) return json(200, { status: "held" });
+      return json(200, { ...this.#txStatus(request.hash), hash: request.hash });
     }
     return json(404, { error: "not_found" });
   }
 
+  // A transaction's status as the relayer serves it, with the exit it queued.
+  #txStatus(hash: string): Record<string, unknown> {
+    const status = this.status.get(hash);
+    if (status === "failed") return { status, code: "rejected" };
+    const exit = [...this.vault.exits.values(), ...this.vault.settledExits].find(
+      (e) => e.txHash === hash,
+    );
+    return exit === undefined ? { status } : { status, exit_id: exit.id };
+  }
+
   releaseHeld(): void {
     for (const send of this.held.splice(0)) send();
+  }
+
+  // Held requests live in memory only, so a restart forgets them and their claims.
+  restart(): void {
+    this.held = [];
+    this.heldRequests.clear();
+    this.inFlight.clear();
   }
 
   // Strict parsing, then the vault call with a channel account as the submitter.
@@ -420,8 +454,24 @@ export class MockRelayer {
       }
     };
     if (notBefore !== undefined && notBefore > Number(this.vault.timestamp)) {
-      this.held.push(send);
-      return json(202, { held: true });
+      const id = createHash("sha256")
+        .update(`held/${key}/${this.submissions.length}`)
+        .digest("hex")
+        .slice(0, 32);
+      const claimed = proof.inputNullifiers.map(String);
+      for (const nf of claimed) this.inFlight.add(nf);
+      this.heldRequests.set(id, { hash: undefined });
+      this.held.push(() => {
+        for (const nf of claimed) this.inFlight.delete(nf);
+        if (this.refuseHeld !== undefined) {
+          const failure = { code: "refused", reason: this.refuseHeld };
+          this.heldRequests.set(id, { hash: undefined, failure });
+          return;
+        }
+        send();
+        this.heldRequests.set(id, { hash });
+      });
+      return json(202, { held: true, id });
     }
     return send() ? json(202, { hash }) : json(422, { error: "rejected" });
   }

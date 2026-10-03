@@ -325,36 +325,131 @@ describe("relayer client", () => {
     encrypted_output1: "",
   };
 
-  it("takes the hash of a submission, or none for one held until not_before", async () => {
+  const HELD_ID = "0f".repeat(16);
+
+  it("takes the hash of a submission, or the ID of one held until not_before", async () => {
     const hash = "ab".repeat(32);
     const sent = await new RelayerClient("http://r", reply(202, { hash })).submit(proof, ext);
-    assert.deepEqual(sent, { accepted: true, hash });
-    const held = new RelayerClient("http://r", reply(202, { held: true }));
+    assert.deepEqual(sent, { accepted: true, hash, heldId: undefined });
+    const held = new RelayerClient("http://r", reply(202, { held: true, id: HELD_ID }));
     assert.deepEqual(await held.submit(proof, ext, 1_800_000_000), {
       accepted: true,
       hash: undefined,
+      heldId: HELD_ID,
     });
-    // Only a delayed request may come back without a hash.
+    // Only a delayed request may come back without a hash, and then with its ID.
     await assert.rejects(held.submit(proof, ext), isCode("service_rejected"));
-    await assert.rejects(
-      new RelayerClient("http://r", reply(202, {})).submit(proof, ext, 1_800_000_000),
-      isCode("service_rejected"),
-    );
+    for (const body of [
+      {},
+      { held: true },
+      { held: true, id: "0F".repeat(16) },
+      { held: true, id: "0f" },
+    ]) {
+      await assert.rejects(
+        new RelayerClient("http://r", reply(202, body)).submit(proof, ext, 1_800_000_000),
+        isCode("service_rejected"),
+      );
+    }
   });
 
-  it("reads error codes and refusal reasons", async () => {
-    const relayer = new RelayerClient("http://r", reply(403, { error: "refused", reason: 1 }));
-    const result = await relayer.submit(proof, ext);
-    assert.deepEqual(result, { accepted: false, error: "refused", reason: 1 });
-    const odd = await new RelayerClient("http://r", reply(500, { error: "teapot" })).status(
-      "aa".repeat(32),
+  it("reads every error code of a submission and the reason of a refusal", async () => {
+    for (const error of [
+      "bad_request",
+      "wrong_vault",
+      "fee_too_low",
+      "fee_above_cap",
+      "duplicate",
+      "paused",
+      "rejected",
+      "rate_limited",
+      "unavailable",
+    ]) {
+      const result = await new RelayerClient("http://r", reply(400, { error })).submit(proof, ext);
+      assert.deepEqual(result, { accepted: false, error, reason: undefined });
+    }
+    const refused = await new RelayerClient(
+      "http://r",
+      reply(403, { error: "refused", reason: 1 }),
+    ).submit(proof, ext);
+    assert.deepEqual(refused, { accepted: false, error: "refused", reason: 1 });
+    const odd = await new RelayerClient("http://r", reply(418, { error: "teapot" })).submit(
+      proof,
+      ext,
     );
-    assert.equal(odd, "unknown");
+    assert.deepEqual(odd, { accepted: false, error: "unknown", reason: undefined });
     await assert.rejects(
       new RelayerClient("http://r", reply(503, { error: "unavailable" })).quote(),
       (err: unknown) =>
         isCode("service_rejected")(err) && (err as CyphrasError).details["code"] === "unavailable",
     );
+  });
+
+  it("reads a transaction's status, with the code of a failure and the exit it queued", async () => {
+    const hash = "aa".repeat(32);
+    const tx = (status: number, body: unknown) =>
+      new RelayerClient("http://r", reply(status, body)).tx(hash);
+    assert.deepEqual(await tx(200, { status: "pending" }), {
+      status: "pending",
+      code: undefined,
+      exitId: undefined,
+    });
+    assert.deepEqual(await tx(200, { status: "success", exit_id: 4 }), {
+      status: "success",
+      code: undefined,
+      exitId: 4,
+    });
+    assert.deepEqual(await tx(200, { status: "failed", code: "rejected" }), {
+      status: "failed",
+      code: "rejected",
+      exitId: undefined,
+    });
+    assert.equal(await tx(404, { error: "not_found" }), undefined);
+    await assert.rejects(tx(200, { status: "lost" }), isCode("service_rejected"));
+    await assert.rejects(tx(200, { status: "success", exit_id: 0 }), isCode("service_rejected"));
+    await assert.rejects(tx(429, { error: "rate_limited" }), isCode("service_unavailable"));
+  });
+
+  it("follows a held request by its ID until it is sent or fails", async () => {
+    const hash = "bb".repeat(32);
+    const held = (status: number, body: unknown) =>
+      new RelayerClient("http://r", reply(status, body)).held(HELD_ID);
+    const none = { hash: undefined, code: undefined, reason: undefined, exitId: undefined };
+    assert.deepEqual(await held(200, { status: "held" }), { ...none, status: "held" });
+    assert.deepEqual(await held(200, { status: "pending", hash }), {
+      ...none,
+      status: "pending",
+      hash,
+    });
+    assert.deepEqual(await held(200, { status: "success", hash, exit_id: 2 }), {
+      ...none,
+      status: "success",
+      hash,
+      exitId: 2,
+    });
+    // refused by the screening when it was due, so never sent
+    assert.deepEqual(await held(200, { status: "failed", code: "refused", reason: 3 }), {
+      ...none,
+      status: "failed",
+      code: "refused",
+      reason: 3,
+    });
+    assert.deepEqual(await held(200, { status: "failed", hash, code: "rejected" }), {
+      ...none,
+      status: "failed",
+      hash,
+      code: "rejected",
+    });
+    // a relayer that restarted no longer knows the request
+    assert.equal(await held(404, { error: "not_found" }), undefined);
+    for (const body of [
+      { status: "held", hash },
+      { status: "pending" },
+      { status: "success" },
+      { status: "sent", hash },
+      { status: "pending", hash: "BB".repeat(32) },
+    ]) {
+      await assert.rejects(held(200, body), isCode("service_rejected"));
+    }
   });
 });
 

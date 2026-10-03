@@ -62,7 +62,7 @@ import {
   RpcEventSource,
   type SyncLimits,
 } from "./sources.ts";
-import { type ConfirmSpend, type Submission, spend, submissionOf } from "./spend.ts";
+import { type ConfirmSpend, type Submission, followHeld, spend, submissionOf } from "./spend.ts";
 import {
   type ExitPart,
   type Operation,
@@ -606,7 +606,7 @@ export class PrivateWallet {
       checked ? data.horizon : undefined,
     );
     applyExits(core.state, events.exits, await live?.exits().catch(() => undefined), view.ledger);
-    if (live !== undefined) await this.#pollRelayers(core);
+    if (live !== undefined) await this.#pollRelayers(core, view.ledger);
     return {
       leafCount: core.state.tree.leafCount,
       staged:
@@ -619,16 +619,24 @@ export class PrivateWallet {
     };
   }
 
-  // Asks only the relayer that submitted each pending plan about its own transaction.
-  async #pollRelayers(core: Core): Promise<void> {
+  // Asks only the relayer that took each pending plan about it: by its transaction's hash, or by
+  // the ID of a request the relayer holds until its not_before.
+  async #pollRelayers(core: Core, latest: number): Promise<void> {
     for (const plan of core.state.plans) {
       const route = plan.route;
-      if (plan.state !== "submitted" || route.kind !== "relayer" || plan.txHash === undefined) {
-        continue;
-      }
-      const txHash = plan.txHash;
+      if (plan.state !== "submitted" || route.kind !== "relayer") continue;
       const client = this.#relayerClients(route.url)[0] as RelayerClient;
-      plan.relayerStatus = await client.status(txHash).catch(() => "unknown");
+      const { txHash, heldId } = plan;
+      if (txHash !== undefined) {
+        plan.relayerStatus = await client.tx(txHash).then(
+          (tx) => tx?.status ?? "unknown",
+          () => "unknown",
+        );
+      } else if (heldId !== undefined) {
+        await followHeld(core, plan, heldId, client, latest).catch(() => {
+          plan.relayerStatus = "unknown";
+        });
+      }
     }
   }
 

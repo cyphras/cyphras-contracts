@@ -388,6 +388,6 @@ export function resetUnlanded(plans: readonly Plan[]): void {
   for (const plan of plans) {
     if (!unlanded.includes(plan.state)) continue;
     plan.evidence = [];
-    plan.state = plan.txHash === undefined ? "prepared" : "submitted";
+    plan.state = plan.txHash === undefined && plan.heldId === undefined ? "prepared" : "submitted";
   }
 }
