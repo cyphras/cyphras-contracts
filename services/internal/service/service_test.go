@@ -8,12 +8,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stellar/go-stellar-sdk/keypair"
 	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc/rpctest"
+	"github.com/cyphras/cyphras-contracts/services/internal/testdb"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
@@ -34,20 +38,36 @@ func TestTheSubcommandIsTheFirstArgument(t *testing.T) {
 	}
 }
 
-func TestAlertWebhooksComeFromASecretFile(t *testing.T) {
+func TestAServicePagesThroughAtLeastTwoChannels(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	a, err := Alerter("keeper", log)
-	if err != nil || len(a.Channels) != 0 {
-		t.Fatalf("without webhooks: %v", err)
+	if _, err := Alerter("keeper", log); err == nil {
+		t.Fatal("started without webhooks")
 	}
-	path := filepath.Join(t.TempDir(), "hooks")
-	if err := os.WriteFile(path, []byte("slack https://hooks.example/a\ntext https://ntfy.example/b\n"), 0o400); err != nil {
-		t.Fatal(err)
+	dir := t.TempDir()
+	hooks := func(lines string) {
+		path := filepath.Join(dir, "hooks")
+		_ = os.Remove(path)
+		if err := os.WriteFile(path, []byte(lines), 0o400); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("ALERT_WEBHOOKS_FILE", path)
 	}
-	t.Setenv("ALERT_WEBHOOKS_FILE", path)
-	a, err = Alerter("keeper", log)
-	if err != nil || len(a.Channels) != 2 {
-		t.Fatalf("with webhooks: %v", err)
+	hooks("# being rewritten\n")
+	t.Setenv("ALERT_DEV", "1")
+	if _, err := Alerter("keeper", log); err == nil {
+		t.Fatal("started with no channel")
+	}
+	hooks("slack https://hooks.example/a\n")
+	if a, err := Alerter("keeper", log); err != nil || len(a.Channels) != 1 {
+		t.Fatalf("one channel for development: %v", err)
+	}
+	t.Setenv("ALERT_DEV", "")
+	if _, err := Alerter("keeper", log); err == nil {
+		t.Fatal("started with one channel")
+	}
+	hooks("slack https://hooks.example/a\ntext https://ntfy.example/b\n")
+	if a, err := Alerter("keeper", log); err != nil || len(a.Channels) != 2 {
+		t.Fatalf("with two channels: %v", err)
 	}
 }
 
@@ -131,5 +151,24 @@ func TestTheVerifyingKeyMustMatchItsPinAndTheTestnetKeyNeverServesMainnet(t *tes
 		if err := CheckVerifyingKey(raw, pin, network.TestNetworkPassphrase); err == nil {
 			t.Fatalf("a key accepted under the pin %q", pin)
 		}
+	}
+}
+
+func TestTheOperatorQueueTestsAChannelThatRefusedAnAlert(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool, err := pgxpool.New(ctx, testdb.URL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	b := &Base{Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Alerts: &alert.Alerter{Service: "keeper", Channels: []alert.Channel{
+		alert.Webhook{Format: "text", URL: "https://ntfy.example/a"}, alert.Webhook{Format: "text", URL: "https://ntfy.example/b"},
+	}}}
+	if err := b.StartAlerts(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if q := b.Alerts.Queue; q == nil || q.TestEvery != 5*time.Minute || q.Service != "keeper" {
+		t.Fatalf("the operator queue %+v", q)
 	}
 }

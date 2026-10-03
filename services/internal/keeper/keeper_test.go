@@ -41,11 +41,15 @@ type harness struct {
 	simFail func(string) bool
 	// sentHook sees each sent transaction, so a test can play its effect on the chain.
 	sentHook func(string)
-	// chainFail makes the sent transactions it matches fail on chain.
+	// chainFail makes the sent transactions it matches fail on chain, and conflict fail on the
+	// host's storage, as a call does that the exit queue moved under.
 	chainFail func(string) bool
-	last      string
-	status    vault.Status
-	limit     int64
+	conflict  func(string) bool
+	// footprints holds the footprint of each sent transaction.
+	footprints []xdr.LedgerFootprint
+	last       string
+	status     vault.Status
+	limit      int64
 	// outflows holds the outflow of each queued exit by ID.
 	outflows map[uint64]int64
 	// partial makes the simulated vault pay the head exit in part when it does not fit whole.
@@ -59,6 +63,9 @@ type harness struct {
 	// let the vault hold the asset.
 	funds        *big.Int
 	deauthorized bool
+	// flaggedAt is when each flagged deposit was flagged, which the simulated vault refunds only a
+	// day after.
+	flaggedAt map[uint64]uint64
 }
 
 // released is what the simulated vault's release(max) returns: how many exits it handles from the
@@ -133,17 +140,18 @@ func newHarness(t *testing.T) *harness {
 	kp := keypair.MustRandom()
 	key, _ := vault.AccountKey(kp.Address())
 	h.fake.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{AccountId: key.MustAccount().AccountId, SeqNum: 1, Balance: 500_000_000}}, 1, nil)
-	h.fake.SetEntry(vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingStateArchival), xdr.LedgerEntryData{
-		Type: xdr.LedgerEntryTypeConfigSetting,
-		ConfigSetting: &xdr.ConfigSettingEntry{
-			ConfigSettingId: xdr.ConfigSettingIdConfigSettingStateArchival, StateArchivalSettings: &xdr.StateArchivalSettings{MaxEntryTtl: 3_110_400},
-		},
-	}, 1, nil)
+	h.fake.SetSettings(rpctest.Mainnet)
 	h.fake.Simulate = func(req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
 		var env xdr.TransactionEnvelope
 		_ = xdr.SafeUnmarshalBase64(req.Transaction, &env)
 		if h.simFail != nil && h.simFail(describe(env)) {
 			return protocol.SimulateTransactionResponse{Error: "resource limit exceeded"}, nil
+		}
+		var refunded uint64
+		if _, err := fmt.Sscanf(describe(env), "refund %d", &refunded); err == nil {
+			if at, ok := h.flaggedAt[refunded]; ok && uint64(h.now.Unix()) < at+86_400 {
+				return protocol.SimulateTransactionResponse{Error: "HostError: Error(Contract, #138)"}, nil
+			}
 		}
 		data := xdr.SorobanTransactionData{}
 		if env.V1.Tx.Ext.SorobanData != nil {
@@ -174,6 +182,9 @@ func newHarness(t *testing.T) *harness {
 		h.mu.Lock()
 		h.sent = append(h.sent, describe(env))
 		h.last = describe(env)
+		if data := env.V1.Tx.Ext.SorobanData; data != nil {
+			h.footprints = append(h.footprints, data.Resources.Footprint)
+		}
 		hook := h.sentHook
 		h.mu.Unlock()
 		if hook != nil {
@@ -184,7 +195,11 @@ func newHarness(t *testing.T) *harness {
 	h.fake.Get = func(protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
 		h.mu.Lock()
 		failed := h.chainFail != nil && h.chainFail(h.last)
+		conflict := h.conflict != nil && h.conflict(h.last)
 		h.mu.Unlock()
+		if conflict {
+			return conflictOnChain(), nil
+		}
 		if failed {
 			r, _ := xdr.MarshalBase64(xdr.TransactionResult{Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxFailed, Results: &[]xdr.OperationResult{}}})
 			return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusFailed, ResultXDR: r}}, nil
@@ -254,6 +269,12 @@ func (h *harness) live(ledgers uint32) *uint32 {
 
 func (h *harness) shield(amount int64, flag *uint32, flaggedAt uint64) uint64 {
 	id := h.chain.Shield(vaulttest.Depositor, amount)
+	if flag != nil {
+		if h.flaggedAt == nil {
+			h.flaggedAt = map[uint64]uint64{}
+		}
+		h.flaggedAt[id] = flaggedAt
+	}
 	h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)),
 		vaulttest.Pending(id, vaulttest.Depositor, amount, uint64(h.chain.ClosedAt), 3600, flag, flaggedAt), h.chain.Ledger, h.live(600_000))
 	return id
@@ -370,8 +391,10 @@ func TestAScreeningHoldIsRefundedADayAfterItAndNotBefore(t *testing.T) {
 	h.sync()
 	h.now = h.now.Add(24*time.Hour - time.Second)
 	h.sync()
-	if err := h.k.Refund(context.Background()); err != nil || len(h.take()) != 0 {
-		t.Fatalf("refunded before a day passed: %v", err)
+	// The vault would refuse the refund, so the keeper does not even simulate it.
+	simulated := h.fake.CallCount("simulateTransaction")
+	if err := h.k.Refund(context.Background()); err != nil || len(h.take()) != 0 || h.fake.CallCount("simulateTransaction") != simulated {
+		t.Fatalf("refunded, or tried to, before a day passed: %v", err)
 	}
 	h.now = h.now.Add(time.Second)
 	h.sync()

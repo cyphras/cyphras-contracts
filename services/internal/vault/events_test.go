@@ -3,6 +3,7 @@ package vault
 import (
 	"errors"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -343,5 +344,30 @@ func TestBrokenShapesAreRefused(t *testing.T) {
 	b.nextTx("aa").emit("attested", Field{"up_to", U64(3)})
 	if _, err := ParseTxs(b.events); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("split transaction: %v", err)
+	}
+}
+
+func TestOnlyAnEventTheChainCouldHoldIsValid(t *testing.T) {
+	good := RawEvent{Ledger: 7, ClosedAt: 1_700_000_000, TxHash: strings.Repeat("0a", 32), Contract: "CBYJTWEOBJL52FA7J7JNDVM65TW64PXO2EIQBF5YVEE3OROZSBVMP2N5",
+		Topics: []string{"AAAADwAAAAR0ZXN0"}, Value: strings.Repeat("A", maxEventBytes-16)}
+	if err := good.Valid(); err != nil {
+		t.Fatal(err)
+	}
+	for name, spoil := range map[string]func(*RawEvent){
+		"no ledger":             func(e *RawEvent) { e.Ledger = 0 },
+		"no close time":         func(e *RawEvent) { e.ClosedAt = 0 },
+		"a short hash":          func(e *RawEvent) { e.TxHash = e.TxHash[:63] },
+		"a long hash":           func(e *RawEvent) { e.TxHash += "0" },
+		"an upper-case hash":    func(e *RawEvent) { e.TxHash = strings.Repeat("0A", 32) },
+		"an account":            func(e *RawEvent) { e.Contract = "GBA3WCGVHQ5U5HNWIJXBSLCBLB5JWZH4HVWBZMU3ZLF6U4NH7OIZH3XH" },
+		"no topic":              func(e *RawEvent) { e.Topics = nil },
+		"five topics":           func(e *RawEvent) { e.Topics = []string{"a", "b", "c", "d", "e"} },
+		"a byte past the bound": func(e *RawEvent) { e.Value += "AAAA" },
+	} {
+		e := good
+		spoil(&e)
+		if err := e.Valid(); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 }

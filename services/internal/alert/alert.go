@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,6 +52,13 @@ type Webhook struct {
 	Format string
 	URL    string
 	HTTP   *http.Client
+}
+
+// Name implements Named: the webhook's format and the start of a hash of its URL, which holds a
+// token and is never shown.
+func (w Webhook) Name() string {
+	sum := sha256.Sum256([]byte(w.Format + " " + w.URL))
+	return fmt.Sprintf("%s-%x", w.Format, sum[:8])
 }
 
 // Send implements Channel.

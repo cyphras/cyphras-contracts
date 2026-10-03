@@ -141,8 +141,9 @@ func (k *Keeper) Release(ctx context.Context) error {
 		if idle {
 			return nil
 		}
-		ids := make([]uint64, 0, batch)
-		for id := head; id < tail && len(ids) < batch; id++ {
+		// The exits past the batch are those it pays when others release as many first.
+		ids := make([]uint64, 0, batch+int(k.cfg.ExitKeys))
+		for id := head; id < tail && len(ids) < batch+int(k.cfg.ExitKeys); id++ {
 			ids = append(ids, id)
 		}
 		exits, err := k.readExits(ctx, ids, vault.ExitKey)
@@ -151,7 +152,7 @@ func (k *Keeper) Release(ctx context.Context) error {
 		}
 		room, funds := w.room, w.funds
 		n := 0
-		for _, e := range exits {
+		for _, e := range exits[:min(len(exits), batch)] {
 			outflow := new(big.Int).Add(e.Payout, e.Fee)
 			if outflow.Cmp(room) > 0 || outflow.Cmp(funds) > 0 {
 				break
@@ -172,7 +173,7 @@ func (k *Keeper) Release(ctx context.Context) error {
 		n = max(n, 1)
 		res, err := k.callWorth(ctx, fmt.Sprintf("release of %d exits", n), func() (txnbuild.Operation, error) {
 			return k.invoke("release", vault.U32(uint32(n)))
-		}, handledAny)
+		}, handledAny, k.releaseRoom(w.inst.Config.Token, head, n, exits))
 		switch {
 		case errors.Is(err, submit.ErrNotWorth):
 			k.setIdle(state)
@@ -189,6 +190,57 @@ func (k *Keeper) Release(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// releaseRoom gives a release of n exits from head room for the ledger it lands in: the stranded
+// entries of its exits, which a payment the asset contract refuses writes, and the entries of the
+// ExitKeys exits after them, which it pays instead when releases of others pay as many from the
+// head first: those exits, their stranded entries and their payees' balances.
+func (k *Keeper) releaseRoom(token string, head uint64, n int, exits []vault.Exit) submit.Extend {
+	return func(context.Context, xdr.LedgerFootprint) (submit.Extra, error) {
+		var keys []xdr.LedgerKey
+		for id := head; id < head+uint64(n); id++ {
+			key, err := vault.StrandedKey(k.cfg.Vault, id)
+			if err != nil {
+				return submit.Extra{}, err
+			}
+			keys = append(keys, key)
+		}
+		balances := 0
+		for i, e := range exits[min(n, len(exits)):min(n+int(k.cfg.ExitKeys), len(exits))] {
+			id := head + uint64(n+i)
+			exit, err := vault.ExitKey(k.cfg.Vault, id)
+			if err != nil {
+				return submit.Extra{}, err
+			}
+			stranded, err := vault.StrandedKey(k.cfg.Vault, id)
+			if err != nil {
+				return submit.Extra{}, err
+			}
+			keys = append(keys, exit, stranded)
+			for _, p := range []struct {
+				party  string
+				amount *big.Int
+			}{{e.Recipient, e.Payout}, {e.Relayer, e.Fee}} {
+				if p.amount.Sign() <= 0 {
+					continue
+				}
+				paid, err := vault.PayKeys(token, k.cfg.Asset, p.party)
+				if err != nil {
+					return submit.Extra{}, err
+				}
+				for _, key := range paid {
+					if key.Type == xdr.LedgerEntryTypeContractData {
+						balances++
+					}
+				}
+				keys = append(keys, paid...)
+			}
+		}
+		written := uint32(vault.ExitEntryBytes + balances*vault.BalanceEntryBytes)
+		return submit.Extra{ReadWrite: keys, Instructions: vault.SwitchInstructions, WriteBytes: written, NewBytes: written,
+			RentLedgers: vault.EntryTTL, EventBytes: vault.SwitchEventBytes}, nil
+	}
 }
 
 func (k *Keeper) setIdle(state releaseIdle) {
@@ -381,7 +433,7 @@ func (k *Keeper) claim(ctx context.Context, id uint64) error {
 	what := fmt.Sprintf("claim of exit %d", id)
 	res, err := k.attempt(ctx, what, func() (txnbuild.Operation, error) {
 		return k.invoke("claim", vault.U64(id))
-	}, nil)
+	}, nil, k.claimRoom)
 	if errors.Is(err, submit.ErrSimulation) {
 		return nil
 	}
@@ -405,6 +457,17 @@ func (k *Keeper) claim(ctx context.Context, id uint64) error {
 		k.alerts.Raise(ctx, alert.Critical, "call_failed", "%s failed after retries: %v", what, err)
 		return err
 	}
+}
+
+// claimRoom gives a claim the exits from the tail its simulation queued it at to ExitKeys past it,
+// so as many exits queued ahead of it in the same ledger still leave it room.
+func (k *Keeper) claimRoom(_ context.Context, fp xdr.LedgerFootprint) (submit.Extra, error) {
+	tail, ok := vault.QueuedExit(k.cfg.Vault, fp)
+	if !ok {
+		return submit.Extra{}, nil
+	}
+	keys, err := vault.ExitKeys(k.cfg.Vault, tail, k.cfg.ExitKeys)
+	return submit.Extra{ReadWrite: keys}, err
 }
 
 // creates reports whether claiming the exit would queue a payout that creates its recipient's

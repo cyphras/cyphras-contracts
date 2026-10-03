@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -24,6 +25,37 @@ type RawEvent struct {
 	Contract string   `json:"contract"`
 	Topics   []string `json:"topics"`
 	Value    string   `json:"value"`
+}
+
+// maxEventBytes bounds an event's topics and data, base64 included: the network limits the events
+// of a transaction to 16 KiB, about 21.9 KB in base64.
+const maxEventBytes = 32 << 10
+
+// Valid reports a raw event whose fields could have come from the chain: a ledger and its close
+// time, the hash of its transaction in 64 lowercase hex digits, a contract's address, one to four
+// topics, and topics and data no larger than the network lets a transaction's events be. Anything
+// else is malformed, whatever served it.
+func (r RawEvent) Valid() error {
+	if r.Ledger == 0 || r.ClosedAt <= 0 {
+		return malformed("event without a ledger or close time")
+	}
+	if len(r.TxHash) != 64 || strings.Trim(r.TxHash, "0123456789abcdef") != "" {
+		return malformed("transaction hash %.80q", r.TxHash)
+	}
+	if _, err := strkey.Decode(strkey.VersionByteContract, r.Contract); err != nil {
+		return malformed("contract %.80q", r.Contract)
+	}
+	if len(r.Topics) == 0 || len(r.Topics) > 4 {
+		return malformed("event with %d topics", len(r.Topics))
+	}
+	size := len(r.Value)
+	for _, t := range r.Topics {
+		size += len(t)
+	}
+	if size > maxEventBytes {
+		return malformed("event of %d bytes", size)
+	}
+	return nil
 }
 
 // Position orders events in chain order.

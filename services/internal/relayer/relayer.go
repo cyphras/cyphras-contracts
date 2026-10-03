@@ -84,6 +84,9 @@ type Config struct {
 	// a request is accepted and again before it is sent, so its root still has insertions to spare
 	// when the transaction lands; 200 of the 256 the vault keeps when unset.
 	FreshRoots uint32
+	// ExitKeys is how many exits queued ahead of a relayed exit in the ledger it lands in still
+	// leave its footprint room for it to queue; 4 when unset.
+	ExitKeys uint32
 }
 
 func (c *Config) defaults() {
@@ -116,6 +119,9 @@ func (c *Config) defaults() {
 	}
 	if c.FreshRoots == 0 {
 		c.FreshRoots = 200
+	}
+	if c.ExitKeys == 0 {
+		c.ExitKeys = 4
 	}
 }
 
@@ -158,6 +164,8 @@ type Relayer struct {
 	nfNext uint32
 	// following counts the transactions being followed to their outcome.
 	following sync.WaitGroup
+	// exitSlot holds a token while none of this relayer's exits that queue is in flight.
+	exitSlot chan struct{}
 
 	mu       sync.Mutex
 	inflight map[fr.Element]bool
@@ -171,8 +179,11 @@ type Relayer struct {
 
 	chainMu sync.RWMutex
 	inst    *vault.Instance
-	// roots holds the age of each root the vault keeps, 0 for the newest.
+	// roots holds the age of each root the vault keeps, 0 for the newest, as read at rootsLedger.
 	roots       map[fr.Element]uint32
+	rootsLedger uint32
+	// rootsMu makes concurrent reads of the root history wait for one.
+	rootsMu     sync.Mutex
 	latest      uint32
 	latestClose int64
 }
@@ -216,7 +227,9 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		clock: &ledgerClock{fallback: float64(cfg.LedgerSeconds)},
 		known: spentSet{max: maxKnownSpent}, told: verdicts{ttl: verdictLifetime, max: maxVerdicts},
 		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[string]*heldRequest{},
+		exitSlot: make(chan struct{}, 1),
 	}
+	r.exitSlot <- struct{}{}
 	for _, ok := range past {
 		r.results.add(ok)
 	}
@@ -326,7 +339,7 @@ func (r *Relayer) readRoots(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	e, _, err := rpc.One(ctx, r.rpc, key)
+	e, latest, err := rpc.One(ctx, r.rpc, key)
 	if err != nil {
 		return err
 	}
@@ -345,29 +358,44 @@ func (r *Relayer) readRoots(ctx context.Context) error {
 		}
 	}
 	r.chainMu.Lock()
-	r.roots = roots
+	r.roots, r.rootsLedger = roots, latest
 	r.chainMu.Unlock()
 	return nil
 }
 
-// freshRoot reports whether a root is among the vault's newest FreshRoots: one older would leave a
-// transaction made against it to fail when insertions push it out of the vault's history before
-// it lands. The root history is read again first when reread is set, and when the root is newer
-// than the last read.
-func (r *Relayer) freshRoot(ctx context.Context, root fr.Element, reread bool) (bool, error) {
+// freshRoot reports whether a root is among the vault's newest FreshRoots, and whether the vault
+// keeps it at all: one older would leave a transaction made against it to fail when insertions
+// push it out of the vault's history before it lands. The root history is read again first when
+// reread is set, and when the root is newer than the last read, unless it was read at ledger.
+func (r *Relayer) freshRoot(ctx context.Context, root fr.Element, ledger uint32, reread bool) (fresh, known bool, err error) {
 	r.chainMu.RLock()
 	age, known := r.roots[root]
 	r.chainMu.RUnlock()
 	if known && !reread {
-		return age < r.cfg.FreshRoots, nil
+		return age < r.cfg.FreshRoots, true, nil
 	}
-	if err := r.readRoots(ctx); err != nil {
-		return false, err
+	if err := r.readRootsAt(ctx, ledger); err != nil {
+		return false, false, err
 	}
 	r.chainMu.RLock()
 	defer r.chainMu.RUnlock()
 	age, known = r.roots[root]
-	return known && age < r.cfg.FreshRoots, nil
+	return known && age < r.cfg.FreshRoots, known, nil
+}
+
+// readRootsAt reads the root history again unless it was read at ledger or later. The history
+// only changes when a ledger closes, so checks of the same ledger, repeated or concurrent, share
+// one read; an unknown ledger, 0, reads it.
+func (r *Relayer) readRootsAt(ctx context.Context, ledger uint32) error {
+	r.rootsMu.Lock()
+	defer r.rootsMu.Unlock()
+	r.chainMu.RLock()
+	read := r.rootsLedger
+	r.chainMu.RUnlock()
+	if ledger > 0 && read >= ledger {
+		return nil
+	}
+	return r.readRoots(ctx)
 }
 
 // spent reports whether either nullifier is already spent.
@@ -400,13 +428,17 @@ func (r *Relayer) local(ctx context.Context, req Request) *failure {
 		p.Root, p.PublicAmount, p.ExtDataHash, inst.Config.Domain, p.Nullifiers[0], p.Nullifiers[1], p.Commitments[0], p.Commitments[1],
 	}
 	if !r.cfg.Key.Verify(p.A, p.B, p.C, inputs) {
-		return fail(http.StatusUnprocessableEntity, CodeRejected)
+		return settledFail(http.StatusUnprocessableEntity, CodeRejected)
 	}
-	ok, err := r.freshRoot(ctx, p.Root, false)
+	fresh, known, err := r.freshRoot(ctx, p.Root, r.clock.ledgerAt(r.now().Unix()), false)
 	switch {
 	case err != nil:
 		return fail(http.StatusServiceUnavailable, CodeUnavailable)
-	case !ok:
+	case known && !fresh:
+		// A root the vault keeps never grows fresh again.
+		return settledFail(http.StatusUnprocessableEntity, CodeRejected)
+	case !fresh:
+		// A root newer than the history this relayer read may still come.
 		return fail(http.StatusUnprocessableEntity, CodeRejected)
 	}
 	return nil
@@ -686,16 +718,20 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	if f := r.check(req); f != nil {
 		return Accepted{}, f
 	}
-	if f := r.local(ctx, req); f != nil {
-		return Accepted{}, f
-	}
-	// A proof already used, or already refused once it had cost the network, is answered from
-	// memory, so replaying public proofs cannot spend the budget honest requests need.
-	if r.known.any(req.Proof.Nullifiers) {
-		return Accepted{}, fail(http.StatusUnprocessableEntity, CodeRejected)
-	}
+	// A proof already refused for good, once it had been verified or had cost the network, is
+	// answered from memory, so replaying public proofs cannot spend the budget, or the reads of
+	// the root history, honest requests need.
 	if f := r.told.recall(proofKey(req), r.now()); f != nil {
 		return Accepted{}, f
+	}
+	if f := r.local(ctx, req); f != nil {
+		if f.settled {
+			r.told.remember(proofKey(req), *f, r.now())
+		}
+		return Accepted{}, f
+	}
+	if r.known.any(req.Proof.Nullifiers) {
+		return Accepted{}, fail(http.StatusUnprocessableEntity, CodeRejected)
 	}
 	if f := r.guard(req); f != nil {
 		return Accepted{}, f
@@ -972,10 +1008,13 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	if !ok {
 		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
-	release := true
+	release, slot := true, false
 	defer func() {
 		if release {
 			r.channels.release(ch)
+			if slot {
+				r.exitSlot <- struct{}{}
+			}
 		}
 	}()
 	if !r.simulateLimit.Allow() {
@@ -985,9 +1024,7 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	if err != nil {
 		return "", fail(http.StatusBadRequest, CodeBadRequest)
 	}
-	// The bound stops at the deadline itself: a ledger bound excludes its own ledger, so the
-	// transaction can never land where the vault would answer Expired.
-	prepared, err := r.engine.PrepareUntil(ctx, ch, op, req.Ext.Deadline)
+	prepared, slot, err := r.prepare(ctx, ch, op, req)
 	if err != nil {
 		if errors.Is(err, submit.ErrSimulation) {
 			return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
@@ -999,7 +1036,7 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 			return "", f
 		}
 	}
-	current, err := r.freshRoot(ctx, req.Proof.Root, true)
+	current, _, err := r.freshRoot(ctx, req.Proof.Root, prepared.SimulatedAt, true)
 	if err != nil {
 		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
@@ -1024,14 +1061,93 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 		r.alerts.Raise(r.ctx, alert.Critical, "relay_record_failed", "relay record of %s not stored: %v", signed.Hash, err)
 	}
 	r.following.Add(1)
-	go r.follow(signed, ch, req.Proof.Nullifiers, rec)
+	go r.follow(signed, ch, slot, req.Proof.Nullifiers, rec)
 	return signed.Hash, nil
 }
 
-func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, nfs [2]fr.Element, rec Record) {
+// prepare simulates a relayed transaction, with room for the other path of the exit queue, and
+// holds the exit slot for one whose simulation queued its exit: this relayer has one exit that
+// queues in flight at a time, so its own exits never compete for the queue's tail in a ledger. One
+// that has to wait for the slot is simulated again once it holds it, against the tail the exit
+// before it left. slot reports that the caller holds the slot.
+func (r *Relayer) prepare(ctx context.Context, ch *submit.Account, op txnbuild.Operation, req Request) (p *submit.Prepared, slot bool, err error) {
+	for {
+		queued := false
+		// The bound stops at the deadline itself: a ledger bound excludes its own ledger, so the
+		// transaction can never land where the vault would answer Expired.
+		p, err = r.engine.PrepareUntil(ctx, ch, op, req.Ext.Deadline, r.exitRoom(req, &queued))
+		switch {
+		case err != nil || !queued:
+			if slot {
+				r.exitSlot <- struct{}{}
+			}
+			return p, false, err
+		case slot:
+			return p, true, nil
+		}
+		select {
+		case <-r.exitSlot:
+			return p, true, nil
+		default:
+		}
+		select {
+		case <-r.exitSlot:
+			slot = true
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
+}
+
+// exitRoom gives a relayed transaction that pays anything the entries of the exit queue's other
+// path, as vault.TransactRoom names them, with the resources that path may take. The queue's tail
+// is the one the simulation wrote an exit at, or the vault's tail now when it paid at once.
+// queued reports a simulation that queued the exit.
+func (r *Relayer) exitRoom(req Request, queued *bool) submit.Extend {
+	return func(ctx context.Context, fp xdr.LedgerFootprint) (submit.Extra, error) {
+		if req.Ext.ExtAmount.Sign() == 0 && req.Ext.Fee.Sign() == 0 {
+			return submit.Extra{}, nil
+		}
+		inst, _, _ := r.view()
+		tail, ok := vault.QueuedExit(r.cfg.Vault, fp)
+		*queued = ok
+		if !ok || inst == nil {
+			fresh, _, _, err := rpc.VaultInstance(ctx, r.rpc, r.cfg.Vault)
+			if err != nil {
+				return submit.Extra{}, err
+			}
+			inst = &fresh
+			if !ok {
+				tail = fresh.Status.ExitTail
+			}
+		}
+		keys, err := vault.TransactRoom(r.cfg.Vault, inst.Config.Token, r.cfg.Asset, req.Ext, tail, r.cfg.ExitKeys)
+		if err != nil {
+			return submit.Extra{}, err
+		}
+		token, err := vault.ScAddress(inst.Config.Token)
+		if err != nil {
+			return submit.Extra{}, err
+		}
+		// Queueing writes an exit, and paying at once the balances the asset contract keeps.
+		newBytes := uint32(vault.ExitEntryBytes)
+		for _, k := range keys {
+			if k.Type == xdr.LedgerEntryTypeContractData && k.ContractData.Contract.Equals(token) {
+				newBytes += vault.BalanceEntryBytes
+			}
+		}
+		return submit.Extra{ReadWrite: keys, Instructions: vault.SwitchInstructions, WriteBytes: newBytes, NewBytes: newBytes,
+			RentLedgers: vault.EntryTTL, EventBytes: vault.SwitchEventBytes}, nil
+	}
+}
+
+func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, slot bool, nfs [2]fr.Element, rec Record) {
 	defer r.following.Done()
 	res, err := r.engine.Track(r.ctx, s)
 	r.channels.release(ch)
+	if slot {
+		r.exitSlot <- struct{}{}
+	}
 	r.unclaim(nfs)
 	if err != nil {
 		r.log.Warn("tracking stopped", "tx", s.Hash, "error", err.Error())
@@ -1057,16 +1173,21 @@ func (r *Relayer) finish(res submit.Result, sent Record) {
 		r.log.Info("confirmed", "tx", res.Hash, "ledger", res.Ledger, "network_fee", res.FeeCharged)
 	case submit.Failed:
 		rec.Outcome = outcomeFailed
-		r.setStatus(res.Hash, txStatus{Status: "failed", Code: CodeRejected})
 		r.results.add(false)
 		c := r.classify(res, sent)
+		code := CodeRejected
+		if c == causeConflict {
+			// The request rests nowhere and may be sent again.
+			code = CodeUnavailable
+		}
+		r.setStatus(res.Hash, txStatus{Status: "failed", Code: code})
 		r.log.Warn("failed on chain", "tx", res.Hash, "result", res.Code, "cause", c.String(), "network_fee", res.FeeCharged)
 		r.coolDown(sent, c)
 		if c == causeUnclear {
 			r.alerts.Raise(r.ctx, alert.Warning, "rpc_no_diagnostics", "the RPC returned no diagnostic events for failed transaction %s, so its cause cannot be told; it counts as a race and rests its notes and destination. Use an RPC that returns diagnostic events.", res.Hash)
 		}
 		switch c {
-		case causeSpent, causeReceive, causeRace, causeUnclear:
+		case causeSpent, causeReceive, causeRace, causeUnclear, causeConflict:
 			if c == causeSpent {
 				r.known.add(sentNullifiers(sent)...)
 			}
@@ -1118,10 +1239,15 @@ const (
 	causeRace
 	// causeUnclear is a failure the RPC returned no diagnostic events for, which cannot be told.
 	causeUnclear
+	// causeConflict is a call that failed on the host's storage: the exit queue, or another entry
+	// it touched, moved under it past the room its footprint was given. Sent again after a new
+	// simulation, the same request can succeed.
+	causeConflict
 )
 
 func (c cause) String() string {
-	return [...]string{"relayer", "vault", "notes spent first", "destination stopped receiving", "the chain moved under the call", "no diagnostics"}[c]
+	return [...]string{"relayer", "vault", "notes spent first", "destination stopped receiving", "the chain moved under the call", "no diagnostics",
+		"the exit queue moved under the call"}[c]
 }
 
 // The vault's error codes a client can bring about after its request was checked. Codes below
@@ -1153,6 +1279,8 @@ func (r *Relayer) classify(res submit.Result, sent Record) cause {
 	}
 	e := res.ContractError
 	switch {
+	case e == nil && res.Conflict:
+		return causeConflict
 	case e == nil:
 		if nfs := sentNullifiers(sent); len(nfs) == 2 {
 			if spent, err := r.spent(ctx, [2]fr.Element{nfs[0], nfs[1]}); err == nil && spent {
@@ -1252,13 +1380,17 @@ func (r *Relayer) vaultCanPay(ctx context.Context) (bool, error) {
 // coolDown rests what a failed relay carried, in memory and in the database, so a restart does
 // not forget it: the request itself and, unless the relayer was at fault or the chain moved under
 // the call, its notes, for a day; and after a receive failure, or one that cannot be told, the
-// destination, for longer each time it fails again.
+// destination, for longer each time it fails again. A conflict on the exit queue rests nothing.
 func (r *Relayer) coolDown(rec Record, c cause) {
+	if c == causeConflict {
+		return
+	}
 	now := r.now()
 	until := now.Add(r.cfg.Cooldown).Unix()
 	var keys []string
-	// The exact request is never sent again, whatever the cause: a failure the relayer itself
-	// pays for must not be repeatable at will.
+	// The exact request is never sent again, whatever else the cause: a failure the relayer
+	// itself pays for must not be repeatable at will. A conflict needs another exit or call to
+	// land first in the same ledger, which costs whoever sends it.
 	if rec.Request != "" {
 		keys = append(keys, rec.Request)
 	}

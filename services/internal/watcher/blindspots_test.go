@@ -517,3 +517,116 @@ func TestAnUnflagInsideTheAttestedRangeIsJudgedAsAnAttestation(t *testing.T) {
 		}
 	}
 }
+
+// largeDeposits makes n large deposits in one ledger, with the entries the vault keeps for them.
+func (h *harness) largeDeposits(n int) []uint64 {
+	h.t.Helper()
+	c := h.chain
+	var ids []uint64
+	for range n {
+		ids = append(ids, c.Shield(vaulttest.Depositor, 6_000_000_000))
+	}
+	c.NextLedger(5)
+	h.sync()
+	created := uint64(c.ClosedAt - 5)
+	for _, id := range ids {
+		h.primary.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)), vaulttest.Pending(id, vaulttest.Depositor, 6_000_000_000, created, 86400, nil, 0), c.Ledger, nil)
+	}
+	return ids
+}
+
+func (h *harness) waitingChecks() int {
+	h.t.Helper()
+	checks, err := h.w.db.attestChecks(context.Background())
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return len(checks)
+}
+
+func TestEveryEarlyUnflagOfALedgerIsJudged(t *testing.T) {
+	for name, play := range map[string]func(h *harness, x, y uint64){
+		// Two unflags under an attestation that covers neither, in one ledger.
+		"two unflags": func(h *harness, x, y uint64) {
+			h.chain.Flag(x, 6)
+			h.chain.Flag(y, 6)
+			h.chain.Attest(y)
+			h.chain.Unflag(x, 6)
+			h.chain.Unflag(y, 6)
+		},
+		// Flagged again and unflagged again in the ledger of the first unflag.
+		"an unflag, a flag and an unflag": func(h *harness, x, y uint64) {
+			h.chain.Flag(x, 6)
+			h.chain.Flag(y, 6)
+			h.chain.Attest(y)
+			h.chain.NextLedger(60)
+			h.chain.Unflag(x, 6)
+			h.chain.Flag(x, 7)
+			h.chain.Unflag(x, 7)
+			h.chain.Unflag(y, 6)
+		},
+	} {
+		for _, readFails := range []bool{false, true} {
+			h := newHarness(t)
+			ids := h.largeDeposits(2)
+			x, y := ids[0], ids[1]
+			failing := &failingPending{Fake: h.primary, key: mustKeyString(mustKey(vault.PendingKey(vaulttest.Vault, x))), fail: readFails}
+			h.w.rpc = failing
+			h.chain.NextLedger(120)
+			play(h, x, y)
+			h.chain.NextLedger(5)
+			h.sync()
+			failing.fail = false
+			if err := h.w.RetryAttestations(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !h.pages.has("early_attestation_1") || !h.pages.has("early_attestation_2") || h.waitingChecks() != 0 {
+				t.Fatalf("%s, read failing %v: pages %v, %d checks wait", name, readFails, h.pages.codes(), h.waitingChecks())
+			}
+		}
+	}
+}
+
+func TestAnUnflagInTheTransactionOfItsAttestationIsJudged(t *testing.T) {
+	h := newHarness(t)
+	x := h.largeDeposits(1)[0]
+	h.chain.NextLedger(120)
+	h.chain.Tx().
+		Emit("deposit_flagged", vault.Field{Name: "id", Value: vault.U64(x)}, vault.Field{Name: "reason", Value: vault.U32(6)}).
+		Emit("attested", vault.Field{Name: "up_to", Value: vault.U64(x)}).
+		Emit("deposit_unflagged", vault.Field{Name: "id", Value: vault.U64(x)}, vault.Field{Name: "reason", Value: vault.U32(6)})
+	h.chain.NextLedger(5)
+	h.sync()
+	if !h.pages.has("early_attestation_1") {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+}
+
+func TestAnUnflagWaitingForItsJudgmentOutlivesARestart(t *testing.T) {
+	h := newHarness(t)
+	ids := h.largeDeposits(2)
+	x, y := ids[0], ids[1]
+	h.w.rpc = &failingPending{Fake: h.primary, key: mustKeyString(mustKey(vault.PendingKey(vaulttest.Vault, x))), fail: true}
+	h.chain.NextLedger(120)
+	h.chain.Flag(x, 6)
+	h.chain.Attest(y)
+	h.chain.Unflag(x, 6)
+	h.chain.NextLedger(5)
+	h.sync()
+	pages := &recorder{}
+	alerts := &alert.Alerter{Service: "watcher", Channels: []alert.Channel{pages}}
+	again, err := New(context.Background(), h.w.cfg, h.primary, h.second, h.w.chain, nil, alerts, h.w.public, h.w.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := again.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := again.RetryAttestations(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	checks, _ := again.db.attestChecks(context.Background())
+	if !pages.has("early_attestation_1") || len(checks) != 0 {
+		t.Fatalf("after a restart: pages %v, %d checks wait", pages.codes(), len(checks))
+	}
+}

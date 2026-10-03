@@ -131,3 +131,11 @@ func TestOnlyAnAnswerThatWouldRepeatRefusesACopy(t *testing.T) {
 		}
 	}
 }
+
+func TestAWebhookIsNamedWithoutItsToken(t *testing.T) {
+	w := Webhook{Format: "discord", URL: "https://discord.example/api/webhooks/1/SECRET-TOKEN"}
+	other := Webhook{Format: "discord", URL: w.URL + "2"}
+	if n := w.Name(); !strings.HasPrefix(n, "discord-") || len(n) != len("discord-")+16 || strings.Contains(n, "SECRET") || n == other.Name() {
+		t.Fatalf("named %q", n)
+	}
+}

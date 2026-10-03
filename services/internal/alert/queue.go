@@ -19,18 +19,23 @@ import (
 // that is slow, down or rate limited holds up only itself. A lane sends Critical alerts before
 // Warnings, each on its own, and gathers Info alerts into one digest at most every DigestEvery.
 // A copy a channel fails to take is retried with backoff until the channel takes it, and one it
-// refuses with a 4xx answer other than 408 or 429 is dropped, as it would be refused again; a
-// lane whose channel keeps failing rests, as long as a 429 answer asks or at a backoff. With a
-// Store, the copies not yet delivered survive a restart.
+// refuses with a 4xx answer other than 408 or 429 is dropped, as it would be refused again: a
+// dropped Critical goes to the other channels, saying so. A lane whose channel keeps failing
+// rests, as long as a 429 answer asks or at a backoff. With a Store, the copies not yet delivered
+// survive a restart, kept under each channel's name.
 type Queue struct {
 	// Name tells apart the queues that share a store, such as an operator and a public one.
 	Name     string
+	Service  string
 	Channels []Channel
 	Store    *Store
 	Log      *slog.Logger
 	Now      func() time.Time
 	// DigestEvery is how often a lane sends its digest of Info alerts; 5 minutes unless set.
 	DigestEvery time.Duration
+	// TestEvery, when set, is how often a lane that has nothing to send while its channel counts as
+	// failing sends the channel a test, which clears the failing once the channel takes it.
+	TestEvery time.Duration
 
 	mu      sync.Mutex
 	pending []delivery
@@ -54,9 +59,33 @@ type lane struct {
 	// failures counts the sends the channel refused in a row, from the time failing.
 	failures int
 	failing  time.Time
-	// rest is when the lane may send again, and digestAt when its next digest may go.
+	// rest is when the lane may send again, digestAt when its next digest may go, and tried when
+	// it last sent the channel anything.
 	rest     time.Time
 	digestAt time.Time
+	tried    time.Time
+}
+
+// Named is a channel that names itself the same way across restarts, as its configuration does.
+type Named interface {
+	Channel
+	Name() string
+}
+
+// channelName names a channel: by its own name, or by its place in the configuration.
+func (q *Queue) channelName(ch int) string {
+	if n, ok := q.Channels[ch].(Named); ok {
+		return n.Name()
+	}
+	return fmt.Sprintf("channel-%d", ch)
+}
+
+func (q *Queue) channelNames() []string {
+	names := make([]string, len(q.Channels))
+	for i := range q.Channels {
+		names[i] = q.channelName(i)
+	}
+	return names
 }
 
 const (
@@ -121,10 +150,23 @@ func (q *Queue) lane(i int) *lane {
 
 // Put takes an alert for every channel and returns at once.
 func (q *Queue) Put(a Alert) {
+	all := make([]int, len(q.Channels))
+	for i := range all {
+		all[i] = i
+	}
+	q.putTo(a, all)
+}
+
+// putTo takes an alert for the given channels.
+func (q *Queue) putTo(a Alert, channels []int) {
 	defer q.wakeAll()
 	if q.Store != nil {
+		names := make([]string, len(channels))
+		for i, ch := range channels {
+			names[i] = q.channelName(ch)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := q.Store.add(ctx, q.Name, a, len(q.Channels), q.now())
+		err := q.Store.add(ctx, q.Name, a, names, q.now())
 		cancel()
 		if err == nil {
 			return
@@ -133,9 +175,9 @@ func (q *Queue) Put(a Alert) {
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for i := range q.Channels {
+	for _, ch := range channels {
 		q.nextID--
-		q.pending = append(q.pending, delivery{id: q.nextID, channel: i, alert: a, next: q.now()})
+		q.pending = append(q.pending, delivery{id: q.nextID, channel: ch, alert: a, next: q.now()})
 	}
 	// A full queue drops its oldest copies of the lowest severity first, Info before Warning
 	// before Critical.
@@ -163,7 +205,7 @@ func (q *Queue) prune(ctx context.Context) {
 		if q.Store == nil {
 			return
 		}
-		n, err := q.Store.dropChannels(ctx, q.Name, len(q.Channels))
+		n, err := q.Store.dropChannels(ctx, q.Name, q.channelNames())
 		if err != nil {
 			q.logError("alert outbox prune failed", "", err)
 			return
@@ -267,7 +309,33 @@ func (q *Queue) flushLane(ctx context.Context, ch int) time.Duration {
 		l.digestAt = now.Add(q.digestEvery())
 		q.mu.Unlock()
 	}
+	q.test(ctx, l, ch, now)
 	return max(q.restLeft(l, now), 50*time.Millisecond)
+}
+
+// test sends a lane's channel a test when the channel counts as failing and the lane has sent it
+// nothing for TestEvery. A channel that refused one copy, and would take the next, then stops
+// counting as failing although no other alert comes; one that keeps refusing keeps failing, and
+// stalls the heartbeat.
+func (q *Queue) test(ctx context.Context, l *lane, ch int, now time.Time) {
+	q.mu.Lock()
+	due := q.TestEvery > 0 && !l.failing.IsZero() && !now.Before(l.rest) && now.Sub(l.tried) >= q.TestEvery
+	since := l.failing
+	q.mu.Unlock()
+	if !due {
+		return
+	}
+	a := Alert{Service: q.Service, Severity: Info, Code: "channel_test",
+		Message: fmt.Sprintf("a test of this channel, which has refused alerts since %s", since.UTC().Format(time.RFC3339)), Time: now.UTC()}
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
+	err := q.Channels[ch].Send(sendCtx, a)
+	cancel()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	l.tried = now
+	if err == nil {
+		l.failures, l.failing = 0, time.Time{}
+	}
 }
 
 // attempt sends one message standing for the copies given, and reports whether the lane may go
@@ -277,6 +345,9 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
 	err := q.Channels[ch].Send(sendCtx, a)
 	cancel()
+	q.mu.Lock()
+	l.tried = now
+	q.mu.Unlock()
 	if err == nil {
 		for _, d := range ds {
 			q.done(ctx, d)
@@ -291,6 +362,9 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 		q.logError("alert refused by its channel and dropped", a.Code, err)
 		for _, d := range ds {
 			q.done(ctx, d)
+		}
+		if a.Severity == Critical && !strings.HasSuffix(a.Code, rerouted) {
+			q.reroute(a, ch, refused)
 		}
 		// The lane goes on without a rest, but until a send succeeds it counts as failing, so a
 		// channel that refuses every copy, such as a deleted webhook, still stalls the heartbeat.
@@ -324,6 +398,27 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 		return false
 	}
 	return true
+}
+
+// rerouted ends the code of a Critical a channel refused, as the other channels get it.
+const rerouted = "_rerouted"
+
+// reroute puts a Critical one channel refused to the other channels, saying so, so whoever
+// watches only them learns of the alert and of the channel that refused it. A rerouted alert is
+// never rerouted again.
+func (q *Queue) reroute(a Alert, refusing int, refused Refused) {
+	var others []int
+	for i := range q.Channels {
+		if i != refusing {
+			others = append(others, i)
+		}
+	}
+	if len(others) == 0 {
+		return
+	}
+	a.Code += rerouted
+	a.Message = fmt.Sprintf("the %s channel refused this alert, answering %d: %s", q.channelName(refusing), refused.Status, a.Message)
+	q.putTo(a, others)
 }
 
 func (q *Queue) restLeft(l *lane, now time.Time) time.Duration {
@@ -367,7 +462,7 @@ func (q *Queue) Stalled(now time.Time, after time.Duration) bool {
 func (q *Queue) due(ctx context.Context, ch int, now time.Time) []delivery {
 	var out []delivery
 	if q.Store != nil {
-		stored, err := q.Store.due(ctx, q.Name, ch, now, laneBatch)
+		stored, err := q.Store.due(ctx, q.Name, q.channelName(ch), ch, now, laneBatch)
 		if err != nil {
 			q.logError("alert outbox read failed", "", err)
 		}
@@ -434,7 +529,9 @@ func (q *Queue) Waiting(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// OutboxSchema is the table a Store keeps alerts in.
+// OutboxSchema is the table a Store keeps alerts in. A copy is kept under its channel's name; the
+// place of the channel in the configuration, its channel, only tells a copy stored before names
+// were whose it is.
 const OutboxSchema = `
 CREATE TABLE IF NOT EXISTS alert_outbox (
 	id bigserial PRIMARY KEY,
@@ -447,6 +544,9 @@ CREATE TABLE IF NOT EXISTS alert_outbox (
 CREATE INDEX IF NOT EXISTS alert_outbox_due ON alert_outbox (queue, next_at);
 ALTER TABLE alert_outbox ADD COLUMN IF NOT EXISTS rank smallint NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS alert_outbox_lane ON alert_outbox (queue, channel, rank, id);
+ALTER TABLE alert_outbox ADD COLUMN IF NOT EXISTS name text;
+ALTER TABLE alert_outbox ALTER COLUMN channel DROP NOT NULL;
+CREATE INDEX IF NOT EXISTS alert_outbox_named ON alert_outbox (queue, name, rank, id);
 `
 
 // Store keeps the copies of alerts that wait for delivery in a service's own database.
@@ -460,31 +560,32 @@ func (s *Store) Init(ctx context.Context) error {
 	return err
 }
 
-func (s *Store) add(ctx context.Context, queue string, a Alert, channels int, now time.Time) error {
+func (s *Store) add(ctx context.Context, queue string, a Alert, names []string, now time.Time) error {
 	body, err := json.Marshal(a)
 	if err != nil {
 		return err
 	}
 	batch := &pgx.Batch{}
-	for i := range channels {
-		batch.Queue(`INSERT INTO alert_outbox (queue, channel, alert, next_at, rank) VALUES ($1, $2, $3, $4, $5)`, queue, i, body, now.UnixMilli(), rank(a.Severity))
+	for _, name := range names {
+		batch.Queue(`INSERT INTO alert_outbox (queue, name, alert, next_at, rank) VALUES ($1, $2, $3, $4, $5)`, queue, name, body, now.UnixMilli(), rank(a.Severity))
 	}
 	return s.Pool.SendBatch(ctx, batch).Close()
 }
 
-func (s *Store) due(ctx context.Context, queue string, channel int, now time.Time, limit int) ([]delivery, error) {
-	rows, err := s.Pool.Query(ctx, `SELECT id, channel, alert, attempts, next_at FROM alert_outbox
-		WHERE queue = $1 AND channel = $2 AND next_at <= $3 ORDER BY rank, id LIMIT $4`, queue, channel, now.UnixMilli(), limit)
+// due lists the copies of the named channel due now, which the lane of channel delivers.
+func (s *Store) due(ctx context.Context, queue, name string, channel int, now time.Time, limit int) ([]delivery, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT id, alert, attempts, next_at FROM alert_outbox
+		WHERE queue = $1 AND name = $2 AND next_at <= $3 ORDER BY rank, id LIMIT $4`, queue, name, now.UnixMilli(), limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []delivery
 	for rows.Next() {
-		var d delivery
+		d := delivery{channel: channel}
 		var body []byte
 		var next int64
-		if err := rows.Scan(&d.id, &d.channel, &body, &d.attempts, &next); err != nil {
+		if err := rows.Scan(&d.id, &body, &d.attempts, &next); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(body, &d.alert); err != nil {
@@ -496,8 +597,13 @@ func (s *Store) due(ctx context.Context, queue string, channel int, now time.Tim
 	return out, rows.Err()
 }
 
-func (s *Store) dropChannels(ctx context.Context, queue string, channels int) (int64, error) {
-	tag, err := s.Pool.Exec(ctx, `DELETE FROM alert_outbox WHERE queue = $1 AND channel >= $2`, queue, channels)
+// dropChannels names the copies stored before names by the channels now at their place, then drops
+// the copies of channels no longer configured.
+func (s *Store) dropChannels(ctx context.Context, queue string, names []string) (int64, error) {
+	if _, err := s.Pool.Exec(ctx, `UPDATE alert_outbox SET name = ($2::text[])[channel + 1] WHERE queue = $1 AND name IS NULL`, queue, names); err != nil {
+		return 0, err
+	}
+	tag, err := s.Pool.Exec(ctx, `DELETE FROM alert_outbox WHERE queue = $1 AND (name IS NULL OR NOT name = ANY($2))`, queue, names)
 	return tag.RowsAffected(), err
 }
 

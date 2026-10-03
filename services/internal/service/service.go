@@ -44,13 +44,11 @@ func Logger(name string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", name, "version", Version)
 }
 
-// Alerter pages through the webhooks in ALERT_WEBHOOKS_FILE, if that is set.
+// Alerter pages through the webhooks in ALERT_WEBHOOKS_FILE, which must list at least two, so a
+// page reaches the operator when one channel refuses it. ALERT_DEV=1 lets a development setup run
+// with one; none is never enough.
 func Alerter(name string, log *slog.Logger) (*alert.Alerter, error) {
 	a := &alert.Alerter{Service: name, Log: log, Cooldown: 15 * time.Minute}
-	if os.Getenv("ALERT_WEBHOOKS_FILE") == "" {
-		log.Warn("no alert webhooks configured; alerts go to the log only")
-		return a, nil
-	}
 	data, err := config.Secret("ALERT_WEBHOOKS")
 	if err != nil {
 		return nil, err
@@ -58,6 +56,13 @@ func Alerter(name string, log *slog.Logger) (*alert.Alerter, error) {
 	channels, err := alert.ParseWebhooks(data)
 	if err != nil {
 		return nil, err
+	}
+	least := 2
+	if os.Getenv("ALERT_DEV") == "1" {
+		least = 1
+	}
+	if len(channels) < least {
+		return nil, fmt.Errorf("ALERT_WEBHOOKS_FILE lists %d alert channels; at least %d are needed", len(channels), least)
 	}
 	a.Channels = channels
 	return a, nil
@@ -67,17 +72,21 @@ func Alerter(name string, log *slog.Logger) (*alert.Alerter, error) {
 // in its own database: no alert waits on a webhook, and none is lost when one fails or the
 // service restarts.
 func (b *Base) StartAlerts(ctx context.Context, pool *pgxpool.Pool) error {
-	return StartQueue(ctx, b.Alerts, "operator", pool, b.Log)
+	return StartQueue(ctx, b.Alerts, "operator", pool, b.Log, operatorTestEvery)
 }
 
+// operatorTestEvery is how often an operator channel that refused an alert, and has nothing else
+// to send, is tested: half the time a heartbeat waits before it stops for a stalled channel.
+const operatorTestEvery = 5 * time.Minute
+
 // StartQueue gives an alerter a queue named name, kept in the pool's database, and runs it until
-// ctx ends.
-func StartQueue(ctx context.Context, a *alert.Alerter, name string, pool *pgxpool.Pool, log *slog.Logger) error {
+// ctx ends. A channel that refused an alert is tested every testEvery, if that is set.
+func StartQueue(ctx context.Context, a *alert.Alerter, name string, pool *pgxpool.Pool, log *slog.Logger, testEvery time.Duration) error {
 	store := &alert.Store{Pool: pool}
 	if err := store.Init(ctx); err != nil {
 		return err
 	}
-	q := &alert.Queue{Name: name, Channels: a.Channels, Store: store, Log: log}
+	q := &alert.Queue{Name: name, Service: a.Service, Channels: a.Channels, Store: store, Log: log, TestEvery: testEvery}
 	a.Queue = q
 	go q.Run(ctx)
 	return nil

@@ -149,13 +149,11 @@ func (ix *Indexer) Cursor() uint32 {
 // Apply implements follow.Sink: check the window against the vault's rules, archive its raw
 // events, store it, then reconcile with the chain.
 func (ix *Indexer) Apply(ctx context.Context, b follow.Batch) error {
-	// Only what was archived before this window is judged against it: what keep adds now is this
-	// copy itself.
-	ix.archiveMu.Lock()
-	archived := ix.archivedTo
-	ix.archiveMu.Unlock()
 	// The raw events are kept before they are judged: a window that faults must still outlive RPC.
-	if err := ix.keep(b.Raw, b.From, b.To); err != nil {
+	// Only what was archived before keep is judged against the window: what it adds is this copy
+	// itself.
+	archived, err := ix.keep(b.Raw, b.From, b.To)
+	if err != nil {
 		return fmt.Errorf("archive: %w", err)
 	}
 	ix.mu.RLock()
@@ -442,20 +440,23 @@ func (ix *Indexer) Run(ctx context.Context, f *follow.Follower, poll time.Durati
 	f.Run(ctx, poll, func(err error) { ix.Fault(ctx, err) })
 }
 
-// keep appends the part of a window the archive does not hold yet.
-func (ix *Indexer) keep(raw []vault.RawEvent, from, to uint32) error {
+// keep appends the part of a window the archive does not hold yet, and returns the last ledger
+// the archive held before. Append writes every event of the range or none, so the digests of the
+// events it is given are those of what it wrote.
+func (ix *Indexer) keep(raw []vault.RawEvent, from, to uint32) (uint32, error) {
 	if ix.archive == nil {
-		return nil
+		return 0, nil
 	}
 	if from > to {
-		return fmt.Errorf("%w: ledgers %d to %d", archive.ErrRange, from, to)
+		return 0, fmt.Errorf("%w: ledgers %d to %d", archive.ErrRange, from, to)
 	}
 	ix.archiveMu.Lock()
 	defer ix.archiveMu.Unlock()
-	if to <= ix.archivedTo {
-		return nil
+	before := ix.archivedTo
+	if to <= before {
+		return before, nil
 	}
-	from = max(from, ix.archivedTo+1)
+	from = max(from, before+1)
 	var events []vault.RawEvent
 	for _, e := range raw {
 		if e.Ledger >= from {
@@ -463,7 +464,7 @@ func (ix *Indexer) keep(raw []vault.RawEvent, from, to uint32) error {
 		}
 	}
 	if err := ix.archive.Append(events, from, to); err != nil {
-		return err
+		return before, err
 	}
 	ix.archivedTo = to
 	if len(ix.archived) > maxArchivedDigests {
@@ -473,7 +474,7 @@ func (ix *Indexer) keep(raw []vault.RawEvent, from, to uint32) error {
 	for l, d := range digests(events, from, to) {
 		ix.archived[l] = d
 	}
-	return nil
+	return before, nil
 }
 
 // maxArchivedDigests bounds the digests kept while ingest is stuck and the archive copies ahead.
@@ -494,8 +495,10 @@ func (ix *Indexer) confirm(ctx context.Context, base *chainstate.State, raw []va
 	}
 	ix.archiveMu.Lock()
 	defer ix.archiveMu.Unlock()
+	// The whole window is applied, so none of its digests is needed again.
+	last := to
 	defer func() {
-		for l := uint64(from); l <= uint64(to); l++ {
+		for l := uint64(from); l <= uint64(last); l++ {
 			delete(ix.archived, uint32(l))
 		}
 	}()
@@ -607,7 +610,8 @@ func (ix *Indexer) ArchiveStep(ctx context.Context, src follow.Source) (bool, er
 	if err != nil {
 		return false, err
 	}
-	return true, ix.keep(raw, next, to)
+	_, err = ix.keep(raw, next, to)
+	return true, err
 }
 
 // archiveWindow is the most ledgers the archive copies at once.

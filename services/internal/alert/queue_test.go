@@ -530,3 +530,130 @@ func TestACopyItsChannelRefusesIsDroppedWithoutRestingTheLane(t *testing.T) {
 		t.Fatal("a channel refusing every copy for 11 minutes is not stalled")
 	}
 }
+
+// hook answers status to its first refusals requests, as a Telegram chat being re-added answers
+// 400, then takes every message.
+type hook struct {
+	mu       sync.Mutex
+	status   int
+	refusals int
+	taken    []string
+}
+
+func (h *hook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	b, _ := io.ReadAll(r.Body)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.refusals != 0 {
+		h.refusals--
+		w.WriteHeader(h.status)
+		return
+	}
+	h.taken = append(h.taken, string(b))
+}
+
+func (h *hook) got(s string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, b := range h.taken {
+		if strings.Contains(b, s) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestARefusedCriticalGoesToTheOtherChannelsAndATestClearsTheRefusal(t *testing.T) {
+	ctx := context.Background()
+	telegram, discord := &hook{status: http.StatusBadRequest, refusals: 1}, &hook{}
+	st, sd := httptest.NewServer(telegram), httptest.NewServer(discord)
+	defer st.Close()
+	defer sd.Close()
+	now := time.Unix(1_728_000_000, 0)
+	q := &Queue{Name: "operator", Service: "watcher", TestEvery: 5 * time.Minute, Now: func() time.Time { return now }, Channels: []Channel{
+		Webhook{Format: "telegram", URL: st.URL + "/bot1/sendMessage?chat_id=1", HTTP: st.Client()},
+		Webhook{Format: "discord", URL: sd.URL, HTTP: sd.Client()},
+	}}
+	q.Put(Alert{Service: "watcher", Severity: Critical, Code: "early_attestation_7", Message: "asp key stolen", Time: now})
+	q.Flush(ctx)
+	q.Flush(ctx)
+	name := q.channelName(0)
+	if discord.got("early_attestation_7") != 2 || discord.got("the "+name+" channel refused this alert") != 1 || telegram.got("early_attestation_7") != 0 {
+		t.Fatalf("discord took %d copies, telegram %d", discord.got("early_attestation_7"), telegram.got("early_attestation_7"))
+	}
+	if telegram.got("channel_test") != 0 {
+		t.Fatal("tested right after the refusal")
+	}
+	// Nothing else comes: a test of the refusing channel, which takes it, clears its refusal.
+	for range 20 {
+		now = now.Add(time.Minute)
+		q.Flush(ctx)
+	}
+	if telegram.got("channel_test") != 1 || q.Stalled(now, 10*time.Minute) {
+		t.Fatalf("%d tests, stalled %v", telegram.got("channel_test"), q.Stalled(now, 10*time.Minute))
+	}
+	// A channel that keeps refusing, as a deleted webhook does, stays stalled though tested.
+	telegram.mu.Lock()
+	telegram.status, telegram.refusals = http.StatusNotFound, -1
+	telegram.mu.Unlock()
+	q.Put(Alert{Service: "watcher", Severity: Warning, Code: "hot_balance_low", Time: now})
+	for range 20 {
+		q.Flush(ctx)
+		now = now.Add(time.Minute)
+	}
+	if !q.Stalled(now, 10*time.Minute) {
+		t.Fatal("a channel refusing every test is not stalled")
+	}
+	// A rerouted alert the other channel refuses too is not rerouted back.
+	discord.mu.Lock()
+	discord.status, discord.refusals = http.StatusBadRequest, -1
+	discord.mu.Unlock()
+	q.Put(Alert{Service: "watcher", Severity: Critical, Code: "invariant", Time: now})
+	for range 3 {
+		q.Flush(ctx)
+	}
+	if n, _ := q.Waiting(ctx); n != 0 {
+		t.Fatalf("%d copies circle between refusing channels", n)
+	}
+}
+
+// named is a channel with a name of its own.
+type named struct {
+	Channel
+	name string
+}
+
+func (n named) Name() string { return n.name }
+
+func TestStoredCopiesFollowTheirChannelWhereverTheConfigurationPutsIt(t *testing.T) {
+	ctx := context.Background()
+	store := outboxStore(t)
+	now := time.Unix(1_728_000_000, 0)
+	clock := func() time.Time { return now }
+	a, b := &recorder{}, &recorder{}
+	q := &Queue{Name: "operator", Store: store, Now: clock, Channels: []Channel{named{a, "a"}, named{b, "b"}, named{&counted{}, "c"}}}
+	q.Put(Alert{Severity: Critical, Code: "invariant", Time: now})
+	q.Flush(ctx)
+	// The middle channel is taken out: the third one, now second, still gets its own copy.
+	now = now.Add(time.Hour)
+	c := &recorder{}
+	restarted := &Queue{Name: "operator", Store: store, Now: clock, Channels: []Channel{named{a, "a"}, named{c, "c"}}}
+	restarted.Flush(ctx)
+	if len(c.sent) != 1 || len(a.sent) != 1 {
+		t.Fatalf("the third channel got %d, the first %d", len(c.sent), len(a.sent))
+	}
+	if n, err := restarted.Waiting(ctx); err != nil || n != 0 {
+		t.Fatalf("%d copies wait, %v", n, err)
+	}
+	// A copy stored by place before names is named by the channel now at its place.
+	old := fmt.Sprintf(`{"code": "old", "time": %q}`, now.UTC().Format(time.RFC3339))
+	if _, err := store.Pool.Exec(ctx, `INSERT INTO alert_outbox (queue, channel, alert, next_at, rank) VALUES ('operator', 1, $1, 0, 0)`, old); err != nil {
+		t.Fatal(err)
+	}
+	upgraded := &Queue{Name: "operator", Store: store, Now: clock, Channels: []Channel{named{a, "a"}, named{c, "c"}}}
+	upgraded.Flush(ctx)
+	if len(c.sent) != 2 || c.sent[1].Code != "old" {
+		t.Fatalf("the old copy went to %+v", c.sent)
+	}
+}

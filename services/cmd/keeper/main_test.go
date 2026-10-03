@@ -19,4 +19,8 @@ func TestOnlyACourtOrderIsHeldFromRefundsByDefault(t *testing.T) {
 	if _, err := holdReasons(); err == nil {
 		t.Fatal("a reason that is not a number was taken")
 	}
+	t.Setenv("HOLD_REASONS", "100, 6")
+	if _, err := holdReasons(); err == nil {
+		t.Fatal("the screening hold's reason was taken")
+	}
 }
