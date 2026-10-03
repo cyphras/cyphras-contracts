@@ -413,6 +413,12 @@ export class MockRelayer {
     for (const send of this.held.splice(0)) send();
   }
 
+  // Another instance behind the same address knows no held request by its ID, while this one
+  // still holds them and their claims.
+  forgetIds(): void {
+    this.heldRequests.clear();
+  }
+
   // Held requests live in memory only, so a restart forgets them and their claims.
   restart(): void {
     this.held = [];

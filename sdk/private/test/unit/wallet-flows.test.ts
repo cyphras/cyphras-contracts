@@ -335,6 +335,26 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 1);
   });
 
+  it("keeps following a held payment the relayer refuses again as a duplicate", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    world.relayer.forgetIds();
+    await alice.sync();
+    // The proof went again, and the relayer that still holds it answered duplicate.
+    assert.equal(world.requests.filter((r) => r.endsWith("/v1/submit")).length, 2);
+    assert.equal(world.relayer.submissions.length, 1);
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    assert.notEqual(plan?.relayerStatus, "failed");
+    world.advance(700);
+    world.relayer.releaseHeld();
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+  });
+
   it("stops following a held payment the relayer dropped when it was due", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
