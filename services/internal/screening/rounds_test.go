@@ -182,7 +182,7 @@ func TestQueuedOperatorDecisionsAreCarriedOutByTheService(t *testing.T) {
 func TestOnlyOneProcessWritesAsTheASPAccount(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
-	release, err := LockWriter(ctx, h.s.db.pool, "GASP")
+	lock, err := LockWriter(ctx, h.s.db.pool, "GASP")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,14 +192,14 @@ func TestOnlyOneProcessWritesAsTheASPAccount(t *testing.T) {
 	if other, err := LockWriter(ctx, h.s.db.pool, "GOTHER"); err != nil {
 		t.Fatalf("another account: %v", err)
 	} else {
-		other()
+		other.Release()
 	}
-	release()
+	lock.Release()
 	again, err := LockWriter(ctx, h.s.db.pool, "GASP")
 	if err != nil {
 		t.Fatalf("after the release: %v", err)
 	}
-	again()
+	again.Release()
 }
 
 func TestAnUnclearDestinationIsWithheldWithoutAPublicReason(t *testing.T) {

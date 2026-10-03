@@ -110,6 +110,12 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	s.now = func() time.Time { return h.now }
+	lock, err := LockWriter(context.Background(), pool, vaulttest.Asp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(lock.Release)
+	s.UseLock(lock)
 	h.s = s
 	h.f = &follow.Follower{RPC: h.fake, Live: follow.RPCSource{Client: h.fake, Contract: vaulttest.Vault}, Window: 50, Sink: s}
 	h.setVault(0)

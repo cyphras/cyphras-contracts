@@ -65,6 +65,8 @@ type Screener struct {
 	alerts       *alert.Alerter
 	log          *slog.Logger
 	now          func() time.Time
+	// lock is the asp account's lock, without which nothing is sent as the account.
+	lock *Lock
 
 	mu       sync.RWMutex
 	state    *chainstate.State
@@ -115,6 +117,9 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 }
 
 func (s *Screener) clock() time.Time { return s.now() }
+
+// UseLock sets the lock of the asp account; the screener sends nothing as the account without it.
+func (s *Screener) UseLock(l *Lock) { s.lock = l }
 
 // Cursor implements follow.Sink.
 func (s *Screener) Cursor() uint32 {
@@ -194,7 +199,15 @@ func (s *Screener) invoke(fn string, args ...xdr.ScVal) (txnbuild.Operation, err
 	}}, nil
 }
 
+var errNoLock = errors.New("screening: sending as the asp account needs its lock")
+
 func (s *Screener) send(ctx context.Context, fn string, args ...xdr.ScVal) (submit.Result, error) {
+	if s.lock == nil {
+		return submit.Result{}, errNoLock
+	}
+	if err := s.lock.Held(ctx); err != nil {
+		return submit.Result{}, err
+	}
 	res, err := s.engine.Do(ctx, s.asp, func() (txnbuild.Operation, error) { return s.invoke(fn, args...) }, 4)
 	if err != nil {
 		return res, err

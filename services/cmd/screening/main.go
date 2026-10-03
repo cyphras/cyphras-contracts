@@ -56,11 +56,22 @@ func main() {
 		}
 		return
 	}
-	release, err := screening.LockWriter(ctx, b.pool, b.asp)
+	lock, err := screening.LockWriter(ctx, b.pool, b.asp)
 	if err != nil {
 		service.Fatal(log, "start", err)
 	}
-	defer release()
+	defer lock.Release()
+	s.UseLock(lock)
+	go lock.Keep(ctx, 10*time.Second)
+	go func() {
+		select {
+		case <-lock.Lost():
+			if ctx.Err() == nil {
+				service.Fatal(log, "writer lock", screening.ErrLockLost)
+			}
+		case <-ctx.Done():
+		}
+	}()
 
 	tokenHash, err := hex.DecodeString(config.Env("SCREEN_TOKEN_SHA256", ""))
 	if err != nil || len(tokenHash) != 32 {
@@ -282,7 +293,7 @@ func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 // writeOrQueue sends an operator's decision as the asp account when no other process does, and
 // otherwise queues it for the running service.
 func writeOrQueue(ctx context.Context, b *built, send func() error, queue func() (int64, error)) error {
-	release, err := screening.LockWriter(ctx, b.pool, b.asp)
+	lock, err := screening.LockWriter(ctx, b.pool, b.asp)
 	switch {
 	case errors.Is(err, screening.ErrWriterRunning):
 		id, err := queue()
@@ -294,7 +305,8 @@ func writeOrQueue(ctx context.Context, b *built, send func() error, queue func()
 	case err != nil:
 		return err
 	}
-	defer release()
+	defer lock.Release()
+	b.screener.UseLock(lock)
 	return send()
 }
 
