@@ -90,3 +90,77 @@ func TestAnUnknownRootIsARaceNotTheRelayersFault(t *testing.T) {
 		t.Fatalf("after three evicted roots: %d %v", code, health)
 	}
 }
+
+func TestTheSameRequestFailingForResourcesIsNotRepeated(t *testing.T) {
+	h := trapdoorHarness(t)
+	ctx := context.Background()
+	dest := keypair.MustRandom().Address()
+	h.fund(dest)
+	req := h.forged(t, dest, -20_000_000, 5_000_000)
+	h.setTxStatus(failedAs(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded, vaulttest.Vault, 0))
+	if _, f := h.r.Submit(ctx, req); f != nil {
+		t.Fatalf("not sent: %v", f)
+	}
+	h.waitIdle()
+	for range 2 {
+		if _, f := h.r.Submit(ctx, req); f == nil || f.code != CodeRejected {
+			t.Fatalf("the same request sent again: %v", f)
+		}
+	}
+	if code, health := h.get("/v1/health"); code != http.StatusOK || health["paused"] != false {
+		t.Fatalf("one request repeated: %d %v", code, health)
+	}
+}
+
+// simulatedAt makes the harness's simulations read the chain at a ledger.
+func (h *harness) simulatedAt(ledger uint32) {
+	simulate := h.fake.Simulate
+	h.fake.Simulate = func(r protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		resp, err := simulate(r)
+		resp.LatestLedger = ledger
+		return resp, err
+	}
+}
+
+func TestAnAccountGrownAfterTheSimulationIsARaceItsOwnerRestsFor(t *testing.T) {
+	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
+	h.simulatedAt(1000)
+	h.setTxStatus(failedAs(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded, vaulttest.Vault, 0))
+	dest := keypair.MustRandom().Address()
+	h.fund(dest)
+	// The destination adds signers to its account in the ledger after the simulation.
+	send := h.fake.Send
+	h.fake.Send = func(r protocol.SendTransactionRequest) (protocol.SendTransactionResponse, error) {
+		key := mustKey(vault.AccountKey(dest))
+		h.fake.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{AccountId: key.MustAccount().AccountId, Balance: 10_000_000}}, 1001, nil)
+		return send(r)
+	}
+	h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
+	if h.r.brk.open(h.clock()) || !h.r.cool.cooling(h.clock().Unix(), destinationKey(dest)) {
+		t.Fatal("a destination that grew paused relaying instead of resting")
+	}
+
+	// The fee address changing is a race too, which rests no destination.
+	h = newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
+	h.simulatedAt(1000)
+	h.setTxStatus(failedAs(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded, vaulttest.Vault, 0))
+	h.fake.SetEntry(mustKey(vault.AccountKey(feeAddress)), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{
+		AccountId: mustKey(vault.AccountKey(feeAddress)).MustAccount().AccountId, Balance: 10_000_000}}, 1002, nil)
+	dest = keypair.MustRandom().Address()
+	h.fund(dest)
+	h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
+	if h.r.brk.open(h.clock()) || h.r.cool.cooling(h.clock().Unix(), destinationKey(dest)) {
+		t.Fatal("a fee address that changed was taken for the relayer's fault or the destination's")
+	}
+
+	// Nothing changed: the simulation fell short on its own, which is the relayer's to answer for.
+	h = newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
+	h.simulatedAt(1000)
+	h.setTxStatus(failedAs(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded, vaulttest.Vault, 0))
+	dest = keypair.MustRandom().Address()
+	h.fund(dest)
+	h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
+	if !h.r.brk.open(h.clock()) {
+		t.Fatal("a resource shortfall of the relayer's own did not count")
+	}
+}

@@ -396,3 +396,79 @@ func TestAFailedCallNamesTheErrorClosestToItsCause(t *testing.T) {
 		t.Fatal("a success named an error")
 	}
 }
+
+// ledgerCostSettings publishes the network's fees for read and written bytes.
+func (h *harness) ledgerCostSettings(read1KB, write1KB int64, maxRead, maxWrite uint32) {
+	h.fake.SetEntry(vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostV0), xdr.LedgerEntryData{
+		Type: xdr.LedgerEntryTypeConfigSetting, ConfigSetting: &xdr.ConfigSettingEntry{
+			ConfigSettingId: xdr.ConfigSettingIdConfigSettingContractLedgerCostV0,
+			ContractLedgerCost: &xdr.ConfigSettingContractLedgerCostV0{
+				FeeDiskRead1Kb: xdr.Int64(read1KB), TxMaxDiskReadBytes: xdr.Uint32(maxRead), TxMaxWriteBytes: xdr.Uint32(maxWrite),
+			},
+		}}, 1, nil)
+	h.fake.SetEntry(vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostExtV0), xdr.LedgerEntryData{
+		Type: xdr.LedgerEntryTypeConfigSetting, ConfigSetting: &xdr.ConfigSettingEntry{
+			ConfigSettingId:       xdr.ConfigSettingIdConfigSettingContractLedgerCostExtV0,
+			ContractLedgerCostExt: &xdr.ConfigSettingContractLedgerCostExtV0{FeeWrite1Kb: xdr.Int64(write1KB)},
+		}}, 1, nil)
+}
+
+func TestTheClassicEntriesACallTouchesGetRoomToGrow(t *testing.T) {
+	h := newHarness(t)
+	h.engine.ResourceMarginPct = 0
+	account, err := vault.AccountKey(keypair.MustRandom().Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract, err := vault.InstanceKey("CBYJTWEOBJL52FA7J7JNDVM65TW64PXO2EIQBF5YVEE3OROZSBVMP2N5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustline := xdr.LedgerKey{Type: xdr.LedgerEntryTypeTrustline, TrustLine: &xdr.LedgerKeyTrustLine{
+		AccountId: account.MustAccount().AccountId, Asset: xdr.MustNewCreditAsset("USDC", keypair.MustRandom().Address()).ToTrustLineAsset(),
+	}}
+	h.fake.Simulate = func(protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		data := xdr.SorobanTransactionData{Resources: xdr.SorobanResources{
+			Footprint:     xdr.LedgerFootprint{ReadOnly: []xdr.LedgerKey{trustline, contract}, ReadWrite: []xdr.LedgerKey{account}},
+			DiskReadBytes: 500, WriteBytes: 300,
+		}}
+		encoded, _ := xdr.MarshalBase64(data)
+		return protocol.SimulateTransactionResponse{TransactionDataXDR: encoded, MinResourceFee: 10_000, Results: []protocol.SimulateHostFunctionResult{{}}, LatestLedger: 990}, nil
+	}
+	// Without the network's byte fees there is nothing to pad by.
+	if _, err := h.engine.Prepare(context.Background(), h.account, invoke()); err == nil {
+		t.Fatal("prepared without the network's byte fees")
+	}
+	h.ledgerCostSettings(1000, 3000, 200_000, 132_096)
+	p, err := h.engine.Prepare(context.Background(), h.account, invoke())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := sorobanData(t, p).Resources
+	// The account and the trustline are read, and the account written.
+	if res.DiskReadBytes != 500+2*2048 || res.WriteBytes != 300+2048 {
+		t.Fatalf("read %d, write %d", res.DiskReadBytes, res.WriteBytes)
+	}
+	if p.ResourceFee != 10_000+4_000+6_000 || p.SimulatedAt != 990 {
+		t.Fatalf("resource fee %d at ledger %d", p.ResourceFee, p.SimulatedAt)
+	}
+	// The padding stays within the network's limits.
+	h.engine.costs = ledgerCosts{}
+	h.ledgerCostSettings(1000, 3000, 2_000, 1_000)
+	if p, err = h.engine.Prepare(context.Background(), h.account, invoke()); err != nil {
+		t.Fatal(err)
+	}
+	if res := sorobanData(t, p).Resources; res.DiskReadBytes != 2_000 || res.WriteBytes != 1_000 || p.ResourceFee != 10_000+1_465+2_051 {
+		t.Fatalf("read %d, write %d, fee %d", res.DiskReadBytes, res.WriteBytes, p.ResourceFee)
+	}
+}
+
+func sorobanData(t *testing.T, p *Prepared) xdr.SorobanTransactionData {
+	t.Helper()
+	env := p.Tx.ToXDR()
+	data, ok := env.V1.Tx.Ext.GetSorobanData()
+	if !ok {
+		t.Fatal("no Soroban data")
+	}
+	return data
+}

@@ -184,10 +184,24 @@ func TestAFaultOfTheRelayersOwnLeavesTheNotesFree(t *testing.T) {
 	h.setTxStatus(failedAs(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded, vaulttest.Vault, vaultCannotReceive))
 	req := h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
 	h.setTxStatus(success(900_000))
-	if _, f := h.r.Submit(context.Background(), req); f != nil {
+	// The very request is never sent again; the same notes in a new proof are.
+	if _, f := h.r.Submit(context.Background(), req); f == nil || f.code != CodeRejected {
+		t.Fatalf("the request that failed was sent again: %v", f)
+	}
+	if _, f := h.r.Submit(context.Background(), h.reproved(t, req)); f != nil {
 		t.Fatalf("the same notes after a fault of the relayer's own: %v", f)
 	}
 	h.waitIdle()
+}
+
+// reproved is a new proof spending the same notes.
+func (h *harness) reproved(t *testing.T, req Request) Request {
+	t.Helper()
+	p := req.Proof
+	p.Commitments[0] = randomField(t)
+	p.A, p.B, p.C = forge([8]fr.Element{p.Root, p.PublicAmount, p.ExtDataHash, h.domain, p.Nullifiers[0], p.Nullifiers[1], p.Commitments[0], p.Commitments[1]})
+	req.Proof = p
+	return req
 }
 
 func TestAnRPCWhoseOldestLedgerIsPastItsLatestIsNotFollowed(t *testing.T) {

@@ -62,6 +62,10 @@ type Record struct {
 	ExitID      *uint64
 	Nullifiers  [2]string
 	Channel     string
+	// Request names the proof that was sent and SimulatedAt the ledger its simulation read, while
+	// this run follows the transaction; neither is stored.
+	Request     string
+	SimulatedAt uint32
 }
 
 type store struct {

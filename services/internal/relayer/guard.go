@@ -2,6 +2,7 @@ package relayer
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"math"
 	"sync"
 	"time"
@@ -25,6 +26,13 @@ func nullifierKey(hex string) string { return "nullifier:" + hex }
 // destinationKey names a destination by its full address, a muxed one included, so that one
 // failure cannot rest every other user of the same account.
 func destinationKey(address string) string { return "destination:" + address }
+
+// requestKey names one request by its proof, so a request that failed on chain is not sent
+// again, whatever the cause.
+func requestKey(req Request) string {
+	k := proofKey(req)
+	return "request:" + hex.EncodeToString(k[:])
+}
 
 // strikeMemory is how long after its rest a destination's failures still count toward the next
 // rest.

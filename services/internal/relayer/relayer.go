@@ -450,7 +450,7 @@ func (r *Relayer) guard(req Request) *failure {
 	if r.brk.open(now) {
 		return fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
-	keys := []string{nullifierKey(req.Proof.Nullifiers[0].Hex()), nullifierKey(req.Proof.Nullifiers[1].Hex())}
+	keys := []string{nullifierKey(req.Proof.Nullifiers[0].Hex()), nullifierKey(req.Proof.Nullifiers[1].Hex()), requestKey(req)}
 	if req.Ext.ExtAmount.Sign() < 0 {
 		keys = append(keys, destinationKey(req.Ext.Recipient))
 	}
@@ -978,8 +978,8 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	}
 	release = false
 	r.setStatus(signed.Hash, txStatus{Status: "pending"})
-	rec := Record{Hash: signed.Hash, Kind: "transfer", Fee: req.Ext.Fee.String(), Channel: ch.ID,
-		Nullifiers: [2]string{req.Proof.Nullifiers[0].Hex(), req.Proof.Nullifiers[1].Hex()}}
+	rec := Record{Hash: signed.Hash, Kind: "transfer", Fee: req.Ext.Fee.String(), Channel: ch.ID, Request: requestKey(req),
+		Nullifiers: [2]string{req.Proof.Nullifiers[0].Hex(), req.Proof.Nullifiers[1].Hex()}, SimulatedAt: prepared.SimulatedAt}
 	if req.Ext.ExtAmount.Sign() < 0 {
 		rec.Kind, rec.Destination, rec.Screening = "unshield", req.Ext.Recipient, "allow"
 	}
@@ -1071,10 +1071,10 @@ const (
 	causeVault
 	// causeSpent is notes another transaction spent first.
 	causeSpent
-	// causeReceive is a destination that stopped receiving after it was checked.
+	// causeReceive is a destination that stopped receiving, or grew, after it was checked.
 	causeReceive
 	// causeRace is the chain moving under the call between its simulation and its ledger: the root
-	// it was proved against pushed out of the vault's history.
+	// it was proved against pushed out of the vault's history, or the fee address's entries changed.
 	causeRace
 )
 
@@ -1098,11 +1098,17 @@ func (r *Relayer) classify(res submit.Result, sent Record) cause {
 	if res.Code != xdr.TransactionResultCodeTxFailed.String() {
 		return causeRelayer
 	}
-	if res.InvokeCode != nil && *res.InvokeCode != xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped {
-		return causeRelayer
-	}
 	ctx, cancel := context.WithTimeout(r.ctx, 10*time.Second)
 	defer cancel()
+	if res.InvokeCode != nil {
+		switch *res.InvokeCode {
+		case xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped:
+		case xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded:
+			return r.resourceCause(ctx, sent)
+		default:
+			return causeRelayer
+		}
+	}
 	e := res.ContractError
 	switch {
 	case e == nil:
@@ -1133,6 +1139,46 @@ func (r *Relayer) classify(res submit.Result, sent Record) cause {
 	return causeVault
 }
 
+// resourceCause tells a call that ran out of the resources its simulation measured. Anyone can
+// grow their own account between the simulation and the call's ledger, so it is a race when the
+// destination's entries or the fee address's changed after the simulation, and the relayer's own
+// failure otherwise.
+func (r *Relayer) resourceCause(ctx context.Context, sent Record) cause {
+	if sent.SimulatedAt == 0 {
+		return causeRelayer
+	}
+	if sent.Destination != "" && r.changedSince(ctx, sent.Destination, sent.SimulatedAt) {
+		return causeReceive
+	}
+	if r.changedSince(ctx, r.cfg.FeeAddress, sent.SimulatedAt) {
+		return causeRace
+	}
+	return causeRelayer
+}
+
+// changedSince reports whether the classic entries an address receives the vault's asset in
+// changed after a ledger.
+func (r *Relayer) changedSince(ctx context.Context, address string, ledger uint32) bool {
+	account, err := vault.AccountOf(address)
+	if err != nil || account[0] != 'G' {
+		return false
+	}
+	keys, err := vault.ReceiveKeys(r.cfg.Asset, account)
+	if err != nil {
+		return false
+	}
+	entries, _, err := rpc.Entries(ctx, r.rpc, keys)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.LastModified > ledger {
+			return true
+		}
+	}
+	return false
+}
+
 // vaultCanPay reports whether the issuer lets the vault hold, and so send, its asset.
 func (r *Relayer) vaultCanPay(ctx context.Context) (bool, error) {
 	inst, _, _ := r.view()
@@ -1159,23 +1205,30 @@ func (r *Relayer) vaultCanPay(ctx context.Context) (bool, error) {
 }
 
 // coolDown rests what a failed relay carried, in memory and in the database, so a restart does
-// not forget it: the notes, unless the relayer was at fault or the chain moved under the call, for
-// a day; and after a receive failure the destination, for longer each time it fails again.
+// not forget it: the request itself and, unless the relayer was at fault or the chain moved under
+// the call, its notes, for a day; and after a receive failure the destination, for longer each
+// time it fails again.
 func (r *Relayer) coolDown(rec Record, c cause) {
-	if c == causeRelayer || c == causeRace {
-		return
-	}
 	now := r.now()
+	until := now.Add(r.cfg.Cooldown).Unix()
 	var keys []string
-	for _, nf := range rec.Nullifiers {
-		if nf != "" {
-			keys = append(keys, nullifierKey(nf))
+	// The exact request is never sent again, whatever the cause: a failure the relayer itself
+	// pays for must not be repeatable at will.
+	if rec.Request != "" {
+		keys = append(keys, rec.Request)
+	}
+	if c != causeRelayer && c != causeRace {
+		for _, nf := range rec.Nullifiers {
+			if nf != "" {
+				keys = append(keys, nullifierKey(nf))
+			}
 		}
 	}
-	until := now.Add(r.cfg.Cooldown).Unix()
-	r.cool.add(keys, until)
-	if err := r.db.coolDown(r.ctx, keys, until); err != nil {
-		r.alerts.Raise(r.ctx, alert.Warning, "cooldown_not_stored", "a cooldown was kept in memory only: %v", err)
+	if len(keys) > 0 {
+		r.cool.add(keys, until)
+		if err := r.db.coolDown(r.ctx, keys, until); err != nil {
+			r.alerts.Raise(r.ctx, alert.Warning, "cooldown_not_stored", "a cooldown was kept in memory only: %v", err)
+		}
 	}
 	if c != causeReceive || rec.Destination == "" {
 		return

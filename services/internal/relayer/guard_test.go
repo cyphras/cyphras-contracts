@@ -248,7 +248,8 @@ func TestAReceiveFailureCoolsDownItsNotesAndDestination(t *testing.T) {
 	}
 	var rows int
 	_ = h.r.db.pool.QueryRow(context.Background(), `SELECT count(*) FROM relay_cooldowns`).Scan(&rows)
-	if rows != 3 {
+	// The request itself, its two notes and its destination.
+	if rows != 4 {
 		t.Fatalf("%d cooldowns stored", rows)
 	}
 	// A restart remembers them; the destination rests ten minutes after its first failure.
