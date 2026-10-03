@@ -23,7 +23,7 @@ import type { VaultInstance } from "../vault/state.ts";
 import { type Core, newId, selectNotes, spendNote, spendableNotes, spendingKeys } from "./core.ts";
 import { payoutFromEvents } from "./exits.ts";
 import { type Warning, unshieldWarnings } from "./nudges.ts";
-import type { OwnedNote, Plan, PlanState, Route } from "./state.ts";
+import type { OwnedNote, Plan, PlanState, RootCheck, Route } from "./state.ts";
 
 /** What the user is asked to confirm before a spend is proved. */
 export interface SpendReview {
@@ -237,6 +237,7 @@ function planOf(
       };
     }),
     root: built.witness.root,
+    builtAt: (core.state.rootCheck as RootCheck).ledger,
     deadline: built.ext.deadline,
     ext: extDataToJson(built.ext),
     proof,

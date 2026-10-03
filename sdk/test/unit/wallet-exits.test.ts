@@ -227,7 +227,7 @@ describe("the exit queue: sources", () => {
     assert.equal(plan?.state, "claimed");
   });
 
-  it("finds a payout stranded between syncs by the indexer entry of its own transaction", async () => {
+  it("follows a payout stranded while RPC no longer covered it, by its exit ID", async () => {
     const { world, alice } = await funded();
     fillWindow(world);
     const destination = world.signer("closed account").publicKey;
@@ -238,14 +238,16 @@ describe("the exit queue: sources", () => {
       confirm: confirmAll,
     });
     assert.ok("planId" in sub);
+    await alice.sync();
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
     world.vault.unpayable.add(destination);
     world.advance(86_400);
     await alice.releaseExits(world.signer("anyone"));
-    // RPC no longer covers the ledgers of the unshield, so no event names its exit
-    world.rpc.oldestLedger = world.vault.ledger;
-    const summary = await alice.sync();
-    assert.equal(summary.crossChecked, false);
-    let [plan] = await alice.plans();
+    // RPC no longer covers the release, so no event of it reaches the wallet.
+    world.rpc.oldestLedger = world.vault.ledger + 1;
+    assert.equal((await alice.sync()).crossChecked, false);
+    [plan] = await alice.plans();
     assert.equal(plan?.state, "stranded");
     assert.equal(plan?.exitId, 1);
     world.vault.unpayable.delete(destination);

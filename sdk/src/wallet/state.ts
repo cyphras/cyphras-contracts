@@ -96,6 +96,8 @@ export interface Plan {
   readonly commitments: readonly [bigint, bigint];
   readonly outputs: readonly PlanOutput[];
   readonly root: bigint;
+  // The ledger of the vault read whose root history held `root` when the plan was built.
+  readonly builtAt: number;
   readonly deadline: number;
   readonly ext: ExtDataJson;
   readonly proof: TxProofJson;
@@ -165,6 +167,8 @@ export interface WalletState {
   tree: TreeSnapshot;
   lastLeafLedger: number;
   nullifierSince: number;
+  // Every spend from this ledger up to nullifierSince was confirmed by the cross-check.
+  checkedFrom: number;
   nullifierBuffer: { readonly nf: bigint; readonly ledger: number; readonly txHash: string }[];
   notes: OwnedNote[];
   sent: SentNote[];
@@ -180,6 +184,7 @@ export function emptyState(deployLedger: number): WalletState {
     tree: { leafCount: 0, upper: [], partial: [] },
     lastLeafLedger: 0,
     nullifierSince: deployLedger,
+    checkedFrom: deployLedger,
     nullifierBuffer: [],
     notes: [],
     sent: [],

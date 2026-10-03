@@ -157,6 +157,9 @@ export interface PlanView extends Submission {
   readonly payoutLeft: bigint | undefined;
   readonly operationId: string | undefined;
   readonly relayerStatus: string | undefined;
+  // The payment may still land, or failed by the wallet's last reading of the chain only: paying
+  // it again must go through retry, which spends the same notes, never through a new send.
+  readonly mustRetry: boolean;
 }
 
 const VIEWING_KEY_WARNING =
@@ -475,10 +478,12 @@ export class PrivateWallet {
     }
     let newNotes = 0;
     if (check.state === "verified") {
-      // Only leaves under a root the vault confirms count: notes at them, and spends of notes.
-      newNotes = applyDownload(core.state, core.scan, data);
+      // Only leaves under a root the vault confirms count: notes at them, and spends of notes. A
+      // plan moves only on data the cross-check confirmed too, or that RPC itself served.
+      const checked = source.kind === "rpc" || crossChecked;
+      newNotes = applyDownload(core.state, core.scan, data, checked);
       core.state.rootCheck = check;
-      advancePlans(core.state, data.horizon, view.roots);
+      if (checked) advancePlans(core.state, data.horizon, view);
     } else {
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
@@ -545,6 +550,7 @@ export class PrivateWallet {
       payoutLeft: p.exit?.payoutLeft,
       operationId: p.operationId,
       relayerStatus: p.relayerStatus,
+      mustRetry: isActive(p) || p.state === "dead",
     }));
   }
 
@@ -755,8 +761,8 @@ export class PrivateWallet {
   }
 
   /**
-   * Proves a stalled payment again with the same notes, so at most one of the two can land. The
-   * relayer, the fee cap and self-relay may differ from the first attempt.
+   * Proves a stalled or dead payment again with the same notes, so at most one of the two can
+   * land. The relayer, the fee cap and self-relay may differ from the first attempt.
    */
   retry(planId: string, request: RetryRequest): Promise<Submission> {
     return this.#run(async () => {
@@ -764,8 +770,8 @@ export class PrivateWallet {
       const { state } = this.#core;
       const plan = state.plans.find((p) => p.id === planId);
       if (plan === undefined) fail("not_found", "no plan has that ID");
-      if (!isActive(plan)) {
-        fail("invalid_argument", "only a prepared or submitted plan can be retried");
+      if (!isActive(plan) && plan.state !== "dead") {
+        fail("invalid_argument", "only a prepared, submitted or dead plan can be retried");
       }
       const inputs = plan.inputs.map((input) => {
         const note = state.notes.find((n) => n.pos === input.pos);

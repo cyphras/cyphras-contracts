@@ -140,6 +140,7 @@ const bytes = (b: Uint8Array): xdr.ScVal =>
   xdr.ScVal.scvBytes(b as unknown as Parameters<typeof xdr.ScVal.scvBytes>[0]);
 
 const DAY = 86_400n;
+const randomFill = (length: number): Uint8Array => crypto.getRandomValues(new Uint8Array(length));
 const REFUND_DELAY = DAY;
 const VK = parseVerifyingKey(JSON.parse(new TextDecoder().decode(TRAPDOOR_VK)));
 
@@ -532,6 +533,14 @@ export class MockVault {
     } else {
       this.stranded.set(id, left);
       this.#exitPaid(id, payoutPaid, feePaid, left);
+    }
+  }
+
+  // Other users' activity: pairs of random commitments, each pair its own insertion.
+  insertFiller(pairs: number): void {
+    for (let i = 0; i < pairs; i++) {
+      const cms = [0, 1].map(() => BigInt("0x" + bytesToHex(randomFill(32))) % P);
+      this.#insertPair(cms, [randomFill(181), randomFill(181)]);
     }
   }
 

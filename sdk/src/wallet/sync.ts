@@ -30,8 +30,10 @@ export interface ScanKeys {
 
 // What one sync downloaded, before anything of it is checked or applied.
 export interface Download {
-  // The first ledger of nullifiers asked for, and the ledger up to which they are complete.
+  // The first ledger of nullifiers asked for, the ledger the source claims to be complete to, and
+  // the ledger up to which they are used: no later than the vault was read at.
   readonly since: number;
+  readonly completeTo: number;
   readonly horizon: number;
   readonly nullifiers: readonly SpentNullifier[];
   // The leaves after the local tree's last one, up to the vault's NextLeaf at most.
@@ -74,6 +76,7 @@ export async function downloadChain(
     view,
     data: {
       since,
+      completeTo: served.completeToLedger,
       horizon,
       nullifiers: served.nullifiers.filter((n) => n.ledger <= horizon),
       firstIndex,
@@ -111,6 +114,9 @@ export async function crossCheck(
   } catch (err) {
     if (err instanceof CyphrasError) return { verified: false, exits: [] };
     throw err;
+  }
+  if (data.completeTo > Math.max(events.latest, data.horizon)) {
+    fail("indexer_fault", "the indexer claims to be complete past the chain's latest ledger");
   }
   const differ = (): never =>
     fail("indexer_fault", "the indexer's leaves or nullifiers differ from the vault's events");
@@ -220,9 +226,15 @@ function recordEvidence(
 }
 
 // Applies a download whose tree the vault's root history has confirmed: scans the new leaves,
-// keeps the paths of owned notes in completed pages, marks spent notes and records the evidence
-// of plans. Returns how many notes it found.
-export function applyDownload(state: WalletState, keys: ScanKeys, data: Download): number {
+// keeps the paths of owned notes in completed pages and marks spent notes. The evidence of plans
+// is recorded only from data the cross-check confirmed, since it decides whether a payment failed.
+// Returns how many notes it found.
+export function applyDownload(
+  state: WalletState,
+  keys: ScanKeys,
+  data: Download,
+  checked: boolean,
+): number {
   const cache = new AddressCache(keys.incoming);
   let newNotes = 0;
   for (const leaf of data.leaves) if (scanLeaf(state, leaf, keys, cache)) newNotes++;
@@ -248,7 +260,8 @@ export function applyDownload(state: WalletState, keys: ScanKeys, data: Download
     const hit = spent.get(note.nf);
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
-  recordEvidence(state.plans, data.leaves, buffer);
+  if (checked) recordEvidence(state.plans, data.leaves, buffer);
+  else state.checkedFrom = data.horizon + 1;
   state.nullifierSince = data.horizon + 1;
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
   state.nullifierBuffer = buffer.filter((n) => n.ledger >= state.lastLeafLedger);
@@ -259,14 +272,13 @@ export function isActive(plan: Plan): boolean {
   return ACTIVE_STATES.includes(plan.state);
 }
 
-// Moves each unconfirmed plan along the submission state machine with what the chain shows.
-export function advancePlans(
-  state: WalletState,
-  completeToLedger: number,
-  history: RootHistory | undefined,
-): void {
+// Moves each plan that has not landed along the submission state machine, with data the root
+// check and the cross-check both confirmed. `horizon` is the ledger up to which the cross-checked
+// nullifiers are complete; it is never past the ledger the vault was read at. A dead plan is
+// reconsidered too: if its own transaction turns out to have landed, it is confirmed.
+export function advancePlans(state: WalletState, horizon: number, view: ChainView): void {
   for (const plan of state.plans) {
-    if (!isActive(plan)) continue;
+    if (!isActive(plan) && plan.state !== "dead") continue;
     const landed = plan.evidence.find(
       (e) => e.nullifiers.every(Boolean) && e.outputs.every((pos) => pos !== undefined),
     );
@@ -281,14 +293,19 @@ export function advancePlans(
       plan.state = "superseded";
       continue;
     }
-    if (completeToLedger >= plan.deadline) {
+    // A plan is declared dead only when every spend since it was built is known and checked.
+    if (plan.state === "dead" || state.checkedFrom > plan.builtAt) continue;
+    // The vault refuses the proof after its deadline.
+    if (horizon >= plan.deadline) {
       plan.state = "dead";
       continue;
     }
+    // The root left the vault's history, as read at or after the ledger the plan was built at.
+    const roots = view.roots;
     if (
-      history !== undefined &&
-      completeToLedger >= history.ledger &&
-      !history.roots.includes(plan.root)
+      roots.ledger >= plan.builtAt &&
+      horizon >= roots.ledger &&
+      !roots.roots.includes(plan.root)
     ) {
       plan.state = "dead";
     }

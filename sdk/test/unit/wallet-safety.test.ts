@@ -6,6 +6,7 @@ import { bytesToHex, randomBytes } from "../../src/bytes.ts";
 import { encryptOutput } from "../../src/encryption.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import { noteCommitment, randomFieldElement, randomScalar } from "../../src/notes.ts";
+import type { FetchLike } from "../../src/net/http.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
 import { type Plan, type WalletState, loadState, saveState } from "../../src/wallet/state.ts";
 import { XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
@@ -473,6 +474,159 @@ describe("wallet safety: the submission state machine", () => {
     await bob.sync();
     assert.equal((await bob.balance()).spendable, 90n * XLM);
     assert.equal((await alice.balance()).spendable, 100n * XLM - 92n * XLM);
+  });
+});
+
+describe("wallet safety: when a payment is dead", () => {
+  it("keeps a held payment alive when the indexer claims to be complete past its deadline", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
+    world.indexer.completeTo = world.vault.ledger + 400;
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    assert.equal(plan?.mustRetry, true);
+    // The relayer sends the held request in time, and it lands.
+    world.advance(600);
+    world.relayer.releaseHeld();
+    world.indexer.completeTo = undefined;
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    assert.equal(plan?.mustRetry, false);
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
+  it("does not kill a live payment on a lagging RPC node's stale view of the vault", async () => {
+    const world = await createWorld();
+    let stale: string | undefined;
+    let mode: "live" | "capture" | "replay" = "live";
+    const isView = (body: { method?: string; params?: { keys?: unknown[] } } | undefined) =>
+      body?.method === "getLedgerEntries" && body.params?.keys?.length === 3;
+    const lagging: FetchLike = async (input, init) => {
+      const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
+      if (mode === "replay" && isView(body) && stale !== undefined) {
+        return new Response(JSON.stringify({ ...JSON.parse(stale), id: body.id }), {
+          status: 200,
+        });
+      }
+      const res = await world.fetch(input, init);
+      if (mode === "capture" && isView(body)) stale = await res.clone().text();
+      return res;
+    };
+    const alice = await openWallet({ ...world, fetch: lagging }, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    // A node's view of the vault from before the deposit was admitted.
+    mode = "capture";
+    await alice.sync();
+    mode = "live";
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
+    mode = "replay";
+    const summary = await alice.sync();
+    mode = "live";
+    assert.equal(summary.rootVerified, false);
+    assert.deepEqual(
+      (await alice.plans()).map((p) => p.state),
+      ["submitted"],
+    );
+    world.advance(600);
+    world.relayer.releaseHeld();
+    await alice.sync();
+    assert.deepEqual(
+      (await alice.plans()).map((p) => p.state),
+      ["settled"],
+    );
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
+  it("keeps a payment alive when RPC could not cross-check the ledgers up to its deadline", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
+    );
+    world.advance(121 * 5);
+    world.rpc.oldestLedger = world.vault.ledger + 1;
+    assert.equal((await alice.sync()).crossChecked, false);
+    world.rpc.oldestLedger = 1;
+    assert.equal((await alice.sync()).crossChecked, true);
+    // Its spends up to the deadline went unchecked, so it stays open; paying again needs retry.
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "prepared");
+    assert.equal(plan?.mustRetry, true);
+    assert.equal((await alice.balance()).spendable, 0n);
+  });
+
+  it("declares a payment dead once its root has left the vault's history", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
+    );
+    // 256 pairs from other users push the plan's root out of the vault's last 256 roots, long
+    // before its deadline.
+    world.fill(256);
+    await alice.sync();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "dead");
+    assert.equal((await alice.balance()).spendable, 100n * XLM);
+  });
+
+  it("confirms a payment marked dead once its own transaction shows it landed", async () => {
+    const world = await createWorld();
+    const backend = new MemoryStore();
+    const alice = await openWallet(world, 0, backend);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
+    // An earlier reading of the chain took it for dead.
+    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const state = (await loadState(sealed)) as WalletState;
+    (state.plans[0] as Plan).state = "dead";
+    await saveState(sealed, state);
+    const reopened = await openWallet(world, 0, backend);
+    world.advance(600);
+    world.relayer.releaseHeld();
+    await reopened.sync();
+    assert.deepEqual(
+      (await reopened.plans()).map((p) => p.state),
+      ["settled"],
+    );
+  });
+
+  it("pays a dead payment again only with the same notes", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
+    );
+    world.advance(121 * 5);
+    await alice.sync();
+    const [dead] = await alice.plans();
+    assert.equal(dead?.state, "dead");
+    assert.equal(dead?.mustRetry, true);
+    const retried = await alice.retry(dead?.planId as string, { maxFee: 2n * XLM });
+    await alice.sync();
+    // The retry spent the dead plan's notes: its landing supersedes the dead plan.
+    const states = Object.fromEntries((await alice.plans()).map((p) => [p.planId, p.state]));
+    assert.equal(states[retried.planId], "settled");
+    assert.equal(states[dead?.planId as string], "superseded");
   });
 });
 

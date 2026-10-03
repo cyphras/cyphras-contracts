@@ -421,6 +421,8 @@ export interface World {
   advance(seconds: number): void;
   // The keeper and the screening service: attest and admit every eligible deposit.
   admitAll(): void;
+  // Other users' transactions adding `pairs` pairs of leaves, in one ledger.
+  fill(pairs: number): void;
 }
 
 export async function createWorld(options: { limits?: Partial<Limits> } = {}): Promise<World> {
@@ -508,6 +510,11 @@ export async function createWorld(options: { limits?: Partial<Limits> } = {}): P
     advance(seconds: number) {
       vault.timestamp += BigInt(seconds);
       vault.ledger += Math.ceil(seconds / 5);
+    },
+    fill(pairs: number) {
+      rpc.run(createHash("sha256").update(`fill ${vault.ledger}`).digest("hex"), () =>
+        vault.insertFiller(pairs),
+      );
     },
     admitAll() {
       const ids = [...vault.pending.keys()].sort((a, b) => a - b);
