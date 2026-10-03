@@ -362,6 +362,27 @@ func TestFlaggedDepositsAreRefundedAfterTheCorrectionWindowUnlessHeld(t *testing
 	}
 }
 
+func TestAScreeningHoldIsRefundedADayAfterItAndNotBefore(t *testing.T) {
+	h := newHarness(t)
+	hold := uint32(6)
+	heldAt := uint64(h.now.Unix())
+	h.shield(10, &hold, heldAt)
+	h.sync()
+	h.now = h.now.Add(24*time.Hour - time.Second)
+	h.sync()
+	if err := h.k.Refund(context.Background()); err != nil || len(h.take()) != 0 {
+		t.Fatalf("refunded before a day passed: %v", err)
+	}
+	h.now = h.now.Add(time.Second)
+	h.sync()
+	if err := h.k.Refund(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.take(); !equal(got, []string{"refund 1"}) {
+		t.Fatalf("refunds %v", got)
+	}
+}
+
 func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 	h := newHarness(t)
 	h.shield(10, nil, 0)

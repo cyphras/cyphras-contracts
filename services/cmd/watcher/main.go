@@ -113,7 +113,7 @@ func list(name string) []string {
 // settings reads the watcher's thresholds and the accounts it watches.
 func settings(base *service.Base) (watcher.Config, error) {
 	cfg := watcher.Config{
-		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger,
+		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, Asset: base.Vault.Asset,
 		IndexerURL: config.Env("INDEXER_URL", ""), HealthURLs: list("HEALTH_URLS"),
 		ServiceAccounts: list("SERVICE_ACCOUNTS"), IgnoreFunders: map[string]bool{},
 	}

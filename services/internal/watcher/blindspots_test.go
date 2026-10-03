@@ -280,6 +280,40 @@ func TestAnAttestationCheckOutlivesAFailedReadAndARestart(t *testing.T) {
 	}
 }
 
+func TestAnUnflagSharingItsAttestationsLedgerOutlivesAFailedRead(t *testing.T) {
+	h := newHarness(t)
+	c := h.chain
+	large := c.Shield(vaulttest.Depositor, 6_000_000_000)
+	c.NextLedger(5)
+	h.sync()
+	created := uint64(c.ClosedAt - 5)
+	key := mustKey(vault.PendingKey(vaulttest.Vault, large))
+	h.primary.SetContractData(key, vaulttest.Pending(large, vaulttest.Depositor, 6_000_000_000, created, 86400, nil, 0), c.Ledger, nil)
+	failing := &failingPending{Fake: h.primary, key: mustKeyString(key), fail: true}
+	h.w.rpc = failing
+	// Flagged, attested past and unflagged in one ledger, a day early, while the deposit's entry
+	// cannot be read: the attestation itself covers nothing and is judged at once.
+	c.NextLedger(120)
+	c.Flag(large, 6)
+	c.Attest(large)
+	c.Unflag(large, 6)
+	c.NextLedger(5)
+	h.sync()
+	if h.pages.has("early_attestation") {
+		t.Fatal("judged without the delay")
+	}
+	failing.fail = false
+	if err := h.w.RetryAttestations(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !h.pages.has("early_attestation_1") {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+	if checks, _ := h.w.db.attestChecks(context.Background()); len(checks) != 0 {
+		t.Fatalf("a judged check stayed: %v", checks)
+	}
+}
+
 func TestALargerSpikeWithinTheCooldownStillPages(t *testing.T) {
 	h := newHarness(t)
 	h.limit = 100_000_000
@@ -455,5 +489,31 @@ func TestADepositNotAttestedPastItsEligibilityPages(t *testing.T) {
 	}
 	if !resolved {
 		t.Fatalf("pages %v", h.pages.codes())
+	}
+}
+
+func TestAnUnflagInsideTheAttestedRangeIsJudgedAsAnAttestation(t *testing.T) {
+	for _, early := range []bool{true, false} {
+		h := newHarness(t)
+		c := h.chain
+		large := c.Shield(vaulttest.Depositor, 6_000_000_000)
+		c.NextLedger(5)
+		h.sync()
+		created := uint64(c.ClosedAt - 5)
+		h.primary.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, large)), vaulttest.Pending(large, vaulttest.Depositor, 6_000_000_000, created, 86400, nil, 0), c.Ledger, nil)
+		// A stolen asp key flags the deposit, attests past it and unflags it, all a day early. A
+		// hold lifted in the deposit's own final window is what the screening service does.
+		c.NextLedger(120)
+		c.Flag(large, 6)
+		c.Attest(large)
+		if !early {
+			c.NextLedger(86400 - 120 - 5*60)
+		}
+		c.Unflag(large, 6)
+		c.NextLedger(5)
+		h.sync()
+		if got := h.pages.has("early_attestation_1"); got != early {
+			t.Fatalf("early %v: pages %v", early, h.pages.codes())
+		}
 	}
 }

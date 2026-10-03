@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -185,5 +186,78 @@ func TestOnlyPagesOfValueCountTowardThePagesRead(t *testing.T) {
 	h.MaxPages = 1
 	if _, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour)); err != nil || gap != GapVolume || reads["/accounts/"+clean+"/payments"] != 2 {
 		t.Fatalf("gap %d after %v, %v", gap, reads, err)
+	}
+}
+
+func TestAPageThatCannotBeReadIsAGapNotAnError(t *testing.T) {
+	now := time.Now().UTC()
+	claimed := map[string]any{"_embedded": map[string]any{"records": []any{
+		map[string]any{"type": "claimable_balance_claimed", "created_at": now, "balance_id": "00ab", "asset": "native", "amount": "1.0000000"},
+	}}}
+	// The page of payments, of effects, or of the operations that name a claimed balance's creator.
+	for _, page := range []string{"/payments", "/effects", "/operations"} {
+		for name, body := range map[string]string{
+			"not json":  "<html>busy</html>",
+			"too large": `{"_embedded": {"records": [{"type": "payment", "from": "` + strings.Repeat("x", 9<<20) + `"}]}}`,
+		} {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, page):
+					_, _ = w.Write([]byte(body))
+				case page == "/operations" && strings.HasSuffix(r.URL.Path, "/effects"):
+					_ = json.NewEncoder(w).Encode(claimed)
+				default:
+					_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": []any{}}})
+				}
+			}))
+			h := Client{URL: srv.URL, HTTP: srv.Client(), MaxPages: 3}
+			_, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour))
+			srv.Close()
+			if err != nil || gap != GapVolume {
+				t.Fatalf("%s, %s: gap %d, %v", page, name, gap, err)
+			}
+		}
+	}
+}
+
+func TestPagesOfDustDoNotCountTowardThePagesRead(t *testing.T) {
+	now := time.Now().UTC()
+	reads := 0
+	// Two pages of tiny payments, then one payment that matters.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/payments") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": []any{}}})
+			return
+		}
+		reads++
+		records := make([]map[string]any, pageSize)
+		for i := range records {
+			records[i] = map[string]any{"type": "payment", "created_at": now, "from": thief, "to": clean, "amount": "0.0000001", "asset_type": "native"}
+		}
+		if reads == 3 {
+			records = []map[string]any{{"type": "payment", "created_at": now, "from": funder, "to": clean, "amount": "100", "asset_type": "native"}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"_links":    map[string]any{"next": map[string]string{"href": "http://" + r.Host + r.URL.Path + "?cursor=next"}},
+			"_embedded": map[string]any{"records": records},
+		})
+	}))
+	defer srv.Close()
+	h := Client{URL: srv.URL, HTTP: srv.Client(), MaxPages: 2, Floors: map[string]*big.Int{"native": big.NewInt(100_000_000)}}
+	got, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour))
+	if err != nil || gap != 0 || len(got) != 2*pageSize+1 {
+		t.Fatalf("%d inflows, gap %d, %v", len(got), gap, err)
+	}
+	// A payment at the floor is value, so pages of them count.
+	reads = 0
+	h.Floors = map[string]*big.Int{"native": big.NewInt(1)}
+	if _, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour)); err != nil || gap != GapVolume {
+		t.Fatalf("gap %d, %v", gap, err)
+	}
+	// Without a floor every payment is value, and the history is longer than the pages read.
+	reads = 0
+	h.Floors = nil
+	if _, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour)); err != nil || gap != GapVolume {
+		t.Fatalf("gap %d, %v", gap, err)
 	}
 }

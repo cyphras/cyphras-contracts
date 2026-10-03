@@ -44,16 +44,9 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
-	hold := map[uint32]bool{}
-	for _, r := range strings.Split(config.Env("HOLD_REASONS", "100"), ",") {
-		if r = strings.TrimSpace(r); r == "" {
-			continue
-		}
-		n, err := strconv.ParseUint(r, 10, 32)
-		if err != nil {
-			service.Fatal(log, "config", err)
-		}
-		hold[uint32(n)] = true
+	hold, err := holdReasons()
+	if err != nil {
+		service.Fatal(log, "config", err)
 	}
 	floor, err := config.Int("BALANCE_FLOOR", 500_000_000)
 	if err != nil {
@@ -79,4 +72,22 @@ func main() {
 	}
 	log.Info("running", "vault", base.Vault.Vault, "account", key.Address())
 	k.Run(ctx, f, time.Second)
+}
+
+// holdReasons reads HOLD_REASONS, the flag reasons the keeper never refunds: by default a written
+// order from an authority only. A screening hold, reason 6, is not one of them, since a hold is
+// harmless only because its deposit goes back to the depositor once the refund delay passes.
+func holdReasons() (map[uint32]bool, error) {
+	hold := map[uint32]bool{}
+	for _, r := range strings.Split(config.Env("HOLD_REASONS", "100"), ",") {
+		if r = strings.TrimSpace(r); r == "" {
+			continue
+		}
+		n, err := strconv.ParseUint(r, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		hold[uint32(n)] = true
+	}
+	return hold, nil
 }

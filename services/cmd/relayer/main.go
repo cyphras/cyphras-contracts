@@ -21,6 +21,7 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/relayer"
 	"github.com/cyphras/cyphras-contracts/services/internal/service"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
 // minChannels is the fewest channel accounts a relayer runs with.
@@ -40,6 +41,13 @@ func main() {
 	}
 	if err := r.Resume(); err != nil {
 		service.Fatal(log, "resume", err)
+	}
+	diagnosed, err := r.CheckDiagnostics(ctx)
+	if err != nil {
+		service.Fatal(log, "diagnostics check", err)
+	}
+	if !diagnosed {
+		log.Warn("the RPC returns no diagnostic events; failures that cannot be told count as races")
 	}
 	go r.Run(10 * time.Second)
 	addr := config.Env("LISTEN_ADDR", "127.0.0.1:8081")
@@ -97,6 +105,13 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	if err != nil {
 		return nil, err
 	}
+	freshRoots, err := config.Int("FRESH_ROOTS", 200)
+	if err == nil && (freshRoots < 1 || freshRoots > vault.RootHistory) {
+		err = fmt.Errorf("FRESH_ROOTS must be 1 to %d", vault.RootHistory)
+	}
+	if err != nil {
+		return nil, err
+	}
 	screenURL, err := config.Required("SCREENING_URL")
 	if err != nil {
 		return nil, err
@@ -141,7 +156,7 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	}
 	r, err := relayer.New(ctx, relayer.Config{
 		Vault: base.Vault.Vault, NetworkID: base.NetworkID, Asset: base.Vault.Asset, FeeAddress: feeAddress,
-		Pricing: pricing, LedgerSeconds: 5, MaxHeld: 1000, Jitter: 10 * time.Minute, Key: key,
+		Pricing: pricing, LedgerSeconds: 5, MaxHeld: 1000, Jitter: 10 * time.Minute, Key: key, FreshRoots: uint32(freshRoots),
 	}, base.RPC, engine, channels,
 		relayer.ScreeningClient{URL: screenURL, Token: token, HTTP: &http.Client{Timeout: 5 * time.Second}},
 		relayer.NewStore(pool), bootstrap, base.Alerts, base.Log)

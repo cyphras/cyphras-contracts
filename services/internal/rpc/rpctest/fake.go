@@ -176,6 +176,14 @@ func (f *Fake) GetEvents(_ context.Context, req protocol.GetEventsRequest) (prot
 	if err := f.call("getEvents"); err != nil {
 		return protocol.GetEventsResponse{}, err
 	}
+	if len(req.Filters) > protocol.MaxFiltersLimit {
+		return protocol.GetEventsResponse{}, errors.New("maximum 5 filters per request")
+	}
+	for _, flt := range req.Filters {
+		if len(flt.ContractIDs) > protocol.MaxContractIDsLimit || len(flt.Topics) > protocol.MaxTopicsLimit {
+			return protocol.GetEventsResponse{}, errors.New("maximum 5 contract IDs and 5 topics per filter")
+		}
+	}
 	start := protocol.Cursor{Ledger: req.StartLedger}
 	limit := uint(100)
 	if req.Pagination != nil {

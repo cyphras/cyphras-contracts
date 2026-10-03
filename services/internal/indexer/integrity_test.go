@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
 	"github.com/cyphras/cyphras-contracts/services/internal/follow"
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
@@ -407,7 +409,7 @@ func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
 			other[i].TxHash = strings.Repeat("ee", 32)
 		}
 	}
-	if err := h.ix.confirm(context.Background(), base, other, from, to); err != nil {
+	if err := h.ix.confirm(context.Background(), base, other, from, to, to); err != nil {
 		t.Fatal(err)
 	}
 	kept, err := archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}.Events(context.Background(), from, to)
@@ -423,13 +425,13 @@ func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
 	if err := h.ix.archive.Append(bogus, from, to); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.ix.confirm(context.Background(), base, good, from, to); err != nil {
+	if err := h.ix.confirm(context.Background(), base, good, from, to, to); err != nil {
 		t.Fatal(err)
 	}
 	if kept, err = (archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}).Events(context.Background(), from, to); err != nil || !maps.Equal(digests(kept, from, to), digests(good, from, to)) {
 		t.Fatalf("the archive kept a copy that does not apply: %v", err)
 	}
-	if !h.paged("archive_replaced") {
+	if !h.pagedAs("archive_replaced", alert.Critical) {
 		t.Fatalf("pages %+v", h.pages.alerts)
 	}
 	// An archive that cannot be read back pages.
@@ -442,7 +444,7 @@ func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if err := h.ix.confirm(context.Background(), base, other, from, to); err != nil {
+	if err := h.ix.confirm(context.Background(), base, other, from, to, to); err != nil {
 		t.Fatal(err)
 	}
 	if !h.paged("archive_unreadable") {
@@ -459,6 +461,15 @@ func (h *harness) paged(code string) bool {
 	return false
 }
 
+func (h *harness) pagedAs(code string, sev alert.Severity) bool {
+	for _, a := range h.pages.alerts {
+		if a.Code == code && a.Severity == sev {
+			return true
+		}
+	}
+	return false
+}
+
 func mustB64(t *testing.T, v xdr.ScVal) string {
 	t.Helper()
 	s, err := xdr.MarshalBase64(v)
@@ -466,4 +477,99 @@ func mustB64(t *testing.T, v xdr.ScVal) string {
 		t.Fatal(err)
 	}
 	return s
+}
+
+// batchOf is the window a follower would hand the indexer for raw events.
+func batchOf(t *testing.T, raw []vault.RawEvent, from, to uint32) follow.Batch {
+	t.Helper()
+	var events []vault.Event
+	for _, r := range raw {
+		e, err := vault.Decode(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, e)
+	}
+	txs, err := vault.ParseTxs(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return follow.Batch{From: from, To: to, Raw: raw, Txs: txs, Latest: to + 1000}
+}
+
+func eventsIn(events []vault.RawEvent, from, to uint32) []vault.RawEvent {
+	var out []vault.RawEvent
+	for _, e := range events {
+		if e.Ledger >= from && e.Ledger <= to {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestAWindowAcrossWhatWasArchivedKeepsTheGoodCopy(t *testing.T) {
+	for _, straddle := range []bool{false, true} {
+		h := newHarness(t)
+		h.activity()
+		h.ready()
+		from := h.chain.Ledger + 1
+		lie := *h.chain
+		lie.Events = slices.Clone(h.chain.Events)
+		// The chain holds a deposit in each of two ledgers; a lying RPC serves only the second.
+		h.chain.NextLedger(5)
+		h.chain.Shield(vaulttest.Depositor, 10_000_000)
+		h.chain.NextLedger(5)
+		h.chain.Shield(vaulttest.Depositor, 20_000_000)
+		lie.NextLedger(5)
+		lie.NextLedger(5)
+		lie.Shield(vaulttest.Depositor, 20_000_000)
+		to := h.chain.Ledger
+		good := eventsIn(h.chain.Events, from, to)
+		// The archive copied the good history of the window, or of its first ledger only.
+		archivedTo := to
+		if straddle {
+			archivedTo = from
+		}
+		if err := h.ix.keep(eventsIn(good, from, archivedTo), from, archivedTo); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.ix.Apply(context.Background(), batchOf(t, eventsIn(lie.Events, from, to), from, to)); err != nil {
+			t.Fatal(err)
+		}
+		kept, err := archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}.Events(context.Background(), from, from)
+		if err != nil || !maps.Equal(digests(kept, from, from), digests(eventsIn(good, from, from), from, from)) {
+			t.Fatalf("straddle %v: the archive gave up the good copy of ledger %d: %v", straddle, from, err)
+		}
+		critical := false
+		for _, a := range h.pages.alerts {
+			critical = critical || (a.Code == "archive_disagrees" && a.Severity == alert.Critical)
+		}
+		if !critical {
+			t.Fatalf("straddle %v: pages %+v", straddle, h.pages.alerts)
+		}
+	}
+}
+
+// oversized serves an event larger than any the vault emits for the first ledger asked.
+type oversized struct{}
+
+func (oversized) Events(_ context.Context, from, _ uint32) ([]vault.RawEvent, error) {
+	return []vault.RawEvent{{Ledger: from, Contract: vaulttest.Vault, TxHash: strings.Repeat("ab", 32), Topics: []string{"t"}, Value: strings.Repeat("A", 2<<20)}}, nil
+}
+
+func TestAnEventTooLargeForTheArchivePages(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.ready()
+	h.fake.SetLatest(h.chain.Ledger + 5)
+	first := h.ix.archivedTo + 1
+	if _, err := h.ix.ArchiveStep(context.Background(), oversized{}); err != nil {
+		t.Fatal(err)
+	}
+	if !h.pagedAs(fmt.Sprintf("archive_event_too_large_%d", first), alert.Critical) {
+		t.Fatalf("pages %+v", h.pages.alerts)
+	}
+	if _, err := (archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}).Events(context.Background(), 10, h.ix.archivedTo); err != nil {
+		t.Fatalf("the archive cannot be read: %v", err)
+	}
 }

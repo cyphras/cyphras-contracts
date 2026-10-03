@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS screening (
 ALTER TABLE screening ADD COLUMN IF NOT EXISTS first_findings text;
 ALTER TABLE screening ADD COLUMN IF NOT EXISTS flag_kind text;
 ALTER TABLE screening ADD COLUMN IF NOT EXISTS recheck_at bigint;
+ALTER TABLE screening ADD COLUMN IF NOT EXISTS review_at bigint;
 CREATE TABLE IF NOT EXISTS operator_ops (
 	id bigserial PRIMARY KEY,
 	kind text NOT NULL,
@@ -140,6 +141,8 @@ type row struct {
 	flagKind string
 	// needsFlag marks a refusal whose flag has not been sent yet.
 	needsFlag bool
+	// reviewAt is when the deposit was last sent to review.
+	reviewAt *uint64
 }
 
 // reason is the deposit's flag: the one this service sent last, which counts before the follower
@@ -163,7 +166,7 @@ func (r *row) awaitsReview() bool {
 func (s store) pending(ctx context.Context) ([]row, error) {
 	rows, err := s.pool.Query(ctx, `SELECT d.id, d.depositor, d.amount::text, d.created_at, d.flag_reason,
 		s.delay, COALESCE(s.first_check, ''), s.refuse_reason, COALESCE(s.review, ''), COALESCE(s.recheck, ''), s.flag_sent,
-		COALESCE(s.first_findings, ''), COALESCE(s.flag_kind, ''), s.recheck_at
+		COALESCE(s.first_findings, ''), COALESCE(s.flag_kind, ''), s.recheck_at, s.review_at
 		FROM deposits d LEFT JOIN screening s ON s.deposit_id = d.id
 		WHERE d.outcome IS NULL ORDER BY d.id`)
 	if err != nil {
@@ -177,10 +180,14 @@ func (s store) pending(ctx context.Context) ([]row, error) {
 		var flag, refuseReason, flagSent *int32
 		var delay *int64
 		var findings string
-		var recheckAt *int64
+		var recheckAt, reviewAt *int64
 		if err := rows.Scan(&id, &r.depositor, &r.amount, &created, &flag, &delay, &r.firstCheck, &refuseReason, &r.review, &r.recheck, &flagSent,
-			&findings, &r.flagKind, &recheckAt); err != nil {
+			&findings, &r.flagKind, &recheckAt, &reviewAt); err != nil {
 			return nil, err
+		}
+		if reviewAt != nil {
+			at := uint64(*reviewAt)
+			r.reviewAt = &at
 		}
 		if recheckAt != nil {
 			at := uint64(*recheckAt)
@@ -210,7 +217,7 @@ func u32p(v *int32) *uint32 {
 
 func (s store) update(ctx context.Context, id uint64, column string, value any) error {
 	switch column {
-	case "delay", "first_check", "refuse_reason", "review", "recheck", "flag_sent", "first_findings", "flag_kind", "recheck_at":
+	case "delay", "first_check", "refuse_reason", "review", "recheck", "flag_sent", "first_findings", "flag_kind", "recheck_at", "review_at":
 	default:
 		return errors.New("screening: unknown column")
 	}

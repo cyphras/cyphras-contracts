@@ -132,7 +132,9 @@ func (s *Screener) runOps(ctx context.Context) error {
 
 // Unflag corrects a mistaken flag while the deposit is pending. A deposit inside the attested
 // range is admitted as soon as the flag is gone, so the automated checks run again first, and the
-// unflag is refused unless they pass.
+// unflag is refused unless they pass. A hold is lifted only as its own final check would lift it:
+// in the deposit's final window, on a check that finds nothing at all, which then counts as that
+// final check.
 func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string) error {
 	r, err := s.pendingRow(ctx, id)
 	if err != nil {
@@ -145,6 +147,17 @@ func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string)
 	if err != nil {
 		return err
 	}
+	now := s.now()
+	held := *r.flag == ReasonHeld
+	if held {
+		if r.delay == nil {
+			return fmt.Errorf("screening: deposit %d has no delay read yet", id)
+		}
+		eligible := vault.PendingDeposit{Amount: r.amountInt(), CreatedAt: r.createdAt, Delay: *r.delay}.EligibleAt(inst.Config, inst.Limits)
+		if uint64(now.Add(s.cfg.RecheckWindow).Unix()) < eligible {
+			return fmt.Errorf("screening: deposit %d is held until its final window, which opens %s before it is eligible", id, s.cfg.RecheckWindow)
+		}
+	}
 	since := time.Unix(int64(r.createdAt), 0).Add(-FunderWindow)
 	verdict, err := s.check.Check(ctx, r.depositor, s.hops(r, inst.Limits), since)
 	if err != nil {
@@ -153,11 +166,19 @@ func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string)
 	if verdict.Refused {
 		return fmt.Errorf("screening: the checks refuse deposit %d now: %s", id, verdict.Detail)
 	}
+	if held && !verdict.Clear() {
+		return fmt.Errorf("screening: the checks do not clear deposit %d now: %s", id, verdict.Detail)
+	}
 	res, err := s.send(ctx, "unflag", vault.U64(id))
 	if err != nil {
 		return err
 	}
-	for column, value := range map[string]any{"first_check": "pass", "review": "cleared", "recheck": nil, "recheck_at": nil, "flag_sent": nil, "refuse_reason": nil, "flag_kind": nil} {
+	reset := map[string]any{"first_check": "pass", "review": "cleared", "recheck": nil, "recheck_at": nil, "flag_sent": nil, "refuse_reason": nil, "flag_kind": nil}
+	if held {
+		reset["recheck"], reset["recheck_at"], reset["flag_kind"] = "pass", now.Unix(), "lifted"
+		s.record(ctx, Decision{Kind: "recheck", DepositID: &id, Address: r.depositor, Amount: r.amount, Outcome: "pass", Detail: verdict.Detail, Sources: verdict.Sources})
+	}
+	for column, value := range reset {
 		if err := s.db.update(ctx, id, column, value); err != nil {
 			return err
 		}

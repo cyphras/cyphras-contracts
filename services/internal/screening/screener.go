@@ -35,13 +35,16 @@ type Config struct {
 	PolicyVersion string
 	// RecheckWindow is how long before eligibility the final check runs.
 	RecheckWindow time.Duration
-	// Cutoff is how long before eligibility an attested deposit without a passed re-check is
-	// refused rather than risk its admission unchecked.
+	// Cutoff is how long before eligibility a deposit whose checks keep failing, without a passed
+	// re-check, is held rather than risk its admission unchecked.
 	Cutoff time.Duration
 	// FirstCheckWithin is the time the policy allows for a deposit's first check.
 	FirstCheckWithin time.Duration
 	// RequestLookups bounds the funder lookups per minute that relayed unshields may cause.
 	RequestLookups int
+	// ReviewSLA is how long a deposit may wait for a person before the oldest one waiting pages
+	// as overdue; 2 hours when unset.
+	ReviewSLA time.Duration
 	// Workers bounds the checks that run at once. TickChecks and TickBudget bound the checks one
 	// round starts and how long it starts them for; what does not fit waits for the next round,
 	// the nearest deadline first. Unset, they are 4, 40 and 15 seconds.
@@ -74,6 +77,10 @@ type Screener struct {
 	latest   uint32
 	fault    bool
 	tickedAt time.Time
+	// reviews is how many deposits wait for a person, and oldestReview how long the first of them
+	// has waited, as the last round found.
+	reviews      int
+	oldestReview time.Duration
 	// retries holds the deposits whose last check failed, with when to try each again.
 	retries map[uint64]retry
 }
@@ -95,6 +102,9 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 	}
 	if cfg.TickBudget <= 0 {
 		cfg.TickBudget = 15 * time.Second
+	}
+	if cfg.ReviewSLA <= 0 {
+		cfg.ReviewSLA = 2 * time.Hour
 	}
 	s := &Screener{cfg: cfg, rpc: client, chain: chain, db: store{chain.Pool}, check: check, engine: engine, asp: asp, alerts: alerts, log: log, now: time.Now,
 		retries: map[uint64]retry{}}
@@ -319,6 +329,7 @@ func (s *Screener) plan(v vaultView, r *row) plan {
 	}
 	inRecheck := v.now+uint64(s.cfg.RecheckWindow.Seconds()) >= p.eligibleAt
 	attested := r.id <= v.inst.Status.AttestedUpTo
+	passed := r.recheck == "pass" && (attested || s.fresh(v.now, r))
 	switch {
 	case r.firstCheck == "refuse":
 		return flag(refusal, "first_check", "refused at the first check")
@@ -326,6 +337,10 @@ func (s *Screener) plan(v vaultView, r *row) plan {
 		return flag(ReasonReview, "review", "refused by the reviewer")
 	case r.recheck == "refuse":
 		return flag(refusal, "recheck", "refused at the final check")
+	case !held && !passed && v.now+uint64(s.cfg.Cutoff.Seconds()) >= p.eligibleAt && s.failing(r.id):
+		// Its own checks keep failing: held, it is admitted on nothing and holds back no later
+		// deposit, and the hold is lifted once its final check passes.
+		return flag(ReasonHeld, "hold", "its checks could not run in time")
 	case r.firstCheck == "":
 		p.task = taskFirst
 	case r.review == "needed":
@@ -339,9 +354,7 @@ func (s *Screener) plan(v vaultView, r *row) plan {
 		p.task = taskLift
 	case held:
 		p.task = taskRecheck
-	case r.recheck == "pass" && (attested || s.fresh(v.now, r)):
-	case attested && v.now+uint64(s.cfg.Cutoff.Seconds()) >= p.eligibleAt && s.retrying(r.id):
-		return flag(ReasonHeld, "hold", "the final check could not run in time")
+	case passed:
 	default:
 		p.task = taskRecheck
 	}
@@ -354,11 +367,12 @@ func (s *Screener) fresh(now uint64, r *row) bool {
 	return r.recheckAt != nil && now <= *r.recheckAt+uint64(s.cfg.RecheckWindow.Seconds())
 }
 
-func (s *Screener) retrying(id uint64) bool {
+// failing reports a deposit whose last check failed and whose next try is not due yet.
+func (s *Screener) failing(id uint64) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	_, ok := s.retries[id]
-	return ok
+	r, ok := s.retries[id]
+	return ok && s.now().Before(r.next)
 }
 
 // due reports whether a deposit whose checks failed may be tried again, at a backoff from 30
@@ -475,10 +489,29 @@ func (s *Screener) settle(ctx context.Context, v vaultView, rows []row, flags, l
 // check holds the deposit, and the keeper refunds it a day after the hold.
 func (s *Screener) remind(ctx context.Context, rows []row) {
 	var waiting []uint64
+	var oldest uint64
+	var since time.Duration
 	for i := range rows {
-		if rows[i].awaitsReview() {
-			waiting = append(waiting, rows[i].id)
+		r := &rows[i]
+		if !r.awaitsReview() {
+			continue
 		}
+		waiting = append(waiting, r.id)
+		at := r.createdAt
+		if r.reviewAt != nil {
+			at = *r.reviewAt
+		}
+		if waited := s.now().Sub(time.Unix(int64(at), 0)); waited > since {
+			oldest, since = r.id, waited
+		}
+	}
+	s.mu.Lock()
+	s.reviews, s.oldestReview = len(waiting), since
+	s.mu.Unlock()
+	if since > s.cfg.ReviewSLA {
+		s.alerts.Raise(ctx, alert.Critical, "review_overdue", "deposit %d has waited %s for a review, past the %s the policy allows", oldest, since.Round(time.Minute), s.cfg.ReviewSLA)
+	} else {
+		s.alerts.Clear(ctx, "review_overdue", "every review is within its time again")
 	}
 	if len(waiting) == 0 {
 		s.alerts.Clear(ctx, "review_needed", "no deposit waits for a review")
@@ -620,11 +653,19 @@ func (s *Screener) firstCheck(ctx context.Context, v vaultView, p plan) (string,
 		return "", err
 	}
 	if outcome == "refer" {
-		if err := s.db.update(ctx, id, "review", "needed"); err != nil {
+		if err := s.sendToReview(ctx, id); err != nil {
 			return "", err
 		}
 	}
 	return outcome, s.db.update(ctx, id, "first_check", outcome)
+}
+
+// sendToReview marks a deposit for a person to decide, from now.
+func (s *Screener) sendToReview(ctx context.Context, id uint64) error {
+	if err := s.db.update(ctx, id, "review_at", s.now().Unix()); err != nil {
+		return err
+	}
+	return s.db.update(ctx, id, "review", "needed")
 }
 
 // recheck runs a deposit's final check with current sources. A refusal is flagged; anything a
@@ -655,7 +696,7 @@ func (s *Screener) recheck(ctx context.Context, v vaultView, p plan) error {
 		if err := s.db.update(ctx, id, "first_findings", strings.Join(verdict.Findings, "\n")); err != nil {
 			return err
 		}
-		if err := s.db.update(ctx, id, "review", "needed"); err != nil {
+		if err := s.sendToReview(ctx, id); err != nil {
 			return err
 		}
 		r.findings, r.review = verdict.Findings, "needed"
@@ -869,6 +910,10 @@ type Health struct {
 	LatestLedger   uint32 `json:"latest_ledger"`
 	IngestedLedger uint32 `json:"ingested_ledger"`
 	AttestedUpTo   uint64 `json:"attested_up_to"`
+	// ReviewQueue is how many deposits wait for a person, and OldestReview how many seconds the
+	// first of them has waited.
+	ReviewQueue  int   `json:"review_queue"`
+	OldestReview int64 `json:"oldest_review_seconds"`
 }
 
 // Not-ready codes of the health endpoint.
@@ -887,6 +932,7 @@ func (s *Screener) Health() Health {
 	h := Health{
 		Vault: s.cfg.Vault, NetworkID: fmt.Sprintf("%x", s.cfg.NetworkID), PolicyVersion: s.cfg.PolicyVersion,
 		LatestLedger: s.latest, IngestedLedger: s.cursor, AttestedUpTo: s.state.AttestedUpTo,
+		ReviewQueue: s.reviews, OldestReview: int64(s.oldestReview.Seconds()),
 	}
 	switch {
 	case s.fault:

@@ -248,7 +248,8 @@ func TestAReceiveFailureCoolsDownItsNotesAndDestination(t *testing.T) {
 	}
 	var rows int
 	_ = h.r.db.pool.QueryRow(context.Background(), `SELECT count(*) FROM relay_cooldowns`).Scan(&rows)
-	if rows != 3 {
+	// The request itself, its two notes and its destination.
+	if rows != 4 {
 		t.Fatalf("%d cooldowns stored", rows)
 	}
 	// A restart remembers them; the destination rests ten minutes after its first failure.
@@ -377,7 +378,7 @@ func TestRacesNeverPauseRelayingButGuardIt(t *testing.T) {
 
 func TestRepeatedFailuresPauseRelayingAndRaiseTheFee(t *testing.T) {
 	h := newHarness(t, vault.Status{}, func(c *Config) { c.BreakerFailures = 1 })
-	h.setTxStatus(failedOnChain())
+	h.setTxStatus(failedWith(vaulttest.Vault, 101))
 	if code, _ := h.post(fixture(t, "unshield_muxed")); code != http.StatusAccepted {
 		t.Fatal("not sent")
 	}

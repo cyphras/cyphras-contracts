@@ -111,6 +111,10 @@ func TestAReferralAtTheFinalCheckHoldsTheDepositForAPerson(t *testing.T) {
 	if reviews, _ := h.s.Reviews(context.Background()); len(reviews) != 1 {
 		t.Fatalf("not sent to review: %v", reviews)
 	}
+	// It waits for a person from the referral, not from the deposit.
+	if hl := h.s.Health(); hl.ReviewQueue != 1 || hl.OldestReview != 0 {
+		t.Fatalf("health %+v", hl)
+	}
 	if err := h.s.DecideReview(context.Background(), 1, "reviewer", true); err != nil {
 		t.Fatal(err)
 	}

@@ -15,6 +15,7 @@ import (
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 )
@@ -171,16 +172,24 @@ func TestADepositEligibleMoreThanADayAwayIsNotHeld(t *testing.T) {
 	if got := h.sent(); len(got) != 0 {
 		t.Fatalf("a hold that could end in a refund: %v", got)
 	}
-	// Within a day of eligibility, it is held.
-	h.now = h.now.Add(2*24*time.Hour + time.Minute)
+	// Half an hour more than a day before eligibility, a hold could still end in a refund.
+	eligible := time.Unix(int64(h.deposits[big].createdAt), 0).Add(3 * 24 * time.Hour)
+	h.now = eligible.Add(-24*time.Hour - 30*time.Minute)
 	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+	h.tick()
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("a hold that could end in a refund: %v", got)
+	}
+	// Within a day of eligibility, it is held.
+	h.now = eligible.Add(-23 * time.Hour)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "3", h.now)
 	h.tick()
 	if got := h.sent(); !equal(got, []string{"flag 1 6", "attest 2"}) {
 		t.Fatalf("a day before eligibility: %v", got)
 	}
 }
 
-func TestADepositInItsFinalWindowIsNeverHeldPastAnother(t *testing.T) {
+func TestADepositWhoseChecksKeepFailingIsHeldAtItsCutoff(t *testing.T) {
 	h := newHarness(t)
 	first := h.shield(clean, 10_000_000)
 	h.tick()
@@ -188,16 +197,42 @@ func TestADepositInItsFinalWindowIsNeverHeldPastAnother(t *testing.T) {
 	h.chain.ClosedAt = h.now.Unix()
 	h.shield(keypair.MustRandom().Address(), 10_000_000)
 	h.tick()
-	// The first deposit's final check fails while the second one's passes: the first one ends the
-	// run, since its own window is open and a hold would only stand for a check that is due.
-	h.now = h.now.Add(56 * time.Minute)
+	// The first deposit's final window opens and its check fails: it is tried again, not held.
 	h.s.check.Inflows = failing{clean}
+	h.now = h.now.Add(49 * time.Minute)
 	h.tick()
 	if got := h.sent(); len(got) != 0 {
-		t.Fatalf("held a deposit whose final check is due: %v", got)
+		t.Fatalf("held before its cutoff: %v", got)
 	}
 	if r := h.s.retries[first]; r.attempts == 0 {
 		t.Fatal("the first deposit was not checked")
+	}
+	// At its cutoff its check still fails: it is held, and the deposit behind it is attested on time.
+	h.now = h.now.Add(3 * time.Minute)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 6", "attest 2"}) {
+		t.Fatalf("at the cutoff: %v", got)
+	}
+}
+
+func TestADepositWhoseFirstCheckNeverRunsHoldsBackNothing(t *testing.T) {
+	h := newHarness(t)
+	bad := keypair.MustRandom().Address()
+	h.s.check.Inflows = failing{bad}
+	h.shield(bad, 10_000_000)
+	h.tick()
+	h.now = h.now.Add(5 * time.Minute)
+	h.chain.ClosedAt = h.now.Unix()
+	h.shield(keypair.MustRandom().Address(), 10_000_000)
+	h.tick()
+	var all []string
+	for _, step := range []time.Duration{45 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+		h.now = h.now.Add(step)
+		h.tick()
+		all = append(all, h.sent()...)
+	}
+	if !equal(all, []string{"flag 1 6", "attest 2"}) {
+		t.Fatalf("sent %v", all)
 	}
 }
 
@@ -283,5 +318,99 @@ func TestALiftedHoldIsNotLiftedAgainBeforeTheChainShowsIt(t *testing.T) {
 	}
 	if got := h.sent(); len(got) != 0 {
 		t.Fatalf("a lifted hold was lifted again: %v", got)
+	}
+}
+
+// gapped reads one account's history only in part, as a flood of tiny payments makes Horizon.
+type gapped struct {
+	inner   Inflows
+	account string
+}
+
+func (g gapped) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, Gap, error) {
+	out, gap, err := g.inner.Inflows(ctx, account, since)
+	if account == g.account {
+		gap |= GapVolume
+	}
+	return out, gap, err
+}
+
+func TestTheReviewQueueIsMeasuredAndPagedPastItsTime(t *testing.T) {
+	// The review time is the default, 2 hours.
+	h := newHarness(t)
+	victim := keypair.MustRandom().Address()
+	h.s.check.Inflows = gapped{inner: h.s.check.Inflows, account: victim}
+	big := h.shield(victim, 6_000_000_000)
+	h.tick()
+	if hl := h.s.Health(); hl.ReviewQueue != 1 || hl.OldestReview != 0 {
+		t.Fatalf("after the first check: %+v", hl)
+	}
+	h.now = h.now.Add(time.Hour)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+	h.tick()
+	if hl := h.s.Health(); hl.OldestReview != 3600 || h.paged("review_overdue") {
+		t.Fatalf("an hour in: %+v", hl)
+	}
+	h.now = h.now.Add(61 * time.Minute)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "3", h.now)
+	h.tick()
+	var overdue bool
+	for _, p := range h.pages {
+		overdue = overdue || (p.Code == "review_overdue" && p.Severity == alert.Critical)
+	}
+	if !overdue {
+		t.Fatalf("pages %+v", h.pages)
+	}
+	if err := h.s.DecideReview(context.Background(), big, "reviewer", true); err != nil {
+		t.Fatal(err)
+	}
+	h.tick()
+	if hl := h.s.Health(); hl.ReviewQueue != 0 || !h.paged("review_overdue_resolved") {
+		t.Fatalf("after the review: %+v", hl)
+	}
+}
+
+func TestAnOperatorLiftsAHoldOnlyAsItsFinalCheckWould(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	big := h.shield(clean, 6_000_000_000)
+	h.tick()
+	h.shield(keypair.MustRandom().Address(), 10_000_000)
+	h.tick()
+	h.now = h.now.Add(55 * time.Minute)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 6", "attest 2"}) {
+		t.Fatalf("sent %v", got)
+	}
+	h.tick()
+	// A day before its final window, the hold stays whatever the checks say.
+	if err := h.s.Unflag(ctx, big, "reviewer", "looked fine"); err == nil || !strings.Contains(err.Error(), "final window") {
+		t.Fatalf("an early unflag: %v", err)
+	}
+	// In its final window a referral is not clear enough.
+	h.now = time.Unix(int64(h.deposits[big].createdAt), 0).Add(24*time.Hour - 9*time.Minute)
+	h.funders[clean] = []string{funder}
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}, funder: {Source: "exploits", Refer: true}}, "2", h.now)
+	if err := h.s.Unflag(ctx, big, "reviewer", "looked fine"); err == nil || !strings.Contains(err.Error(), "do not clear") {
+		t.Fatalf("an unflag on a referral: %v", err)
+	}
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("sent %v", got)
+	}
+	// A clear check then counts as the final check: the deposit is not checked again before it is
+	// admitted, and the lifted flag is not lifted twice.
+	delete(h.funders, clean)
+	if err := h.s.Unflag(ctx, big, "reviewer", "looked fine"); err != nil {
+		t.Fatal(err)
+	}
+	lifted := h.now
+	h.now = h.now.Add(time.Minute)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"unflag 1"}) {
+		t.Fatalf("sent %v", got)
+	}
+	rows, err := h.s.db.pending(ctx)
+	if err != nil || rows[0].recheck != "pass" || rows[0].recheckAt == nil || *rows[0].recheckAt != uint64(lifted.Unix()) {
+		t.Fatalf("rows %+v %v", rows, err)
 	}
 }

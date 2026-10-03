@@ -18,9 +18,10 @@ import (
 // Queue delivers alerts in the background, on a lane of its own for each channel, so a channel
 // that is slow, down or rate limited holds up only itself. A lane sends Critical alerts before
 // Warnings, each on its own, and gathers Info alerts into one digest at most every DigestEvery.
-// A copy a channel refuses is retried with backoff until the channel takes it; a lane whose
-// channel keeps failing rests, as long as a 429 answer asks or at a backoff. With a Store, the
-// copies not yet delivered survive a restart.
+// A copy a channel fails to take is retried with backoff until the channel takes it, and one it
+// refuses with a 4xx answer other than 408 or 429 is dropped, as it would be refused again; a
+// lane whose channel keeps failing rests, as long as a 429 answer asks or at a backoff. With a
+// Store, the copies not yet delivered survive a restart.
 type Queue struct {
 	// Name tells apart the queues that share a store, such as an operator and a public one.
 	Name     string
@@ -35,6 +36,7 @@ type Queue struct {
 	pending []delivery
 	nextID  int64
 	lanes   []*lane
+	pruned  sync.Once
 }
 
 // delivery is one channel's copy of an alert.
@@ -135,12 +137,41 @@ func (q *Queue) Put(a Alert) {
 		q.nextID--
 		q.pending = append(q.pending, delivery{id: q.nextID, channel: i, alert: a, next: q.now()})
 	}
-	if over := len(q.pending) - maxPending; over > 0 {
-		for _, d := range q.pending[:over] {
-			q.logError("alert dropped from a full queue", d.alert.Code, nil)
+	// A full queue drops its oldest copies of the lowest severity first, Info before Warning
+	// before Critical.
+	for over := len(q.pending) - maxPending; over > 0; {
+		r := 0
+		for _, d := range q.pending {
+			r = max(r, rank(d.alert.Severity))
 		}
-		q.pending = append([]delivery(nil), q.pending[over:]...)
+		kept := q.pending[:0]
+		for _, d := range q.pending {
+			if over > 0 && rank(d.alert.Severity) == r {
+				q.logError("alert dropped from a full queue", d.alert.Code, nil)
+				over--
+				continue
+			}
+			kept = append(kept, d)
+		}
+		q.pending = kept
 	}
+}
+
+// prune drops, once, the stored copies of channels no longer configured, which no lane reads.
+func (q *Queue) prune(ctx context.Context) {
+	q.pruned.Do(func() {
+		if q.Store == nil {
+			return
+		}
+		n, err := q.Store.dropChannels(ctx, q.Name, len(q.Channels))
+		if err != nil {
+			q.logError("alert outbox prune failed", "", err)
+			return
+		}
+		if n > 0 && q.Log != nil {
+			q.Log.Warn("alert copies of removed channels dropped", "queue", q.Name, "copies", n)
+		}
+	})
 }
 
 func (q *Queue) wakeAll() {
@@ -165,6 +196,7 @@ func (q *Queue) logError(msg, code string, err error) {
 
 // Run delivers on every lane until ctx ends.
 func (q *Queue) Run(ctx context.Context) {
+	q.prune(ctx)
 	var wg sync.WaitGroup
 	for i := range q.Channels {
 		wg.Go(func() {
@@ -185,6 +217,7 @@ func (q *Queue) Run(ctx context.Context) {
 
 // Flush runs one pass of every lane and returns how long until a lane has work again.
 func (q *Queue) Flush(ctx context.Context) time.Duration {
+	q.prune(ctx)
 	waits := make([]time.Duration, len(q.Channels))
 	var wg sync.WaitGroup
 	for i := range q.Channels {
@@ -238,8 +271,8 @@ func (q *Queue) flushLane(ctx context.Context, ch int) time.Duration {
 }
 
 // attempt sends one message standing for the copies given, and reports whether the lane may go
-// on. A 429 rests the lane for as long as it asks; another refusal retries the copies later, and
-// a run of them rests the lane.
+// on. A 429 rests the lane for as long as it asks, and a refusal that would repeat drops the
+// copies; any other failure retries them later, and a run of them rests the lane.
 func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds []delivery, a Alert) bool {
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
 	err := q.Channels[ch].Send(sendCtx, a)
@@ -250,6 +283,21 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 		}
 		q.mu.Lock()
 		l.failures, l.failing = 0, time.Time{}
+		q.mu.Unlock()
+		return true
+	}
+	var refused Refused
+	if errors.As(err, &refused) {
+		q.logError("alert refused by its channel and dropped", a.Code, err)
+		for _, d := range ds {
+			q.done(ctx, d)
+		}
+		// The lane goes on without a rest, but until a send succeeds it counts as failing, so a
+		// channel that refuses every copy, such as a deleted webhook, still stalls the heartbeat.
+		q.mu.Lock()
+		if l.failing.IsZero() {
+			l.failing = now
+		}
 		q.mu.Unlock()
 		return true
 	}
@@ -327,13 +375,13 @@ func (q *Queue) due(ctx context.Context, ch int, now time.Time) []delivery {
 	}
 	q.mu.Lock()
 	for _, d := range q.pending {
-		if d.channel == ch && !d.next.After(now) && len(out) < 2*laneBatch {
+		if d.channel == ch && !d.next.After(now) {
 			out = append(out, d)
 		}
 	}
 	q.mu.Unlock()
 	slices.SortStableFunc(out, func(a, b delivery) int { return rank(a.alert.Severity) - rank(b.alert.Severity) })
-	return out
+	return out[:min(len(out), 2*laneBatch)]
 }
 
 func (q *Queue) done(ctx context.Context, d delivery) {
@@ -446,6 +494,11 @@ func (s *Store) due(ctx context.Context, queue string, channel int, now time.Tim
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) dropChannels(ctx context.Context, queue string, channels int) (int64, error) {
+	tag, err := s.Pool.Exec(ctx, `DELETE FROM alert_outbox WHERE queue = $1 AND channel >= $2`, queue, channels)
+	return tag.RowsAffected(), err
 }
 
 func (s *Store) done(ctx context.Context, id int64) error {

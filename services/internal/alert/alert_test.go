@@ -3,6 +3,7 @@ package alert
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type recorder struct {
@@ -94,5 +96,38 @@ func TestAnUnreachableWebhookDoesNotLeakItsURL(t *testing.T) {
 	err := w.Send(context.Background(), Alert{})
 	if err == nil || strings.Contains(err.Error(), "SECRET") {
 		t.Fatalf("error %v", err)
+	}
+}
+
+func TestAMessageIsCutToWhatItsChannelTakes(t *testing.T) {
+	long := strings.Repeat("m", 5000)
+	for format, limit := range map[string]int{"discord": 2000, "telegram": 4096, "slack": 4000, "text": 4096} {
+		a := fit(format, Alert{Service: "watcher", Severity: Warning, Code: "root_mismatch", Message: long})
+		if len(a.text()) != limit || !strings.HasSuffix(a.Message, " [truncated]") {
+			t.Fatalf("%s sends %d bytes, not %d", format, len(a.text()), limit)
+		}
+	}
+	if a := fit("json", Alert{Code: "root_mismatch", Message: long}); len(a.Message) != 4096 {
+		t.Fatalf("json sends a message of %d bytes", len(a.Message))
+	}
+	short := Alert{Code: "root_mismatch", Message: strings.Repeat("m", 1980)}
+	if fit("discord", short) != short {
+		t.Fatal("a message that fits was cut")
+	}
+	// The cut falls inside a two-byte character, which goes rather than half of it.
+	a := fit("discord", Alert{Severity: Info, Code: "c", Message: strings.Repeat("\u00e9", 1500)})
+	if !utf8.ValidString(a.Message) || len(a.text()) > 2000 {
+		t.Fatalf("cut to %d bytes, valid %v", len(a.text()), utf8.ValidString(a.Message))
+	}
+}
+
+func TestOnlyAnAnswerThatWouldRepeatRefusesACopy(t *testing.T) {
+	for status, refused := range map[int]bool{400: true, 401: true, 403: true, 404: true, 413: true, 408: false, 429: false, 500: false, 502: false} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
+		err := Webhook{Format: "json", URL: srv.URL, HTTP: srv.Client()}.Send(context.Background(), Alert{})
+		srv.Close()
+		if err == nil || errors.As(err, new(Refused)) != refused {
+			t.Fatalf("%d: %v", status, err)
+		}
 	}
 }

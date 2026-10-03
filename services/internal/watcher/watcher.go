@@ -44,6 +44,9 @@ type HotAccount struct {
 	Address string
 	// Floor is the balance in stroops below which the watcher alerts; 0 checks none.
 	Floor int64
+	// AssetFloor is the balance of the vault's asset, when that is not lumens, below which the
+	// watcher alerts, in the asset's smallest unit; 0 checks none.
+	AssetFloor int64
 }
 
 // Config sets what the watcher watches and its thresholds.
@@ -57,6 +60,8 @@ type Config struct {
 	HotAccounts []HotAccount
 	// Lumens is the contract of the native asset, whose transfers out of a hot account page.
 	Lumens string
+	// Asset is the vault's asset, "native" or CODE:ISSUER.
+	Asset string
 	// ServiceAccounts are checked against CAP-77 freezes, with the vault, its code and its asset.
 	ServiceAccounts []string
 	// BurstMultiple and BurstFloor bound transact calls within 10 minutes: alert above the
@@ -218,9 +223,8 @@ func (w *Watcher) Apply(ctx context.Context, b follow.Batch) error {
 		// An attestation's timing is judged after the window is stored; until it is, the check
 		// stays in the database, so neither a failed read nor a restart loses it.
 		for _, n := range delta.Notices {
-			if n.Name == "attested" && n.ClosedAt+secondsPerDay >= b.LatestCloseTime {
-				a := n.Body.(chainstate.Attestation)
-				if err := w.db.addAttestCheck(ctx, tx, attestCheck{upTo: a.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: a.Covered}); err != nil {
+			if c, ok := judged(n); ok && n.ClosedAt+secondsPerDay >= b.LatestCloseTime {
+				if err := w.db.addAttestCheck(ctx, tx, c); err != nil {
 					return err
 				}
 			}
@@ -325,8 +329,9 @@ var governance = map[string]bool{
 }
 
 // notices reports governance events to the operator and the public channel, flags and requeued
-// exits as information, stranded exits, and checks every attestation against the screening
-// policy's timing. Events older than a day, met while rebuilding, are not reported again.
+// exits as information, stranded exits, and checks every attestation, and every unflag inside the
+// attested range, against the screening policy's timing. Events older than a day, met while
+// rebuilding, are not reported again.
 func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, latestClose int64) {
 	for _, n := range notices {
 		if n.ClosedAt+secondsPerDay < latestClose {
@@ -352,9 +357,9 @@ func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, late
 		case n.Name == "exit_requeued":
 			r := n.Body.(vault.ExitRequeued)
 			w.alerts.Raise(ctx, alert.Info, fmt.Sprintf("exit_requeued_%d", r.NewID), "%v of the payout and %v of the fee of stranded exit %d were queued again as exit %d", r.Payout, r.Fee, r.ID, r.NewID)
-		case n.Name == "attested":
-			a := n.Body.(chainstate.Attestation)
-			if err := w.judgeAttestation(ctx, attestCheck{upTo: a.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: a.Covered}); err != nil {
+		}
+		if c, ok := judged(n); ok {
+			if err := w.judgeAttestation(ctx, c); err != nil {
 				w.log.Warn("attestation check deferred", "ledger", n.Ledger, "error", err.Error())
 			}
 		}
@@ -377,7 +382,7 @@ func describe(body any) string {
 		return "resumed; the next halt is possible from " + time.Unix(int64(b.NextHaltAt), 0).UTC().Format(time.RFC3339)
 	case vault.DepositFlagged:
 		return fmt.Sprintf("deposit %d, reason %d", b.ID, b.Reason)
-	case vault.DepositUnflagged:
+	case chainstate.Unflag:
 		return fmt.Sprintf("deposit %d, reason %d cleared", b.ID, b.Reason)
 	}
 	return fmt.Sprintf("%+v", body)
@@ -386,6 +391,21 @@ func describe(body any) string {
 func limitsText(l vault.Limits) string {
 	return fmt.Sprintf("min_deposit %v, max_deposit %v, max_daily_per_depositor %v, tvl_cap %v, max_daily_outflow %v, max_fee %v, large_deposit_threshold %v",
 		l.MinDeposit, l.MaxDeposit, l.MaxDailyPerDepositor, l.TvlCap, l.MaxDailyOutflow, l.MaxFee, l.LargeDepositThreshold)
+}
+
+// judged is the attestation check a notice calls for: an attestation covers the deposits it
+// vouches for, and an unflag inside the attested range covers its deposit from then on, as an
+// attestation made at that moment would.
+func judged(n chainstate.Notice) (attestCheck, bool) {
+	switch b := n.Body.(type) {
+	case chainstate.Attestation:
+		return attestCheck{upTo: b.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: b.Covered}, true
+	case chainstate.Unflag:
+		if b.ID <= b.AttestedUpTo {
+			return attestCheck{upTo: b.AttestedUpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: []uint64{b.ID}}, true
+		}
+	}
+	return attestCheck{}, false
 }
 
 // attestSlack allows for ledger close times around the screening service's ten-minute window.
@@ -433,11 +453,11 @@ func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 		eligible := vault.PendingDeposit{Amount: amount, CreatedAt: createdAt, Delay: delay}.EligibleAt(inst.Config, inst.Limits)
 		if uint64(c.closedAt)+600+attestSlack < eligible {
 			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("early_attestation_%d", id),
-				"attestation up to deposit %d at ledger %d covered deposit %d %d seconds before its final-check window; the asp key may be stolen",
-				c.upTo, c.ledger, id, eligible-600-uint64(c.closedAt))
+				"deposit %d came under the attestation up to %d at ledger %d, %d seconds before its final-check window; the asp key may be stolen",
+				id, c.upTo, c.ledger, eligible-600-uint64(c.closedAt))
 		}
 	}
-	return w.db.dropAttestCheck(ctx, c.upTo, c.ledger)
+	return w.db.dropAttestCheck(ctx, c)
 }
 
 // RetryAttestations judges the attestations whose check could not run when they were seen.
@@ -611,21 +631,33 @@ func transferFilters(vaultID string) []protocol.TopicFilter {
 	}
 }
 
-// checkHotTransfers pages on any transfer of lumens out of a hot account in the window, whoever
-// sent the transaction: a hot account only pays its own fees, which the native asset reports as
-// fee events, never as transfers.
+// checkHotTransfers pages on any transfer of lumens or of the vault's asset out of a hot account
+// in the window, and on any burn of the vault's asset from one, whoever sent the transaction: a
+// hot account only pays its own fees, which the native asset reports as fee events, never as
+// transfers.
 func (w *Watcher) checkHotTransfers(ctx context.Context, b follow.Batch) error {
-	if w.cfg.Lumens == "" {
-		return nil
+	w.mu.RLock()
+	inst := w.inst
+	w.mu.RUnlock()
+	type watched struct {
+		contract string
+		burns    bool
 	}
-	transfer := xdr.ScSymbol("transfer")
-	name := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &transfer}
+	var contracts []watched
+	if w.cfg.Lumens != "" {
+		contracts = append(contracts, watched{contract: w.cfg.Lumens})
+	}
+	if inst != nil && inst.Config.Token != w.cfg.Lumens {
+		contracts = append(contracts, watched{contract: inst.Config.Token, burns: true})
+	}
+	transfer, burn := xdr.ScSymbol("transfer"), xdr.ScSymbol("burn")
+	sent := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &transfer}
+	burned := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &burn}
 	one := protocol.WildCardExactOne
-	// A request takes at most five topic filters.
-	for group := range slices.Chunk(w.cfg.HotAccounts, 5) {
+	sender := map[string]HotAccount{}
+	for _, c := range contracts {
 		var topics []protocol.TopicFilter
-		sender := map[string]HotAccount{}
-		for _, h := range group {
+		for _, h := range w.cfg.HotAccounts {
 			from, err := vault.Address(h.Address)
 			if err != nil {
 				return err
@@ -635,30 +667,38 @@ func (w *Watcher) checkHotTransfers(ctx context.Context, b follow.Batch) error {
 				return err
 			}
 			sender[topic] = h
-			topics = append(topics, protocol.TopicFilter{{ScVal: &name}, {ScVal: &from}, {Wildcard: &one}, {Wildcard: &one}})
-		}
-		src := follow.RPCSource{Client: w.rpc, Contract: w.cfg.Lumens, Topics: topics, PageLimit: 1000}
-		events, err := src.Events(ctx, b.From, b.To)
-		if errors.Is(err, follow.ErrRetention) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("hot account transfers: %w", err)
-		}
-		for _, e := range events {
-			if len(e.Topics) < 2 {
-				continue
+			topics = append(topics, protocol.TopicFilter{{ScVal: &sent}, {ScVal: &from}, {Wildcard: &one}, {Wildcard: &one}})
+			if c.burns {
+				topics = append(topics, protocol.TopicFilter{{ScVal: &burned}, {ScVal: &from}, {Wildcard: &one}})
 			}
-			h, ok := sender[e.Topics[1]]
-			if !ok {
-				continue
+		}
+		// A request takes at most five topic filters.
+		for group := range slices.Chunk(topics, 5) {
+			src := follow.RPCSource{Client: w.rpc, Contract: c.contract, Topics: group, PageLimit: 1000}
+			events, err := src.Events(ctx, b.From, b.To)
+			if errors.Is(err, follow.ErrRetention) {
+				return nil
 			}
-			what := "lumens"
-			if t, err := vault.DecodeTransfer(e); err == nil {
-				what = fmt.Sprintf("%v stroops to %s", t.Amount, t.To)
+			if err != nil {
+				return fmt.Errorf("hot account transfers: %w", err)
 			}
-			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("hot_account_transfer_%.16s_%d", e.TxHash, e.Index),
-				"the %s account %s sent %s in ledger %d, which only a stolen key does", h.Name, h.Address, what, e.Ledger)
+			for _, e := range events {
+				if len(e.Topics) < 2 {
+					continue
+				}
+				h, ok := sender[e.Topics[1]]
+				if !ok {
+					continue
+				}
+				what := "funds of contract " + c.contract
+				if t, err := vault.DecodeTransfer(e); err == nil {
+					what = fmt.Sprintf("%v units of contract %s to %s", t.Amount, c.contract, t.To)
+				} else if t, err := vault.DecodeBurn(e); err == nil {
+					what = fmt.Sprintf("%v units of contract %s, burned", t.Amount, c.contract)
+				}
+				w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("hot_account_transfer_%.16s_%d", e.TxHash, e.Index),
+					"the %s account %s sent %s in ledger %d, which only a stolen key does", h.Name, h.Address, what, e.Ledger)
+			}
 		}
 	}
 	return nil

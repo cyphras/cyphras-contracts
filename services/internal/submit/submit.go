@@ -66,6 +66,89 @@ type Engine struct {
 	// Poll is the interval between getTransaction calls.
 	Poll time.Duration
 	Now  func() time.Time
+
+	costMu sync.Mutex
+	costs  ledgerCosts
+}
+
+// ledgerCosts are the network's fees and limits for the bytes a call reads and writes, read with
+// the time they were read.
+type ledgerCosts struct {
+	at                      time.Time
+	read1KB, write1KB       int64
+	maxReadBytes, maxWrites uint32
+}
+
+// classicPad is the room added to the bytes a call may read and write for each classic entry it
+// touches, an account or a trustline: anyone can grow their own account, by signers or
+// sponsorships, between a simulation and the ledger the call lands in, and the call would then run
+// out of the bytes the simulation measured. An account entry holds at most about 2 KB.
+const classicPad = 2048
+
+// ledgerCosts reads the network's fees for read and written bytes, at most once an hour.
+func (e *Engine) ledgerCosts(ctx context.Context) (ledgerCosts, error) {
+	e.costMu.Lock()
+	defer e.costMu.Unlock()
+	if !e.costs.at.IsZero() && e.now().Sub(e.costs.at) < time.Hour {
+		return e.costs, nil
+	}
+	base, ext := vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostV0), vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostExtV0)
+	entries, _, err := rpc.Entries(ctx, e.RPC, []xdr.LedgerKey{base, ext})
+	if err != nil {
+		return ledgerCosts{}, fmt.Errorf("ledger costs: %w", err)
+	}
+	b, x := entries[mustKeyString(base)].Data.ConfigSetting, entries[mustKeyString(ext)].Data.ConfigSetting
+	if b == nil || b.ContractLedgerCost == nil || x == nil || x.ContractLedgerCostExt == nil {
+		return ledgerCosts{}, errors.New("ledger costs: the network's settings are missing")
+	}
+	e.costs = ledgerCosts{
+		at: e.now(), read1KB: int64(b.ContractLedgerCost.FeeDiskRead1Kb), write1KB: int64(x.ContractLedgerCostExt.FeeWrite1Kb),
+		maxReadBytes: uint32(b.ContractLedgerCost.TxMaxDiskReadBytes), maxWrites: uint32(b.ContractLedgerCost.TxMaxWriteBytes),
+	}
+	return e.costs, nil
+}
+
+func mustKeyString(k xdr.LedgerKey) string {
+	s, err := rpc.KeyString(k)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
+// padClassic adds classicPad to the bytes the call may read for each classic entry in its
+// footprint, and to the bytes it may write for each it writes, within the network's limits, and
+// returns the fee those bytes add.
+func (e *Engine) padClassic(ctx context.Context, res *xdr.SorobanResources) (int64, error) {
+	classic := func(keys []xdr.LedgerKey) uint64 {
+		n := uint64(0)
+		for _, k := range keys {
+			if k.Type == xdr.LedgerEntryTypeAccount || k.Type == xdr.LedgerEntryTypeTrustline {
+				n++
+			}
+		}
+		return n
+	}
+	writes := classic(res.Footprint.ReadWrite)
+	reads := writes + classic(res.Footprint.ReadOnly)
+	if reads == 0 {
+		return 0, nil
+	}
+	c, err := e.ledgerCosts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	read := min(uint64(res.DiskReadBytes)+reads*classicPad, max(uint64(c.maxReadBytes), uint64(res.DiskReadBytes)))
+	write := min(uint64(res.WriteBytes)+writes*classicPad, max(uint64(c.maxWrites), uint64(res.WriteBytes)))
+	fee := perKB(read-uint64(res.DiskReadBytes), c.read1KB) + perKB(write-uint64(res.WriteBytes), c.write1KB)
+	res.DiskReadBytes, res.WriteBytes = xdr.Uint32(read), xdr.Uint32(write)
+	return fee, nil
+}
+
+// perKB is the fee of a number of bytes at a rate per 1024 of them, rounded up as the network
+// rounds it.
+func perKB(bytes uint64, rate int64) int64 {
+	return int64((bytes*uint64(rate) + 1023) / 1024)
 }
 
 func (e *Engine) now() time.Time {
@@ -105,6 +188,8 @@ type Prepared struct {
 	MaxLedger uint32
 	// Return is the simulated return value of the call.
 	Return *xdr.ScVal
+	// SimulatedAt is the ledger the simulation read the chain at.
+	SimulatedAt uint32
 }
 
 func (e *Engine) loadSequence(ctx context.Context, a *Account) error {
@@ -214,7 +299,11 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 	if e.MaxResourceFee > 0 && sim.MinResourceFee > e.MaxResourceFee {
 		return nil, fmt.Errorf("%w: a resource fee of %d stroops is above the cap", ErrSimulation, sim.MinResourceFee)
 	}
-	resource := sim.MinResourceFee + sim.MinResourceFee*e.ResourceMarginPct/100
+	padding, err := e.padClassic(ctx, &data.Resources)
+	if err != nil {
+		return nil, err
+	}
+	resource := sim.MinResourceFee + sim.MinResourceFee*e.ResourceMarginPct/100 + padding
 	data.ResourceFee = xdr.Int64(resource)
 	sop.setExt(xdr.TransactionExt{V: 1, SorobanData: &data})
 	var ret *xdr.ScVal
@@ -243,7 +332,8 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 	if err != nil {
 		return nil, err
 	}
-	return &Prepared{Account: a, Tx: tx, Seq: a.seq + 1, InclusionFee: inclusion, ResourceFee: resource, MaxTime: maxTime, MaxLedger: maxLedger, Return: ret}, nil
+	return &Prepared{Account: a, Tx: tx, Seq: a.seq + 1, InclusionFee: inclusion, ResourceFee: resource, MaxTime: maxTime, MaxLedger: maxLedger, Return: ret,
+		SimulatedAt: uint32(sim.LatestLedger)}, nil
 }
 
 // Signed is a transaction accepted for inclusion.
@@ -377,6 +467,9 @@ type Result struct {
 	// ContractError is the first contract error the diagnostic events of a failed call name, when
 	// the RPC returns them.
 	ContractError *ContractError
+	// Diagnosed is set when the RPC returned diagnostic events for the transaction; one that does
+	// not keeps the cause of a failure from being told.
+	Diagnosed bool
 }
 
 // ContractError is an error a contract raised: the contract and its code.
@@ -485,6 +578,7 @@ func (e *Engine) result(s *Signed, resp protocol.GetTransactionResponse) Result 
 	if r.Outcome == Failed {
 		r.ContractError = contractError(diagnostics)
 	}
+	r.Diagnosed = len(diagnostics) > 0
 	return r
 }
 
