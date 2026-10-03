@@ -199,6 +199,29 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal(owedTo(world, destination), 90n * XLM);
   });
 
+  it("goes on with a split whose part the user retried by hand once the retry lands", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const { alice } = await twoNotes(world);
+    const destination = world.signer("exchange").publicKey;
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: destination,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+    );
+    const [part] = await alice.plans();
+    await alice.retry(part?.planId as string, { maxFee: 2n * XLM, confirm: confirmAll });
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "superseded");
+    const view = await finish(world, alice);
+    assert.equal(view?.state, "done");
+    assert.equal(owedTo(world, destination), 90n * XLM);
+  });
+
   it("blocks a split whose part did not land when its notes were spent elsewhere", async () => {
     const world = await createWorld({ limits: SPLIT });
     const { alice } = await twoNotes(world);

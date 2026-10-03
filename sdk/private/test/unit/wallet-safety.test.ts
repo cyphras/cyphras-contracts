@@ -1154,6 +1154,33 @@ describe("wallet safety: a damaged store", () => {
     assert.equal(deposits[1]?.state, "failed");
     assert.equal((await reopened.balance()).pendingDeposits, 40n * XLM);
   });
+
+  it("fails a deposit that never landed only once the ledgers up to its deadline are checked", async () => {
+    const world = await createWorld();
+    const backend = new MemoryStore();
+    const rpc = flakyEvents(world);
+    const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, backend);
+    await alice.shield({ amount: 40n * XLM, signer: world.signer("depositor") });
+    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const state = (await loadState(sealed)) as WalletState;
+    const landed = state.deposits[0] as WalletState["deposits"][0];
+    state.deposits.push({
+      ...landed,
+      id: undefined,
+      txHash: undefined,
+      state: "submitting",
+      commitments: [randomFieldElement(), randomFieldElement()],
+    });
+    await saveState(sealed, state);
+    const reopened = await openWallet({ ...world, fetch: rpc.fetch }, 0, backend);
+    world.advance(121 * 5);
+    rpc.down = true;
+    await reopened.sync();
+    assert.equal((await reopened.deposits())[1]?.state, "submitting");
+    rpc.down = false;
+    await reopened.sync();
+    assert.equal((await reopened.deposits())[1]?.state, "failed");
+  });
 });
 
 describe("wallet safety: what services learn", () => {

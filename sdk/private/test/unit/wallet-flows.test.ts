@@ -595,7 +595,10 @@ describe("wallet: a pool of an issued asset", () => {
 
   it("burns a payout to the asset's issuer only when the caller agrees to it", async () => {
     const issuer = keypairFor("issuer").publicKey();
-    const world = await createWorld({ asset: `USDC:${issuer}` });
+    const world = await createWorld({
+      asset: `USDC:${issuer}`,
+      limits: { maxDailyOutflow: 50n * XLM, tvlCap: 350n * XLM },
+    });
     world.signer("issuer");
     const alice = await openWallet(world, 0);
     await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
@@ -615,6 +618,18 @@ describe("wallet: a pool of an issued asset", () => {
         ...(burnToIssuer === undefined ? {} : { burnToIssuer }),
       });
     await assert.rejects(unshield(issuer), burned);
+    // A split is refused before its operation starts.
+    await assert.rejects(
+      alice.unshield({
+        to: issuer,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+      burned,
+    );
+    assert.deepEqual(await alice.continueOperations(), []);
     // Nor through a muxed address on the issuer's account.
     await assert.rejects(
       unshield(new MuxedAccount(new Account(issuer, "0"), "3").accountId()),
