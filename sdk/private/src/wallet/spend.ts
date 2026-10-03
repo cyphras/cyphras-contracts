@@ -145,12 +145,18 @@ async function chooseRelay(
   return fail("service_unavailable", "no relayer is available", { service: "relayer" });
 }
 
+// A payout to an account that does not exist yet creates it. The vault accepts one only in the
+// native asset, and of at least the new account's minimum balance of two base reserves.
+const NEW_ACCOUNT_MIN_PAYOUT = 10_000_000n;
+
+interface Destination {
+  readonly createdLedger: number | undefined;
+  readonly latestLedger: number;
+  readonly createsAccount: boolean;
+}
+
 // The destination must be able to receive before anything is proved.
-async function checkDestination(
-  core: Core,
-  to: string,
-  amount: bigint,
-): Promise<{ createdLedger: number | undefined; latestLedger: number }> {
+async function checkDestination(core: Core, to: string, amount: bigint): Promise<Destination> {
   const { deployment } = core;
   if (!isAccountId(to) && !isContractId(to) && !isMuxedAccountId(to)) {
     fail(
@@ -160,7 +166,19 @@ async function checkDestination(
   }
   if (to === deployment.vault) fail("destination_invalid", "the vault cannot be the destination");
   const dest = await core.services.vault.destination(to, deployment.asset.name);
-  if (!dest.exists) fail("destination_invalid", "the destination does not exist on the network");
+  if (!dest.exists) {
+    if (deployment.asset.name !== "native" || isContractId(to)) {
+      fail("destination_invalid", "the destination does not exist on the network");
+    }
+    if (amount < NEW_ACCOUNT_MIN_PAYOUT) {
+      fail(
+        "destination_invalid",
+        "the destination does not exist yet, and a payout that creates it must be at least 1 XLM",
+        { minimum: NEW_ACCOUNT_MIN_PAYOUT.toString() },
+      );
+    }
+    return { createdLedger: undefined, latestLedger: dest.latestLedger, createsAccount: true };
+  }
   if (deployment.asset.name !== "native" && !isContractId(to)) {
     if (dest.trustline === undefined || !dest.trustline.authorized) {
       fail("destination_invalid", "the destination has no authorized trustline for the asset");
@@ -169,7 +187,11 @@ async function checkDestination(
       fail("destination_invalid", "the destination's trustline limit is too low for the amount");
     }
   }
-  return { createdLedger: dest.createdLedger, latestLedger: dest.latestLedger };
+  return {
+    createdLedger: dest.createdLedger,
+    latestLedger: dest.latestLedger,
+    createsAccount: false,
+  };
 }
 
 function vaultOpen(
@@ -220,6 +242,7 @@ function planOf(
   inputs: readonly OwnedNote[],
   built: BuiltTransaction,
   proof: ReturnType<typeof txProofToJson>,
+  createsAccount: boolean,
 ): Plan {
   return {
     id: newId(),
@@ -230,6 +253,7 @@ function planOf(
     amount: intent.amount,
     fee,
     to: intent.to,
+    createsAccount,
     inputs: inputs.map((n) => ({ pos: n.pos, nf: n.nf as bigint, value: n.value })),
     nullifiers: built.nullifiers,
     commitments: built.commitments,
@@ -300,7 +324,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
   const cap = intent.maxFee < instance.limits.maxFee ? intent.maxFee : instance.limits.maxFee;
 
   let recipient: AddressKey | undefined;
-  let destination: { createdLedger: number | undefined; latestLedger: number } | undefined;
+  let destination: Destination | undefined;
   if (intent.kind === "send") {
     recipient = decodeAddress(core.deployment.network, intent.to);
   } else {
@@ -341,6 +365,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
         notes: core.state.notes,
         now: core.now(),
         destinationCreatedLedger: destination?.createdLedger,
+        createsAccount: destination?.createsAccount ?? false,
         latestLedger: destination?.latestLedger ?? 0,
         admittedDeposits: stats?.admittedDeposits,
         selfRelay: relay === undefined,
@@ -414,6 +439,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       inputs,
       built,
       txProofToJson(proof),
+      destination?.createsAccount ?? false,
     );
     core.state.plans.push(plan);
     await core.save();

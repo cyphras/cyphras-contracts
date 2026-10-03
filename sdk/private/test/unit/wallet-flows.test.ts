@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Account, MuxedAccount } from "@stellar/stellar-base";
+import { Account, MuxedAccount, StrKey } from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
 import { MemoryStore } from "../../src/storage.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
 import { INDEXER, RPC, XLM, createWorld } from "../support/network.ts";
+import { keypairFor } from "../support/rpc.ts";
 import { confirmAll, isError, openWallet } from "../support/wallets.ts";
 
 async function funded(amount = 100n * XLM) {
@@ -281,14 +282,22 @@ describe("wallet: spends", () => {
     );
   });
 
-  it("refuses a destination that does not exist, the vault itself, and self-relayed transfers", async () => {
+  it("refuses a destination that does not exist unless the payout can create it, and the vault itself", async () => {
     const { world, alice } = await funded();
-    const missing = "GCFX7GZHEKRT3B6VQ2DXBUZOFHPDQPWF3RN6ZC4KSPV5R4UE6RYQKQVX";
+    const missing = keypairFor("nobody yet").publicKey();
+    // Below the minimum balance of a new account, a payout cannot create it.
     await assert.rejects(
-      alice.unshield({ to: missing, amount: 1n * XLM, maxFee: 2n * XLM, confirm: confirmAll }),
+      alice.unshield({ to: missing, amount: XLM / 2n, maxFee: 2n * XLM, confirm: confirmAll }),
       (err: unknown) =>
         err instanceof CyphrasError &&
-        (err.code === "destination_invalid" || err.code === "invalid_argument"),
+        err.code === "destination_invalid" &&
+        err.details["minimum"] === XLM.toString(),
+    );
+    // No payment creates a contract.
+    const noContract = StrKey.encodeContract(Buffer.alloc(32, 7));
+    await assert.rejects(
+      alice.unshield({ to: noContract, amount: 5n * XLM, maxFee: 2n * XLM, confirm: confirmAll }),
+      isError("destination_invalid"),
     );
     await assert.rejects(
       alice.unshield({
@@ -303,6 +312,38 @@ describe("wallet: spends", () => {
       alice.send({ to: "not an address", amount: 1n, maxFee: 2n * XLM }),
       isError("invalid_address"),
     );
+  });
+
+  it("unshields to a native account that does not exist yet, which its payout creates", async () => {
+    const { world, alice } = await funded();
+    const fresh = keypairFor("fresh account").publicKey();
+    const reviews: string[][] = [];
+    const result = await alice.unshield({
+      to: fresh,
+      amount: 5n * XLM,
+      maxFee: 2n * XLM,
+      confirm: (review) => {
+        reviews.push(review.warnings.map((w) => w.code));
+        return true;
+      },
+    });
+    assert.ok("planId" in result);
+    // The pool funds the account, so no funder links it: the warning explains that instead.
+    assert.ok(reviews[0]?.includes("destination_created_by_payout"));
+    assert.ok(!reviews[0]?.includes("new_destination_account"));
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+    assert.ok(world.rpc.accounts.has(fresh));
+    assert.deepEqual(
+      world.vault.transfers.filter((t) => t.to === fresh).map((t) => t.amount),
+      [5n * XLM],
+    );
+    // A muxed address on a missing account creates its base account the same way.
+    const base = keypairFor("fresh base account").publicKey();
+    const muxed = new MuxedAccount(new Account(base, "0"), "7").accountId();
+    await alice.unshield({ to: muxed, amount: 2n * XLM, maxFee: 2n * XLM, confirm: confirmAll });
+    await alice.sync();
+    assert.ok(world.rpc.accounts.has(base));
   });
 
   it("refuses a quote above the smallest cap and proves again when the relayer wants more", async () => {

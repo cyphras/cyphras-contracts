@@ -210,12 +210,20 @@ export interface ExitPosition {
   // What this exit still owes to its recipient and its relayer.
   readonly payoutLeft: bigint;
   readonly feeLeft: bigint;
-  // Unix seconds: the end of the UTC day by which releases have paid it at the latest. Halts can
+  // The first part of the payout creates the recipient's account. Release pays no such part below
+  // the account's minimum balance, and leaves the rest of a shorter window unused.
+  readonly createsAccount: boolean;
+  // Unix seconds: the end of the UTC day by which releases have paid it at the latest, which
+  // allows for exits whose first part waits for a window that can create the account. Halts can
   // make it later.
   readonly paidBy: number;
 }
 
-export function exitPosition(queue: ExitQueue, exitId: number): ExitPosition | undefined {
+export function exitPosition(
+  queue: ExitQueue,
+  exitId: number,
+  createsAccount: boolean,
+): ExitPosition | undefined {
   const mine = queue.exits.find((e) => e.id === exitId);
   if (mine?.position === undefined || mine.paidBy === undefined) return undefined;
   const position = mine.position;
@@ -227,6 +235,7 @@ export function exitPosition(queue: ExitQueue, exitId: number): ExitPosition | u
       .reduce((s, e) => s + e.payoutLeft + e.feeLeft, 0n),
     payoutLeft: mine.payoutLeft,
     feeLeft: mine.feeLeft,
+    createsAccount,
     paidBy: mine.paidBy,
   };
 }

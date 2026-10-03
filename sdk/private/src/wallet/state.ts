@@ -103,6 +103,8 @@ export interface Plan {
   readonly amount: bigint;
   readonly fee: bigint;
   readonly to: string;
+  // The unshield's destination did not exist when it was built, so its payout creates it.
+  readonly createsAccount: boolean;
   readonly inputs: readonly { readonly pos: number; readonly nf: bigint; readonly value: bigint }[];
   readonly nullifiers: readonly [bigint, bigint];
   readonly commitments: readonly [bigint, bigint];

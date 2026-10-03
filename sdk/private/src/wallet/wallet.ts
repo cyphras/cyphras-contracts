@@ -920,11 +920,13 @@ export class PrivateWallet {
   /** Where a queued payout of this wallet stands in the vault's exit queue, and when it is due. */
   async exitPosition(planId: string): Promise<ExitPosition | undefined> {
     const plan = this.#core.state.plans.find((p) => p.id === planId);
-    const queued = plan?.exit?.parts.find((p) => !p.stranded && p.payoutLeft > 0n);
-    if (queued === undefined) return undefined;
+    const exit = plan?.exit;
+    const queued = exit?.parts.find((p) => !p.stranded && p.payoutLeft > 0n);
+    if (plan === undefined || exit === undefined || queued === undefined) return undefined;
     const queue = await this.#indexer()?.exits();
     if (queue === undefined) return undefined;
-    return exitPosition(queue, queued.id);
+    // Until a first part is paid, the recipient's account does not exist.
+    return exitPosition(queue, queued.id, plan.createsAccount && payoutLeft(exit) === plan.amount);
   }
 
   /**

@@ -104,6 +104,11 @@ export class MockRpc {
     this.passphrase = passphrase;
   }
 
+  // An account the native asset contract created with a payment, whose key no test holds.
+  createAccount(publicKey: string): void {
+    this.account(Keypair.fromPublicKey(publicKey));
+  }
+
   account(keypair: Keypair): Account {
     const account = {
       keypair,

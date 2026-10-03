@@ -9,6 +9,7 @@ export type WarningCode =
   | "recent_shield"
   | "whole_balance_after_shield"
   | "new_destination_account"
+  | "destination_created_by_payout"
   | "small_anonymity_set"
   | "anonymity_set_unknown"
   | "self_relay_links_account"
@@ -31,6 +32,8 @@ const MESSAGES: Readonly<Record<WarningCode, string>> = {
     "This withdraws the whole balance right after a deposit, which links the two.",
   new_destination_account:
     "The destination account is new; whoever funded it can be linked to this withdrawal.",
+  destination_created_by_payout:
+    "The destination account does not exist yet: this withdrawal creates it, so the pool alone funds it and nothing else links it to you. 1 XLM of it stays locked as the account's minimum balance, so send more than the recipient needs to spend.",
   small_anonymity_set:
     "Few deposits have entered the pool, so this withdrawal hides among only a few others.",
   anonymity_set_unknown: "The size of the pool's anonymity set could not be read.",
@@ -60,6 +63,7 @@ export interface UnshieldContext {
   readonly notes: readonly OwnedNote[];
   readonly now: number;
   readonly destinationCreatedLedger: number | undefined;
+  readonly createsAccount: boolean;
   readonly latestLedger: number;
   readonly admittedDeposits: number | undefined;
   readonly selfRelay: boolean;
@@ -92,7 +96,9 @@ export function unshieldWarnings(c: UnshieldContext): Warning[] {
   const shieldedLately = c.now - lastShield < NUDGE_THRESHOLDS.recentShieldMs;
   if (shieldedLately) codes.push("recent_shield");
   if (shieldedLately && c.amount + c.fee >= c.spendable) codes.push("whole_balance_after_shield");
-  if (
+  if (c.createsAccount) {
+    codes.push("destination_created_by_payout");
+  } else if (
     c.destinationCreatedLedger !== undefined &&
     c.latestLedger - c.destinationCreatedLedger < NUDGE_THRESHOLDS.newAccountLedgers
   ) {

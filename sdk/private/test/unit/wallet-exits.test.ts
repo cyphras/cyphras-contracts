@@ -7,6 +7,7 @@ import type { ExitEvent } from "../../src/wallet/sources.ts";
 import { type Plan, type WalletState, emptyState } from "../../src/wallet/state.ts";
 import type { OperationView } from "../../src/wallet/wallet.ts";
 import { XLM, createWorld } from "../support/network.ts";
+import { keypairFor } from "../support/rpc.ts";
 import { confirmAll, isError, openWallet } from "../support/wallets.ts";
 
 const SMALL = { maxDailyOutflow: 50n * XLM, tvlCap: 350n * XLM };
@@ -217,6 +218,47 @@ describe("the exit queue", () => {
       { id: 2, payoutLeft: 10n * XLM, feeLeft: 0n, stranded: false },
     ]);
     assert.equal((await alice.exitPosition(sub.planId))?.exitId, 2);
+  });
+
+  it("waits for a window that can pay the first part of a payout that creates its account", async () => {
+    const { world, alice } = await funded();
+    const day = (): bigint => world.vault.timestamp / 86_400n;
+    world.vault.outflowDay = day();
+    world.vault.outflow = 50n * XLM;
+    const fresh = keypairFor("fresh account").publicKey();
+    const sub = await alice.unshield({
+      to: fresh,
+      amount: 20n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    assert.ok("planId" in sub);
+    await alice.sync();
+    let position = await alice.exitPosition(sub.planId);
+    assert.equal(position?.createsAccount, true);
+    assert.equal(position?.paidBy, Number((day() + 2n) * 86_400n) - 1);
+
+    // Less than the new account's minimum balance is left of tomorrow's window: nothing is paid.
+    world.advance(86_400);
+    world.vault.outflowDay = day();
+    world.vault.outflow = 50n * XLM - XLM / 2n;
+    await alice.releaseExits(world.signer("anyone"));
+    await alice.sync();
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.payoutLeft, 20n * XLM);
+    assert.equal(world.rpc.accounts.has(fresh), false);
+
+    // A first part that funds the minimum balance creates the account.
+    world.vault.outflow = 45n * XLM;
+    await alice.releaseExits(world.signer("anyone"));
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.payoutLeft, 15n * XLM);
+    assert.ok(world.rpc.accounts.has(fresh));
+    position = await alice.exitPosition(sub.planId);
+    assert.equal(position?.createsAccount, false);
+    assert.equal(position?.paidBy, Number((day() + 2n) * 86_400n) - 1);
   });
 
   it("puts queued payouts in FIFO order behind the ones ahead", async () => {
@@ -441,6 +483,7 @@ describe("following an exit from the vault's events and the indexer's account", 
       amount: 10n,
       fee: 1n,
       to: "recipient",
+      createsAccount: false,
       inputs: [],
       nullifiers: [1n, 2n],
       commitments: [3n, 4n],

@@ -148,6 +148,9 @@ const bytes = (b: Uint8Array): xdr.ScVal =>
   xdr.ScVal.scvBytes(b as unknown as Parameters<typeof xdr.ScVal.scvBytes>[0]);
 
 const DAY = 86_400n;
+// The native asset contract creates a missing account with a transfer of at least its minimum
+// balance, two base reserves.
+const NEW_ACCOUNT_MIN = 10_000_000n;
 const randomFill = (length: number): Uint8Array => crypto.getRandomValues(new Uint8Array(length));
 const REFUND_DELAY = DAY;
 const VK = parseVerifyingKey(JSON.parse(new TextDecoder().decode(TRAPDOOR_VK)));
@@ -243,6 +246,9 @@ export class MockVault {
   readonly transfers: Transfer[] = [];
   // Accounts that cannot receive a payout, to strand exits in tests.
   readonly unpayable = new Set<string>();
+  // The network's accounts, which the world connects to its RPC. A contract always exists.
+  accountExists: (account: string) => boolean = () => true;
+  createAccount: (account: string) => void = () => {};
   // The issuer keeps the vault itself from paying out.
   vaultCannotPay = false;
 
@@ -353,7 +359,21 @@ export class MockVault {
   }
 
   #pay(to: string, amount: bigint): void {
-    if (amount > 0n) this.transfers.push({ from: this.address, to: baseAccount(to), amount });
+    if (amount === 0n) return;
+    const account = baseAccount(to);
+    if (!this.accountExists(account)) this.createAccount(account);
+    this.transfers.push({ from: this.address, to: account, amount });
+  }
+
+  // What the asset contract takes: a transfer to an account that can hold the asset, or one that
+  // creates a missing account with at least its minimum balance. A relayer is paid fees, which
+  // are too small to create it, so it must exist.
+  #receives(to: string, amount: bigint): boolean {
+    const account = baseAccount(to);
+    if (this.unpayable.has(account)) return false;
+    return (
+      this.accountExists(account) || (!StrKey.isValidContract(to) && amount >= NEW_ACCOUNT_MIN)
+    );
   }
 
   shield(proof: TxProof, ext: ExtData, depositor: string): bigint {
@@ -420,10 +440,11 @@ export class MockVault {
     if (outflow > this.tvl - this.pendingTotal - this.queuedTotal) {
       refuse(ERROR.ExceedsAdmittedValue);
     }
-    // A party paid by the exit must be able to receive now, whether it is paid at once or queued.
+    // A party paid by the exit must be able to receive now, whether it is paid at once or queued;
+    // only the recipient of a payout large enough to create its account may be missing.
     if (
-      (payout > 0n && this.unpayable.has(baseAccount(ext.recipient))) ||
-      (ext.fee > 0n && this.unpayable.has(ext.relayer))
+      (payout > 0n && !this.#receives(ext.recipient, payout)) ||
+      (ext.fee > 0n && !this.#receives(ext.relayer, 0n))
     ) {
       refuse(ERROR.CannotReceive);
     }
@@ -491,7 +512,7 @@ export class MockVault {
 
   // Pays one part of an exit unless the asset contract would refuse it, and returns what it paid.
   #tryPay(to: string, amount: bigint): bigint {
-    if (amount === 0n || this.unpayable.has(baseAccount(to))) return 0n;
+    if (amount === 0n || !this.#receives(to, amount)) return 0n;
     this.#pay(to, amount);
     return amount;
   }
@@ -513,8 +534,12 @@ export class MockVault {
       if (room === 0n) break;
       const id = this.exitHead;
       const exit = this.exits.get(id) as Exit;
-      count++;
       const payout = exit.payout < room ? exit.payout : room;
+      // No first part below its minimum balance goes to an account the payout creates; the exit
+      // waits for the next window.
+      const missing = !this.accountExists(baseAccount(exit.recipient));
+      if (missing && payout < NEW_ACCOUNT_MIN && exit.payout >= NEW_ACCOUNT_MIN) break;
+      count++;
       const fee = exit.fee < room - payout ? exit.fee : room - payout;
       const payoutPaid = this.#tryPay(exit.recipient, payout);
       const feePaid = this.#tryPay(exit.relayer, fee);
@@ -564,10 +589,10 @@ export class MockVault {
   claim(id: number): bigint {
     if (this.#halted()) refuse(ERROR.Halted);
     const exit = this.stranded.get(id) ?? refuse(ERROR.NotStranded);
-    const movable = (to: string, part: bigint): bigint =>
-      part > 0n && !this.unpayable.has(baseAccount(to)) ? part : 0n;
-    const payout = movable(exit.recipient, exit.payout);
-    const fee = movable(exit.relayer, exit.fee);
+    // Judged as transact judges the parties.
+    const payout =
+      exit.payout > 0n && this.#receives(exit.recipient, exit.payout) ? exit.payout : 0n;
+    const fee = exit.fee > 0n && this.#receives(exit.relayer, 0n) ? exit.fee : 0n;
     if (payout === 0n && fee === 0n) refuse(ERROR.NothingClaimable);
     if (this.dryRun) return BigInt(this.exitTail);
     const newId = this.exitTail++;

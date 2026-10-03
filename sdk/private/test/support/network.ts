@@ -43,6 +43,15 @@ export const DEFAULT_LIMITS: Limits = {
 // The end of the UTC day by which releases have paid each queued exit at the latest, as the
 // indexer computes it: from the day of max(now, haltedUntil), as many more days as the exits up to
 // and including it owe, in whole windows.
+// What a queued exit can take from the windows, as the services count it: what it owes and, in a
+// native vault, up to 1 XLM of a window that release leaves unused rather than pay a first part
+// below 1 XLM to an account that may not exist yet.
+function takes(e: Exit): bigint {
+  const first = e.payout > 0n && e.payout === e.queuedPayout;
+  const account = e.recipient.startsWith("G") || e.recipient.startsWith("M");
+  return e.payout + e.fee + (first && account ? XLM - 1n : 0n);
+}
+
 function paidBy(
   owed: readonly bigint[],
   now: number,
@@ -248,7 +257,7 @@ export class MockIndexer {
         const used = v.outflowDay === BigInt(today) ? v.outflow : 0n;
         const queued = [...v.exits.values()].sort((a, b) => a.id - b.id);
         const paid = paidBy(
-          queued.map((e) => e.payout + e.fee),
+          queued.map(takes),
           now,
           Number(v.haltedUntil),
           v.limits.maxDailyOutflow,
@@ -495,6 +504,10 @@ export async function createWorld(options: { limits?: Partial<Limits> } = {}): P
     throw new TypeError(`no route to ${url.origin}`);
   };
   rpc.account(relayer.channel);
+  rpc.account(keypairFor("relayer fee"));
+  vault.accountExists = (account) =>
+    !StrKey.isValidEd25519PublicKey(account) || rpc.accounts.has(account);
+  vault.createAccount = (account) => rpc.createAccount(account);
   const world: World = {
     vault,
     rpc,
