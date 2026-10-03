@@ -176,9 +176,10 @@ export interface Operation {
   // The part whose landing starts the gap before the next one.
   awaiting: string | undefined;
   nextAt: number;
-  // Blocked by a part that did not land whose notes are gone: sending it again with other notes
-  // could pay twice, so the caller decides.
-  state: "active" | "done" | "blocked";
+  // Blocked by a part that did not land whose notes were spent elsewhere: sending it again with
+  // other notes could pay twice, so the caller decides, unless the part lands after all. Abandoned
+  // by the caller, it sends nothing more.
+  state: "active" | "done" | "blocked" | "abandoned";
   blockedBy: string | undefined;
 }
 

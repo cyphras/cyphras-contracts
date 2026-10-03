@@ -197,6 +197,7 @@ export interface OperationView {
   readonly parts: number;
   readonly state: Operation["state"];
   // The part that blocks a blocked operation: it did not land, and its notes were spent elsewhere.
+  // resumeOperation goes on without it, and abandonOperation stops the operation.
   readonly blockedBy: string | undefined;
   // Milliseconds since the epoch from which the next part may go.
   readonly nextAt: number;
@@ -236,6 +237,35 @@ const SPLIT_GAP_MS = { min: 3_600_000, max: 21_600_000 };
 function randomGap(): number {
   const r = new DataView(randomBytes(4).buffer).getUint32(0) / 2 ** 32;
   return SPLIT_GAP_MS.min + Math.floor(r * (SPLIT_GAP_MS.max - SPLIT_GAP_MS.min));
+}
+
+// What became of the part an operation awaits. It landed, itself or as a retry by the same notes;
+// it is dead with all its notes free, to go again with them; one of its notes was spent by a
+// landed payment of this wallet that is no part of the operation, so it can never land and never
+// paid; or it did not land and its notes were spent elsewhere, which only the caller can judge.
+function partFate(
+  state: WalletState,
+  parts: readonly Plan[],
+  part: Plan,
+): "landed" | "again" | "unpaid" | "blocked" {
+  const landed = (p: Plan): boolean => LANDED_STATES.includes(p.state);
+  if (
+    landed(part) ||
+    parts.some((p) => landed(p) && p.nullifiers.some((nf) => part.nullifiers.includes(nf)))
+  ) {
+    return "landed";
+  }
+  const free = part.inputs.every((i) =>
+    state.notes.some((n) => n.pos === i.pos && n.spent === undefined),
+  );
+  if (part.state === "dead" && free) return "again";
+  const ours = state.plans.some(
+    (q) =>
+      !parts.includes(q) &&
+      landed(q) &&
+      q.inputs.some((i) => part.inputs.some((input) => input.nf === i.nf)),
+  );
+  return ours ? "unpaid" : "blocked";
 }
 
 // A view-only wallet has no seed, so its store key comes from the viewing key: its state is as
@@ -926,57 +956,100 @@ export class PrivateWallet {
     };
   }
 
+  // One step of an operation: follows the part it awaits, then sends the next one once it is due.
+  // With `resume`, a part that blocks the operation is taken, on the caller's word, for one that
+  // never paid.
+  async #advance(
+    op: Operation,
+    signer: TransactionSigner | undefined,
+    resume: boolean,
+  ): Promise<void> {
+    if (op.state === "done" || op.state === "abandoned") return;
+    const { state } = this.#core;
+    const parts = state.plans.filter((p) => p.operationId === op.id);
+    if (parts.some(isActive)) return;
+    // A self-relayed part goes only with its signer; the operation's state moves without it.
+    const sends = op.route.kind !== "self" || signer?.publicKey === op.route.account;
+    const relay = op.route.kind === "self" ? signer : undefined;
+    const awaiting = parts.find((p) => p.id === op.awaiting);
+    if (awaiting !== undefined) {
+      const fate = partFate(state, parts, awaiting);
+      if (fate === "blocked" && !resume) {
+        op.state = "blocked";
+        op.blockedBy = awaiting.id;
+        return;
+      }
+      op.state = "active";
+      op.blockedBy = undefined;
+      if (fate === "again") {
+        const notes = awaiting.inputs.map(
+          (i) => state.notes.find((n) => n.pos === i.pos) as OwnedNote,
+        );
+        if (sends) await this.#nextPart(op, relay, notes, awaiting);
+        return;
+      }
+      op.awaiting = undefined;
+      // A part that never paid takes no gap: the next one goes in its place.
+      if (fate === "landed") op.nextAt = this.#core.now() + randomGap();
+    }
+    if (this.#sent(op) >= op.total) {
+      op.state = "done";
+      return;
+    }
+    if (this.#core.now() < op.nextAt || !sends) return;
+    await this.#nextPart(op, relay, undefined, undefined);
+  }
+
+  #operation(operationId: string): Operation {
+    const op = this.#core.state.operations.find((o) => o.id === operationId);
+    if (op === undefined) fail("not_found", "no operation has that ID");
+    return op;
+  }
+
   /**
    * Sends the next part of each split unshield whose previous part has landed and whose random
-   * gap has passed. A part that is dead goes again with its own notes, as retry sends it; one that
-   * did not land and whose notes were spent elsewhere blocks the operation for the caller to
-   * decide. A self-relayed operation needs its signer again.
+   * gap has passed. A part that is dead goes again with its own notes, as retry sends it. A part
+   * whose notes a landed payment of this wallet spent never paid, and the next part takes its
+   * place. One that did not land and whose notes were spent elsewhere blocks the operation until
+   * it lands after all, or the caller resumes or abandons the operation. A self-relayed operation
+   * needs its signer again.
    */
   continueOperations(signer?: TransactionSigner): Promise<OperationView[]> {
     return this.#run(async () => {
       await this.#sync(false);
-      const { state } = this.#core;
-      for (const op of state.operations) {
-        if (op.state !== "active") continue;
-        const parts = state.plans.filter((p) => p.operationId === op.id);
-        if (parts.some(isActive)) continue;
-        // A self-relayed part goes only with its signer; the operation's state moves without it.
-        const sends = op.route.kind !== "self" || signer?.publicKey === op.route.account;
-        const relay = op.route.kind === "self" ? signer : undefined;
-        const awaiting = parts.find((p) => p.id === op.awaiting);
-        if (awaiting !== undefined) {
-          // A retry of the part, by the same notes, that landed stands for it.
-          const landed =
-            LANDED_STATES.includes(awaiting.state) ||
-            parts.some(
-              (p) =>
-                LANDED_STATES.includes(p.state) &&
-                p.nullifiers.some((nf) => awaiting.nullifiers.includes(nf)),
-            );
-          if (!landed) {
-            const free = awaiting.inputs
-              .map((i) => state.notes.find((n) => n.pos === i.pos))
-              .filter((n): n is OwnedNote => n !== undefined && n.spent === undefined);
-            if (awaiting.state !== "dead" || free.length !== awaiting.inputs.length) {
-              op.state = "blocked";
-              op.blockedBy = awaiting.id;
-              continue;
-            }
-            if (sends) await this.#nextPart(op, relay, free, awaiting);
-            continue;
-          }
-          op.awaiting = undefined;
-          op.nextAt = this.#core.now() + randomGap();
-        }
-        if (this.#sent(op) >= op.total) {
-          op.state = "done";
-          continue;
-        }
-        if (this.#core.now() < op.nextAt || !sends) continue;
-        await this.#nextPart(op, relay, undefined, undefined);
-      }
+      for (const op of this.#core.state.operations) await this.#advance(op, signer, false);
       await this.#core.save();
-      return state.operations.map((op) => this.#operationView(op));
+      return this.#core.state.operations.map((op) => this.#operationView(op));
+    });
+  }
+
+  /**
+   * Goes on with a blocked split unshield on the caller's word that the part blocking it never
+   * paid, as when its notes were spent elsewhere: the next part goes in its place, with other
+   * notes. Should the part have landed after all, the operation simply goes on from it.
+   */
+  resumeOperation(operationId: string, signer?: TransactionSigner): Promise<OperationView> {
+    return this.#run(async () => {
+      await this.#sync(false);
+      const op = this.#operation(operationId);
+      if (op.state !== "blocked") fail("invalid_argument", "only a blocked operation resumes");
+      await this.#advance(op, signer, true);
+      await this.#core.save();
+      return this.#operationView(op);
+    });
+  }
+
+  /**
+   * Stops a split unshield that is not done: nothing more of it is sent. Parts already sent are
+   * followed as before, and count as sent once they land.
+   */
+  abandonOperation(operationId: string): Promise<OperationView> {
+    return this.#run(async () => {
+      const op = this.#operation(operationId);
+      if (op.state === "done") fail("invalid_argument", "the operation is done");
+      op.state = "abandoned";
+      await this.#core.save();
+      return this.#operationView(op);
     });
   }
 
