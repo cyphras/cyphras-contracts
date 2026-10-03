@@ -29,8 +29,13 @@ import { RelayerClient } from "../net/relayer.ts";
 import type { Prover } from "../prover.ts";
 import { type AccountLock, LeaseLock, lockName, webLock } from "../lock.ts";
 import { type KeyValueStore, SealedStore } from "../storage.ts";
-import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
-import { type ChainReads, type Core, chainReads, newId } from "./core.ts";
+import {
+  DEFAULT_NETWORK_FEE_CAPS,
+  type NetworkFeeCaps,
+  type TransactionSigner,
+  invokeVault,
+} from "../vault/invoke.ts";
+import { type ChainReads, type Core, chainReads, invokeContext, newId } from "./core.ts";
 import {
   type DepositInfo,
   type ShieldReceipt,
@@ -75,6 +80,9 @@ export interface ConnectionOptions {
   // Service URLs other than the pinned ones; each must report the pinned vault and network.
   readonly indexers?: readonly string[];
   readonly relayers?: readonly string[];
+  // The most a transaction the SDK builds may pay the network; defaults to 0.01 XLM for inclusion
+  // and 1 XLM for resources.
+  readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   // Starts from a fresh state when the stored one cannot be read, instead of refusing to open. The
   // first sync then rebuilds notes and history from the chain; local records of submissions and
   // deposits that were only in the lost state are gone.
@@ -330,6 +338,7 @@ export class PrivateWallet {
       artifacts,
       state,
       chain: undefined,
+      feeCaps: { ...DEFAULT_NETWORK_FEE_CAPS, ...options.networkFeeCaps },
       save: () => states.save(state),
       now,
       sleep,
@@ -870,7 +879,7 @@ export class PrivateWallet {
   releaseExits(signer: TransactionSigner, max = 10): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      const { hash } = await invokeVault(this.#invokeContext(), signer, {
+      const { hash } = await invokeVault(invokeContext(this.#core), signer, {
         fn: "release",
         args: [xdr.ScVal.scvU32(max)],
         transfers: [],
@@ -886,23 +895,13 @@ export class PrivateWallet {
   claimExit(exitId: number, signer: TransactionSigner): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      const { hash } = await invokeVault(this.#invokeContext(), signer, {
+      const { hash } = await invokeVault(invokeContext(this.#core), signer, {
         fn: "claim",
         args: [xdr.ScVal.scvU64(new xdr.Uint64(BigInt(exitId)))],
         transfers: [],
       });
       return { txHash: hash };
     });
-  }
-
-  #invokeContext() {
-    const { services, deployment } = this.#core;
-    return {
-      rpc: services.rpc,
-      networkPassphrase: deployment.networkPassphrase,
-      vault: deployment.vault,
-      sleep: (ms: number) => this.#core.sleep(ms),
-    };
   }
 
   /**

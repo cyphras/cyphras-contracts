@@ -789,6 +789,64 @@ describe("wallet safety: what services learn", () => {
   });
 });
 
+describe("wallet safety: network fees", () => {
+  it("pays the simulated resource fee once, on top of the inclusion fee", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 10n * XLM, signer: world.signer("d") });
+    // the mock RPC quotes 150 stroops for inclusion and simulates 1,000 for resources
+    assert.deepEqual(world.rpc.sentFees, [1_150n]);
+  });
+
+  it("shows the fee to a signer that confirms it, and signs nothing it declines", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const honest = world.signer("d");
+    const shown: bigint[] = [];
+    let signed = false;
+    const declining = {
+      publicKey: honest.publicKey,
+      confirmFee: (fee: { total: bigint }) => {
+        shown.push(fee.total);
+        return false;
+      },
+      signTransaction: async (envelope: string, passphrase: string) => {
+        signed = true;
+        return honest.signTransaction(envelope, passphrase);
+      },
+    };
+    await assert.rejects(
+      alice.shield({ amount: 10n * XLM, signer: declining }),
+      isError("not_confirmed"),
+    );
+    assert.deepEqual(shown, [1_150n]);
+    assert.equal(signed, false);
+    assert.equal(world.vault.pending.size, 0);
+  });
+
+  it("refuses a network fee above its caps before signing", async () => {
+    const world = await createWorld();
+    const capped = await PrivateWallet.open({
+      deployment: world.deployment,
+      allowUnpinnedDeployment: true,
+      keys: keySource.mnemonic(MNEMONIC, { account: 0 }),
+      prover: new TrapdoorProver(),
+      artifacts: trapdoorArtifacts,
+      storage: new MemoryStore(),
+      rpcUrl: RPC,
+      fetch: world.fetch,
+      clock: world.clock,
+      sleep: async () => {},
+      networkFeeCaps: { resource: 999n },
+    });
+    await assert.rejects(
+      capped.shield({ amount: 10n * XLM, signer: world.signer("d") }),
+      isError("fee_above_cap"),
+    );
+    assert.deepEqual(world.rpc.sentFees, []);
+  });
+});
+
 describe("wallet safety: secrets", () => {
   it("keeps keys out of errors and of the store", async () => {
     const world = await createWorld();

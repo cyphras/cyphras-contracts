@@ -18,7 +18,7 @@ export type { DisclosureCheck, PaymentDisclosure } from "./wallet/disclosure.ts"
 export type { ExitPosition } from "./wallet/exits.ts";
 export type { Verification, ServiceState } from "./wallet/services.ts";
 export type { PlanState } from "./wallet/state.ts";
-export type { TransactionSigner } from "./vault/invoke.ts";
+export type { NetworkFee, NetworkFeeCaps, TransactionSigner } from "./vault/invoke.ts";
 
 export { keySource, SIGNATURE_MESSAGE } from "./keysource.ts";
 export type {

@@ -13,13 +13,35 @@ import { type MetaEvent, type SorobanRpc, keyId } from "../net/rpc.ts";
 import { vaultErrorName } from "./errors.ts";
 import { accountKey } from "./state.ts";
 
+/** The network fee of a Stellar transaction the SDK built, in stroops. */
+export interface NetworkFee {
+  // What the transaction bids for inclusion, and what its simulated resources cost.
+  readonly inclusion: bigint;
+  readonly resource: bigint;
+  readonly total: bigint;
+}
+
+/** The most the SDK lets a transaction it builds pay, in stroops. */
+export interface NetworkFeeCaps {
+  readonly inclusion: bigint;
+  readonly resource: bigint;
+}
+
+export const DEFAULT_NETWORK_FEE_CAPS: NetworkFeeCaps = {
+  inclusion: 100_000n,
+  resource: 10_000_000n,
+};
+
 /**
  * A Stellar wallet that signs transactions, in the shape wallets already expose. The result is
- * the signed transaction envelope as base64 XDR, or an object carrying it as `signedTxXdr`.
+ * the signed transaction envelope as base64 XDR, or an object carrying it as `signedTxXdr`. A
+ * signer that can ask its user implements confirmFee: every transaction the SDK builds shows it the
+ * network fee before signing, and goes ahead only on true.
  */
 export interface TransactionSigner {
   readonly publicKey: string;
   signTransaction(xdr: string, networkPassphrase: string): Promise<unknown>;
+  confirmFee?(fee: NetworkFee): boolean | Promise<boolean>;
 }
 
 // A call the signer authorizes as the transaction source: the vault function, and the token
@@ -34,6 +56,7 @@ export interface InvokeContext {
   readonly rpc: SorobanRpc;
   readonly networkPassphrase: string;
   readonly vault: string;
+  readonly feeCaps: NetworkFeeCaps;
   readonly sleep: (ms: number) => Promise<void>;
 }
 
@@ -142,11 +165,23 @@ export async function invokeVault(
   if (simulation.needsRestore) fail("rpc_error", "the call needs archived entries restored first");
   const auth = simulation.auth.map((a) => xdr.SorobanAuthorizationEntry.fromXDR(a, "base64"));
   checkAuth(auth, ctx.vault, call);
-  const inclusion = await ctx.rpc.sorobanInclusionFee().catch(() => MIN_INCLUSION_FEE);
-  const fee =
-    (inclusion > MIN_INCLUSION_FEE ? inclusion : MIN_INCLUSION_FEE) + simulation.minResourceFee;
+  const quoted = await ctx.rpc.sorobanInclusionFee().catch(() => MIN_INCLUSION_FEE);
+  const inclusion = quoted > MIN_INCLUSION_FEE ? quoted : MIN_INCLUSION_FEE;
   const data = xdr.SorobanTransactionData.fromXDR(simulation.transactionData, "base64");
-  const tx = build(fee, data, auth);
+  const resource = BigInt(data.resourceFee().toString());
+  if (inclusion > ctx.feeCaps.inclusion || resource > ctx.feeCaps.resource) {
+    fail("fee_above_cap", "the network fee is above the cap", {
+      inclusion: inclusion.toString(),
+      resource: resource.toString(),
+    });
+  }
+  const fee: NetworkFee = { inclusion, resource, total: inclusion + resource };
+  if (signer.confirmFee !== undefined && !(await signer.confirmFee(fee))) {
+    fail("not_confirmed", "the network fee was not confirmed");
+  }
+  // The builder adds the resource fee of the Soroban data to the inclusion fee it is given.
+  const tx = build(inclusion, data, auth);
+  if (BigInt(tx.fee) !== fee.total) fail("rpc_error", "the transaction's fee is not the one shown");
   const hash = bytesToHex(Uint8Array.from(tx.hash()));
 
   const signedXdr = signedEnvelope(await signer.signTransaction(tx.toXDR(), ctx.networkPassphrase));

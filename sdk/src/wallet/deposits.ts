@@ -8,7 +8,7 @@ import { proveTransaction } from "../proving.ts";
 import { buildTransaction } from "../transaction.ts";
 import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
 import type { VaultInstance } from "../vault/state.ts";
-import { type Core, spendingKeys } from "./core.ts";
+import { type Core, invokeContext, spendingKeys } from "./core.ts";
 import { DEADLINE_LEDGERS } from "./spend.ts";
 import type { DepositEvent } from "./sources.ts";
 import type { Deposit, WalletState } from "./state.ts";
@@ -46,15 +46,6 @@ export function depositInfo(d: Deposit): DepositInfo {
     refundableAt:
       d.flag?.flaggedAt === undefined ? undefined : d.flag.flaggedAt + REFUND_DELAY_SECONDS,
     refundReason: d.refundReason,
-  };
-}
-
-function invokeContext(core: Core) {
-  return {
-    rpc: core.services.rpc,
-    networkPassphrase: core.deployment.networkPassphrase,
-    vault: core.deployment.vault,
-    sleep: (ms: number) => core.sleep(ms),
   };
 }
 

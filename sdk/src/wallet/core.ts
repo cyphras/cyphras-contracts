@@ -5,6 +5,7 @@ import { fail } from "../errors.ts";
 import type { AddressKey, SpendingKeys } from "../keys.ts";
 import { CommitmentTree } from "../merkle.ts";
 import type { Prover } from "../prover.ts";
+import type { InvokeContext, NetworkFeeCaps } from "../vault/invoke.ts";
 import type { SpendNote } from "../transaction.ts";
 import type { PoolStats } from "../net/indexer.ts";
 import type { ChainView } from "../vault/state.ts";
@@ -32,12 +33,23 @@ export interface Core {
   readonly state: WalletState;
   // Set by every sync that succeeds.
   chain: ChainReads | undefined;
+  readonly feeCaps: NetworkFeeCaps;
   save(): Promise<void>;
   now(): number;
   sleep(ms: number): Promise<void>;
 }
 
 export const newId = (): string => bytesToHex(randomBytes(16));
+
+export function invokeContext(core: Core): InvokeContext {
+  return {
+    rpc: core.services.rpc,
+    networkPassphrase: core.deployment.networkPassphrase,
+    vault: core.deployment.vault,
+    feeCaps: core.feeCaps,
+    sleep: (ms: number) => core.sleep(ms),
+  };
+}
 
 export function chainReads(core: Core): ChainReads {
   if (core.chain === undefined) fail("tree_unverified", "the wallet has not synced; sync first");

@@ -23,6 +23,7 @@ import type { VaultInstance } from "../vault/state.ts";
 import {
   type Core,
   chainReads,
+  invokeContext,
   newId,
   selectNotes,
   spendNote,
@@ -452,12 +453,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
 async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Promise<Submission> {
   const ext: ExtData = extDataFromJson(plan.ext);
   const result = await invokeVault(
-    {
-      rpc: core.services.rpc,
-      networkPassphrase: core.deployment.networkPassphrase,
-      vault: core.deployment.vault,
-      sleep: (ms) => core.sleep(ms),
-    },
+    invokeContext(core),
     signer,
     {
       fn: "transact",

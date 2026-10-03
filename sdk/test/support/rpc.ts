@@ -93,6 +93,8 @@ export class MockRpc {
   readonly records = new Map<string, TxRecord>();
   oldestLedger = 1;
   calls: string[] = [];
+  // The fee of every transaction sent, in stroops.
+  sentFees: bigint[] = [];
   // Test hooks: extra authorization the simulation asks for, and a send status to return once.
   injectAuth: xdr.SorobanAuthorizationEntry | undefined;
   sendOnce: string | undefined;
@@ -428,6 +430,7 @@ export class MockRpc {
       case "sendTransaction": {
         const tx = this.#parse(params["transaction"] as string);
         const hash = bytesToHex(Uint8Array.from(tx.hash()));
+        this.sentFees.push(BigInt(tx.fee));
         if (this.sendOnce !== undefined) {
           const status = this.sendOnce;
           this.sendOnce = undefined;
