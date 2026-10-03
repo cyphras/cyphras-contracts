@@ -22,7 +22,7 @@ import type { FetchLike } from "../../src/net/http.ts";
 import type { TransactionSigner } from "../../src/vault/invoke.ts";
 import { MockRpc, RpcFailure, keypairFor } from "./rpc.ts";
 import { trapdoorPins } from "./trapdoor.ts";
-import { type Exit, type Limits, MockVault } from "./vault.ts";
+import { type Exit, type Limits, MockVault, type Moment } from "./vault.ts";
 
 export const RPC = "http://rpc.test";
 export const INDEXER = "http://indexer.test";
@@ -66,6 +66,12 @@ function paidBy(
     return (day + days + 1) * 86_400 - 1;
   });
 }
+
+// The ledger, time and transaction of a step in an exit's life, as the indexer names them.
+const moment = (step: string, m: Moment | undefined): Record<string, unknown> =>
+  m === undefined
+    ? {}
+    : { [`${step}_ledger`]: m.ledger, [`${step}_at`]: Number(m.at), [`${step}_tx`]: m.tx };
 
 // Field elements as the indexer serves them: 32 bytes of hex with no prefix.
 const fieldHex = (x: bigint): string => bytesToHex(bigIntToBytesBE(x, 32));
@@ -279,7 +285,10 @@ export class MockIndexer {
           queued_ledger: e.ledger,
           tx_hash: e.txHash,
           ...(e.requeuedFrom === undefined ? {} : { requeued_from: e.requeuedFrom }),
+          ...moment("stranded", e.stranded),
           ...(e.requeuedTo.length === 0 ? {} : { requeued_to: e.requeuedTo }),
+          ...moment("requeued", e.requeued),
+          ...moment("settled", e.settled),
         });
         return json(200, {
           head: v.exitHead,

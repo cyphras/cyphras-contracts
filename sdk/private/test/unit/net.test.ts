@@ -259,6 +259,103 @@ describe("indexer exit queue", () => {
     );
   });
 
+  it("reads the exit list exactly as the services serve it", async () => {
+    const hash = (c: string) => c.repeat(64);
+    const recipient = "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ";
+    const relayer = "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGSNFHEYVXM3XOJMDS674JZ";
+    const exit = (id: number, state: string, left: readonly [string, string]) => ({
+      id,
+      state,
+      payout: "100",
+      fee: "1",
+      payout_paid: "0",
+      fee_paid: "0",
+      payout_requeued: "0",
+      fee_requeued: "0",
+      payout_left: left[0],
+      fee_left: left[1],
+      recipient,
+      relayer,
+      queued_at: 1_728_000_000,
+      queued_ledger: 40,
+      tx_hash: hash("a"),
+    });
+    const at = (ledger: number) => 1_728_000_000 + 5 * ledger;
+    const body = {
+      head: 5,
+      tail: 7,
+      queued_total: "262",
+      max_daily_outflow: "1000",
+      window: { day: 20_000, used: "300", resets_at: 1_728_086_400 },
+      halted_until: 0,
+      exits: [
+        {
+          ...exit(5, "paid_in_part", ["60", "1"]),
+          position: 0,
+          payout_paid: "40",
+          paid_by: 1_728_086_399,
+        },
+        {
+          ...exit(6, "queued", ["100", "0"]),
+          position: 1,
+          fee: "0",
+          tx_hash: hash("e"),
+          requeued_from: 3,
+          paid_by: 1_728_172_799,
+        },
+        {
+          ...exit(2, "settled", ["0", "0"]),
+          payout_paid: "100",
+          fee_paid: "1",
+          settled_ledger: 50,
+          settled_at: at(50),
+          settled_tx: hash("c"),
+        },
+        {
+          ...exit(3, "requeued", ["0", "0"]),
+          fee_paid: "1",
+          payout_requeued: "100",
+          stranded_ledger: 45,
+          stranded_at: at(45),
+          stranded_tx: hash("d"),
+          requeued_to: [6],
+          requeued_ledger: 48,
+          requeued_at: at(48),
+          requeued_tx: hash("e"),
+        },
+        {
+          ...exit(4, "stranded", ["100", "1"]),
+          stranded_ledger: 46,
+          stranded_at: at(46),
+          stranded_tx: hash("f"),
+        },
+      ],
+      complete_to: 60,
+    };
+    const q = await new IndexerClient("http://i", reply(200, body)).exits();
+    assert.deepEqual([q.head, q.tail, q.completeTo], [5, 7, 60]);
+    assert.deepEqual(
+      q.exits.map((e) => [
+        e.id,
+        e.state,
+        e.position,
+        e.paidBy,
+        e.payoutLeft,
+        e.feeLeft,
+        e.requeuedFrom,
+        e.requeuedTo,
+      ]),
+      [
+        [5, "paid_in_part", 0, 1_728_086_399, 60n, 1n, undefined, []],
+        [6, "queued", 1, 1_728_172_799, 100n, 0n, 3, []],
+        [2, "settled", undefined, undefined, 0n, 0n, undefined, []],
+        [3, "requeued", undefined, undefined, 0n, 0n, undefined, [6]],
+        [4, "stranded", undefined, undefined, 100n, 1n, undefined, []],
+      ],
+    );
+    assert.equal(q.exits[1]?.txHash, hash("e"));
+  });
+
   it("refuses a queue with a gap, a misplaced exit or an unknown state", async () => {
     for (const exits of [
       [exit(3, "queued", 0)],

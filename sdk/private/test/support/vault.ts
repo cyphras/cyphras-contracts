@@ -120,6 +120,16 @@ export interface Exit {
   ledger: number;
   requeuedFrom: number | undefined;
   requeuedTo: number[];
+  // When a release stranded it, claims moved all it still owed, and a release paid it in full.
+  stranded: Moment | undefined;
+  requeued: Moment | undefined;
+  settled: Moment | undefined;
+}
+
+export interface Moment {
+  ledger: number;
+  at: bigint;
+  tx: string;
 }
 
 export interface EmittedEvent {
@@ -273,6 +283,10 @@ export class MockVault {
     this.domain = options.domain;
     this.wasmHash = options.wasmHash;
     this.limits = options.limits;
+  }
+
+  #moment(): Moment {
+    return { ledger: this.ledger, at: this.timestamp, tx: this.txHash };
   }
 
   #emit(topic: string, fields: [string, xdr.ScVal][]): void {
@@ -476,6 +490,9 @@ export class MockVault {
         ledger: this.ledger,
         requeuedFrom: undefined,
         requeuedTo: [],
+        stranded: undefined,
+        requeued: undefined,
+        settled: undefined,
       });
       this.#emit("exit_queued", [
         ["id", u64(id)],
@@ -551,7 +568,7 @@ export class MockVault {
       if (payoutPaid < payout || feePaid < fee) {
         this.exits.delete(id);
         this.exitHead++;
-        this.stranded.set(id, left);
+        this.stranded.set(id, { ...left, stranded: this.#moment() });
         this.#emit("exit_stranded", [
           ["id", u64(id)],
           ["payout", i128(left.payout)],
@@ -560,7 +577,7 @@ export class MockVault {
       } else if (left.payout === 0n && left.fee === 0n) {
         this.exits.delete(id);
         this.exitHead++;
-        this.settledExits.push(left);
+        this.settledExits.push({ ...left, settled: this.#moment() });
         this.#settled(-payoutPaid, feePaid, exit.recipient, exit.relayer, id);
       } else {
         this.exits.set(id, left);
@@ -606,7 +623,7 @@ export class MockVault {
     };
     if (left.payout === 0n && left.fee === 0n) {
       this.stranded.delete(id);
-      this.requeuedExits.push(left);
+      this.requeuedExits.push({ ...left, requeued: this.#moment() });
     } else {
       this.stranded.set(id, left);
     }
@@ -624,6 +641,9 @@ export class MockVault {
       ledger: this.ledger,
       requeuedFrom: id,
       requeuedTo: [],
+      stranded: undefined,
+      requeued: undefined,
+      settled: undefined,
     });
     this.#emit("exit_requeued", [
       ["id", u64(id)],
