@@ -37,8 +37,14 @@ func TestTransfersAndBalancesDecode(t *testing.T) {
 	if _, err := DecodeTransfer(raw); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("mint: %v", err)
 	}
-	n, err := DecodeBalance(Struct(Field{"amount", i128(t, 12)}, Field{"authorized", Bool(true)}, Field{"clawback", Bool(false)}))
-	if err != nil || n.Int64() != 12 {
+	n, authorized, err := DecodeBalance(Struct(Field{"amount", i128(t, 12)}, Field{"authorized", Bool(true)}, Field{"clawback", Bool(false)}))
+	if err != nil || n.Int64() != 12 || !authorized {
 		t.Fatalf("balance %v, %v", n, err)
+	}
+	if _, err := TrustlineKey(testRelayer, "USDC:"+testRelayer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := TrustlineKey(testRelayer, "native"); err == nil {
+		t.Fatal("a trustline for the native asset")
 	}
 }

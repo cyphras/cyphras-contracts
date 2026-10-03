@@ -74,6 +74,8 @@ type harness struct {
 	limit   int64
 	// tamper changes what the primary RPC reports after the honest state is computed.
 	tamper func(*vault.Status, *big.Int)
+	// deauthorized makes the issuer refuse to let the vault hold the asset.
+	deauthorized bool
 }
 
 func newHarness(t *testing.T, mutate ...func(*Config)) *harness {
@@ -178,7 +180,7 @@ func (h *harness) publish() {
 		fake.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), vaulttest.RootRing(tr.Root(), uint32(tr.Len()/2)%vault.RootHistory), h.chain.Ledger, nil)
 		amount, _ := vault.I128(balance)
 		fake.SetContractData(mustKey(vault.BalanceKey(vaulttest.Token, vaulttest.Vault)), vault.Struct(
-			vault.Field{Name: "amount", Value: amount}, vault.Field{Name: "authorized", Value: vault.Bool(true)}, vault.Field{Name: "clawback", Value: vault.Bool(false)},
+			vault.Field{Name: "amount", Value: amount}, vault.Field{Name: "authorized", Value: vault.Bool(!h.deauthorized)}, vault.Field{Name: "clawback", Value: vault.Bool(false)},
 		), h.chain.Ledger, nil)
 	}
 }
@@ -592,5 +594,21 @@ func TestARebuildDoesNotReportOldGovernanceAgain(t *testing.T) {
 	}
 	if h.pages.has("governance_paused") || h.public.has("governance_paused") {
 		t.Fatalf("an old governance event was reported again: %v %v", h.pages.codes(), h.public.codes())
+	}
+}
+
+func TestAVaultTheIssuerDeauthorizesPages(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.sync()
+	h.deauthorized = true
+	h.publish()
+	if err := h.w.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"vault_deauthorized", "vault_authorization_false"} {
+		if !h.pages.has(want) {
+			t.Fatalf("missing %s in %v", want, h.pages.codes())
+		}
 	}
 }

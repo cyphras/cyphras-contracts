@@ -39,6 +39,45 @@ const (
 )
 
 // fixture returns the request body of one of the vault's real-proof fixture steps.
+// fund creates the account behind an address, so the vault would pay it.
+func (h *harness) fund(address string) {
+	account, err := vault.AccountOf(address)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if account[0] == 'C' {
+		return
+	}
+	key := mustKey(vault.AccountKey(account))
+	h.fake.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{AccountId: key.MustAccount().AccountId, Balance: 10_000_000}}, 1, nil)
+}
+
+// fixtureRecipients lists the recipients the fixture proofs pay.
+func fixtureRecipients(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile("../vault/testdata/proofs.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Steps []struct {
+			Ext struct {
+				Recipient string `json:"recipient"`
+			} `json:"ext"`
+		} `json:"steps"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, s := range f.Steps {
+		if s.Ext.Recipient != "" {
+			out = append(out, s.Ext.Recipient)
+		}
+	}
+	return out
+}
+
 // fixtureChain returns the domain the fixture proofs are bound to and every root they prove
 // against, which the test vault then knows.
 func fixtureChain(t *testing.T) (fr.Element, []fr.Element) {
@@ -165,6 +204,9 @@ func newHarness(t *testing.T, status vault.Status) *harness {
 		DelaySmall: 3600, DelayLarge: 86400, Limit: 1_000_000_000_000, Large: 5_000_000_000, Status: status, Domain: domain,
 	}), 10, nil)
 	h.fake.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), vaulttest.Roots(roots...), 10, nil)
+	for _, recipient := range fixtureRecipients(t) {
+		h.fund(recipient)
+	}
 	var channels []*submit.Account
 	for range 2 {
 		kp := keypair.MustRandom()
@@ -595,5 +637,21 @@ func TestForgedOrSpentProofsAreRefusedBeforeAnything(t *testing.T) {
 	}
 	if len(h.screen.asked) != 0 || h.fake.CallCount("simulateTransaction") != 0 {
 		t.Fatal("a refused proof reached screening or simulation")
+	}
+}
+
+func TestAnUnshieldToAnAccountThatCannotReceiveIsRefusedFirst(t *testing.T) {
+	h := newHarness(t, vault.Status{})
+	body := fixture(t, "unshield_muxed")
+	recipient, err := vault.AccountOf(body["ext"].(map[string]any)["recipient"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.fake.DeleteEntry(mustKey(vault.AccountKey(recipient)))
+	if code, out := h.post(body); code != http.StatusUnprocessableEntity || out["error"] != CodeRejected {
+		t.Fatalf("unshield to a missing account: %d %v", code, out)
+	}
+	if len(h.screen.asked) != 0 || h.fake.CallCount("simulateTransaction") != 0 {
+		t.Fatal("an unpayable unshield reached screening or simulation")
 	}
 }

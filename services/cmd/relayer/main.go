@@ -128,10 +128,23 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return relayer.New(ctx, relayer.Config{
+	r, err := relayer.New(ctx, relayer.Config{
 		Vault: base.Vault.Vault, NetworkID: base.NetworkID, Asset: base.Vault.Asset, FeeAddress: feeAddress,
 		Pricing: pricing, LedgerSeconds: 5, MaxHeld: 1000, Jitter: 10 * time.Minute, Key: key,
 	}, base.RPC, engine, channels,
 		relayer.ScreeningClient{URL: screenURL, Token: token, HTTP: &http.Client{Timeout: 5 * time.Second}},
 		relayer.NewStore(pool), bootstrap, base.Alerts, base.Log)
+	if err != nil {
+		return nil, err
+	}
+	// Every relayed fee goes to the fee address, so the vault would refuse every relay if it could
+	// not receive the asset.
+	ok, err := r.CanReceive(ctx, feeAddress)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("the fee address cannot receive the vault's asset: it needs an account and an authorized trustline")
+	}
+	return r, nil
 }

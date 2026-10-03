@@ -231,7 +231,65 @@ func (r *Relayer) verified(ctx context.Context, req Request) *failure {
 	if spent {
 		return fail(http.StatusUnprocessableEntity, CodeRejected)
 	}
+	// The vault refuses an exit to a party that cannot receive; refusing it here first spares the
+	// screening and the simulation.
+	if req.Ext.ExtAmount.Sign() < 0 {
+		ok, err := r.CanReceive(ctx, req.Ext.Recipient)
+		if err != nil {
+			return fail(http.StatusServiceUnavailable, CodeUnavailable)
+		}
+		if !ok {
+			return fail(http.StatusUnprocessableEntity, CodeRejected)
+		}
+	}
 	return nil
+}
+
+// CanReceive mirrors the vault's check of an account that is to be paid: it must exist and, for an
+// issued asset, hold a trustline the issuer has authorized. A contract address is left to the
+// simulation, which runs the vault's own check.
+func (r *Relayer) CanReceive(ctx context.Context, address string) (bool, error) {
+	account, err := vault.AccountOf(address)
+	if err != nil || account[0] != 'G' {
+		return err == nil, err
+	}
+	keys := []xdr.LedgerKey{}
+	accountKey, err := vault.AccountKey(account)
+	if err != nil {
+		return false, err
+	}
+	keys = append(keys, accountKey)
+	if r.cfg.Asset != "native" {
+		k, err := vault.TrustlineKey(account, r.cfg.Asset)
+		if err != nil {
+			return false, err
+		}
+		keys = append(keys, k)
+	}
+	entries, _, err := rpc.Entries(ctx, r.rpc, keys)
+	if err != nil {
+		return false, err
+	}
+	if _, ok := entries[mustKeyString(accountKey)]; !ok {
+		return false, nil
+	}
+	if len(keys) == 1 {
+		return true, nil
+	}
+	tl, ok := entries[mustKeyString(keys[1])]
+	if !ok || tl.Data.TrustLine == nil {
+		return false, nil
+	}
+	return xdr.TrustLineFlags(tl.Data.TrustLine.Flags)&xdr.TrustLineFlagsAuthorizedFlag != 0, nil
+}
+
+// mustKeyString encodes a key the relayer built itself, which always encodes.
+func mustKeyString(k xdr.LedgerKey) string {
+	s, err := rpc.KeyString(k)
+	if err != nil {
+		panic(err)
+	}
+	return s
 }
 
 // ErrNoQuote reports that the quote would exceed the vault's fee cap, or that the relayer cannot

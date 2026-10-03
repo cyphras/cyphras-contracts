@@ -105,6 +105,8 @@ type Watcher struct {
 	pendingCross []follow.Batch
 	crossFails   int
 	healthFails  map[string]int
+	// authorized is whether the issuer let the vault hold the asset at the last read.
+	authorized *bool
 }
 
 // New loads the stored chain state.

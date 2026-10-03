@@ -98,16 +98,17 @@ func (w *Watcher) Reconcile(ctx context.Context) error {
 		w.alerts.Clear(ctx, "state_mismatch", "the watcher agrees with the vault again")
 	}
 
-	balance := new(big.Int)
+	balance, authorized := new(big.Int), true
 	if e, ok := entries[mustKeyString(keys[3])]; ok {
 		v, err := rpc.ContractValue(e)
 		if err != nil {
 			return err
 		}
-		if balance, err = vault.DecodeBalance(v); err != nil {
+		if balance, authorized, err = vault.DecodeBalance(v); err != nil {
 			return err
 		}
 	}
+	w.checkAuthorization(ctx, authorized)
 	if balance.Cmp(inst.Status.Tvl) < 0 {
 		w.alerts.Raise(ctx, alert.Critical, "balance_below_tvl", "the vault holds %v of its asset but owes %v", balance, inst.Status.Tvl)
 	} else {
@@ -119,6 +120,23 @@ func (w *Watcher) Reconcile(ctx context.Context) error {
 	w.compareProviders(ctx, keys, entries, latest)
 	w.crossCheckEvents(ctx)
 	return nil
+}
+
+// checkAuthorization pages when the asset's issuer stops letting the vault hold the asset, which
+// stops every payment out of it, and reports any change of that authorization.
+func (w *Watcher) checkAuthorization(ctx context.Context, authorized bool) {
+	w.mu.Lock()
+	changed := w.authorized != nil && *w.authorized != authorized
+	w.authorized = &authorized
+	w.mu.Unlock()
+	if changed {
+		w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("vault_authorization_%t", authorized), "the issuer changed the vault's authorization to hold the asset to %t", authorized)
+	}
+	if !authorized {
+		w.alerts.Raise(ctx, alert.Critical, "vault_deauthorized", "the issuer does not let the vault hold the asset: no exit can be paid")
+	} else {
+		w.alerts.Clear(ctx, "vault_deauthorized", "the vault may hold the asset again")
+	}
 }
 
 // statusDiff lists the fields where the vault's status and the watcher's replay differ.

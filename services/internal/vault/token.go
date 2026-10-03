@@ -7,13 +7,14 @@ import (
 )
 
 // DecodeBalance reads an asset contract's Balance(holder) entry, a map of amount, authorized and
-// clawback, and returns the amount.
-func DecodeBalance(v xdr.ScVal) (*big.Int, error) {
+// clawback, and returns the amount and whether the holder may hold the asset.
+func DecodeBalance(v xdr.ScVal) (*big.Int, bool, error) {
 	d := newDecoder(v, []string{"amount", "authorized", "clawback"})
 	if d.err != nil {
-		return nil, d.err
+		return nil, false, d.err
 	}
-	return d.i128("amount"), d.err
+	amount, authorized := d.i128("amount"), d.bool("authorized")
+	return amount, authorized, d.err
 }
 
 // Transfer is an asset contract's transfer event.

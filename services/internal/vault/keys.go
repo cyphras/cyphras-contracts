@@ -1,6 +1,8 @@
 package vault
 
 import (
+	"strings"
+
 	"github.com/stellar/go-stellar-sdk/xdr"
 )
 
@@ -102,6 +104,28 @@ func AccountKey(account string) (xdr.LedgerKey, error) {
 	}
 	var k xdr.LedgerKey
 	if err := k.SetAccount(id); err != nil {
+		return xdr.LedgerKey{}, err
+	}
+	return k, nil
+}
+
+// TrustlineKey is the trustline of an account for an issued asset named as the asset contract
+// names it, CODE:ISSUER.
+func TrustlineKey(account, asset string) (xdr.LedgerKey, error) {
+	id, err := xdr.AddressToAccountId(account)
+	if err != nil {
+		return xdr.LedgerKey{}, malformed("account %q", account)
+	}
+	code, issuer, ok := strings.Cut(asset, ":")
+	if !ok {
+		return xdr.LedgerKey{}, malformed("asset %q", asset)
+	}
+	a, err := xdr.NewCreditAsset(code, issuer)
+	if err != nil {
+		return xdr.LedgerKey{}, malformed("asset %q", asset)
+	}
+	var k xdr.LedgerKey
+	if err := k.SetTrustline(id, a.ToTrustLineAsset()); err != nil {
 		return xdr.LedgerKey{}, err
 	}
 	return k, nil
