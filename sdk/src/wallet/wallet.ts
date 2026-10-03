@@ -10,6 +10,7 @@ import {
 import { type ArtifactSource, PinnedArtifacts } from "../artifacts.ts";
 import { packPoint } from "../babyjub.ts";
 import { bigIntToBytesLE, concatBytes, randomBytes, utf8 } from "../bytes.ts";
+import { CommitmentTree } from "../merkle.ts";
 import { type Deployment, type DeploymentName, resolveDeployment } from "../deployments.ts";
 import { CyphrasError, fail } from "../errors.ts";
 import {
@@ -53,11 +54,12 @@ import { type Operation, type Plan, emptyState, loadState, saveState } from "./s
 import {
   type ScanKeys,
   advancePlans,
+  applyDownload,
   checkRoot,
   crossCheck,
+  downloadChain,
   isActive,
   resetUnlanded,
-  syncChain,
 } from "./sync.ts";
 
 /** Options shared by full and view-only wallets. */
@@ -438,9 +440,9 @@ export class PrivateWallet {
     const indexer = this.#indexer();
     let source: IndexerSource | RpcEventSource =
       indexer === undefined ? this.#rpcSource(core) : new IndexerSource(indexer);
-    let update;
+    let download;
     try {
-      update = await syncChain(core.state, core.scan, source);
+      download = await downloadChain(core.state, source, core.services.vault);
     } catch (err) {
       // An indexer that becomes unreachable is passed over for the vault's RPC events; one that
       // served inconsistent data is a fault the caller must see.
@@ -452,39 +454,43 @@ export class PrivateWallet {
         throw err;
       }
       source = this.#rpcSource(core);
-      update = await syncChain(core.state, core.scan, source);
+      download = await downloadChain(core.state, source, core.services.vault);
     }
+    const { view, data } = download;
     let crossChecked = false;
     let exitEvents: readonly ExitEvent[];
     if (source.kind === "indexer") {
-      const check = await crossCheck(core.services.rpc, core.deployment.vault, update);
+      const check = await crossCheck(core.services.rpc, core.deployment.vault, data);
       crossChecked = check.verified;
       exitEvents = check.exits;
     } else {
       exitEvents = (await source.events()).exits;
     }
-    // F-27: the root history is read on every sync, so reading it does not signal a spend.
-    const history = await core.services.vault.rootHistory();
-    const check = checkRoot(core.state, history);
+    const check = checkRoot(data.tree, view.roots);
     if (check.state === "mismatch") {
       fail(
         "tree_unverified",
         "the synced tree contradicts the vault; nothing of this sync was kept",
       );
     }
-    core.state.rootCheck = check;
-    advancePlans(core.state, update.completeToLedger, history);
-    // Read on every sync, like the root history, so that a spend's read of it stands out less.
-    await core.services.vault.instance();
+    let newNotes = 0;
+    if (check.state === "verified") {
+      // Only leaves under a root the vault confirms count: notes at them, and spends of notes.
+      newNotes = applyDownload(core.state, core.scan, data);
+      core.state.rootCheck = check;
+      advancePlans(core.state, data.horizon, view.roots);
+    } else {
+      core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
+    }
     const live = source.kind === "indexer" ? indexer : undefined;
     await trackDeposits(core, await live?.deposits().catch(() => undefined));
     applyExits(core.state, exitEvents, await live?.exits().catch(() => undefined));
     if (live !== undefined) await this.#pollRelayers(core);
     return {
       leafCount: core.state.tree.leafCount,
-      newNotes: update.newNotes,
+      newNotes,
       source: source.kind,
-      rootVerified: check.state === "verified",
+      rootVerified: core.state.rootCheck.state === "verified",
       crossChecked,
     };
   }

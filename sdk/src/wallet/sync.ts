@@ -7,7 +7,7 @@ import { CommitmentTree, PAGE_SIZE, pagePath } from "../merkle.ts";
 import type { Leaf, SpentNullifier } from "../net/indexer.ts";
 import type { SorobanRpc } from "../net/rpc.ts";
 import { nullifier } from "../notes.ts";
-import type { RootHistory } from "../vault/state.ts";
+import type { ChainView, RootHistory, VaultReader } from "../vault/state.ts";
 import { type ChainSource, type ExitEvent, RpcEventSource } from "./sources.ts";
 import {
   ACTIVE_STATES,
@@ -28,14 +28,124 @@ export interface ScanKeys {
   readonly nkFold: bigint | undefined;
 }
 
-export interface ChainUpdate {
-  readonly newNotes: number;
-  // The index of the first leaf and the first ledger of nullifiers this sync asked for.
-  readonly firstIndex: number;
-  readonly sinceLedger: number;
-  readonly leaves: readonly Leaf[];
+// What one sync downloaded, before anything of it is checked or applied.
+export interface Download {
+  // The first ledger of nullifiers asked for, and the ledger up to which they are complete.
+  readonly since: number;
+  readonly horizon: number;
   readonly nullifiers: readonly SpentNullifier[];
-  readonly completeToLedger: number;
+  // The leaves after the local tree's last one, up to the vault's NextLeaf at most.
+  readonly firstIndex: number;
+  readonly leaves: readonly Leaf[];
+  // The local tree extended by those leaves, and the pages they completed.
+  readonly tree: CommitmentTree;
+  readonly pages: readonly { readonly page: number; readonly leaves: readonly bigint[] }[];
+}
+
+// Downloads the nullifiers spent since the last sync, then reads the vault, then the leaves after
+// the local tree's last one up to the vault's NextLeaf. A leaf past NextLeaf cannot be checked
+// against the vault yet, so the next sync takes it. Nullifiers count only up to the ledger the
+// vault was read at, so every transaction whose nullifiers are kept has its leaves below NextLeaf.
+export async function downloadChain(
+  state: WalletState,
+  source: ChainSource,
+  vault: VaultReader,
+): Promise<{ readonly view: ChainView; readonly data: Download }> {
+  const since = state.nullifierSince;
+  const served = await source.nullifiers(since);
+  const view = await vault.view();
+  const horizon = Math.min(served.completeToLedger, view.ledger);
+  const tree = CommitmentTree.fromSnapshot(state.tree);
+  const firstIndex = tree.leafCount;
+  const nextLeaf = view.roots.nextLeaf;
+  const leaves: Leaf[] = [];
+  const pages: { page: number; leaves: readonly bigint[] }[] = [];
+  while (tree.leafCount < nextLeaf) {
+    const batch = await source.nextLeaves(tree);
+    const accepted = batch.leaves.slice(0, nextLeaf - tree.leafCount);
+    if ((tree.leafCount + accepted.length) % 2 !== 0) {
+      fail("indexer_fault", "the leaves end in the middle of an inserted pair");
+    }
+    pages.push(...tree.append(accepted.map((l) => l.commitment)));
+    leaves.push(...accepted);
+    if (batch.done || accepted.length < batch.leaves.length) break;
+  }
+  return {
+    view,
+    data: {
+      since,
+      horizon,
+      nullifiers: served.nullifiers.filter((n) => n.ledger <= horizon),
+      firstIndex,
+      leaves,
+      tree,
+      pages,
+    },
+  };
+}
+
+export interface CrossCheck {
+  // RPC covered the range and agreed with the indexer.
+  readonly verified: boolean;
+  // The exit events RPC returned for the range and after it.
+  readonly exits: readonly ExitEvent[];
+}
+
+const leafKey = (l: Leaf): string =>
+  `${l.index}/${l.commitment}/${bytesToHex(l.ciphertext)}/${l.ledger}/${l.txHash}`;
+const nfKey = (n: SpentNullifier): string => `${n.nullifier}/${n.ledger}/${n.txHash}`;
+
+// Compares what the indexer served with the vault's events from RPC since the same ledger. Every
+// served leaf is compared by its index, whatever ledger the indexer gave it; only a leaf added
+// before that ledger, which RPC no longer shows, rests on the root check alone. Unverified when
+// RPC cannot cover the range; a difference raises indexer_fault, since either the indexer or the
+// RPC is wrong, and neither is trusted until it is resolved.
+export async function crossCheck(
+  rpc: SorobanRpc,
+  vault: string,
+  data: Download,
+): Promise<CrossCheck> {
+  let events;
+  try {
+    events = await new RpcEventSource(rpc, vault, data.since).events();
+  } catch (err) {
+    if (err instanceof CyphrasError) return { verified: false, exits: [] };
+    throw err;
+  }
+  const differ = (): never =>
+    fail("indexer_fault", "the indexer's leaves or nullifiers differ from the vault's events");
+  const onChain = new Map(events.leaves.map((l) => [l.index, l]));
+  const first = events.leaves[0]?.index ?? Number.POSITIVE_INFINITY;
+  for (const leaf of data.leaves) {
+    if (leaf.index < first) continue;
+    const chain = onChain.get(leaf.index);
+    if (chain === undefined || leafKey(chain) !== leafKey(leaf)) differ();
+  }
+  // Every leaf added up to the horizon must have been served.
+  const end = data.firstIndex + data.leaves.length;
+  if (events.leaves.some((l) => l.index >= end && l.ledger <= data.horizon)) differ();
+  const within = (n: SpentNullifier): boolean => n.ledger <= data.horizon;
+  const served = new Set(data.nullifiers.map(nfKey));
+  const chainNfs = new Set(events.nullifiers.filter(within).map(nfKey));
+  if (served.size !== chainNfs.size || [...served].some((k) => !chainNfs.has(k))) differ();
+  return { verified: true, exits: events.exits };
+}
+
+// F-27: the local root must be one of the vault's last 256 roots, read from the ledger.
+export function checkRoot(tree: CommitmentTree, history: RootHistory): RootCheck {
+  const root = tree.root();
+  const known = history.roots.filter((r) => r !== 0n);
+  const base = { ledger: history.ledger, root, roots: known };
+  if (history.nextLeaf < tree.leafCount) return { ...base, state: "behind" };
+  if (history.nextLeaf === tree.leafCount) {
+    const current = history.roots[history.newest];
+    return { ...base, state: current === root ? "verified" : "mismatch" };
+  }
+  if (known.includes(root)) return { ...base, state: "verified" };
+  // More than 255 pairs behind: the root has left the history, which says nothing about its
+  // correctness. The wallet syncs further before it spends.
+  const pairsBehind = (history.nextLeaf - tree.leafCount) / 2;
+  return { ...base, state: pairsBehind >= history.roots.length ? "behind" : "mismatch" };
 }
 
 function scanLeaf(state: WalletState, leaf: Leaf, keys: ScanKeys, cache: AddressCache): boolean {
@@ -92,7 +202,7 @@ function evidenceOf(plan: Plan, txHash: string, ledger: number): Evidence {
 
 // Records, per transaction, which of a plan's commitments the new leaves add and which of its
 // nullifiers the new nullifiers spend.
-export function recordEvidence(
+function recordEvidence(
   plans: readonly Plan[],
   leaves: readonly Leaf[],
   nullifiers: readonly { readonly nf: bigint; readonly ledger: number; readonly txHash: string }[],
@@ -109,47 +219,28 @@ export function recordEvidence(
   }
 }
 
-// Downloads every nullifier spent since the last sync, then every leaf after the local tree's
-// last one, scans the leaves and extends the tree. Nullifiers come first, so any transaction
-// whose nullifiers are seen also has its leaves in the same sync.
-export async function syncChain(
-  state: WalletState,
-  keys: ScanKeys,
-  source: ChainSource,
-): Promise<ChainUpdate> {
-  const tree = CommitmentTree.fromSnapshot(state.tree);
-  const firstIndex = tree.leafCount;
-  const sinceLedger = state.nullifierSince;
-  const { nullifiers, completeToLedger } = await source.nullifiers(sinceLedger);
+// Applies a download whose tree the vault's root history has confirmed: scans the new leaves,
+// keeps the paths of owned notes in completed pages, marks spent notes and records the evidence
+// of plans. Returns how many notes it found.
+export function applyDownload(state: WalletState, keys: ScanKeys, data: Download): number {
   const cache = new AddressCache(keys.incoming);
-  const fetched: Leaf[] = [];
   let newNotes = 0;
-  for (;;) {
-    const { leaves, done } = await source.nextLeaves(tree);
-    if ((tree.leafCount + leaves.length) % 2 !== 0) {
-      fail("indexer_fault", "the leaves end in the middle of an inserted pair");
-    }
-    for (const leaf of leaves) {
-      if (scanLeaf(state, leaf, keys, cache)) newNotes++;
-    }
-    for (const page of tree.append(leaves.map((l) => l.commitment))) {
-      const start = page.page * PAGE_SIZE;
-      for (const note of state.notes) {
-        if (note.pagePath === undefined && note.pos >= start && note.pos < start + PAGE_SIZE) {
-          note.pagePath = pagePath(page.leaves, note.pos - start);
-        }
+  for (const leaf of data.leaves) if (scanLeaf(state, leaf, keys, cache)) newNotes++;
+  for (const page of data.pages) {
+    const start = page.page * PAGE_SIZE;
+    for (const note of state.notes) {
+      if (note.pagePath === undefined && note.pos >= start && note.pos < start + PAGE_SIZE) {
+        note.pagePath = pagePath(page.leaves, note.pos - start);
       }
     }
-    const last = leaves[leaves.length - 1];
-    if (last !== undefined) state.lastLeafLedger = last.ledger;
-    state.tree = tree.snapshot();
-    fetched.push(...leaves);
-    if (done) break;
   }
+  state.tree = data.tree.snapshot();
+  const last = data.leaves[data.leaves.length - 1];
+  if (last !== undefined) state.lastLeafLedger = last.ledger;
 
   const buffer = [
     ...state.nullifierBuffer,
-    ...nullifiers.map((n) => ({ nf: n.nullifier, ledger: n.ledger, txHash: n.txHash })),
+    ...data.nullifiers.map((n) => ({ nf: n.nullifier, ledger: n.ledger, txHash: n.txHash })),
   ];
   const spent = new Map(buffer.map((n) => [n.nf, n]));
   for (const note of state.notes) {
@@ -157,29 +248,11 @@ export async function syncChain(
     const hit = spent.get(note.nf);
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
-  recordEvidence(state.plans, fetched, buffer);
-  state.nullifierSince = completeToLedger + 1;
+  recordEvidence(state.plans, data.leaves, buffer);
+  state.nullifierSince = data.horizon + 1;
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
   state.nullifierBuffer = buffer.filter((n) => n.ledger >= state.lastLeafLedger);
-  return { newNotes, firstIndex, sinceLedger, leaves: fetched, nullifiers, completeToLedger };
-}
-
-// F-27: the local root must be one of the vault's last 256 roots, read from the ledger.
-export function checkRoot(state: WalletState, history: RootHistory): RootCheck {
-  const tree = CommitmentTree.fromSnapshot(state.tree);
-  const root = tree.root();
-  const known = history.roots.filter((r) => r !== 0n);
-  const base = { ledger: history.ledger, root, roots: known };
-  if (history.nextLeaf < tree.leafCount) return { ...base, state: "behind" };
-  if (history.nextLeaf === tree.leafCount) {
-    const current = history.roots[history.newest];
-    return { ...base, state: current === root ? "verified" : "mismatch" };
-  }
-  if (known.includes(root)) return { ...base, state: "verified" };
-  // More than 255 pairs behind: the root has left the history, which says nothing about its
-  // correctness. The wallet syncs further before it spends.
-  const pairsBehind = (history.nextLeaf - tree.leafCount) / 2;
-  return { ...base, state: pairsBehind >= history.roots.length ? "behind" : "mismatch" };
+  return newNotes;
 }
 
 export function isActive(plan: Plan): boolean {
@@ -231,52 +304,4 @@ export function resetUnlanded(plans: readonly Plan[]): void {
     plan.evidence = [];
     plan.state = plan.txHash === undefined ? "prepared" : "submitted";
   }
-}
-
-// RPC keeps events for about a week; a cross-check looks at most a day back.
-const CROSS_CHECK_LEDGERS = 17_280;
-
-export interface CrossCheck {
-  // RPC covered the range and agreed with the indexer.
-  readonly verified: boolean;
-  // The exit events RPC returned for the range and after it.
-  readonly exits: readonly ExitEvent[];
-}
-
-// Compares what the indexer served in this sync with the vault's events from RPC for the same
-// ledgers. Unverified when RPC cannot cover the range; a difference raises indexer_fault, since
-// either the indexer or the RPC is wrong, and neither is trusted until it is resolved.
-export async function crossCheck(
-  rpc: SorobanRpc,
-  vault: string,
-  update: ChainUpdate,
-): Promise<CrossCheck> {
-  // The served data covers nullifiers from sinceLedger and every leaf after firstIndex; leaves
-  // after the last scanned one lie at or after sinceLedger.
-  const from = Math.max(update.sinceLedger, update.completeToLedger - CROSS_CHECK_LEDGERS);
-  if (from > update.completeToLedger) return { verified: true, exits: [] };
-  let events;
-  try {
-    events = await new RpcEventSource(rpc, vault, from).events();
-  } catch (err) {
-    if (err instanceof CyphrasError) return { verified: false, exits: [] };
-    throw err;
-  }
-  const within = (ledger: number): boolean => ledger >= from && ledger <= update.completeToLedger;
-  const leafKey = (l: Leaf): string =>
-    `${l.index}/${l.commitment}/${bytesToHex(l.ciphertext)}/${l.txHash}`;
-  const served = new Set(update.leaves.filter((l) => within(l.ledger)).map(leafKey));
-  // Every leaf added after the tree's last one up to the complete ledger must have been served.
-  const onChain = new Set(
-    events.leaves.filter((l) => within(l.ledger) && l.index >= update.firstIndex).map(leafKey),
-  );
-  const nfKey = (n: SpentNullifier): string => `${n.nullifier}/${n.txHash}`;
-  const servedNfs = new Set(update.nullifiers.filter((n) => within(n.ledger)).map(nfKey));
-  const chainNfs = new Set(events.nullifiers.filter((n) => within(n.ledger)).map(nfKey));
-  const same = (a: Set<string>, b: Set<string>): boolean =>
-    a.size === b.size && [...a].every((x) => b.has(x));
-  if (!same(served, onChain) || !same(servedNfs, chainNfs)) {
-    fail("indexer_fault", "the indexer's leaves or nullifiers differ from the vault's events");
-  }
-  return { verified: true, exits: events.exits };
 }

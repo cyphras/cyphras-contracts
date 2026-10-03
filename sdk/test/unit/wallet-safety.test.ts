@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Address, TransactionBuilder, type Transaction, xdr } from "@stellar/stellar-base";
+import { decodeAddress } from "../../src/address.ts";
+import { bytesToHex, randomBytes } from "../../src/bytes.ts";
+import { encryptOutput } from "../../src/encryption.ts";
 import { CyphrasError } from "../../src/errors.ts";
+import { noteCommitment, randomFieldElement, randomScalar } from "../../src/notes.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
 import { type Plan, type WalletState, loadState, saveState } from "../../src/wallet/state.ts";
 import { XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
@@ -11,6 +15,25 @@ import { MNEMONIC } from "../helpers.ts";
 
 // A commitment as the indexer serves it, with its lowest bit flipped.
 const flipLowBit = (cm: string): string => (BigInt("0x" + cm) ^ 1n).toString(16).padStart(64, "0");
+
+// A forged pair the indexer could append: a 1,000 XLM note to `to` and a random leaf.
+function forgedPayment(to: string, value: bigint): Record<string, string>[] {
+  const address = decodeAddress("testnet", to);
+  const note = { d: address.d, gd: address.gd, pkd: address.pkd, value, rcm: randomFieldElement() };
+  const hex32 = (x: bigint): string => x.toString(16).padStart(64, "0");
+  return [
+    {
+      commitment: hex32(noteCommitment(note)),
+      ciphertext: bytesToHex(encryptOutput(note, new Uint8Array(32), randomScalar())),
+      tx_hash: "cd".repeat(32),
+    },
+    {
+      commitment: hex32(randomFieldElement()),
+      ciphertext: bytesToHex(randomBytes(181)),
+      tx_hash: "cd".repeat(32),
+    },
+  ];
+}
 
 async function funded(world?: World) {
   const w = world ?? (await createWorld());
@@ -25,6 +48,8 @@ async function funded(world?: World) {
 describe("wallet safety: services that lie", () => {
   it("stops when the indexer changes a leaf it served before", async () => {
     const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
     world.indexer.tamperLeaf = (index, cm) => (index === 0 ? flipLowBit(cm) : cm);
     await assert.rejects(alice.sync(), isError("indexer_fault"));
   });
@@ -53,6 +78,59 @@ describe("wallet safety: services that lie", () => {
     assert.equal(summary.rootVerified, true);
     assert.equal(fresh.treeStatus().fault, false);
     assert.equal((await fresh.balance()).spendable, 100n * XLM);
+  });
+
+  it("counts no note from leaves past the vault's NextLeaf", async () => {
+    const { world } = await funded();
+    const bob = await openWallet(world, 1);
+    const fake = forgedPayment(bob.generateAddress(), 1_000n * XLM);
+    const real = world.vault.leaves.length;
+    const lying = rewritingFetch(world, {
+      "/v1/leaves": (body) => ({
+        ...body,
+        leaves: [
+          ...(body["leaves"] as unknown[]),
+          ...fake.map((leaf, i) => ({
+            index: real + i,
+            ...leaf,
+            // a ledger past the indexer's complete-to, as if the cross-check could skip them
+            ledger: world.vault.ledger + 1,
+          })),
+        ],
+      }),
+    });
+    const fooled = await openWallet({ ...world, fetch: lying }, 1);
+    const summary = await fooled.sync();
+    assert.equal(summary.rootVerified, true);
+    assert.equal(summary.crossChecked, true);
+    assert.equal(summary.leafCount, real);
+    assert.equal((await fooled.balance()).spendable, 0n);
+    assert.deepEqual(await fooled.history(), []);
+  });
+
+  it("never counts a forged note, even once the vault has a leaf at its index", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const fake = forgedPayment(bob.generateAddress(), 1_000n * XLM);
+    const base = world.vault.leaves.length;
+    const lying = rewritingFetch(world, {
+      "/v1/leaves": (body) => ({
+        ...body,
+        leaves: [
+          ...(body["leaves"] as { index: number }[]).filter((l) => l.index < base),
+          ...fake.map((leaf, i) => ({ index: base + i, ...leaf, ledger: world.vault.ledger })),
+        ],
+      }),
+    });
+    const fooled = await openWallet({ ...world, fetch: lying }, 1);
+    await fooled.sync();
+    assert.equal((await fooled.balance()).spendable, 0n);
+    // Real activity adds a pair at the forged indices.
+    await alice.send({ to: alice.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM });
+    await assert.rejects(fooled.sync(), isError("indexer_fault"));
+    assert.equal(fooled.treeStatus().fault, true);
+    assert.equal(fooled.treeStatus().leafCount, base);
+    assert.equal((await fooled.balance()).spendable, 0n);
   });
 
   it("refuses services that point at another vault or network", async () => {

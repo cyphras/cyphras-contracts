@@ -105,6 +105,13 @@ export interface RootHistory {
   readonly ledger: number;
 }
 
+// The vault's instance and tree as of one ledger, read together.
+export interface ChainView {
+  readonly ledger: number;
+  readonly instance: VaultInstance;
+  readonly roots: RootHistory;
+}
+
 export interface PendingDepositEntry {
   readonly depositor: string;
   readonly flag: number | undefined;
@@ -179,10 +186,19 @@ export class VaultReader {
     return { ...parseInstance(entry.data), latestLedger };
   }
 
-  async rootHistory(): Promise<RootHistory> {
+  // The instance, the root history and NextLeaf in one read, so all three are of one ledger. A
+  // sync reads them every time, so that reading them is not a sign of an upcoming spend.
+  async view(): Promise<ChainView> {
+    const instance = instanceKey(this.vault);
     const rootsKey = contractDataKey(this.vault, dataKey("Roots"));
     const nextKey = contractDataKey(this.vault, dataKey("NextLeaf"));
-    const { entries, latestLedger } = await this.#rpc.getLedgerEntries([rootsKey, nextKey]);
+    const { entries, latestLedger } = await this.#rpc.getLedgerEntries([
+      instance,
+      rootsKey,
+      nextKey,
+    ]);
+    const vault = entries.get(keyId(instance));
+    if (vault === undefined) fail("deployment_mismatch", "the pinned vault does not exist");
     const roots = entries.get(keyId(rootsKey));
     const next = entries.get(keyId(nextKey));
     if (roots === undefined || next === undefined) fail("rpc_error", "the vault's tree is missing");
@@ -190,10 +206,14 @@ export class VaultReader {
     const nextLeaf = next.data.contractData().val();
     if (nextLeaf.switch().name !== "scvU64") fail("rpc_error", "the next leaf index is not a u64");
     return {
-      roots: ring.vecU256("roots"),
-      newest: ring.u32("newest"),
-      nextLeaf: Number(nextLeaf.u64().toString()),
       ledger: latestLedger,
+      instance: { ...parseInstance(vault.data), latestLedger },
+      roots: {
+        roots: ring.vecU256("roots"),
+        newest: ring.u32("newest"),
+        nextLeaf: Number(nextLeaf.u64().toString()),
+        ledger: latestLedger,
+      },
     };
   }
 
