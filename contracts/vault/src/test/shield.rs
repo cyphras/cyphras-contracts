@@ -72,6 +72,7 @@ fn a_shield_queues_the_deposit_and_pulls_the_funds() {
             encrypted_output1: ext.encrypted_output1.clone(),
             created_at: s.now(),
             flag: None,
+            flagged_at: 0,
         })
     );
     assert!(s.vault.is_spent(&proof.input_nullifiers.get_unchecked(0)));

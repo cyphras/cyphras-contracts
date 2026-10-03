@@ -1,6 +1,6 @@
 use soroban_sdk::{testutils::Events as _, Address, Event, Vec};
 
-use super::setup::{outcome, Setup, DELAY_LARGE, DELAY_SMALL, XLM};
+use super::setup::{outcome, Setup, DAY, DELAY_LARGE, DELAY_SMALL, XLM};
 use crate::{events, Error};
 
 /// The addresses whose authorization the last call required.
@@ -74,9 +74,16 @@ fn a_flag_refuses_a_pending_deposit_and_a_second_flag_replaces_the_reason() {
         s.env.events().all().filter_by_contract(&vault),
         std::vec![events::DepositFlagged { id: 1, reason: 1 }.to_xdr(&s.env, &vault)]
     );
-    assert_eq!(s.vault.pending(&1).unwrap().flag, Some(1));
+    let flagged_at = s.now();
+    let flag = |s: &Setup| {
+        let deposit = s.vault.pending(&1).unwrap();
+        (deposit.flag, deposit.flagged_at)
+    };
+    assert_eq!(flag(&s), (Some(1), flagged_at));
+    // A new reason keeps the time of the first flag.
+    s.advance(3_600);
     s.vault.flag(&1, &99);
-    assert_eq!(s.vault.pending(&1).unwrap().flag, Some(99));
+    assert_eq!(flag(&s), (Some(99), flagged_at));
 
     assert_eq!(outcome(s.vault.try_flag(&1, &0)), Err(Error::BadReason));
     assert_eq!(
@@ -99,7 +106,8 @@ fn unflag_clears_a_mistaken_flag_while_the_deposit_is_pending() {
         s.env.events().all().filter_by_contract(&vault),
         std::vec![events::DepositUnflagged { id: 1, reason: 5 }.to_xdr(&s.env, &vault)]
     );
-    assert_eq!(s.vault.pending(&1).unwrap().flag, None);
+    let deposit = s.vault.pending(&1).unwrap();
+    assert_eq!((deposit.flag, deposit.flagged_at), (None, 0));
 
     s.vault.attest(&1);
     s.advance(DELAY_SMALL);
@@ -120,7 +128,8 @@ fn flags_and_unflags_work_while_halted() {
     s.vault.flag(&1, &3);
     s.vault.unflag(&1);
     s.vault.flag(&1, &4);
-    assert_eq!(s.vault.pending(&1).unwrap().flag, Some(4));
+    let deposit = s.vault.pending(&1).unwrap();
+    assert_eq!((deposit.flag, deposit.flagged_at), (Some(4), s.now()));
 }
 
 #[test]
@@ -303,12 +312,16 @@ fn the_depositor_cancels_a_deposit_that_is_not_admitted() {
 }
 
 #[test]
-fn anyone_refunds_a_flagged_deposit_and_only_to_its_depositor() {
+fn anyone_refunds_a_deposit_flagged_a_day_ago_and_only_to_its_depositor() {
     let s = Setup::new();
     let depositor = s.account("depositor", 100 * XLM);
     s.shield(&depositor, 30 * XLM).unwrap();
     assert_eq!(outcome(s.vault.try_refund(&1)), Err(Error::NotFlagged));
     s.vault.flag(&1, &3);
+    assert_eq!(outcome(s.vault.try_refund(&1)), Err(Error::RefundTooEarly));
+    s.advance(DAY - 1);
+    assert_eq!(outcome(s.vault.try_refund(&1)), Err(Error::RefundTooEarly));
+    s.advance(1);
 
     s.vault.refund(&1);
     assert!(authorizers(&s).is_empty());
@@ -333,6 +346,7 @@ fn a_pending_deposit_can_always_leave_while_halted_or_paused() {
     s.vault.halt();
     s.vault.flag(&2, &5);
     s.vault.cancel(&1);
+    s.advance(DAY);
     s.vault.refund(&2);
     assert_eq!(s.balance(&depositor), 100 * XLM);
 }
@@ -349,6 +363,7 @@ fn a_deposit_is_resolved_at_most_once() {
     s.vault.admit(&ids(&s, &[1]));
     s.vault.cancel(&2);
     s.vault.flag(&3, &1);
+    s.advance(DAY);
     s.vault.refund(&3);
     for id in 1..=3 {
         assert_eq!(outcome(s.vault.try_cancel(&id)), Err(Error::UnknownDeposit));
@@ -357,6 +372,27 @@ fn a_deposit_is_resolved_at_most_once() {
     assert_eq!(s.vault.admit(&ids(&s, &[1, 2, 3])), ids(&s, &[]));
     assert_eq!(s.vault.next_leaf_index(), 2);
     assert_eq!(s.balance(&depositor), 99 * XLM);
+}
+
+#[test]
+fn a_mistaken_flag_can_be_corrected_before_anyone_else_refunds_it() {
+    let s = Setup::new();
+    let depositor = s.account("depositor", 10_000 * XLM);
+    let limits = s.vault.limits();
+    s.shield(&depositor, limits.max_deposit).unwrap();
+    s.vault.flag(&1, &5);
+
+    // A third party cannot refund it in the same ledger, before the ASP can look again.
+    s.env.set_auths(&[]);
+    assert_eq!(outcome(s.vault.try_refund(&1)), Err(Error::RefundTooEarly));
+    s.env.mock_all_auths();
+    s.advance(DAY - 1);
+    s.vault.unflag(&1);
+    s.advance(1);
+    assert_eq!(outcome(s.vault.try_refund(&1)), Err(Error::NotFlagged));
+    s.vault.attest(&1);
+    s.advance(DELAY_LARGE);
+    assert_eq!(s.vault.admit(&ids(&s, &[1])), ids(&s, &[1]));
 }
 
 #[test]

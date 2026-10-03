@@ -80,7 +80,8 @@ impl Status {
     }
 }
 
-/// A deposit waiting in the entry queue. `flag` holds the reason code of a refusal.
+/// A deposit waiting in the entry queue. `flag` is the reason code of the ASP's refusal and
+/// `flagged_at` the time the deposit was first flagged, 0 while it is not.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingDeposit {
@@ -92,6 +93,7 @@ pub struct PendingDeposit {
     pub encrypted_output1: Bytes,
     pub created_at: u64,
     pub flag: Option<u32>,
+    pub flagged_at: u64,
 }
 
 /// The last 256 roots, one per inserted leaf pair. `newest` indexes the current root; slots not

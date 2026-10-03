@@ -17,6 +17,7 @@ struct Deposit {
     amount: i128,
     created_at: u64,
     flag: Option<u32>,
+    flagged_at: u64,
 }
 
 #[derive(Debug)]
@@ -139,6 +140,7 @@ impl Model {
                     amount: *amount,
                     created_at: now,
                     flag: None,
+                    flagged_at: 0,
                 };
                 self.pending.insert(id, deposit);
                 Ok(Done::Id(id))
@@ -190,12 +192,16 @@ impl Model {
                     return Err(Error::BadReason);
                 }
                 let deposit = self.pending.get_mut(id).ok_or(Error::UnknownDeposit)?;
+                if deposit.flag.is_none() {
+                    deposit.flagged_at = now;
+                }
                 deposit.flag = Some(*reason);
                 Ok(Done::Unit)
             }
             Op::Unflag(id) => {
                 let deposit = self.pending.get_mut(id).ok_or(Error::UnknownDeposit)?;
                 deposit.flag.take().ok_or(Error::NotFlagged)?;
+                deposit.flagged_at = 0;
                 Ok(Done::Unit)
             }
             Op::Admit(ids) => {
@@ -219,8 +225,11 @@ impl Model {
             }
             Op::Cancel(id) | Op::Refund(id) => {
                 let deposit = self.pending.get(id).ok_or(Error::UnknownDeposit)?;
-                if matches!(op, Op::Refund(_)) && deposit.flag.is_none() {
-                    return Err(Error::NotFlagged);
+                if matches!(op, Op::Refund(_)) {
+                    deposit.flag.ok_or(Error::NotFlagged)?;
+                    if now < deposit.flagged_at + DAY {
+                        return Err(Error::RefundTooEarly);
+                    }
                 }
                 self.status.tvl -= deposit.amount;
                 self.resolve(*id);
@@ -489,8 +498,13 @@ impl Run {
             let actual = s.vault.pending(id).unwrap();
             assert_eq!(actual.depositor, self.depositors[d.depositor]);
             assert_eq!(
-                (actual.amount, actual.created_at, actual.flag),
-                (d.amount, d.created_at, d.flag)
+                (
+                    actual.amount,
+                    actual.created_at,
+                    actual.flag,
+                    actual.flagged_at
+                ),
+                (d.amount, d.created_at, d.flag, d.flagged_at)
             );
         }
 

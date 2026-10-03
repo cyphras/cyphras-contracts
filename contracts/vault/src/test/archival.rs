@@ -12,7 +12,7 @@ use soroban_sdk::{
 use super::{
     e2e::Flow,
     fixtures,
-    setup::{outcome, Setup, XLM},
+    setup::{outcome, Setup, DAY, XLM},
 };
 use crate::{DataKey, Error};
 
@@ -84,6 +84,7 @@ fn an_archived_pending_deposit_can_still_be_cancelled_or_refunded() {
     s.shield(&depositor, 10 * XLM).unwrap();
     s.shield(&depositor, 20 * XLM).unwrap();
     s.vault.flag(&2, &4);
+    s.advance(DAY);
     archive(&s.env, &s.vault.address, &DataKey::Pending(1));
     archive(&s.env, &s.vault.address, &DataKey::Pending(2));
 

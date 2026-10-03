@@ -29,6 +29,9 @@ const DAY: u64 = 86_400;
 const HALT_DURATION: u64 = 72 * 3_600;
 const HALT_COOLDOWN: u64 = 7 * DAY;
 const LOOSENING_DELAY: u64 = 7 * DAY;
+// Anyone may refund a flagged deposit only this long after it was flagged, which leaves the ASP
+// time to correct a mistaken flag. The depositor can cancel at any time.
+const REFUND_DELAY: u64 = DAY;
 
 // sha256("Public Global Stellar Network ; September 2015")
 const MAINNET_NETWORK_ID: [u8; 32] = [
@@ -170,6 +173,7 @@ impl Vault {
                 encrypted_output1: ext.encrypted_output1,
                 created_at: now,
                 flag: None,
+                flagged_at: 0,
             },
         );
         storage::set_status(&env, &status);
@@ -301,7 +305,8 @@ impl Vault {
         Ok(())
     }
 
-    /// The ASP refuses a pending deposit with a public reason code, replacing any earlier flag.
+    /// The ASP refuses a pending deposit with a public reason code. Flagging a flagged deposit
+    /// replaces the reason and keeps the time of the first flag, so it cannot postpone a refund.
     /// Code 0 is reserved for a depositor's cancellation.
     pub fn flag(env: Env, id: u64, reason: u32) -> Result<(), Error> {
         storage::config(&env).asp.require_auth();
@@ -309,6 +314,9 @@ impl Vault {
             return Err(Error::BadReason);
         }
         let mut deposit = storage::pending(&env, id).ok_or(Error::UnknownDeposit)?;
+        if deposit.flag.is_none() {
+            deposit.flagged_at = env.ledger().timestamp();
+        }
         deposit.flag = Some(reason);
         storage::set_pending(&env, id, &deposit);
         events::DepositFlagged { id, reason }.publish(&env);
@@ -319,8 +327,8 @@ impl Vault {
     pub fn unflag(env: Env, id: u64) -> Result<(), Error> {
         storage::config(&env).asp.require_auth();
         let mut deposit = storage::pending(&env, id).ok_or(Error::UnknownDeposit)?;
-        let reason = deposit.flag.ok_or(Error::NotFlagged)?;
-        deposit.flag = None;
+        let reason = deposit.flag.take().ok_or(Error::NotFlagged)?;
+        deposit.flagged_at = 0;
         storage::set_pending(&env, id, &deposit);
         events::DepositUnflagged { id, reason }.publish(&env);
         Ok(())
@@ -397,10 +405,13 @@ impl Vault {
         Ok(())
     }
 
-    /// Anyone returns a flagged deposit to its depositor. Works while halted.
+    /// Anyone returns a deposit flagged at least a day ago to its depositor. Works while halted.
     pub fn refund(env: Env, id: u64) -> Result<(), Error> {
         let deposit = storage::pending(&env, id).ok_or(Error::UnknownDeposit)?;
         let reason = deposit.flag.ok_or(Error::NotFlagged)?;
+        if env.ledger().timestamp() < deposit.flagged_at.saturating_add(REFUND_DELAY) {
+            return Err(Error::RefundTooEarly);
+        }
         release(&env, id, deposit, reason);
         Ok(())
     }

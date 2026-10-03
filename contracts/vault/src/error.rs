@@ -43,4 +43,5 @@ pub enum Error {
     LimitsNotReady = 37,
     Overflow = 38,
     ForgeableKey = 39,
+    RefundTooEarly = 40,
 }
