@@ -1274,27 +1274,77 @@ describe("wallet safety: when a payment is dead", () => {
     assert.equal(balance.locked, 0n);
   });
 
-  it("declares a payment dead once the tree it holds has a leaf from past its deadline, though no spend was checked", async () => {
-    const { world, store } = await funded();
-    const rpc = flakyEvents(world);
-    const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, store);
+  it("declares a payment dead once its tree holds a checked leaf from past its deadline, though its spends are not all in", async () => {
+    const { world, alice, store } = await funded();
     const bob = await openWallet(world, 1);
     world.relayer.failures.push({ error: "unavailable" });
     await assert.rejects(
       alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
     );
+    const { deadline } = await storedPlan(store);
     world.advance(121 * 5);
-    // Other users' pairs past the deadline, the newest of which the indexer has not taken in.
+    // Other users' pairs past the deadline, the newest of which the indexer has not taken in, nor
+    // the spends up to the deadline.
     world.fill(1);
     world.indexer.leafLimit = world.vault.leaves.length;
+    world.indexer.completeTo = deadline - 1;
     world.fill(1);
-    rpc.down = true;
     const summary = await alice.sync();
-    assert.equal(summary.crossChecked, false);
-    assert.equal(summary.rootVerified, true);
+    assert.equal(summary.crossChecked, true);
     assert.ok(summary.leafCount < world.vault.leaves.length);
     assert.equal((await alice.plans())[0]?.state, "dead");
     assert.equal((await alice.balance()).spendable, 100n * XLM);
+  });
+
+  it("takes no unchecked ledger of a leaf as the end of a payment's chance to land", async () => {
+    const { world, store } = await funded();
+    let lie = false;
+    let hidden: string | undefined;
+    const lying: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (lie && url.origin === RPC && body?.method === "getEvents") {
+        const error = { code: -32603, message: "busy" };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+      }
+      const res = await world.fetch(input, init);
+      if (!lie || url.origin !== INDEXER || res.status !== 200) return res;
+      // The indexer hides the payment's landing and dates the last leaf it serves past the
+      // deadline, while RPC cannot check it.
+      const reply = await res.json();
+      if (reply.leaves !== undefined) {
+        reply.leaves = reply.leaves.filter((l: { tx_hash: string }) => l.tx_hash !== hidden);
+        const last = reply.leaves[reply.leaves.length - 1];
+        if (last !== undefined) last.ledger = world.vault.ledger;
+      }
+      if (reply.nullifiers !== undefined) {
+        reply.nullifiers = reply.nullifiers.filter(
+          (n: { tx_hash: string }) => n.tx_hash !== hidden,
+        );
+      }
+      return new Response(JSON.stringify(reply), { status: 200 });
+    };
+    const alice = await openWallet({ ...world, fetch: lying }, 0, store);
+    const bob = await openWallet(world, 1);
+    world.fill(1);
+    const notBefore = Number(world.vault.timestamp) + 60;
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
+    world.fill(1);
+    world.advance(120);
+    world.relayer.releaseHeld();
+    hidden = world.vault.leaves.at(-1)?.txHash;
+    world.advance(400 * 5);
+    lie = true;
+    assert.equal((await alice.sync()).crossChecked, false);
+    assert.equal((await alice.plans())[0]?.state, "submitted");
+    lie = false;
+    // The next sync checks what the unchecked one took, and finds the forged ledger.
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    await alice.rescan();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
   });
 
   it("confirms a payment marked dead once its own transaction shows it landed", async () => {
@@ -1586,6 +1636,46 @@ describe("wallet safety: unchecked ledgers", () => {
     await fooled.rescan();
     await fooled.sync();
     assert.equal((await fooled.balance()).spendable, 10n * XLM);
+  });
+
+  it("keeps apart unchecked syncs whose leaves a checked one came between", async () => {
+    const { world, store } = await funded();
+    // RPC answers getEvents with an error while `down` is set, and from a ledger at or before
+    // `before` while that is set, as a node that is busy, or that cannot serve older events yet.
+    let down = false;
+    let before: number | undefined;
+    const fetch: FetchLike = async (input, init) => {
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      const from = body?.params?.startLedger as number | undefined;
+      const busy = down || (before !== undefined && from !== undefined && from <= before);
+      if (busy && new URL(input).origin === RPC && body?.method === "getEvents") {
+        const error = { code: -32603, message: "busy" };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+      }
+      return world.fetch(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, store);
+    // The indexer lists spends only up to one ledger, while leaves go on.
+    world.fill(1);
+    const stuck = world.vault.ledger;
+    world.indexer.completeTo = stuck;
+    down = true;
+    await alice.sync();
+    down = false;
+    before = stuck;
+    world.fill(1);
+    assert.equal((await alice.sync()).crossChecked, true);
+    down = true;
+    world.fill(1);
+    assert.equal((await alice.sync()).uncheckedLeaves, 4);
+    down = false;
+    before = undefined;
+    world.indexer.completeTo = undefined;
+    await alice.sync();
+    const summary = await alice.sync();
+    assert.equal(summary.uncheckedLeaves, 0);
+    assert.equal(summary.uncheckedLedgers, 0);
   });
 
   it("keeps ledgers RPC no longer holds as unchecked, without asking for them again", async () => {

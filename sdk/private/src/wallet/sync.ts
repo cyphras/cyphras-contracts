@@ -1,5 +1,6 @@
+import { sha256 } from "@noble/hashes/sha2";
 import { encodeAddress } from "../address.ts";
-import { bytesToHex } from "../bytes.ts";
+import { bytesToHex, utf8 } from "../bytes.ts";
 import { AddressCache, decryptIncoming, recoverOutgoing } from "../encryption.ts";
 import { CyphrasError, fail } from "../errors.ts";
 import type { IncomingKeys, Network } from "../keys.ts";
@@ -14,6 +15,7 @@ import {
   type Evidence,
   type FoundLeaf,
   LANDED_STATES,
+  type LeafChunk,
   type OwnedNote,
   type Plan,
   type RootCheck,
@@ -121,6 +123,22 @@ export interface CrossCheck {
 const leafKey = (l: Leaf): string =>
   `${l.index}/${l.commitment}/${bytesToHex(l.ciphertext)}/${l.ledger}/${l.txHash}`;
 const nfKey = (n: SpentNullifier): string => `${n.nullifier}/${n.ledger}/${n.txHash}`;
+
+// Leaves a sync takes unchecked are kept as digests of runs of at most this many, for a recheck to
+// compare with the vault's events once RPC holds them.
+const CHUNK_LEAVES = 1024;
+
+const digestOf = (leaves: readonly Leaf[]): string =>
+  bytesToHex(sha256(utf8(leaves.map(leafKey).join("\n"))));
+
+function chunksOf(leaves: readonly Leaf[]): LeafChunk[] {
+  const chunks: LeafChunk[] = [];
+  for (let i = 0; i < leaves.length; i += CHUNK_LEAVES) {
+    const run = leaves.slice(i, i + CHUNK_LEAVES);
+    chunks.push({ end: (run[run.length - 1] as Leaf).index + 1, digest: digestOf(run) });
+  }
+  return chunks;
+}
 
 // Compares what the indexer served with the vault's events from RPC since the same ledger. Every
 // served leaf is compared by its index, whatever ledger the indexer gave it; only a leaf added
@@ -360,10 +378,15 @@ function scanDownload(
       paths,
       found: [...(staged?.found ?? []), ...planLeaves],
       unchecked:
-        staged?.unchecked ??
-        (checked || data.leaves[0] === undefined
-          ? undefined
-          : { first: data.leaves[0].index, ledger: data.leaves[0].ledger }),
+        staged?.unchecked === undefined
+          ? checked || data.leaves[0] === undefined
+            ? undefined
+            : {
+                first: data.leaves[0].index,
+                ledger: data.leaves[0].ledger,
+                chunks: chunksOf(data.leaves),
+              }
+          : { ...staged.unchecked, chunks: [...staged.unchecked.chunks, ...chunksOf(data.leaves)] },
     },
     newNotes,
   };
@@ -398,6 +421,10 @@ export function applyDownload(
   }
   state.notes.push(...staging.notes);
   state.sent.push(...staging.sent);
+  // The ledgers of leaves a cross-check matched with the vault's events are the vault's own.
+  if (checked && staging.unchecked === undefined && staging.tree.leafCount > state.tree.leafCount) {
+    state.checkedLeafLedger = Math.max(state.checkedLeafLedger, staging.lastLeafLedger);
+  }
   state.tree = staging.tree;
   state.lastLeafLedger = staging.lastLeafLedger;
   state.staging = undefined;
@@ -427,35 +454,40 @@ export function applyDownload(
   return newNotes;
 }
 
-// Joins a range to the last one when their ledgers touch, so a run of unchecked syncs is one range.
+// Joins a range to the last one when their ledgers touch and their leaves follow one another, so a
+// run of unchecked syncs is one range.
 function addUnchecked(state: WalletState, range: UncheckedRange): void {
   const at = state.unchecked.length - 1;
   const last = state.unchecked[at];
-  if (last === undefined || last.lost || last.to + 1 < range.from) {
+  const [a, b] = [last?.leaves, range.leaves];
+  if (
+    last === undefined ||
+    last.lost ||
+    last.to + 1 < range.from ||
+    (a !== undefined && b !== undefined && a.end !== b.first)
+  ) {
     state.unchecked.push(range);
     return;
   }
-  const [a, b] = [last.leaves, range.leaves];
   state.unchecked[at] = {
     from: last.from,
     to: Math.max(last.to, range.to),
     leaves:
       a === undefined || b === undefined
         ? (a ?? b)
-        : { first: a.first, end: Math.max(a.end, b.end), ledger: a.ledger },
+        : { first: a.first, end: b.end, ledger: a.ledger, chunks: [...a.chunks, ...b.chunks] },
     lost: false,
   };
 }
 
 // Checks what the wallet kept from the oldest range a sync took unchecked, against the vault's own
-// events while RPC still holds them: the wallet's notes and outgoing outputs at the range's leaves,
-// found again by trial decryption with the transaction and ledger of each, where the plans'
-// commitments landed among those leaves, and the spends of its notes in the range's ledgers. A
-// difference is the indexer's. Returns the events of the ledgers whose spends were checked; what
-// RPC does not reach yet stays in the range, and a range RPC no longer holds is kept, as lost.
+// events while RPC still holds them: every leaf the sync took, by the digests of runs of them, and
+// the spends of the wallet's notes in the range's ledgers. A difference is the indexer's. The
+// ledgers of the leaves checked become the vault's own. Returns the events of the ledgers whose
+// spends were checked; what RPC does not reach yet stays in the range, and a range RPC no longer
+// holds is kept, as lost.
 export async function recheck(
   state: WalletState,
-  keys: ScanKeys,
   rpc: SorobanRpc,
   vault: string,
   maxPages: number,
@@ -482,43 +514,31 @@ export async function recheck(
   if (leaves !== undefined) {
     const { first, end } = leaves;
     // The leaves RPC shows follow one another from the range's first, up to the last ledger it
-    // covers.
+    // covers; each run of them it shows in full must be the run the sync took.
     const shown = events.leaves.filter((l) => l.index >= first && l.index < end);
     if (shown.some((l, i) => l.index !== first + i)) differ();
-    const covered = (pos: number): boolean => pos >= first && pos < first + shown.length;
-    const found: WalletState = { ...state, notes: [], sent: [] };
-    const cache = new AddressCache(keys.incoming);
-    for (const leaf of shown) scanLeaf(found, leaf, keys, cache);
-    const where = (x: { pos: number; txHash: string; ledger: number }): string =>
-      `${x.pos}/${x.txHash}/${x.ledger}`;
-    for (const [kept, chain] of [
-      [state.notes, found.notes],
-      [state.sent, found.sent],
-    ] as const) {
-      const ours = kept.filter((x) => covered(x.pos)).map(where);
-      const theirs = chain.map(where);
-      if (ours.length !== theirs.length || ours.some((x) => !theirs.includes(x))) differ();
+    let next = first;
+    let chunks = leaves.chunks;
+    for (const chunk of leaves.chunks) {
+      if (chunk.end > first + shown.length) break;
+      if (digestOf(shown.slice(next - first, chunk.end - first)) !== chunk.digest) differ();
+      next = chunk.end;
+      chunks = chunks.slice(1);
     }
-    for (const plan of state.plans) {
-      for (const e of plan.evidence) {
-        e.outputs.forEach((pos, slot) => {
-          const chain = pos === undefined || !covered(pos) ? undefined : shown[pos - first];
-          if (
-            chain !== undefined &&
-            (chain.commitment !== plan.commitments[slot] ||
-              chain.txHash !== e.txHash ||
-              chain.ledger !== e.ledger)
-          ) {
-            differ();
-          }
-        });
-      }
+    const lastChecked = shown[next - 1 - first];
+    if (lastChecked !== undefined) {
+      state.checkedLeafLedger = Math.max(state.checkedLeafLedger, lastChecked.ledger);
     }
-    const next = first + shown.length;
     leaves =
       next === end
         ? undefined
-        : { first: next, end, ledger: shown.length === 0 ? leaves.ledger : events.latest + 1 };
+        : {
+            first: next,
+            end,
+            ledger:
+              shown[next - first]?.ledger ?? (next === first ? leaves.ledger : events.latest + 1),
+            chunks,
+          };
   }
   const to = Math.min(range.to, events.latest);
   const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
@@ -606,12 +626,13 @@ function landingRefuted(state: WalletState, plan: Plan): boolean {
 }
 
 // No sign of the plan up to its deadline: none of its commitments is known, and either the tree
-// the vault's root confirmed holds a leaf added after the deadline, and so every leaf added up to
-// it, or the checked spends of every ledger from the plan's building to its deadline show none of
-// its notes spent, as a landing would have. It never landed, and now never will.
+// the vault's root confirmed holds a leaf whose ledger a check confirmed is after the deadline,
+// and so every leaf added up to it, or the checked spends of every ledger from the plan's building
+// to its deadline show none of its notes spent, as a landing would have. It never landed, and now
+// never will.
 function missedDeadline(state: WalletState, plan: Plan): boolean {
   if (plan.evidence.some((e) => e.outputs.some((pos) => pos !== undefined))) return false;
-  if (state.lastLeafLedger > plan.deadline) return true;
+  if (state.checkedLeafLedger > plan.deadline) return true;
   if (!checkedBetween(state, plan.builtAt, plan.deadline)) return false;
   return plan.inputs.every((input) => {
     const spent = state.notes.find((n) => n.pos === input.pos)?.spent;

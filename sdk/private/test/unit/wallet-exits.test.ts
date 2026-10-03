@@ -896,12 +896,16 @@ describe("the exit queue: sources", () => {
 });
 
 describe("an indexer that renames the transaction a payment landed in", () => {
-  // A fetch whose indexer names another transaction for the newest one in the replies of `paths`
-  // while `renaming` is set, and whose RPC answers getEvents with an error while `eventsDown` is
-  // set.
+  type Entry = { tx_hash: string; ledger: number };
+  const renamed = (x: Entry): Entry => ({ ...x, tx_hash: "ab".repeat(32) });
+
+  // A fetch whose indexer relabels the entries of the newest transaction in the replies of `paths`
+  // while `renaming` is set, by default naming another transaction for it, and whose RPC answers
+  // getEvents with an error while `eventsDown` is set.
   function renamingFetch(
     world: Awaited<ReturnType<typeof createWorld>>,
     paths = ["/v1/leaves", "/v1/nullifiers"],
+    relabel = renamed,
   ) {
     const control = {
       renaming: false,
@@ -926,8 +930,7 @@ describe("an indexer that renames the transaction a payment landed in", () => {
         }
         const reply = await res.json();
         const landing = world.vault.leaves.at(-1)?.txHash;
-        const rename = (x: { tx_hash: string }) =>
-          x.tx_hash === landing ? { ...x, tx_hash: "ab".repeat(32) } : x;
+        const rename = (x: Entry) => (x.tx_hash === landing ? relabel(x) : x);
         if (reply.leaves !== undefined) reply.leaves = reply.leaves.map(rename);
         if (reply.nullifiers !== undefined) reply.nullifiers = reply.nullifiers.map(rename);
         return new Response(JSON.stringify(reply), { status: 200 });
@@ -1002,6 +1005,29 @@ describe("an indexer that renames the transaction a payment landed in", () => {
     const [plan] = await alice.plans();
     assert.equal(plan?.state, "settled");
     assert.equal(plan?.txHash, landing);
+  });
+
+  it("catches a forged ledger on the landing of a payment that left no change", async () => {
+    const world = await createWorld();
+    // The leaves of the landing keep their transaction and are given a later ledger.
+    const control = renamingFetch(world, ["/v1/leaves"], (x) => ({ ...x, ledger: x.ledger + 50 }));
+    const alice = await fundedThrough(world, control.fetch);
+    const destination = world.signer("exchange").publicKey;
+    await alice.unshield({
+      to: destination,
+      amount: 99n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    control.renaming = true;
+    control.eventsDown = true;
+    await alice.sync();
+    control.renaming = false;
+    control.eventsDown = false;
+    world.fill(1);
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    await alice.rescan();
+    assert.equal((await alice.plans())[0]?.state, "settled");
   });
 });
 

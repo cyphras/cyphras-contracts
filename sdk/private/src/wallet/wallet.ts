@@ -707,7 +707,6 @@ export class PrivateWallet {
     }
     const rechecked = await recheck(
       core.state,
-      core.scan,
       core.services.rpc,
       core.deployment.vault,
       limits.eventPages,
