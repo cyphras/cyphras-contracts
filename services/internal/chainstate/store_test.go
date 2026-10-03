@@ -98,6 +98,77 @@ func TestARepeatedNullifierAcrossWindowsIsCaughtByTheStore(t *testing.T) {
 	}
 }
 
+func TestQueuedExitsReload(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	s, _, err := st.Load(ctx, testVault, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.Apply([]vault.Tx{{Ledger: 10, ClosedAt: 1_728_000_000, Hash: "a", Calls: []any{
+		shield(1, 1, 1000), vault.Attested{UpTo: 1}, admission(1, 0), queued(10, 2, 1, -300, 5), queued(20, 4, 2, -100, 0),
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Commit(ctx, 10, 10, s, d, nil); err != nil {
+		t.Fatal(err)
+	}
+	next := s.Clone()
+	d, err = next.Apply([]vault.Tx{{Ledger: 11, ClosedAt: 1_728_000_005, Hash: "b", Calls: []any{release(1, -300, 5)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Commit(ctx, 11, 11, next, d, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := st.Load(ctx, testVault, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Exits) != 1 || got.Exits[2] == nil || got.Exits[2].Payout.Int64() != 100 || got.ExitHead != 2 || got.ExitTail != 3 || got.QueuedTotal.Int64() != 100 {
+		t.Fatalf("exits reloaded as %+v, head %d tail %d", got.Exits, got.ExitHead, got.ExitTail)
+	}
+	var releasedAt int64
+	_ = st.Pool.QueryRow(ctx, `SELECT released_at FROM exits WHERE id = 1`).Scan(&releasedAt)
+	if releasedAt != 1_728_000_005 {
+		t.Fatalf("release time %d", releasedAt)
+	}
+	// Exit 2 is stranded, survives a reload as a stranded exit, and is claimed.
+	next = got.Clone()
+	d, err = next.Apply([]vault.Tx{{Ledger: 12, ClosedAt: 1_728_000_010, Hash: "c", Calls: []any{vault.ExitStranded{ID: 2, Payout: big.NewInt(100), Fee: new(big.Int)}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Commit(ctx, 12, 12, next, d, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err = st.Load(ctx, testVault, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Exits) != 0 || got.Stranded[2] == nil || got.Stranded[2].Payout.Int64() != 100 || got.ExitHead != 3 || got.QueuedTotal.Int64() != 100 {
+		t.Fatalf("stranded exits reloaded as %+v", got.Stranded)
+	}
+	next = got.Clone()
+	d, err = next.Apply([]vault.Tx{{Ledger: 13, ClosedAt: 1_728_000_015, Hash: "d", Calls: []any{release(2, -100, 0)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Commit(ctx, 13, 13, next, d, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err = st.Load(ctx, testVault, 10)
+	if err != nil || len(got.Stranded) != 0 || got.QueuedTotal.Sign() != 0 {
+		t.Fatalf("after the claim: %+v, %v", got.Stranded, err)
+	}
+	var claims int
+	_ = st.Pool.QueryRow(ctx, `SELECT count(*) FROM settlements WHERE exit_id = 2`).Scan(&claims)
+	if claims != 1 {
+		t.Fatalf("%d settlements of exit 2", claims)
+	}
+}
+
 func TestPendingDepositsAndFlagsReload(t *testing.T) {
 	ctx := context.Background()
 	st := openStore(t)
@@ -135,6 +206,9 @@ func TestPendingDepositsAndFlagsReload(t *testing.T) {
 	}
 	if got.Queued == nil || got.Queued.ReadyAt != 44 || got.Queued.Limits.MaxFee.Int64() != 6 {
 		t.Fatalf("queued limits reloaded as %+v", got.Queued)
+	}
+	if got.PendingTotal.Int64() != 400 {
+		t.Fatalf("pending total %v", got.PendingTotal)
 	}
 	if err := st.Reset(ctx); err != nil {
 		t.Fatal(err)

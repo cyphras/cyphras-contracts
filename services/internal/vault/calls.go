@@ -10,11 +10,19 @@ type Shield struct {
 	Deposit    DepositPending
 }
 
-// Transact is the event shape of one transact: two nullifiers, the two outputs, then settled.
+// Transact is the event shape of one transact: two nullifiers, the two outputs, then settled when
+// it paid at once or exit_queued when its payment waits in the exit queue.
 type Transact struct {
 	Nullifiers [2]NewNullifier
 	Outputs    [2]NewCommitment
-	Settled    Settled
+	Settled    *Settled
+	Queued     *ExitQueued
+}
+
+// ExitSettled is a settled event that carries an exit ID: a queued exit release paid in full, or
+// the unpaid parts of a stranded exit that claim paid.
+type ExitSettled struct {
+	Settled Settled
 }
 
 // Admission is the event shape of one admitted deposit: its two outputs, then deposit_admitted.
@@ -29,7 +37,8 @@ type Tx struct {
 	Ledger   uint32
 	ClosedAt int64
 	Hash     string
-	// Calls holds Shield, Transact and Admission values, and the bodies of single-event calls.
+	// Calls holds Shield, Transact, Admission and ExitSettled values, and the bodies of the other
+	// single events, such as an ExitStranded of a release.
 	Calls []any
 }
 
@@ -86,11 +95,15 @@ func parseCalls(events []Event) ([]any, error) {
 			if err != nil {
 				return nil, err
 			}
-			settled, ok := at[Settled](events, i+4)
-			if !ok {
-				return nil, malformed("spent nullifiers without a deposit or a settlement")
+			t := Transact{Nullifiers: [2]NewNullifier{first, second}, Outputs: outputs}
+			if settled, ok := at[Settled](events, i+4); ok && settled.ExitID == nil {
+				t.Settled = &settled
+			} else if queued, ok := at[ExitQueued](events, i+4); ok {
+				t.Queued = &queued
+			} else {
+				return nil, malformed("spent nullifiers without a deposit, a settlement or a queued exit")
 			}
-			calls = append(calls, Transact{Nullifiers: [2]NewNullifier{first, second}, Outputs: outputs, Settled: settled})
+			calls = append(calls, t)
 			i += 5
 		case NewCommitment:
 			outputs, err := outputPair(events, i)
@@ -107,7 +120,13 @@ func parseCalls(events []Event) ([]any, error) {
 			}
 			calls = append(calls, Admission{Outputs: outputs, Admitted: admitted})
 			i += 3
-		case DepositPending, Settled, DepositAdmitted:
+		case Settled:
+			if first.ExitID == nil {
+				return nil, malformed("a settlement without its transact")
+			}
+			calls = append(calls, ExitSettled{Settled: first})
+			i++
+		case DepositPending, DepositAdmitted, ExitQueued:
 			return nil, malformed("%s out of place", events[i].Name)
 		default:
 			calls = append(calls, first)

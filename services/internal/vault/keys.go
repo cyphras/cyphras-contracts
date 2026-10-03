@@ -55,6 +55,16 @@ func PendingKey(vault string, id uint64) (xdr.LedgerKey, error) {
 	return contractData(vault, enumKey("Pending", U64(id)), xdr.ContractDataDurabilityPersistent)
 }
 
+// ExitKey is the entry of a queued exit.
+func ExitKey(vault string, id uint64) (xdr.LedgerKey, error) {
+	return contractData(vault, enumKey("Exit", U64(id)), xdr.ContractDataDurabilityPersistent)
+}
+
+// StrandedKey is the entry of a stranded exit, which holds an Exit with only the unpaid parts.
+func StrandedKey(vault string, id uint64) (xdr.LedgerKey, error) {
+	return contractData(vault, enumKey("Stranded", U64(id)), xdr.ContractDataDurabilityPersistent)
+}
+
 // TreeKeys are the tree entries bump_ttl extends.
 func TreeKeys(vault string) ([]xdr.LedgerKey, error) {
 	var keys []xdr.LedgerKey

@@ -32,6 +32,9 @@ func testStatus(t *testing.T) xdr.ScVal {
 		Field{"attested_up_to", U64(2)},
 		Field{"tvl", i128(t, 300)},
 		Field{"pending_total", i128(t, 100)},
+		Field{"queued_total", i128(t, 50)},
+		Field{"exit_head", U64(3)},
+		Field{"exit_tail", U64(5)},
 		Field{"outflow_day", U64(19000)},
 		Field{"outflow", i128(t, 7)},
 	)
@@ -66,7 +69,7 @@ func TestTheInstanceStorageDecodes(t *testing.T) {
 	if inst.Config.Token != testToken || inst.Config.DelayLarge != 86400 || inst.Config.Domain != fr.SetUint64(5) {
 		t.Fatalf("config %+v", inst.Config)
 	}
-	if inst.Status.NextDepositID != 4 || !inst.Status.TransfersPaused || inst.Status.PendingTotal.Int64() != 100 {
+	if inst.Status.NextDepositID != 4 || !inst.Status.TransfersPaused || inst.Status.PendingTotal.Int64() != 100 || inst.Status.QueuedTotal.Int64() != 50 || inst.Status.ExitTail != 5 {
 		t.Fatalf("status %+v", inst.Status)
 	}
 	if inst.QueuedLimits == nil || inst.QueuedLimits.ReadyAt != 77 {
@@ -137,6 +140,27 @@ func TestAPendingDepositDecodesAndKnowsWhenItIsEligible(t *testing.T) {
 	// A loosening after the shield does not shorten the delay the deposit was made under.
 	if got := d.EligibleAt(cfg, limits); got != 1000+86400 {
 		t.Fatalf("eligible at %d", got)
+	}
+}
+
+func TestAnExitDecodes(t *testing.T) {
+	e, err := DecodeExit(Struct(
+		Field{"recipient", addr(t, testDepositor)}, Field{"payout", i128(t, 700)}, Field{"relayer", addr(t, testRelayer)},
+		Field{"fee", i128(t, 10)}, Field{"queued_at", U64(99)},
+	))
+	if err != nil || e.Payout.Int64() != 700 || e.QueuedAt != 99 || e.Recipient != testDepositor {
+		t.Fatalf("exit %+v %v", e, err)
+	}
+	for name, build := range map[string]func(string, uint64) (xdr.LedgerKey, error){"Exit": ExitKey, "Stranded": StrandedKey} {
+		k, err := build("CBYJTWEOBJL52FA7J7JNDVM65TW64PXO2EIQBF5YVEE3OROZSBVMP2N5", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cd := k.MustContractData()
+		v := *cd.Key.MustVec()
+		if cd.Durability != xdr.ContractDataDurabilityPersistent || len(v) != 2 || string(v[0].MustSym()) != name || uint64(v[1].MustU64()) != 4 {
+			t.Fatalf("%s key %+v", name, cd)
+		}
 	}
 }
 

@@ -107,7 +107,25 @@ func (b *builder) pending(id uint64, amount int64) *builder {
 func (b *builder) settled(extAmount, fee int64) *builder {
 	return b.emit("settled",
 		Field{"ext_amount", i128(b.t, extAmount)}, Field{"fee", i128(b.t, fee)},
+		Field{"recipient", addr(b.t, testRelayer)}, Field{"relayer", addr(b.t, testRelayer)},
+		Field{"exit_id", xdr.ScVal{Type: xdr.ScValTypeScvVoid}})
+}
+
+func (b *builder) released(id uint64, extAmount, fee int64) *builder {
+	return b.emit("settled",
+		Field{"ext_amount", i128(b.t, extAmount)}, Field{"fee", i128(b.t, fee)},
+		Field{"recipient", addr(b.t, testRelayer)}, Field{"relayer", addr(b.t, testRelayer)},
+		Field{"exit_id", U64(id)})
+}
+
+func (b *builder) queued(id uint64, extAmount, fee int64) *builder {
+	return b.emit("exit_queued",
+		Field{"id", U64(id)}, Field{"ext_amount", i128(b.t, extAmount)}, Field{"fee", i128(b.t, fee)},
 		Field{"recipient", addr(b.t, testRelayer)}, Field{"relayer", addr(b.t, testRelayer)})
+}
+
+func (b *builder) stranded(id uint64, payout, fee int64) *builder {
+	return b.emit("exit_stranded", Field{"id", U64(id)}, Field{"payout", i128(b.t, payout)}, Field{"fee", i128(b.t, fee)})
 }
 
 func (b *builder) admitted(id, leaf uint64) *builder {
@@ -197,8 +215,14 @@ func TestUnknownTopicsAndMalformedEventsAreRefused(t *testing.T) {
 	}
 	if _, err := Decode(b.raw("settled", Struct(
 		Field{"ext_amount", i128(t, 1)}, Field{"fee", i128(t, 0)},
-		Field{"recipient", addr(t, testRelayer)}, Field{"relayer", addr(t, testRelayer)}))); !errors.Is(err, ErrMalformed) {
+		Field{"recipient", addr(t, testRelayer)}, Field{"relayer", addr(t, testRelayer)},
+		Field{"exit_id", xdr.ScVal{Type: xdr.ScValTypeScvVoid}}))); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("positive settlement: %v", err)
+	}
+	if _, err := Decode(b.raw("exit_queued", Struct(
+		Field{"id", U64(1)}, Field{"ext_amount", i128(t, 0)}, Field{"fee", i128(t, 0)},
+		Field{"recipient", addr(t, testRelayer)}, Field{"relayer", addr(t, testRelayer)}))); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("queued exit that pays nothing: %v", err)
 	}
 }
 
@@ -229,11 +253,55 @@ func TestTransactionsParseIntoTheShapesTheVaultEmits(t *testing.T) {
 	if a.Admitted.ID != 2 || a.Outputs[0].Index != 2 {
 		t.Fatalf("second admission %+v", a)
 	}
-	if tr := txs[3].Calls[0].(Transact); tr.Settled.ExtAmount.Int64() != -10 || tr.Outputs[1].Index != 5 {
+	if tr := txs[3].Calls[0].(Transact); tr.Settled == nil || tr.Settled.ExtAmount.Int64() != -10 || tr.Outputs[1].Index != 5 {
 		t.Fatalf("transact %+v", tr)
 	}
 	if len(txs[4].Calls) != 3 {
 		t.Fatalf("multi-call transaction parsed as %d calls", len(txs[4].Calls))
+	}
+}
+
+func TestExitsParseIntoQueuedTransactsAndReleases(t *testing.T) {
+	b := newBuilder(t)
+	b.nextTx("01").nullifier(1).nullifier(2).commitment(0, 11).commitment(1, 12).queued(1, -10, 1)
+	b.nextTx("02").released(1, -10, 1).stranded(2, 5, 0).released(3, -5, 0)
+	b.nextTx("03").released(2, -5, 0)
+	txs, err := ParseTxs(b.events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr := txs[0].Calls[0].(Transact); tr.Queued == nil || tr.Settled != nil || tr.Queued.ID != 1 {
+		t.Fatalf("queued transact %+v", tr)
+	}
+	if r := txs[1].Calls[2].(ExitSettled); *r.Settled.ExitID != 3 || len(txs[1].Calls) != 3 {
+		t.Fatalf("release %+v", txs[1].Calls)
+	}
+	if st := txs[1].Calls[1].(ExitStranded); st.ID != 2 || st.Payout.Int64() != 5 || st.Fee.Sign() != 0 {
+		t.Fatalf("stranded %+v", st)
+	}
+	if c := txs[2].Calls[0].(ExitSettled); *c.Settled.ExitID != 2 {
+		t.Fatalf("claim %+v", c)
+	}
+	for name, v := range map[string][2]int64{"nothing unpaid": {0, 0}, "negative part": {-1, 2}} {
+		if _, err := Decode(newBuilder(t).nextTx("aa").raw("exit_stranded", Struct(
+			Field{"id", U64(1)}, Field{"payout", i128(t, v[0])}, Field{"fee", i128(t, v[1])}))); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	for name, build := range map[string]func(*builder){
+		"settlement without transact":  func(b *builder) { b.settled(-1, 0) },
+		"queued exit without transact": func(b *builder) { b.queued(1, -1, 0) },
+		"transact ending in a release": func(b *builder) { b.nullifier(1).nullifier(2).commitment(0, 1).commitment(1, 2).released(1, -1, 0) },
+		"transact ending in nothing":   func(b *builder) { b.nullifier(1).nullifier(2).commitment(0, 1).commitment(1, 2) },
+		"transact ending in an attested": func(b *builder) {
+			b.nullifier(1).nullifier(2).commitment(0, 1).commitment(1, 2).emit("attested", Field{"up_to", U64(1)})
+		},
+	} {
+		b := newBuilder(t).nextTx("aa")
+		build(b)
+		if _, err := ParseTxs(b.events); !errors.Is(err, ErrMalformed) {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 }
 

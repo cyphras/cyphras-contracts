@@ -299,7 +299,19 @@ func structOf(v xdr.ScVal, names ...string) (map[string]xdr.ScVal, error) {
 	return out, nil
 }
 
-// optionOf decodes an Option<u32>, which the SDK encodes as void or the value.
+// optionU64Of decodes an Option<u64>, which the SDK encodes as void or the value.
+func optionU64Of(v xdr.ScVal) (*uint64, error) {
+	if v.Type == xdr.ScValTypeScvVoid {
+		return nil, nil
+	}
+	n, err := u64Of(v)
+	if err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+// optionU32Of decodes an Option<u32>, which the SDK encodes as void or the value.
 func optionU32Of(v xdr.ScVal) (*uint32, error) {
 	if v.Type == xdr.ScValTypeScvVoid {
 		return nil, nil

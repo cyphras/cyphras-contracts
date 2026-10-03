@@ -104,12 +104,31 @@ type NewNullifier struct {
 	Nullifier fr.Element
 }
 
-// Settled is emitted by transact.
+// Settled is emitted by transact when it pays at once. With the exit's ID it is emitted by release
+// for a queued exit it paid in full, and by claim for the unpaid parts of a stranded exit.
 type Settled struct {
 	ExtAmount *big.Int
 	Fee       *big.Int
 	Recipient string
 	Relayer   string
+	ExitID    *uint64
+}
+
+// ExitQueued is emitted by transact when its payment joins the exit queue.
+type ExitQueued struct {
+	ID        uint64
+	ExtAmount *big.Int
+	Fee       *big.Int
+	Recipient string
+	Relayer   string
+}
+
+// ExitStranded is emitted by release for a queued exit with a part the asset contract refused.
+// Payout and Fee are the unpaid parts, which stay owed until claim pays them.
+type ExitStranded struct {
+	ID     uint64
+	Payout *big.Int
+	Fee    *big.Int
 }
 
 // Paused is emitted by set_pause.
@@ -257,13 +276,37 @@ var decoders = map[string]func(xdr.ScVal) (any, error){
 		return NewNullifier{Nullifier: d.field("nullifier")}, d.err
 	},
 	"settled": func(v xdr.ScVal) (any, error) {
-		d := newDecoder(v, []string{"ext_amount", "fee", "recipient", "relayer"})
+		d := newDecoder(v, []string{"ext_amount", "fee", "recipient", "relayer", "exit_id"})
 		if d.err != nil {
 			return nil, d.err
 		}
-		e := Settled{ExtAmount: d.i128("ext_amount"), Fee: d.i128("fee"), Recipient: d.address("recipient"), Relayer: d.address("relayer")}
+		exit, err := optionU64Of(d.fields["exit_id"])
+		d.keep(err)
+		e := Settled{ExtAmount: d.i128("ext_amount"), Fee: d.i128("fee"), Recipient: d.address("recipient"), Relayer: d.address("relayer"), ExitID: exit}
 		if d.err == nil && (e.ExtAmount.Sign() > 0 || e.Fee.Sign() < 0) {
 			return nil, malformed("settled with ext_amount %v and fee %v", e.ExtAmount, e.Fee)
+		}
+		return e, d.err
+	},
+	"exit_queued": func(v xdr.ScVal) (any, error) {
+		d := newDecoder(v, []string{"id", "ext_amount", "fee", "recipient", "relayer"})
+		if d.err != nil {
+			return nil, d.err
+		}
+		e := ExitQueued{ID: d.u64("id"), ExtAmount: d.i128("ext_amount"), Fee: d.i128("fee"), Recipient: d.address("recipient"), Relayer: d.address("relayer")}
+		if d.err == nil && (e.ExtAmount.Sign() > 0 || e.Fee.Sign() < 0 || new(big.Int).Sub(e.Fee, e.ExtAmount).Sign() <= 0) {
+			return nil, malformed("queued exit with ext_amount %v and fee %v", e.ExtAmount, e.Fee)
+		}
+		return e, d.err
+	},
+	"exit_stranded": func(v xdr.ScVal) (any, error) {
+		d := newDecoder(v, []string{"id", "payout", "fee"})
+		if d.err != nil {
+			return nil, d.err
+		}
+		e := ExitStranded{ID: d.u64("id"), Payout: d.i128("payout"), Fee: d.i128("fee")}
+		if d.err == nil && (e.Payout.Sign() < 0 || e.Fee.Sign() < 0 || e.Payout.Sign()+e.Fee.Sign() == 0) {
+			return nil, malformed("stranded exit with payout %v and fee %v", e.Payout, e.Fee)
 		}
 		return e, d.err
 	},

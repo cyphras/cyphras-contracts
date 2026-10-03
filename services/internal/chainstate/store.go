@@ -66,9 +66,30 @@ CREATE TABLE IF NOT EXISTS settlements (
 	ext_amount numeric NOT NULL,
 	fee numeric NOT NULL,
 	recipient text NOT NULL,
-	relayer text NOT NULL
+	relayer text NOT NULL,
+	exit_id bigint
 );
 CREATE INDEX IF NOT EXISTS settlements_by_time ON settlements (closed_at);
+CREATE TABLE IF NOT EXISTS exits (
+	id bigint PRIMARY KEY,
+	payout numeric NOT NULL,
+	fee numeric NOT NULL,
+	recipient text NOT NULL,
+	relayer text NOT NULL,
+	queued_at bigint NOT NULL,
+	ledger bigint NOT NULL,
+	tx_hash text NOT NULL,
+	released_ledger bigint,
+	released_at bigint,
+	released_tx text,
+	unpaid_payout numeric,
+	unpaid_fee numeric,
+	claimed_ledger bigint,
+	claimed_at bigint,
+	claimed_tx text
+);
+CREATE INDEX IF NOT EXISTS exits_waiting ON exits (id) WHERE released_ledger IS NULL;
+CREATE INDEX IF NOT EXISTS exits_stranded ON exits (id) WHERE unpaid_payout IS NOT NULL AND claimed_ledger IS NULL;
 `
 
 // Store persists a State and what each window changed in one Postgres database.
@@ -135,6 +156,10 @@ type stateJSON struct {
 	AttestedUpTo    uint64      `json:"attested_up_to"`
 	NullifierCount  uint64      `json:"nullifier_count"`
 	Tvl             string      `json:"tvl"`
+	PendingTotal    string      `json:"pending_total"`
+	QueuedTotal     string      `json:"queued_total"`
+	ExitHead        uint64      `json:"exit_head"`
+	ExitTail        uint64      `json:"exit_tail"`
 	OutflowDay      uint64      `json:"outflow_day"`
 	Outflow         string      `json:"outflow"`
 	DepositsPaused  bool        `json:"deposits_paused"`
@@ -153,7 +178,8 @@ func encodeState(s *State) ([]byte, error) {
 	}
 	j := stateJSON{
 		Tree: t, NextDepositID: s.NextDepositID, AttestedUpTo: s.AttestedUpTo, NullifierCount: s.NullifierCount,
-		Tvl: s.Tvl.String(), OutflowDay: s.OutflowDay, Outflow: s.Outflow.String(),
+		Tvl: s.Tvl.String(), PendingTotal: s.PendingTotal.String(), QueuedTotal: s.QueuedTotal.String(),
+		ExitHead: s.ExitHead, ExitTail: s.ExitTail, OutflowDay: s.OutflowDay, Outflow: s.Outflow.String(),
 		DepositsPaused: s.DepositsPaused, TransfersPaused: s.TransfersPaused, HaltedUntil: s.HaltedUntil, NextHaltAt: s.NextHaltAt,
 	}
 	if s.Limits != nil {
@@ -178,11 +204,16 @@ func decodeState(raw []byte) (*State, error) {
 		return nil, err
 	}
 	s.NextDepositID, s.AttestedUpTo, s.NullifierCount = j.NextDepositID, j.AttestedUpTo, j.NullifierCount
-	var ok1, ok2 bool
-	s.Tvl, ok1 = new(big.Int).SetString(j.Tvl, 10)
-	s.Outflow, ok2 = new(big.Int).SetString(j.Outflow, 10)
-	if !ok1 || !ok2 {
-		return nil, errors.New("stored amounts")
+	s.ExitHead, s.ExitTail = j.ExitHead, j.ExitTail
+	for _, f := range []struct {
+		dst **big.Int
+		src string
+	}{{&s.Tvl, j.Tvl}, {&s.PendingTotal, j.PendingTotal}, {&s.QueuedTotal, j.QueuedTotal}, {&s.Outflow, j.Outflow}} {
+		n, ok := new(big.Int).SetString(f.src, 10)
+		if !ok {
+			return nil, errors.New("stored amounts")
+		}
+		*f.dst = n
 	}
 	s.OutflowDay = j.OutflowDay
 	s.DepositsPaused, s.TransfersPaused, s.HaltedUntil, s.NextHaltAt = j.DepositsPaused, j.TransfersPaused, j.HaltedUntil, j.NextHaltAt
@@ -210,9 +241,9 @@ var ErrOtherVault = errors.New("chainstate: database holds another vault")
 // the vault's deploy ledger.
 func (st *Store) Load(ctx context.Context, vaultID string, deployLedger uint32) (*State, uint32, error) {
 	var storedVault string
-	var ingested int64
+	var storedDeploy, ingested int64
 	var raw []byte
-	err := st.Pool.QueryRow(ctx, `SELECT vault, ingested_ledger, state FROM chain_meta WHERE id = 1`).Scan(&storedVault, &ingested, &raw)
+	err := st.Pool.QueryRow(ctx, `SELECT vault, deploy_ledger, ingested_ledger, state FROM chain_meta WHERE id = 1`).Scan(&storedVault, &storedDeploy, &ingested, &raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		fresh := New()
 		blob, err := encodeState(fresh)
@@ -231,6 +262,9 @@ func (st *Store) Load(ctx context.Context, vaultID string, deployLedger uint32) 
 	}
 	if storedVault != vaultID {
 		return nil, 0, ErrOtherVault
+	}
+	if storedDeploy != int64(deployLedger) {
+		return nil, 0, fmt.Errorf("%w: the database was built from ledger %d, the deployment names %d", ErrOtherVault, storedDeploy, deployLedger)
 	}
 	s, err := decodeState(raw)
 	if err != nil {
@@ -275,7 +309,45 @@ func (st *Store) Load(ctx context.Context, vaultID string, deployLedger uint32) 
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
+	if err := st.loadExits(ctx, s); err != nil {
+		return nil, 0, err
+	}
 	return s, uint32(ingested), nil
+}
+
+func (st *Store) loadExits(ctx context.Context, s *State) error {
+	rows, err := st.Pool.Query(ctx, `SELECT id, payout::text, fee::text, recipient, relayer, queued_at, ledger, tx_hash,
+		released_ledger IS NOT NULL, coalesce(unpaid_payout, 0)::text, coalesce(unpaid_fee, 0)::text
+		FROM exits WHERE released_ledger IS NULL OR (unpaid_payout IS NOT NULL AND claimed_ledger IS NULL) ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e Exit
+		var id, queuedAt, ledger int64
+		var payout, fee, unpaidPayout, unpaidFee string
+		var released bool
+		if err := rows.Scan(&id, &payout, &fee, &e.Recipient, &e.Relayer, &queuedAt, &ledger, &e.TxHash, &released, &unpaidPayout, &unpaidFee); err != nil {
+			return err
+		}
+		e.ID, e.QueuedAt, e.Ledger = uint64(id), uint64(queuedAt), uint32(ledger)
+		if released {
+			payout, fee = unpaidPayout, unpaidFee
+		}
+		var ok1, ok2 bool
+		e.Payout, ok1 = new(big.Int).SetString(payout, 10)
+		e.Fee, ok2 = new(big.Int).SetString(fee, 10)
+		if !ok1 || !ok2 {
+			return errors.New("stored exit amounts")
+		}
+		if released {
+			s.Stranded[e.ID] = &e
+		} else {
+			s.Exits[e.ID] = &e
+		}
+	}
+	return rows.Err()
 }
 
 // ErrMoved reports a commit whose window does not follow the stored cursor.
@@ -363,10 +435,49 @@ func (st *Store) Commit(ctx context.Context, from, to uint32, s *State, d Delta,
 		}
 	}
 	for _, se := range d.Settlements {
-		if _, err := tx.Exec(ctx, `INSERT INTO settlements (ledger, closed_at, tx_hash, ext_amount, fee, recipient, relayer)
-			VALUES ($1, $2, $3, $4::numeric, $5::numeric, $6, $7)`,
-			int64(se.Ledger), se.ClosedAt, se.TxHash, se.ExtAmount.String(), se.Fee.String(), se.Recipient, se.Relayer); err != nil {
+		var exitID *int64
+		if se.ExitID != nil {
+			id := int64(*se.ExitID)
+			exitID = &id
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO settlements (ledger, closed_at, tx_hash, ext_amount, fee, recipient, relayer, exit_id)
+			VALUES ($1, $2, $3, $4::numeric, $5::numeric, $6, $7, $8)`,
+			int64(se.Ledger), se.ClosedAt, se.TxHash, se.ExtAmount.String(), se.Fee.String(), se.Recipient, se.Relayer, exitID); err != nil {
 			return err
+		}
+	}
+	for _, e := range d.Queued {
+		if _, err := tx.Exec(ctx, `INSERT INTO exits (id, payout, fee, recipient, relayer, queued_at, ledger, tx_hash)
+			VALUES ($1, $2::numeric, $3::numeric, $4, $5, $6, $7, $8)`,
+			int64(e.ID), e.Payout.String(), e.Fee.String(), e.Recipient, e.Relayer, int64(e.QueuedAt), int64(e.Ledger), e.TxHash); err != nil {
+			return err
+		}
+	}
+	for _, e := range d.Released {
+		var unpaidPayout, unpaidFee *string
+		if e.UnpaidPayout.Sign() > 0 || e.UnpaidFee.Sign() > 0 {
+			p, f := e.UnpaidPayout.String(), e.UnpaidFee.String()
+			unpaidPayout, unpaidFee = &p, &f
+		}
+		tag, err := tx.Exec(ctx, `UPDATE exits SET released_ledger = $2, released_at = $3, released_tx = $4,
+			unpaid_payout = $5::numeric, unpaid_fee = $6::numeric WHERE id = $1 AND released_ledger IS NULL`,
+			int64(e.ID), int64(e.PaidLedger), e.PaidAt, e.PaidTx, unpaidPayout, unpaidFee)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return inconsistent("exit %d released twice", e.ID)
+		}
+	}
+	for _, c := range d.Claimed {
+		tag, err := tx.Exec(ctx, `UPDATE exits SET claimed_ledger = $2, claimed_at = $3, claimed_tx = $4
+			WHERE id = $1 AND unpaid_payout IS NOT NULL AND claimed_ledger IS NULL`,
+			int64(c.ID), int64(c.Ledger), c.ClosedAt, c.TxHash)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return inconsistent("stranded exit %d claimed twice", c.ID)
 		}
 	}
 	if hook != nil {
@@ -379,6 +490,6 @@ func (st *Store) Commit(ctx context.Context, from, to uint32, s *State, d Delta,
 
 // Reset deletes everything the chain state holds, for a rebuild from the deploy ledger.
 func (st *Store) Reset(ctx context.Context) error {
-	_, err := st.Pool.Exec(ctx, `TRUNCATE chain_meta, leaves, nullifiers, deposits, settlements`)
+	_, err := st.Pool.Exec(ctx, `TRUNCATE chain_meta, leaves, nullifiers, deposits, settlements, exits`)
 	return err
 }

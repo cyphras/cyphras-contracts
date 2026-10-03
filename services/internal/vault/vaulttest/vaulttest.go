@@ -148,18 +148,75 @@ func (c *Chain) Admit(ids ...uint64) {
 	}
 }
 
-// Transact emits a transact that pays -extAmount to recipient and fee to the relayer.
+// Transact emits a transact that pays -extAmount to recipient and fee to the relayer at once.
 func (c *Chain) Transact(extAmount, fee int64, recipient string) {
 	c.Tx()
 	c.nullifiers()
 	c.output(fr.SetUint64(9_000_000 + c.NextLeaf))
 	c.output(fr.SetUint64(9_000_000 + c.NextLeaf))
+	c.settled(extAmount, fee, recipient, nil)
+}
+
+func (c *Chain) settled(extAmount, fee int64, recipient string, exit *uint64) {
+	exitID := xdr.ScVal{Type: xdr.ScValTypeScvVoid}
+	if exit != nil {
+		exitID = vault.U64(*exit)
+	}
 	c.Emit("settled",
 		vault.Field{Name: "ext_amount", Value: i128(big.NewInt(extAmount))},
 		vault.Field{Name: "fee", Value: i128(big.NewInt(fee))},
 		vault.Field{Name: "recipient", Value: addr(recipient)},
 		vault.Field{Name: "relayer", Value: addr(Relayer)},
+		vault.Field{Name: "exit_id", Value: exitID},
 	)
+}
+
+// Exit is an exit the chain queued, kept so a release can pay it back.
+type Exit struct {
+	ID             uint64
+	ExtAmount, Fee int64
+	Recipient      string
+}
+
+// QueueExit emits a transact whose payment joins the exit queue as exit id.
+func (c *Chain) QueueExit(id uint64, extAmount, fee int64, recipient string) Exit {
+	c.Tx()
+	c.nullifiers()
+	c.output(fr.SetUint64(9_000_000 + c.NextLeaf))
+	c.output(fr.SetUint64(9_000_000 + c.NextLeaf))
+	c.Emit("exit_queued",
+		vault.Field{Name: "id", Value: vault.U64(id)},
+		vault.Field{Name: "ext_amount", Value: i128(big.NewInt(extAmount))},
+		vault.Field{Name: "fee", Value: i128(big.NewInt(fee))},
+		vault.Field{Name: "recipient", Value: addr(recipient)},
+		vault.Field{Name: "relayer", Value: addr(Relayer)},
+	)
+	return Exit{ID: id, ExtAmount: extAmount, Fee: fee, Recipient: recipient}
+}
+
+// Release emits a release that pays the exits in order.
+func (c *Chain) Release(exits ...Exit) {
+	c.Tx()
+	for _, e := range exits {
+		id := e.ID
+		c.settled(e.ExtAmount, e.Fee, e.Recipient, &id)
+	}
+}
+
+// Strand emits a release of one exit whose unpaid parts the asset contract refused.
+func (c *Chain) Strand(e Exit, unpaidPayout, unpaidFee int64) {
+	c.Tx().Emit("exit_stranded",
+		vault.Field{Name: "id", Value: vault.U64(e.ID)},
+		vault.Field{Name: "payout", Value: i128(big.NewInt(unpaidPayout))},
+		vault.Field{Name: "fee", Value: i128(big.NewInt(unpaidFee))},
+	)
+}
+
+// Claim emits a claim that pays the unpaid parts of a stranded exit.
+func (c *Chain) Claim(e Exit, unpaidPayout, unpaidFee int64) {
+	c.Tx()
+	id := e.ID
+	c.settled(-unpaidPayout, unpaidFee, e.Recipient, &id)
 }
 
 // Attest emits attested.
@@ -244,6 +301,9 @@ func Instance(o InstanceOptions) xdr.ScVal {
 		vault.Field{Name: "attested_up_to", Value: vault.U64(s.AttestedUpTo)},
 		vault.Field{Name: "tvl", Value: i128(or(s.Tvl))},
 		vault.Field{Name: "pending_total", Value: i128(or(s.PendingTotal))},
+		vault.Field{Name: "queued_total", Value: i128(or(s.QueuedTotal))},
+		vault.Field{Name: "exit_head", Value: vault.U64(max(s.ExitHead, 1))},
+		vault.Field{Name: "exit_tail", Value: vault.U64(max(s.ExitTail, 1))},
 		vault.Field{Name: "outflow_day", Value: vault.U64(s.OutflowDay)},
 		vault.Field{Name: "outflow", Value: i128(or(s.Outflow))},
 	)

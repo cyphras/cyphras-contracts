@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"math"
 	"math/big"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -48,8 +49,21 @@ type Status struct {
 	AttestedUpTo    uint64
 	Tvl             *big.Int
 	PendingTotal    *big.Int
-	OutflowDay      uint64
-	Outflow         *big.Int
+	QueuedTotal     *big.Int
+	// ExitHead is the oldest queued exit and ExitTail the ID the next one takes; the exit queue
+	// is empty when they are equal.
+	ExitHead   uint64
+	ExitTail   uint64
+	OutflowDay uint64
+	Outflow    *big.Int
+}
+
+// OutflowOn is what the window of the given day has paid so far.
+func (s Status) OutflowOn(day uint64) *big.Int {
+	if s.OutflowDay == day {
+		return new(big.Int).Set(s.Outflow)
+	}
+	return new(big.Int)
 }
 
 // Halted reports whether the vault is halted at the given ledger time.
@@ -77,7 +91,11 @@ type PendingDeposit struct {
 // EligibleAt is the earliest time admit accepts the deposit, which waits for the longer of the
 // delay at shield time and the delay the current configuration gives its amount.
 func (d PendingDeposit) EligibleAt(cfg Config, limits Limits) uint64 {
-	return d.CreatedAt + max(d.Delay, DelayFor(d.Amount, cfg, limits))
+	delay := max(d.Delay, DelayFor(d.Amount, cfg, limits))
+	if d.CreatedAt > math.MaxUint64-delay {
+		return math.MaxUint64
+	}
+	return d.CreatedAt + delay
 }
 
 // DelayFor is the delay the configuration gives a deposit of this amount.
@@ -103,7 +121,8 @@ var (
 	configFields  = []string{"token", "domain", "guardian", "asp", "delay_small", "delay_large"}
 	limitsFields  = []string{"min_deposit", "max_deposit", "max_daily_per_depositor", "tvl_cap", "max_daily_outflow", "max_fee", "large_deposit_threshold"}
 	queuedFields  = []string{"limits", "ready_at"}
-	statusFields  = []string{"deposits_paused", "transfers_paused", "halted_until", "next_halt_at", "next_deposit_id", "attested_up_to", "tvl", "pending_total", "outflow_day", "outflow"}
+	statusFields  = []string{"deposits_paused", "transfers_paused", "halted_until", "next_halt_at", "next_deposit_id", "attested_up_to", "tvl", "pending_total", "queued_total", "exit_head", "exit_tail", "outflow_day", "outflow"}
+	exitFields    = []string{"recipient", "payout", "relayer", "fee", "queued_at"}
 	pendingFields = []string{"depositor", "amount", "commitment0", "commitment1", "encrypted_output0", "encrypted_output1", "created_at", "delay", "flag", "flagged_at"}
 	ringFields    = []string{"roots", "newest"}
 )
@@ -231,10 +250,39 @@ func DecodeStatus(v xdr.ScVal) (Status, error) {
 		AttestedUpTo:    d.u64("attested_up_to"),
 		Tvl:             d.i128("tvl"),
 		PendingTotal:    d.i128("pending_total"),
+		QueuedTotal:     d.i128("queued_total"),
+		ExitHead:        d.u64("exit_head"),
+		ExitTail:        d.u64("exit_tail"),
 		OutflowDay:      d.u64("outflow_day"),
 		Outflow:         d.i128("outflow"),
 	}
 	return s, d.err
+}
+
+// Exit is a payment the vault owes: one waiting in the exit queue, or the unpaid parts of a
+// stranded one.
+type Exit struct {
+	Recipient string
+	Payout    *big.Int
+	Relayer   string
+	Fee       *big.Int
+	QueuedAt  uint64
+}
+
+// DecodeExit decodes an Exit(id) or Stranded(id) entry.
+func DecodeExit(v xdr.ScVal) (Exit, error) {
+	d := newDecoder(v, exitFields)
+	if d.err != nil {
+		return Exit{}, d.err
+	}
+	e := Exit{
+		Recipient: d.address("recipient"),
+		Payout:    d.i128("payout"),
+		Relayer:   d.address("relayer"),
+		Fee:       d.i128("fee"),
+		QueuedAt:  d.u64("queued_at"),
+	}
+	return e, d.err
 }
 
 // DecodePendingDeposit decodes a Pending(id) entry.
