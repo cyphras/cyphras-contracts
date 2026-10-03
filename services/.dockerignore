@@ -1,0 +1,4 @@
+deploy
+**/*_test.go
+**/testdata
+*.env

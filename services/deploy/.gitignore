@@ -1,0 +1,7 @@
+# What the host holds besides this directory: settings, secrets, data and hand-kept lists.
+env/*.env
+secrets/
+data/
+hot-accounts/
+lists/
+backups/

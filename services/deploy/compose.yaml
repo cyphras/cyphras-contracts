@@ -1,0 +1,201 @@
+# The services of one vault on one network, as the VPS runs them behind nginx:
+#
+#   NETWORK=testnet ASSET=xlm INDEXER_PORT=18080 RELAYER_PORT=18081 SCREENING_PORT=18090 \
+#   INDEXER_IMAGE=ghcr.io/cyphras/cyphras-contracts/indexer@sha256:... \
+#   RELAYER_IMAGE=... KEEPER_IMAGE=... SCREENING_IMAGE=... WATCHER_IMAGE=... \
+#   docker compose -p cyphras-testnet-xlm -f compose.yaml up -d
+#
+# The image references come from deployments/<network>.json and always carry a digest. Each
+# service runs as its own user with a read-only root filesystem and no capabilities, publishes its
+# public port on loopback only, for nginx, and reaches only its own database. Settings that are
+# not secret are in env/<service>.env; secrets are files in secrets/<network>/<asset>/, each mode
+# 0400 and owned by the uid of the one service that mounts it (10001 to 10005 below, 999 for the
+# databases). Testnet and mainnet run as separate projects and share nothing. Logs rotate by size;
+# the host's log shipping, if any, keeps 7 days, and 30 for the watcher.
+
+x-service: &service
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  pids_limit: 256
+  mem_limit: 512m
+  logging:
+    driver: json-file
+    options: {max-size: "20m", max-file: "7"}
+
+x-database: &database
+  image: postgres:17.11-bookworm@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652
+  restart: unless-stopped
+  cap_drop: [ALL]
+  cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+  security_opt: ["no-new-privileges:true"]
+  shm_size: 128m
+  mem_limit: 1g
+  logging:
+    driver: json-file
+    options: {max-size: "20m", max-file: "7"}
+
+services:
+  indexer:
+    <<: *service
+    image: ${INDEXER_IMAGE:?set INDEXER_IMAGE to the released image with its digest}
+    user: "10001:10001"
+    env_file: env/indexer.env
+    environment:
+      DEPLOYMENT_FILE: /etc/cyphras/deployment.json
+      DATABASE_URL_FILE: /run/secrets/indexer_database_url
+      ALERT_WEBHOOKS_FILE: /run/secrets/indexer_alert_webhooks
+      ARCHIVE_DIR: /var/lib/cyphras/archive
+      LISTEN_ADDR: 0.0.0.0:8080
+    volumes:
+      - ../../deployments/${NETWORK:?}.json:/etc/cyphras/deployment.json:ro
+      # The event archive is copied off the host daily by backup.sh.
+      - ./data/${NETWORK}/${ASSET:?}/archive:/var/lib/cyphras/archive
+    secrets: [indexer_database_url, indexer_alert_webhooks]
+    ports: ["127.0.0.1:${INDEXER_PORT:?}:8080"]
+    networks: [egress, indexer_db, services]
+    depends_on: [indexer_db]
+
+  relayer:
+    <<: *service
+    image: ${RELAYER_IMAGE:?set RELAYER_IMAGE to the released image with its digest}
+    user: "10002:10002"
+    env_file: env/relayer.env
+    environment:
+      DEPLOYMENT_FILE: /etc/cyphras/deployment.json
+      DATABASE_URL_FILE: /run/secrets/relayer_database_url
+      ALERT_WEBHOOKS_FILE: /run/secrets/relayer_alert_webhooks
+      CHANNEL_KEYS_FILE: /run/secrets/relayer_channel_keys
+      SCREEN_TOKEN_FILE: /run/secrets/relayer_screen_token
+      SCREENING_URL: http://screening:8091/internal/v1/screen
+      LISTEN_ADDR: 0.0.0.0:8081
+    volumes:
+      - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
+    secrets: [relayer_database_url, relayer_alert_webhooks, relayer_channel_keys, relayer_screen_token]
+    ports: ["127.0.0.1:${RELAYER_PORT:?}:8081"]
+    networks: [egress, relayer_db, services]
+    depends_on: [relayer_db, screening]
+
+  keeper:
+    <<: *service
+    image: ${KEEPER_IMAGE:?set KEEPER_IMAGE to the released image with its digest}
+    user: "10003:10003"
+    env_file: env/keeper.env
+    environment:
+      DEPLOYMENT_FILE: /etc/cyphras/deployment.json
+      DATABASE_URL_FILE: /run/secrets/keeper_database_url
+      ALERT_WEBHOOKS_FILE: /run/secrets/keeper_alert_webhooks
+      KEEPER_KEY_FILE: /run/secrets/keeper_key
+    volumes:
+      - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
+    secrets: [keeper_database_url, keeper_alert_webhooks, keeper_key]
+    networks: [egress, keeper_db]
+    depends_on: [keeper_db]
+
+  screening:
+    <<: *service
+    image: ${SCREENING_IMAGE:?set SCREENING_IMAGE to the released image with its digest}
+    user: "10004:10004"
+    env_file: env/screening.env
+    environment:
+      DEPLOYMENT_FILE: /etc/cyphras/deployment.json
+      DATABASE_URL_FILE: /run/secrets/screening_database_url
+      ALERT_WEBHOOKS_FILE: /run/secrets/screening_alert_webhooks
+      ASP_KEY_FILE: /run/secrets/screening_asp_key
+      LISTEN_ADDR: 0.0.0.0:8090
+      # The internal endpoint is reachable from the relayer only, never through nginx.
+      INTERNAL_ADDR: 0.0.0.0:8091
+    volumes:
+      - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
+      - ./lists:/etc/cyphras/lists:ro
+    secrets: [screening_database_url, screening_alert_webhooks, screening_asp_key]
+    ports: ["127.0.0.1:${SCREENING_PORT:?}:8090"]
+    networks: [egress, screening_db, services]
+    depends_on: [screening_db]
+
+  watcher:
+    <<: *service
+    image: ${WATCHER_IMAGE:?set WATCHER_IMAGE to the released image with its digest}
+    user: "10005:10005"
+    env_file: env/watcher.env
+    environment:
+      DEPLOYMENT_FILE: /etc/cyphras/deployment.json
+      DATABASE_URL_FILE: /run/secrets/watcher_database_url
+      ALERT_WEBHOOKS_FILE: /run/secrets/watcher_alert_webhooks
+      PUBLIC_WEBHOOKS_FILE: /run/secrets/watcher_public_webhooks
+      INDEXER_URL: http://indexer:8080
+      HEALTH_URLS: http://indexer:8080/v1/health,http://relayer:8081/v1/health,http://screening:8090/v1/health
+      HOT_ACCOUNTS_FILE: /etc/cyphras/hot-accounts
+    volumes:
+      - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
+      - ./hot-accounts/${NETWORK}-${ASSET}:/etc/cyphras/hot-accounts:ro
+    secrets: [watcher_database_url, watcher_alert_webhooks, watcher_public_webhooks]
+    networks: [egress, watcher_db, services]
+    depends_on: [watcher_db]
+
+  indexer_db:
+    <<: *database
+    environment: {POSTGRES_USER: indexer, POSTGRES_DB: indexer, POSTGRES_PASSWORD_FILE: /run/secrets/indexer_db_password}
+    volumes: ["./data/${NETWORK}/${ASSET}/indexer_db:/var/lib/postgresql/data"]
+    secrets: [indexer_db_password]
+    networks: [indexer_db]
+
+  relayer_db:
+    <<: *database
+    environment: {POSTGRES_USER: relayer, POSTGRES_DB: relayer, POSTGRES_PASSWORD_FILE: /run/secrets/relayer_db_password}
+    volumes: ["./data/${NETWORK}/${ASSET}/relayer_db:/var/lib/postgresql/data"]
+    secrets: [relayer_db_password]
+    networks: [relayer_db]
+
+  keeper_db:
+    <<: *database
+    environment: {POSTGRES_USER: keeper, POSTGRES_DB: keeper, POSTGRES_PASSWORD_FILE: /run/secrets/keeper_db_password}
+    volumes: ["./data/${NETWORK}/${ASSET}/keeper_db:/var/lib/postgresql/data"]
+    secrets: [keeper_db_password]
+    networks: [keeper_db]
+
+  screening_db:
+    <<: *database
+    environment: {POSTGRES_USER: screening, POSTGRES_DB: screening, POSTGRES_PASSWORD_FILE: /run/secrets/screening_db_password}
+    volumes: ["./data/${NETWORK}/${ASSET}/screening_db:/var/lib/postgresql/data"]
+    secrets: [screening_db_password]
+    networks: [screening_db]
+
+  watcher_db:
+    <<: *database
+    environment: {POSTGRES_USER: watcher, POSTGRES_DB: watcher, POSTGRES_PASSWORD_FILE: /run/secrets/watcher_db_password}
+    volumes: ["./data/${NETWORK}/${ASSET}/watcher_db:/var/lib/postgresql/data"]
+    secrets: [watcher_db_password]
+    networks: [watcher_db]
+
+networks:
+  egress: {}
+  services: {internal: true}
+  indexer_db: {internal: true}
+  relayer_db: {internal: true}
+  keeper_db: {internal: true}
+  screening_db: {internal: true}
+  watcher_db: {internal: true}
+
+secrets:
+  indexer_database_url: {file: "./secrets/${NETWORK}/${ASSET}/indexer_database_url"}
+  indexer_alert_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/indexer_alert_webhooks"}
+  indexer_db_password: {file: "./secrets/${NETWORK}/${ASSET}/indexer_db_password"}
+  relayer_database_url: {file: "./secrets/${NETWORK}/${ASSET}/relayer_database_url"}
+  relayer_alert_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/relayer_alert_webhooks"}
+  relayer_channel_keys: {file: "./secrets/${NETWORK}/${ASSET}/relayer_channel_keys"}
+  relayer_screen_token: {file: "./secrets/${NETWORK}/${ASSET}/relayer_screen_token"}
+  relayer_db_password: {file: "./secrets/${NETWORK}/${ASSET}/relayer_db_password"}
+  keeper_database_url: {file: "./secrets/${NETWORK}/${ASSET}/keeper_database_url"}
+  keeper_alert_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/keeper_alert_webhooks"}
+  keeper_key: {file: "./secrets/${NETWORK}/${ASSET}/keeper_key"}
+  keeper_db_password: {file: "./secrets/${NETWORK}/${ASSET}/keeper_db_password"}
+  screening_database_url: {file: "./secrets/${NETWORK}/${ASSET}/screening_database_url"}
+  screening_alert_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/screening_alert_webhooks"}
+  screening_asp_key: {file: "./secrets/${NETWORK}/${ASSET}/screening_asp_key"}
+  screening_db_password: {file: "./secrets/${NETWORK}/${ASSET}/screening_db_password"}
+  watcher_database_url: {file: "./secrets/${NETWORK}/${ASSET}/watcher_database_url"}
+  watcher_alert_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/watcher_alert_webhooks"}
+  watcher_public_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/watcher_public_webhooks"}
+  watcher_db_password: {file: "./secrets/${NETWORK}/${ASSET}/watcher_db_password"}

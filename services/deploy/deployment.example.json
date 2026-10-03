@@ -1,0 +1,29 @@
+{
+  "network": "testnet",
+  "network_passphrase": "Test SDF Network ; September 2015",
+  "vaults": [
+    {
+      "asset": "xlm",
+      "vault": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+      "token": "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526",
+      "deploy_ledger": 1,
+      "fee_tier": "100000",
+      "urls": {
+        "indexer": "https://private.cyphras.com/testnet/xlm/indexer",
+        "relayer": "https://private.cyphras.com/testnet/xlm/relayer",
+        "screening": "https://private.cyphras.com/testnet/screening"
+      }
+    }
+  ],
+  "services": {
+    "tag": "services-v0.0.0",
+    "commit": "0000000000000000000000000000000000000000",
+    "images": {
+      "indexer": "ghcr.io/cyphras/cyphras-contracts/indexer@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "relayer": "ghcr.io/cyphras/cyphras-contracts/relayer@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "keeper": "ghcr.io/cyphras/cyphras-contracts/keeper@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "screening": "ghcr.io/cyphras/cyphras-contracts/screening@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "watcher": "ghcr.io/cyphras/cyphras-contracts/watcher@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}
