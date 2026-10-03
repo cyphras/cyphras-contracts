@@ -1,0 +1,209 @@
+import { createHash, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { parseArgs } from "node:util";
+import * as snarkjs from "snarkjs";
+import {
+  PTAU_BLAKE2B,
+  PTAU_NAME,
+  R1CS_SHA256,
+  checkName,
+  digest,
+  expectHash,
+  mem,
+  newContribution,
+  parseHex,
+  quiet,
+  readZkey,
+  refuseExisting,
+  run,
+  show,
+  step,
+  writeNew,
+} from "./common.mjs";
+
+const USAGE = `Adds your contribution to the Cyphras v2 phase-2 trusted-setup ceremony.
+
+Usage:
+  node contribute.mjs <input.zkey> <output.zkey> "<Name (github: handle)>" --expect <sha256>
+      [--r1cs transaction.r1cs --ptau ${PTAU_NAME}] [--extra-entropy]
+
+  --expect <sha256>  the SHA-256 the coordinator announced for <input.zkey>; nothing is
+                     contributed unless the file matches it
+  --r1cs, --ptau     first verify the whole chain in <input.zkey> against the frozen circuit and
+                     the Hermez powers of tau (recommended, takes about a minute)
+  --extra-entropy    also mix in one line you type, which is not shown and ends at Enter
+                     (anything typed after it is dropped), or everything piped to stdin, on
+                     top of 64 bytes from the operating system's random generator
+
+The secret randomness exists only in the memory of this process. It is never printed, passed on a
+command line or written to disk, and it is gone once the process exits. The name is stored in the
+zkey and published forever: use a public handle, never an email address.`;
+
+run(USAGE, async (argv) => {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      expect: { type: "string" },
+      r1cs: { type: "string" },
+      ptau: { type: "string" },
+      "extra-entropy": { type: "boolean" },
+    },
+  });
+  if (positionals.length !== 3) {
+    throw new Error("expected <input.zkey> <output.zkey> <name>; run with --help");
+  }
+  const [input, output, name] = positionals;
+  checkName(name);
+  if (values.expect === undefined) {
+    throw new Error("--expect is required: the SHA-256 the coordinator announced for the input");
+  }
+  const expected = parseHex(values.expect, 32, "--expect");
+  if (!values.r1cs !== !values.ptau) throw new Error("give both --r1cs and --ptau, or neither");
+  refuseExisting(output);
+
+  console.log(`Contributor: ${name}\nInput:       ${input}\nOutput:      ${output}\n`);
+  const inputData = readFileSync(input);
+  const inputSha256 = digest(inputData);
+  if (inputSha256 !== expected) {
+    throw new Error(
+      `${input} has sha256 ${inputSha256}, not the announced ${expected}. ` +
+        "Do not contribute: download the file again and check with the coordinator.",
+    );
+  }
+  console.log(`Input sha256 ${inputSha256} matches the announced value.`);
+
+  if (values.r1cs) {
+    const r1cs = readFileSync(values.r1cs);
+    const ptau = readFileSync(values.ptau);
+    expectHash(r1cs, "sha256", R1CS_SHA256, `${values.r1cs} is not the frozen v2 r1cs`);
+    expectHash(ptau, "blake2b512", PTAU_BLAKE2B, `${values.ptau} is not the ${PTAU_NAME}`);
+    await step(
+      "Verifying the input against the r1cs and the ptau (snarkjs zkey verify)",
+      async () => {
+        if (!(await snarkjs.zKey.verifyFromR1cs(mem(r1cs), mem(ptau), mem(inputData), quiet))) {
+          throw new Error(`snarkjs zkey verify rejects ${input}. Do not contribute.`);
+        }
+      },
+    );
+  } else {
+    console.log("Skipping the chain check; pass --r1cs and --ptau to verify the input first.");
+  }
+
+  const before = readZkey(inputData, input);
+  if (before.contributions.some((c) => c.type !== 0)) {
+    throw new Error(`${input} already holds the final beacon`);
+  }
+  console.log(`\nContributions so far (compare them with the published attestations):`);
+  before.contributions.forEach((c, i) =>
+    console.log(`  #${i + 1} ${show(c.name)}\n     ${c.hash}`),
+  );
+  if (before.contributions.length === 0) console.log("  none, you are the first");
+
+  const extra = values["extra-entropy"] ? await readExtraEntropy() : Buffer.alloc(0);
+  console.log("");
+  const { hash, data } = await step("Contributing", () => contribute(inputData, name, extra));
+  const c = newContribution(before, readZkey(data, output));
+  if (c.type !== 0 || c.name !== name || c.hash !== hash) {
+    throw new Error("the new zkey does not hold the contribution just made");
+  }
+  writeNew(output, data);
+  const outputSha256 = digest(data);
+
+  console.log(`
+Contribution complete. Publish this attestation from your own account, signed:
+
+  I contributed to the Cyphras v2 trusted-setup ceremony.
+  Name: ${name}
+  Contribution hash (blake2b-512): ${hash}
+  Input zkey sha256: ${inputSha256}
+  Output zkey sha256: ${outputSha256}
+  Machine: <the machine you used, and whether it was offline>
+  Entropy: <how you destroyed it, for example: process exited, machine powered off>
+
+Next:
+  1. Save this attestation and ${output}, then power off this machine. The secret was
+     never written to disk, and powering off clears it from memory.
+  2. As soon as you can, post the attestation, signed, from your own account in the public
+     ceremony thread: it is what ties this contribution to you.
+  3. Send ${output} straight to the coordinator, not through anyone else.
+  4. Once the coordinator confirms receipt, delete ${input} and ${output}.
+`);
+});
+
+async function contribute(input, name, extra) {
+  const os = randomBytes(64);
+  const entropy = createHash("blake2b512").update(os).update(extra).digest();
+  os.fill(0);
+  extra.fill(0);
+  const out = { type: "mem" };
+  try {
+    // snarkjs UTF-8 encodes the entropy it is given, so hex keeps every bit. It hashes it with 64
+    // more bytes from the OS generator to seed the contribution's secret.
+    const hash = await snarkjs.zKey.contribute(
+      mem(input),
+      out,
+      name,
+      entropy.toString("hex"),
+      quiet,
+    );
+    return { hash: Buffer.from(hash).toString("hex"), data: Buffer.from(out.data) };
+  } finally {
+    entropy.fill(0);
+  }
+}
+
+// Typed text is never echoed and piped input is read whole; either one only adds to the OS
+// entropy, so even a guessable text cannot weaken the contribution.
+async function readExtraEntropy() {
+  const { stdin, stderr } = process;
+  if (!stdin.isTTY) {
+    const chunks = [];
+    for await (const chunk of stdin) chunks.push(chunk);
+    const all = Buffer.concat(chunks);
+    for (const chunk of chunks) chunk.fill(0);
+    return all;
+  }
+  stderr.write(
+    "Type one line of random text and press Enter; nothing is shown and only this line is read: ",
+  );
+  return new Promise((resolve, reject) => {
+    const typed = [];
+    // Input after Enter, such as the rest of a pasted text, is read and dropped for a moment
+    // while the terminal still hides it; otherwise it would appear once echo is back on.
+    const drop = (chunk) => chunk.fill(0);
+    const done = (error) => {
+      stdin.off("data", onData);
+      stdin.on("data", drop);
+      setTimeout(() => {
+        stdin.off("data", drop);
+        stdin.setRawMode(false);
+        stdin.pause();
+      }, 500);
+      stderr.write("\n");
+      const out = Buffer.from(typed);
+      typed.fill(0);
+      if (error) {
+        out.fill(0);
+        reject(error);
+      } else {
+        resolve(out);
+      }
+    };
+    const onData = (chunk) => {
+      try {
+        for (const byte of chunk) {
+          if (byte === 3) return done(new Error("cancelled"));
+          if (byte === 4 || byte === 10 || byte === 13) return done();
+          if (byte === 8 || byte === 127) typed.pop();
+          else typed.push(byte);
+        }
+      } finally {
+        chunk.fill(0);
+      }
+    };
+    stdin.setRawMode(true);
+    stdin.resume();
+    stdin.on("data", onData);
+  });
+}

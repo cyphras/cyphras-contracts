@@ -15,8 +15,8 @@
     "vectors": "node scripts/gen-vectors.mjs",
     "fixtures:contracts": "node scripts/contract-fixtures.mjs",
     "test": "mocha \"test/**/*.test.mjs\"",
-    "format": "prettier --write \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\"",
-    "format:check": "prettier --check \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\""
+    "format": "prettier --write \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\" \"ceremony/v2/*.mjs\"",
+    "format:check": "prettier --check \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\" \"ceremony/v2/*.mjs\""
   },
   "dependencies": {
     "circomlib": "2.0.5"

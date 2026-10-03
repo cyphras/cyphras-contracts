@@ -1,0 +1,14 @@
+{
+  "name": "@cyphras/ceremony-v2",
+  "private": true,
+  "type": "module",
+  "description": "Cyphras v2 phase-2 Groth16 trusted-setup ceremony kit",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@noble/curves": "2.4.0",
+    "snarkjs": "0.7.6"
+  }
+}
