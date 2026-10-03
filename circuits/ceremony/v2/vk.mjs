@@ -45,12 +45,18 @@ function g2(p) {
 // The rules the vault build applies before it compiles a key in (check.rs in the verifier), so a
 // bad ceremony output fails here before anyone pins it.
 export function checkVerificationKey(bytes) {
-  const vk = JSON.parse(bytes);
+  // JSON.parse reads 8.0 as 8, while the vault build accepts only an integer, so the source text
+  // of the top-level nPublic is kept and compared too.
+  const sources = new WeakMap();
+  const vk = JSON.parse(bytes, function (key, value, context) {
+    if (key === "nPublic") sources.set(this, context.source);
+    return value;
+  });
   if (vk.protocol !== "groth16" || vk.curve !== "bn128") {
     throw new Error("the key must be Groth16 over BN254");
   }
-  if (vk.nPublic !== PUBLIC_INPUTS) {
-    throw new Error(`the key must have ${PUBLIC_INPUTS} public inputs`);
+  if (vk.nPublic !== PUBLIC_INPUTS || sources.get(vk) !== String(PUBLIC_INPUTS)) {
+    throw new Error(`the key must have ${PUBLIC_INPUTS} public inputs, as an integer`);
   }
   if (!Array.isArray(vk.IC) || vk.IC.length !== PUBLIC_INPUTS + 1) {
     throw new Error(`the key must have ${PUBLIC_INPUTS + 1} IC points`);
