@@ -370,3 +370,58 @@ func TestAnAttestationIsJudgedForEveryDepositItCovers(t *testing.T) {
 		}
 	}
 }
+
+func TestAStalledPrimaryStopsTheHeartbeat(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.activity()
+	h.sync()
+	h.second.Fail["getLedgerEntries"] = errors.New("down")
+	h.second.Fail["getHealth"] = errors.New("down")
+	beats := 0
+	h.w.SetHeartbeat(func(context.Context) error { beats++; return nil })
+	if err := h.w.reconcileAndBeat(ctx); err != nil || beats != 1 {
+		t.Fatalf("a fresh primary: %d beats, %v", beats, err)
+	}
+	// The primary stops at its last ledger while time goes on.
+	h.chain.NextLedger(3 * 60)
+	for range 5 {
+		if err := h.w.reconcileAndBeat(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	critical := false
+	for _, a := range h.pages.alerts {
+		critical = critical || (a.Code == "rpc_stale" && a.Severity == alert.Critical)
+	}
+	if beats != 1 || !critical {
+		t.Fatalf("a stalled primary: %d beats, pages %v", beats, h.pages.codes())
+	}
+}
+
+// refusing refuses every alert, as a webhook that is down does.
+type refusing struct{}
+
+func (refusing) Send(context.Context, alert.Alert) error { return errors.New("webhook down") }
+
+func TestAnAlertChannelThatRefusesEverythingStopsTheHeartbeat(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.activity()
+	h.sync()
+	q := &alert.Queue{Name: "operator", Channels: []alert.Channel{refusing{}}, Now: h.w.now}
+	h.w.alerts.Queue = q
+	beats := 0
+	h.w.SetHeartbeat(func(context.Context) error { beats++; return nil })
+	h.w.alerts.Raise(ctx, alert.Critical, "balance_below_tvl", "test")
+	q.Flush(ctx)
+	if err := h.w.reconcileAndBeat(ctx); err != nil || beats != 1 {
+		t.Fatalf("a channel failing for a moment: %d beats, %v", beats, err)
+	}
+	h.chain.NextLedger(11 * 60)
+	h.sync()
+	q.Flush(ctx)
+	if err := h.w.reconcileAndBeat(ctx); err != nil || beats != 1 {
+		t.Fatalf("a channel failing for 11 minutes: %d beats, %v", beats, err)
+	}
+}

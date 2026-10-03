@@ -91,6 +91,7 @@ func (w *Watcher) Reconcile(ctx context.Context) error {
 	w.mu.Lock()
 	w.inst = &inst
 	w.latest = max(w.latest, latest)
+	w.closedAt = health.LatestLedgerCloseTime
 	cursor := w.cursor
 	w.reads = append(w.reads, statusRead{inst: inst, from: instEntry.LastModified, to: latest, now: now})
 	if len(w.reads) > 16 {

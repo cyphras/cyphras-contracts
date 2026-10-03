@@ -95,6 +95,8 @@ type Watcher struct {
 	state  *chainstate.State
 	cursor uint32
 	latest uint32
+	// closedAt is when the newest ledger the primary RPC knows closed.
+	closedAt int64
 	// roots holds the tree's recent roots by leaf count, as the vault's root ring does.
 	roots     map[uint64]fr.Element
 	rootOrder []uint64
@@ -687,14 +689,35 @@ func amountsText(m map[string]*big.Int) string {
 
 var _ follow.Sink = (*Watcher)(nil)
 
-// reconcileAndBeat reconciles, and pings the heartbeat when that succeeded with ingest healthy.
+const (
+	// staleAfter is how long ago the primary RPC's newest ledger may have closed: ledgers close
+	// every few seconds, so an older one means the watcher sees nothing new.
+	staleAfter = 2 * time.Minute
+	// stalledAfter is how long an alert channel may refuse every send before the heartbeat stops.
+	stalledAfter = 10 * time.Minute
+)
+
+// reconcileAndBeat reconciles, and pings the heartbeat when that succeeded with ingest healthy,
+// the primary RPC serving new ledgers, and every alert channel taking alerts, so a monitor
+// elsewhere notices a watcher that is blind or cannot be heard.
 func (w *Watcher) reconcileAndBeat(ctx context.Context) error {
 	if err := w.Reconcile(ctx); err != nil {
 		return err
 	}
+	now := w.now()
 	w.mu.RLock()
 	healthy := !w.faulted && w.cursor+60 >= w.latest
+	age := now.Sub(time.Unix(w.closedAt, 0))
 	w.mu.RUnlock()
+	if age > staleAfter {
+		w.alerts.Raise(ctx, alert.Critical, "rpc_stale", "the primary RPC's newest ledger closed %s ago, so the watcher sees nothing newer", age.Round(time.Second))
+		return nil
+	}
+	w.alerts.Clear(ctx, "rpc_stale", "the primary RPC serves new ledgers again")
+	if q := w.alerts.Queue; q != nil && q.Stalled(now, stalledAfter) {
+		w.log.Warn("heartbeat withheld: an alert channel refuses every send")
+		return nil
+	}
 	if w.beat == nil || !healthy {
 		return nil
 	}
