@@ -128,13 +128,16 @@ func ParseWebhooks(data []byte) ([]Channel, error) {
 }
 
 // Alerter raises alerts on every channel, at most once per code within the cooldown, and reports
-// when an open alert clears.
+// when an open alert clears. Every alert is logged, a repeat within the cooldown too. With a
+// Queue, delivery runs in the background and Raise returns at once; without one, Raise waits for
+// the channels.
 type Alerter struct {
 	Service  string
 	Channels []Channel
 	Log      *slog.Logger
 	Cooldown time.Duration
 	Now      func() time.Time
+	Queue    *Queue
 
 	mu   sync.Mutex
 	last map[string]time.Time
@@ -158,6 +161,9 @@ func (a *Alerter) Raise(ctx context.Context, sev Severity, code, format string, 
 	a.open[code] = true
 	if t, ok := a.last[code]; ok && now.Sub(t) < a.Cooldown {
 		a.mu.Unlock()
+		if a.Log != nil {
+			a.Log.Log(ctx, level(sev), "alert repeated", "code", code, "severity", sev, "message", fmt.Sprintf(format, args...))
+		}
 		return
 	}
 	a.last[code] = now
@@ -197,6 +203,10 @@ func (a *Alerter) Open(code string) bool {
 func (a *Alerter) deliver(ctx context.Context, al Alert) {
 	if a.Log != nil {
 		a.Log.Log(ctx, level(al.Severity), "alert", "code", al.Code, "severity", al.Severity, "message", al.Message)
+	}
+	if a.Queue != nil {
+		a.Queue.Put(al)
+		return
 	}
 	var wg sync.WaitGroup
 	for _, ch := range a.Channels {

@@ -83,6 +83,9 @@ func build(ctx context.Context, base *service.Base) (*screening.Screener, error)
 	if err != nil {
 		return nil, err
 	}
+	if err := base.StartAlerts(ctx, pool); err != nil {
+		return nil, err
+	}
 	hot, err := config.Key("ASP_KEY")
 	if err != nil {
 		return nil, err

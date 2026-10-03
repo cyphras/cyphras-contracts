@@ -71,6 +71,13 @@ func main() {
 		service.Fatal(log, "database", err)
 	}
 	defer pool.Close()
+	// A webhook that fails must never lose a page, so both queues keep what waits in the database.
+	if err := base.StartAlerts(ctx, pool); err != nil {
+		service.Fatal(log, "alerts", err)
+	}
+	if err := service.StartQueue(ctx, public, "public", pool, log); err != nil {
+		service.Fatal(log, "alerts", err)
+	}
 	w, err := watcher.New(ctx, cfg, base.RPC, second, &chainstate.Store{Pool: pool}, hz, base.Alerts, public, log)
 	if err != nil {
 		service.Fatal(log, "load", err)

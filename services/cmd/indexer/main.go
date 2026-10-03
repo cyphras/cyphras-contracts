@@ -30,6 +30,9 @@ func main() {
 		service.Fatal(log, "database", err)
 	}
 	defer pool.Close()
+	if err := base.StartAlerts(ctx, pool); err != nil {
+		service.Fatal(log, "alerts", err)
+	}
 	chain := &chainstate.Store{Pool: pool, KeepLeaves: true}
 
 	if service.Command("serve") == "rebuild" {

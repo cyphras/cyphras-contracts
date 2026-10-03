@@ -37,6 +37,9 @@ func main() {
 		service.Fatal(log, "database", err)
 	}
 	defer pool.Close()
+	if err := base.StartAlerts(ctx, pool); err != nil {
+		service.Fatal(log, "alerts", err)
+	}
 	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase)
 	if err != nil {
 		service.Fatal(log, "config", err)

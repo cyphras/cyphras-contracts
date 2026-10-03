@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
@@ -59,6 +61,26 @@ func Alerter(name string, log *slog.Logger) (*alert.Alerter, error) {
 	}
 	a.Channels = channels
 	return a, nil
+}
+
+// StartAlerts moves the delivery of the service's alerts into the background, through an outbox
+// in its own database: no alert waits on a webhook, and none is lost when one fails or the
+// service restarts.
+func (b *Base) StartAlerts(ctx context.Context, pool *pgxpool.Pool) error {
+	return StartQueue(ctx, b.Alerts, "operator", pool, b.Log)
+}
+
+// StartQueue gives an alerter a queue named name, kept in the pool's database, and runs it until
+// ctx ends.
+func StartQueue(ctx context.Context, a *alert.Alerter, name string, pool *pgxpool.Pool, log *slog.Logger) error {
+	store := &alert.Store{Pool: pool}
+	if err := store.Init(ctx); err != nil {
+		return err
+	}
+	q := &alert.Queue{Name: name, Channels: a.Channels, Store: store, Log: log}
+	a.Queue = q
+	go q.Run(ctx)
+	return nil
 }
 
 // Start loads the deployment and the vault named by VAULT, connects to RPC_URL (or the file named
