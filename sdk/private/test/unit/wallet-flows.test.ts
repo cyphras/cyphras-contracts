@@ -428,6 +428,29 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 2);
   });
 
+  it("leaves a forgotten held payment alone once its deadline cannot cover a new window at the pace of ledgers", async () => {
+    const world = await createWorld();
+    world.rpc.secondsPerLedger = 4;
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    const deadline = world.relayer.submissions[0]?.ext.deadline as number;
+    world.relayer.restart();
+    // 140 ledgers before the deadline and its margin: at four seconds a ledger, too few for the
+    // relayer's 10-minute window, though five-second ledgers would leave room.
+    world.advance(5 * (deadline - world.vault.ledger - 160));
+    const submits = () => world.requests.filter((r) => r === `${RELAYER}/v1/submit`).length;
+    const before = submits();
+    await alice.sync();
+    assert.equal(submits(), before);
+    assert.equal((await alice.plans())[0]?.state, "submitted");
+  });
+
   it("never pays twice when a held payment is sent again, its ID forgotten and then retried", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
@@ -545,6 +568,27 @@ describe("wallet: spends", () => {
     assert.match(plan?.txHash ?? "", /^[0-9a-f]{64}$/);
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "settled");
+  });
+
+  it("never sends again a held payment the relayer lost once asked to cancel it", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    const sub = await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      notBefore,
+    });
+    // A relayer that restarted no longer knows the request, so it cannot confirm the cancel.
+    world.relayer.restart();
+    assert.equal(await alice.cancelHeld(sub.planId), false);
+    assert.equal((await alice.plans())[0]?.relayerStatus, "unknown");
+    const submits = () => world.requests.filter((r) => r === `${RELAYER}/v1/submit`).length;
+    const before = submits();
+    await alice.sync();
+    assert.equal(submits(), before);
+    assert.equal((await alice.plans())[0]?.state, "submitted");
   });
 
   it("passes over a relayer that has paused relaying, for another one or for self-relay", async () => {
