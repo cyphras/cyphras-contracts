@@ -42,6 +42,9 @@ export interface TransactionStatus {
   readonly latestLedger: number;
   readonly returnValue: xdr.ScVal | undefined;
   readonly events: readonly MetaEvent[];
+  // A failure whose diagnostic events name an error of the host's storage, as of a call that
+  // touched an entry its footprint does not hold.
+  readonly conflict: boolean;
 }
 
 export interface ContractEvent {
@@ -185,10 +188,23 @@ export class SorobanRpc {
     }
     let returnValue: xdr.ScVal | undefined;
     let events: MetaEvent[] = [];
-    if (status === "SUCCESS" && r.has("resultMetaXdr")) {
+    const diagnostics: xdr.DiagnosticEvent[] = [];
+    if (status === "FAILED" && r.has("diagnosticEventsXdr")) {
+      for (const raw of r.array("diagnosticEventsXdr")) {
+        try {
+          diagnostics.push(xdr.DiagnosticEvent.fromXDR(String(raw), "base64"));
+        } catch {
+          r.fault("a diagnostic event is not DiagnosticEvent XDR");
+        }
+      }
+    }
+    if (r.has("resultMetaXdr")) {
       const meta = xdr.TransactionMeta.fromXDR(r.string("resultMetaXdr"), "base64");
-      returnValue = sorobanReturnValue(meta);
-      events = contractEvents(meta);
+      if (status === "SUCCESS") {
+        returnValue = sorobanReturnValue(meta);
+        events = contractEvents(meta);
+      }
+      if (status === "FAILED") diagnostics.push(...diagnosticEvents(meta));
     }
     return {
       status,
@@ -196,6 +212,14 @@ export class SorobanRpc {
       latestLedger: r.integer("latestLedger", 1),
       returnValue,
       events,
+      conflict: diagnostics.some((d) =>
+        d
+          .event()
+          .body()
+          .v0()
+          .topics()
+          .some((t) => t.switch().name === "scvError" && t.error().switch().name === "sceStorage"),
+      ),
     };
   }
 
@@ -253,6 +277,17 @@ function sorobanReturnValue(meta: xdr.TransactionMeta): xdr.ScVal | undefined {
       return meta.v4().sorobanMeta()?.returnValue() ?? undefined;
     default:
       return undefined;
+  }
+}
+
+function diagnosticEvents(meta: xdr.TransactionMeta): xdr.DiagnosticEvent[] {
+  switch (meta.switch()) {
+    case 3:
+      return meta.v3().sorobanMeta()?.diagnosticEvents() ?? [];
+    case 4:
+      return meta.v4().diagnosticEvents();
+    default:
+      return [];
   }
 }
 

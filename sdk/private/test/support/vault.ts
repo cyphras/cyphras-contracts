@@ -540,6 +540,48 @@ export class MockVault {
   // Pays queued exits from the head until today's window is full: of an exit that does not fit, the
   // part that does, payout first, and the rest stays at the head. An exit with a part the asset
   // contract refuses is set aside as stranded with everything it still owes.
+  // An exit another wallet's transaction queued at the tail, backed by that wallet's notes.
+  queueOther(recipient: string, payout: bigint): void {
+    const id = this.exitTail++;
+    this.tvl += payout;
+    this.queuedTotal += payout;
+    this.exits.set(id, {
+      id,
+      payout,
+      fee: 0n,
+      queuedPayout: payout,
+      queuedFee: 0n,
+      movedPayout: 0n,
+      movedFee: 0n,
+      recipient,
+      relayer: recipient,
+      queuedAt: this.timestamp,
+      txHash: this.txHash,
+      ledger: this.ledger,
+      requeuedFrom: undefined,
+      requeuedTo: [],
+      stranded: undefined,
+      requeued: undefined,
+      settled: undefined,
+    });
+    this.#emit("exit_queued", [
+      ["id", u64(id)],
+      ["ext_amount", i128(-payout)],
+      ["fee", i128(0n)],
+      ["recipient", new Address(recipient).toScVal()],
+      ["relayer", new Address(recipient).toScVal()],
+    ]);
+  }
+
+  // Whether an exit of this payout and fee would wait in the queue now rather than be paid at once.
+  queues(payout: bigint, fee: bigint): boolean {
+    const day = this.timestamp / DAY;
+    const usedToday = this.outflowDay === day ? this.outflow : 0n;
+    const fits =
+      this.exitHead === this.exitTail && usedToday + payout + fee <= this.limits.maxDailyOutflow;
+    return payout + fee > 0n && !fits;
+  }
+
   release(max: number): number {
     if (this.#halted()) refuse(ERROR.Halted);
     const day = this.timestamp / DAY;
@@ -815,6 +857,19 @@ export class MockVault {
     return map([
       ["roots", xdr.ScVal.scvVec(this.roots.map(u256))],
       ["newest", xdr.ScVal.scvU32(this.newest)],
+    ]);
+  }
+
+  // The entry of a queued exit, as the vault stores it.
+  exitEntry(id: number): xdr.ScVal | undefined {
+    const e = this.exits.get(id);
+    if (e === undefined) return undefined;
+    return map([
+      ["fee", i128(e.fee)],
+      ["payout", i128(e.payout)],
+      ["queued_at", u64(e.queuedAt)],
+      ["recipient", new Address(e.recipient).toScVal()],
+      ["relayer", new Address(e.relayer).toScVal()],
     ]);
   }
 

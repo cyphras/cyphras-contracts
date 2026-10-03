@@ -36,7 +36,15 @@ import {
   type TransactionSigner,
   invokeVault,
 } from "../vault/invoke.ts";
-import { type ChainReads, type Core, chainReads, invokeContext, newId } from "./core.ts";
+import {
+  type ChainReads,
+  type Core,
+  chainReads,
+  claimRoom,
+  invokeContext,
+  newId,
+  releaseRoom,
+} from "./core.ts";
 import {
   type DepositInfo,
   type ShieldReceipt,
@@ -69,6 +77,7 @@ import {
   cancelHeld,
   checkIssuer,
   followHeld,
+  resendConflicted,
   spend,
   submissionOf,
 } from "./spend.ts";
@@ -792,10 +801,13 @@ export class PrivateWallet {
       const client = this.#relayerClients(route.url)[0] as RelayerClient;
       const { txHash, heldId } = plan;
       if (txHash !== undefined) {
-        plan.relayerStatus = await client.tx(txHash).then(
-          (tx) => tx?.status ?? "unknown",
-          () => "unknown",
-        );
+        const tx = await client.tx(txHash).catch(() => undefined);
+        plan.relayerStatus = tx?.status ?? "unknown";
+        if (tx?.status === "failed" && tx.code === "unavailable") {
+          await resendConflicted(plan, client, latest).catch(() => {
+            plan.relayerStatus = "unknown";
+          });
+        }
       } else if (heldId !== undefined) {
         await followHeld(core, plan, heldId, client, latest, pace).catch(() => {
           plan.relayerStatus = "unknown";
@@ -1223,6 +1235,7 @@ export class PrivateWallet {
         fn: "release",
         args: [xdr.ScVal.scvU32(max)],
         transfers: [],
+        extend: releaseRoom(this.#core, max),
       });
       return { txHash: hash };
     });
@@ -1242,6 +1255,7 @@ export class PrivateWallet {
         fn: "claim",
         args: [xdr.ScVal.scvU64(new xdr.Uint64(BigInt(exitId)))],
         transfers: [],
+        extend: claimRoom(this.#core),
       });
       if (returnValue?.switch().name !== "scvU64") {
         fail("rpc_error", "the claim returned no exit ID");

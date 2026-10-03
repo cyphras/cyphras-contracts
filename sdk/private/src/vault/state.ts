@@ -57,6 +57,61 @@ function trustlineKey(account: string, assetName: string): xdr.LedgerKey {
   );
 }
 
+const u64 = (n: bigint): xdr.ScVal => xdr.ScVal.scvU64(new xdr.Uint64(n));
+
+// The entries of the exit the vault queued with an ID, and of the exit it set aside as stranded.
+export const exitKey = (vault: string, id: bigint): xdr.LedgerKey =>
+  contractDataKey(vault, dataKey("Exit", u64(id)));
+export const strandedKey = (vault: string, id: bigint): xdr.LedgerKey =>
+  contractDataKey(vault, dataKey("Stranded", u64(id)));
+
+// The asset contract's entry of a contract's balance.
+export const balanceKey = (token: string, holder: string): xdr.LedgerKey =>
+  contractDataKey(token, dataKey("Balance", new Address(holder).toScVal()));
+
+// The entries a payment of the pool asset to an address writes: for the native asset the account,
+// for an issued one the account's trustline and nothing for its issuer, and for a contract its
+// balance in the asset contract. A muxed address pays its account.
+export function payKeys(token: string, assetName: string, address: string): xdr.LedgerKey[] {
+  if (StrKey.isValidContract(address)) return [balanceKey(token, address)];
+  const account = baseAccount(address);
+  if (assetName === "native") return [accountKey(account)];
+  return assetName.endsWith(`:${account}`) ? [] : [trustlineKey(account, assetName)];
+}
+
+// The ID of the exit a simulated footprint writes, the queue's tail when the simulation queued one:
+// the largest ID among the vault's exit entries it holds as read-write.
+export function queuedExit(vault: string, footprint: xdr.LedgerFootprint): bigint | undefined {
+  let tail: bigint | undefined;
+  const contract = new Address(vault).toScAddress().toXDR("base64");
+  for (const key of footprint.readWrite()) {
+    if (key.switch().name !== "contractData") continue;
+    const data = key.contractData();
+    if (data.contract().toXDR("base64") !== contract) continue;
+    const vec = data.key().switch().name === "scvVec" ? (data.key().vec() ?? []) : [];
+    const [name, id] = vec;
+    if (
+      vec.length !== 2 ||
+      name?.switch().name !== "scvSymbol" ||
+      name.sym().toString() !== "Exit"
+    ) {
+      continue;
+    }
+    if (id?.switch().name !== "scvU64") continue;
+    const value = BigInt(id.u64().toString());
+    if (tail === undefined || value > tail) tail = value;
+  }
+  return tail;
+}
+
+// An exit in the vault's queue: who it pays and what it still owes them.
+export interface QueuedExitEntry {
+  readonly recipient: string;
+  readonly payout: bigint;
+  readonly relayer: string;
+  readonly fee: bigint;
+}
+
 export interface VaultConfig {
   readonly token: string;
   readonly domain: bigint;
@@ -215,6 +270,25 @@ export class VaultReader {
         ledger: latestLedger,
       },
     };
+  }
+
+  // The queued exits among these IDs, in one read.
+  async exits(ids: readonly bigint[]): Promise<Map<bigint, QueuedExitEntry>> {
+    const keys = ids.map((id) => exitKey(this.vault, id));
+    const { entries } = await this.#rpc.getLedgerEntries(keys);
+    const out = new Map<bigint, QueuedExitEntry>();
+    ids.forEach((id, i) => {
+      const entry = entries.get(keyId(keys[i] as xdr.LedgerKey));
+      if (entry === undefined) return;
+      const e = new Struct(entry.data.contractData().val(), "exit");
+      out.set(id, {
+        recipient: e.address("recipient"),
+        payout: e.i128("payout"),
+        relayer: e.address("relayer"),
+        fee: e.i128("fee"),
+      });
+    });
+    return out;
   }
 
   async pending(id: bigint): Promise<PendingDepositEntry | undefined> {

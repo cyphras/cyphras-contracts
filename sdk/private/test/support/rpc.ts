@@ -21,6 +21,27 @@ interface TxRecord {
   ledger: number;
   returnValue: xdr.ScVal;
   events: EmittedEvent[];
+  // The diagnostic events of a failure, as base64 XDR.
+  diagnostics?: string[];
+}
+
+// A diagnostic event naming a host error, as the host emits for a failed call.
+function diagnostic(error: xdr.ScError): string {
+  return new xdr.DiagnosticEvent({
+    inSuccessfulContractCall: false,
+    event: new xdr.ContractEvent({
+      ext: new xdr.ExtensionPoint(0),
+      contractId: null,
+      type: xdr.ContractEventType.diagnostic(),
+      body: new xdr.ContractEventBody(
+        0,
+        new xdr.ContractEventV0({
+          topics: [xdr.ScVal.scvSymbol("error"), xdr.ScVal.scvError(error)],
+          data: xdr.ScVal.scvVoid(),
+        }),
+      ),
+    }),
+  }).toXDR("base64");
 }
 
 // Decodes the vault's contracttype arguments back into SDK values.
@@ -102,6 +123,34 @@ export class MockRpc {
   // Test hooks: extra authorization the simulation asks for, and a send status to return once.
   injectAuth: xdr.SorobanAuthorizationEntry | undefined;
   sendOnce: string | undefined;
+  // Test hooks: what other transactions do before the next one sent is applied, and whether a
+  // call traps, as the host makes it, when it writes an entry that depends on the vault's state
+  // and its footprint lacks.
+  beforeApply: (() => void) | undefined;
+  enforceFootprint = false;
+  // Test hooks: how many of the next transactions sent fail on chain on the host's storage, as one
+  // whose footprint the chain moved past does, and how many fail in the vault.
+  conflictNext = 0;
+  failNext = 0;
+  // Test hook: failures carry their diagnostic events in their meta, as some RPCs return them.
+  diagnosticsInMeta = false;
+  // Test hook: the Soroban data simulations report.
+  simulated:
+    | {
+        readOnly: xdr.LedgerKey[];
+        readWrite: xdr.LedgerKey[];
+        instructions: number;
+        readBytes: number;
+        writeBytes: number;
+        fee: number;
+      }
+    | undefined;
+  // The transactions sent, in order, and how many entries a footprint may declare, write and read
+  // from disk.
+  sent: Transaction[] = [];
+  maxFootprintEntries = 400;
+  maxWriteEntries = 200;
+  maxDiskReadEntries = 200;
 
   constructor(vault: MockVault, passphrase: string) {
     this.vault = vault;
@@ -269,7 +318,113 @@ export class MockRpc {
     return out;
   }
 
+  // The network's Soroban settings: the public network's at ledger 64,754,596, with the limits on
+  // a footprint's entries the hooks set.
+  #setting(id: xdr.ConfigSettingId): xdr.LedgerEntryData | undefined {
+    const int = (n: number): xdr.Int64 => xdr.Int64.fromString(String(n));
+    const C = xdr.ConfigSettingEntry;
+    const entry = (e: xdr.ConfigSettingEntry): xdr.LedgerEntryData =>
+      xdr.LedgerEntryData.configSetting(e);
+    switch (id.name) {
+      case "configSettingContractComputeV0":
+        return entry(
+          C.configSettingContractComputeV0(
+            new xdr.ConfigSettingContractComputeV0({
+              ledgerMaxInstructions: int(600_000_000),
+              txMaxInstructions: int(400_000_000),
+              feeRatePerInstructionsIncrement: int(7),
+              txMemoryLimit: 41_943_040,
+            }),
+          ),
+        );
+      case "configSettingContractLedgerCostV0":
+        return entry(
+          C.configSettingContractLedgerCostV0(
+            new xdr.ConfigSettingContractLedgerCostV0({
+              ledgerMaxDiskReadEntries: 1_000,
+              ledgerMaxDiskReadBytes: 7_000_000,
+              ledgerMaxWriteLedgerEntries: 500,
+              ledgerMaxWriteBytes: 286_720,
+              txMaxDiskReadEntries: this.maxDiskReadEntries,
+              txMaxDiskReadBytes: 200_000,
+              txMaxWriteLedgerEntries: this.maxWriteEntries,
+              txMaxWriteBytes: 132_096,
+              feeDiskReadLedgerEntry: int(1_563),
+              feeWriteLedgerEntry: int(2_500),
+              feeDiskRead1Kb: int(447),
+              sorobanStateTargetSizeBytes: int(3_000_000_000),
+              rentFee1KbSorobanStateSizeLow: int(-17_000),
+              rentFee1KbSorobanStateSizeHigh: int(10_000),
+              sorobanStateRentFeeGrowthFactor: 5_000,
+            }),
+          ),
+        );
+      case "configSettingContractLedgerCostExtV0":
+        return entry(
+          C.configSettingContractLedgerCostExtV0(
+            new xdr.ConfigSettingContractLedgerCostExtV0({
+              txMaxFootprintEntries: this.maxFootprintEntries,
+              feeWrite1Kb: int(875),
+            }),
+          ),
+        );
+      case "configSettingContractHistoricalDataV0":
+        return entry(
+          C.configSettingContractHistoricalDataV0(
+            new xdr.ConfigSettingContractHistoricalDataV0({ feeHistorical1Kb: int(4_059) }),
+          ),
+        );
+      case "configSettingContractEventsV0":
+        return entry(
+          C.configSettingContractEventsV0(
+            new xdr.ConfigSettingContractEventsV0({
+              txMaxContractEventsSizeBytes: 16_384,
+              feeContractEvents1Kb: int(5_000),
+            }),
+          ),
+        );
+      case "configSettingContractBandwidthV0":
+        return entry(
+          C.configSettingContractBandwidthV0(
+            new xdr.ConfigSettingContractBandwidthV0({
+              ledgerMaxTxsSizeBytes: 133_120,
+              txMaxSizeBytes: 132_096,
+              feeTxSize1Kb: int(406),
+            }),
+          ),
+        );
+      case "configSettingStateArchival":
+        return entry(
+          C.configSettingStateArchival(
+            new xdr.StateArchivalSettings({
+              maxEntryTtl: 3_110_400,
+              minTemporaryTtl: 17_280,
+              minPersistentTtl: 2_073_600,
+              persistentRentRateDenominator: int(1_215),
+              tempRentRateDenominator: int(2_430),
+              maxEntriesToArchive: 1_000,
+              liveSorobanStateSizeWindowSampleSize: 30,
+              liveSorobanStateSizeWindowSamplePeriod: 64,
+              evictionScanSize: 100_000,
+              startingEvictionScanLevel: 7,
+            }),
+          ),
+        );
+      case "configSettingLiveSorobanStateSizeWindow":
+        return entry(
+          C.configSettingLiveSorobanStateSizeWindow(
+            Array.from({ length: 30 }, () => xdr.Uint64.fromString("1664203878")),
+          ),
+        );
+      default:
+        return undefined;
+    }
+  }
+
   #entry(key: xdr.LedgerKey): xdr.LedgerEntryData | undefined {
+    if (key.switch().name === "configSetting") {
+      return this.#setting(key.configSetting().configSettingId());
+    }
     if (key.switch().name === "account") {
       const id = StrKey.encodeEd25519PublicKey(key.account().accountId().ed25519());
       const account = this.accounts.get(id);
@@ -354,6 +509,10 @@ export class MockRpc {
         const val = this.vault.pendingEntry(Number(scValToBigInt(rest[0] as xdr.ScVal)));
         return val === undefined ? undefined : entry(val);
       }
+      case "Exit": {
+        const val = this.vault.exitEntry(Number(scValToBigInt(rest[0] as xdr.ScVal)));
+        return val === undefined ? undefined : entry(val);
+      }
       case "DepositorDay": {
         const total = this.vault.dayTotals.get(
           `${addressOf(rest[0])}/${scValToBigInt(rest[1] as xdr.ScVal)}`,
@@ -372,6 +531,63 @@ export class MockRpc {
       default:
         return undefined;
     }
+  }
+
+  // What a call writes that depends on the vault's state now: the exit at the queue's tail it
+  // queues, or the native balances an exit paid at once moves.
+  #written(fn: string, args: xdr.ScVal[]): xdr.LedgerKey[] {
+    const v = this.vault;
+    const exit = (id: number): xdr.LedgerKey =>
+      xdr.LedgerKey.contractData(
+        new xdr.LedgerKeyContractData({
+          contract: new Address(v.address).toScAddress(),
+          key: xdr.ScVal.scvVec([
+            xdr.ScVal.scvSymbol("Exit"),
+            xdr.ScVal.scvU64(new xdr.Uint64(BigInt(id))),
+          ]),
+          durability: xdr.ContractDataDurability.persistent(),
+        }),
+      );
+    const balance = (holder: string): xdr.LedgerKey =>
+      StrKey.isValidContract(holder)
+        ? xdr.LedgerKey.contractData(
+            new xdr.LedgerKeyContractData({
+              contract: new Address(v.token).toScAddress(),
+              key: xdr.ScVal.scvVec([
+                xdr.ScVal.scvSymbol("Balance"),
+                new Address(holder).toScVal(),
+              ]),
+              durability: xdr.ContractDataDurability.persistent(),
+            }),
+          )
+        : xdr.LedgerKey.account(
+            new xdr.LedgerKeyAccount({ accountId: Keypair.fromPublicKey(holder).xdrAccountId() }),
+          );
+    if (fn === "claim") return [exit(v.exitTail)];
+    if (fn !== "transact") return [];
+    const ext = decodeExtData(args[1] as xdr.ScVal);
+    const payout = -ext.extAmount;
+    if (v.queues(payout, ext.fee)) return [exit(v.exitTail)];
+    if (payout + ext.fee <= 0n) return [];
+    return [
+      balance(v.address),
+      ...(payout > 0n ? [balance(ext.recipient)] : []),
+      ...(ext.fee > 0n ? [balance(ext.relayer)] : []),
+    ];
+  }
+
+  // Whether a transaction's read-write footprint holds what the call writes that depends on the
+  // vault's state when it is applied.
+  #covers(tx: Transaction, fn: string, args: xdr.ScVal[]): boolean {
+    const data = tx.toEnvelope().v1().tx().ext().sorobanData();
+    const writes = new Set(
+      data
+        .resources()
+        .footprint()
+        .readWrite()
+        .map((k) => k.toXDR("base64")),
+    );
+    return this.#written(fn, args).every((k) => writes.has(k.toXDR("base64")));
   }
 
   #parse(envelope: string): Transaction {
@@ -410,7 +626,9 @@ export class MockRpc {
           returnValue: record.returnValue,
         }),
         events: [],
-        diagnosticEvents: [],
+        diagnosticEvents: this.diagnosticsInMeta
+          ? (record.diagnostics ?? []).map((d) => xdr.DiagnosticEvent.fromXDR(d, "base64"))
+          : [],
       }),
     ).toXDR("base64");
   }
@@ -436,12 +654,23 @@ export class MockRpc {
       case "simulateTransaction": {
         const tx = this.#parse(params["transaction"] as string);
         const { fn, args, source } = this.#invoke(tx);
+        // The footprint holds what the call writes that depends on the vault's state now.
+        const written = this.#written(fn, args);
         this.vault.dryRun = true;
         try {
           const result = this.#execute(fn, args, source);
+          const data = new SorobanDataBuilder().setResourceFee(this.simulated?.fee ?? 1000);
+          if (this.simulated !== undefined) {
+            const { readOnly, readWrite, instructions, readBytes, writeBytes } = this.simulated;
+            data
+              .setFootprint(readOnly, readWrite)
+              .setResources(instructions, readBytes, writeBytes);
+          } else {
+            data.setFootprint([], written);
+          }
           return {
-            transactionData: new SorobanDataBuilder().setResourceFee(1000).build().toXDR("base64"),
-            minResourceFee: "1000",
+            transactionData: data.build().toXDR("base64"),
+            minResourceFee: String(this.simulated?.fee ?? 1000),
             results: [
               {
                 auth: this.#auth(fn, args, tx).map((a) => a.toXDR("base64")),
@@ -474,7 +703,30 @@ export class MockRpc {
           return { status: "ERROR", hash, latestLedger: this.vault.ledger };
         }
         account.sequence++;
+        this.sent.push(tx);
         const { fn, args, source } = this.#invoke(tx);
+        const others = this.beforeApply;
+        this.beforeApply = undefined;
+        others?.();
+        const failed = this.failNext > 0;
+        const conflict =
+          !failed &&
+          (this.conflictNext > 0 || (this.enforceFootprint && !this.#covers(tx, fn, args)));
+        if (failed) this.failNext--;
+        else if (this.conflictNext > 0) this.conflictNext--;
+        if (failed || conflict) {
+          const error = conflict
+            ? xdr.ScError.sceStorage(xdr.ScErrorCode.scecExceededLimit())
+            : xdr.ScError.sceContract(121);
+          this.records.set(hash, {
+            status: "FAILED",
+            ledger: this.vault.ledger,
+            returnValue: xdr.ScVal.scvVoid(),
+            events: [],
+            diagnostics: [diagnostic(error)],
+          });
+          return { status: "PENDING", hash, latestLedger: this.vault.ledger };
+        }
         const before = this.vault.events.length;
         try {
           const returnValue = this.run(hash, () => this.#execute(fn, args, source));
@@ -498,6 +750,9 @@ export class MockRpc {
           status: record.status,
           ledger: record.ledger,
           resultMetaXdr: this.#meta(record),
+          ...(record.diagnostics === undefined || this.diagnosticsInMeta
+            ? {}
+            : { diagnosticEventsXdr: record.diagnostics }),
         };
       }
       case "getEvents":

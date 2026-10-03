@@ -1,9 +1,18 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { xdr } from "@stellar/stellar-base";
+import { Account, Address, Asset, Keypair, MuxedAccount, StrKey, xdr } from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
 import type { ExitEntry, ExitQueue } from "../../src/net/indexer.ts";
+import { SorobanRpc } from "../../src/net/rpc.ts";
+import { payKeys, queuedExit } from "../../src/vault/state.ts";
+import { type Core, transactRoom } from "../../src/wallet/core.ts";
+import {
+  DEFAULT_NETWORK_FEE_CAPS,
+  type Extra,
+  type TransactionSigner,
+  invokeVault,
+} from "../../src/vault/invoke.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
 import { applyExits } from "../../src/wallet/exits.ts";
 import type { ExitEvent } from "../../src/wallet/sources.ts";
@@ -1405,5 +1414,418 @@ describe("following an exit from the vault's events and the indexer's account", 
       assert.equal(plan.state, "stranded");
       assert.deepEqual(plan.exit?.parts, [{ id: 1, payoutLeft: 10n, feeLeft: 0n, stranded: true }]);
     }
+  });
+});
+
+describe("exits that other exits race in the same ledger", () => {
+  type World = Awaited<ReturnType<typeof createWorld>>;
+
+  // Other wallets' exits, each its own transaction, applied before this wallet's next one is.
+  function othersFirst(world: World, count: number): () => void {
+    return () => {
+      for (let i = 0; i < count; i++) {
+        world.rpc.run(String(i).padStart(64, "e"), () =>
+          world.vault.queueOther(world.signer(`other ${i}`).publicKey, 1n * XLM),
+        );
+      }
+    };
+  }
+
+  // The vault calls this wallet sent, by function.
+  const sentCalls = (world: World, fn: string): number =>
+    world.rpc.sent.filter(
+      (tx) =>
+        tx.operations[0]?.type === "invokeHostFunction" &&
+        tx.operations[0].func.invokeContract().functionName().toString() === fn,
+    ).length;
+
+  async function selfRelayed(world: World, alice: PrivateWallet, amount = 10n * XLM) {
+    return alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount,
+      selfRelay: world.signer("my account"),
+      confirm: confirmAll,
+    });
+  }
+
+  it("lands an exit queued behind exits other transactions queued at the tail first", async () => {
+    const { world, alice } = await funded();
+    world.rpc.enforceFootprint = true;
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+    world.rpc.beforeApply = othersFirst(world, 4);
+    await selfRelayed(world, alice);
+    assert.equal(sentCalls(world, "transact"), 1);
+    await alice.sync();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.exitId, 5);
+  });
+
+  it("lands an exit that queues though its simulation paid it at once, and the other way round", async () => {
+    const { world, alice } = await funded();
+    world.rpc.enforceFootprint = true;
+    world.rpc.beforeApply = othersFirst(world, 1);
+    await selfRelayed(world, alice);
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "queued");
+    // A release pays the queue before the next exit applies, which its simulation saw queue.
+    world.advance(86_400);
+    world.rpc.beforeApply = () => world.rpc.run("ab".repeat(32), () => world.vault.release(10));
+    await selfRelayed(world, alice, 5n * XLM);
+    assert.equal(sentCalls(world, "transact"), 2);
+    await alice.sync();
+    const states = (await alice.plans()).map((p) => [p.amount, p.state]);
+    assert.deepEqual(states, [
+      [10n * XLM, "settled"],
+      [5n * XLM, "settled"],
+    ]);
+  });
+
+  it("sends the same proof again after a fresh simulation when the tail moved past its footprint", async () => {
+    const { world, alice } = await funded();
+    world.rpc.enforceFootprint = true;
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+    world.rpc.beforeApply = othersFirst(world, 5);
+    await selfRelayed(world, alice);
+    assert.equal(sentCalls(world, "transact"), 2);
+    await alice.sync();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.exitId, 6);
+  });
+
+  it("gives up after five attempts that fail on the host's storage, and leaves the payment to the chain", async () => {
+    const { world, alice } = await funded();
+    world.rpc.enforceFootprint = true;
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+    const always = (): void => {
+      othersFirst(world, 5)();
+      world.rpc.beforeApply = always;
+    };
+    world.rpc.beforeApply = always;
+    await assert.rejects(selfRelayed(world, alice), isError("transaction_failed"));
+    world.rpc.beforeApply = undefined;
+    assert.equal(sentCalls(world, "transact"), 5);
+    await alice.sync();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    assert.equal(plan?.mustRetry, true);
+  });
+
+  it("releases again after a failure on the host's storage, and goes no further after any other", async () => {
+    const { world, alice } = await funded();
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+    await selfRelayed(world, alice);
+    world.advance(86_400);
+    world.rpc.failNext = 1;
+    await assert.rejects(alice.releaseExits(world.signer("anyone")), isError("transaction_failed"));
+    assert.equal(sentCalls(world, "release"), 1);
+    // whether the RPC returns the failure's diagnostic events apart or in its meta
+    world.rpc.diagnosticsInMeta = true;
+    world.rpc.conflictNext = 1;
+    await alice.releaseExits(world.signer("anyone"));
+    assert.equal(sentCalls(world, "release"), 3);
+    world.rpc.diagnosticsInMeta = false;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+    // A deposit that fails on chain goes no further either.
+    world.rpc.conflictNext = 1;
+    await assert.rejects(
+      alice.shield({ amount: 10n * XLM, signer: world.signer("alice depositor") }),
+      isError("transaction_failed"),
+    );
+    assert.equal(sentCalls(world, "shield"), 2);
+  });
+
+  // A key of the vault's storage, or of the asset contract's, and of an account.
+  const dataKey = (contract: string, ...key: xdr.ScVal[]): xdr.LedgerKey =>
+    xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(contract).toScAddress(),
+        key: xdr.ScVal.scvVec(key),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+  const exitAt = (world: World, id: bigint, name = "Exit"): xdr.LedgerKey =>
+    dataKey(world.vault.address, xdr.ScVal.scvSymbol(name), xdr.ScVal.scvU64(new xdr.Uint64(id)));
+  const accountOf = (address: string): xdr.LedgerKey =>
+    xdr.LedgerKey.account(
+      new xdr.LedgerKeyAccount({ accountId: Keypair.fromPublicKey(address).xdrAccountId() }),
+    );
+  const ids = (keys: readonly xdr.LedgerKey[] | undefined): string[] =>
+    (keys ?? []).map((k) => k.toXDR("base64"));
+  const lastData = (world: World) =>
+    world.rpc.sent[world.rpc.sent.length - 1]?.toEnvelope().v1().tx().ext().sorobanData();
+
+  it("gives a self-relayed exit the room the relayer gives its own, in the same order", async () => {
+    const { world, alice } = await funded();
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+    const merchant = world.signer("merchant").publicKey;
+    const balance = dataKey(
+      world.deployment.asset.contract,
+      xdr.ScVal.scvSymbol("Balance"),
+      new Address(world.vault.address).toScVal(),
+    );
+    // The simulation queued the exit and only read the merchant's account.
+    world.rpc.simulated = {
+      readOnly: [accountOf(merchant)],
+      readWrite: [exitAt(world, 1n)],
+      instructions: 4_000_000,
+      readBytes: 300,
+      writeBytes: 300,
+      fee: 1_000,
+    };
+    await selfRelayed(world, alice);
+    const resources = lastData(world)?.resources();
+    // The vault's balance and the exits after the tail are added, and the merchant's account,
+    // which only paying at once writes, moves from the read entries after them.
+    assert.deepEqual(
+      ids(resources?.footprint().readWrite()),
+      ids([
+        exitAt(world, 1n),
+        balance,
+        exitAt(world, 2n),
+        exitAt(world, 3n),
+        exitAt(world, 4n),
+        exitAt(world, 5n),
+        accountOf(merchant),
+      ]),
+    );
+    assert.deepEqual(ids(resources?.footprint().readOnly()), []);
+    assert.equal(resources?.instructions(), 5_000_000);
+    // an exit entry and the vault's balance entry, and room for the merchant's account to grow
+    assert.equal(resources?.diskReadBytes(), 300 + 2048);
+    assert.equal(resources?.writeBytes(), 300 + 400 + 256 + 2048);
+  });
+
+  it("pads a call as the relayer's engine does, to the stroop, within the network's limits and the fee cap", async () => {
+    const world = await createWorld({ limits: SMALL });
+    const payee = world.signer("payee").publicKey;
+    const issuer = world.signer("issuer").publicKey;
+    const vault = world.vault.address;
+    const exit = exitAt(world, 7n);
+    const next = exitAt(world, 8n);
+    const account = accountOf(payee);
+    const fresh = accountOf(world.signer("newcomer").publicKey);
+    const trustline = xdr.LedgerKey.trustline(
+      new xdr.LedgerKeyTrustLine({
+        accountId: Keypair.fromPublicKey(payee).xdrAccountId(),
+        asset: new Asset("USDC", issuer).toTrustLineXDRObject(),
+      }),
+    );
+    const instance = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(vault).toScAddress(),
+        key: xdr.ScVal.scvLedgerKeyContractInstance(),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+    const balance = dataKey(vault, xdr.ScVal.scvSymbol("Balance"), new Address(vault).toScVal());
+    world.rpc.simulated = {
+      readOnly: [account, trustline, instance],
+      readWrite: [exit],
+      instructions: 1_000_000,
+      readBytes: 500,
+      writeBytes: 300,
+      fee: 100_000,
+    };
+    const extra: Extra = {
+      readWrite: [exit, next, account, balance, fresh],
+      instructions: 1_000_000,
+      writeBytes: 656,
+      newBytes: 656,
+      rentLedgers: 519_120,
+      eventBytes: 512,
+    };
+    const fees: bigint[] = [];
+    const anyone = world.signer("anyone");
+    const signer: TransactionSigner = {
+      publicKey: anyone.publicKey,
+      signTransaction: (x, p) => anyone.signTransaction(x, p),
+      confirmFee: (fee) => {
+        fees.push(fee.resource);
+        return true;
+      },
+    };
+    const context = {
+      rpc: new SorobanRpc(RPC, world.fetch),
+      networkPassphrase: world.deployment.networkPassphrase,
+      vault,
+      feeCaps: DEFAULT_NETWORK_FEE_CAPS,
+      sleep: async () => {},
+    };
+    const call = {
+      fn: "release",
+      args: [xdr.ScVal.scvU32(1)],
+      transfers: [],
+      extend: async () => extra,
+    };
+    await invokeVault(context, signer, call);
+    const resources = lastData(world)?.resources();
+    assert.deepEqual(
+      ids(resources?.footprint().readWrite()),
+      ids([exit, next, balance, fresh, account]),
+    );
+    assert.deepEqual(ids(resources?.footprint().readOnly()), ids([trustline, instance]));
+    assert.equal(resources?.instructions(), 2_000_000);
+    assert.equal(resources?.writeBytes(), 300 + 656 + 2 * 2048);
+    assert.equal(resources?.diskReadBytes(), 500 + 3 * 2048);
+    // The Go engine's figures on the public network's settings: the simulated 100,000; 2,682 and
+    // 3,500 for the bytes of the three accounts and trustlines; and the other path's 1,112,211:
+    // four entries written more, one more read from disk, a million instructions, 656 bytes
+    // written, 232 bytes of keys sent, the rent of 656 new bytes for the network's least TTL of a
+    // new persistent entry with its TTL entry, and 512 bytes of events.
+    const other = 4 * 2_500 + 1_563 + 700 + (817 - 257) + 92 + 920 + 1_093_334 + 2_500 + 42 + 2_500;
+    assert.equal(fees[0], BigInt(100_000 + 2_682 + 3_500 + other));
+    // The network's limits on written entries, on entries and on entries read from disk stop the
+    // additions in their order.
+    for (const [limit, value, written] of [
+      ["maxWriteEntries", 3, [exit, next, account]],
+      ["maxFootprintEntries", 5, [exit, next, account]],
+      ["maxDiskReadEntries", 2, [exit, next, balance, account]],
+    ] as const) {
+      world.rpc[limit] = value;
+      await invokeVault(context, signer, call);
+      world.rpc[limit] = 200;
+      assert.deepEqual(ids(lastData(world)?.resources().footprint().readWrite()), ids(written));
+    }
+    // The cap bounds the fee with its padding.
+    const capped = { ...context, feeCaps: { inclusion: 100_000n, resource: 1_000_000n } };
+    await assert.rejects(invokeVault(capped, signer, call), isError("fee_above_cap"));
+  });
+
+  it("sends a relayed payment again when its relayer reports a failure on the host's storage", async () => {
+    const { world, alice } = await funded();
+    world.relayer.conflictNext = 1;
+    await alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    await alice.sync();
+    assert.equal(world.relayer.submissions.length, 2);
+    await alice.sync();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    assert.equal(world.relayer.submissions.length, 2);
+    // A payment the wallet cannot yet tell the fate of past its deadline is not sent again.
+    world.relayer.conflictNext = 1;
+    const built = world.vault.ledger;
+    await alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount: 5n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    world.advance(121 * 5);
+    world.indexer.leafLimit = world.vault.leaves.length;
+    world.indexer.completeTo = built + 100;
+    world.fill(2);
+    await alice.sync();
+    assert.equal((await alice.plans())[1]?.needsUserDecision, true);
+    assert.equal(world.relayer.submissions.length, 3);
+  });
+
+  it("gives a transact that pays only a fee its room, and one that pays nothing none, from the tail it queued at", async () => {
+    const vault = StrKey.encodeContract(Buffer.alloc(32, 9));
+    const token = StrKey.encodeContract(Buffer.alloc(32, 7));
+    const relayer = keypairFor("relayer").publicKey();
+    // The vault's tail now is 3.
+    const core = {
+      deployment: { vault, asset: { contract: token, name: "native" } },
+      services: { vault: { instance: async () => ({ status: { exitTail: 3n } }) } },
+    } as unknown as Core;
+    const exit = (id: bigint) =>
+      dataKey(vault, xdr.ScVal.scvSymbol("Exit"), xdr.ScVal.scvU64(new xdr.Uint64(id)));
+    const balance = dataKey(token, xdr.ScVal.scvSymbol("Balance"), new Address(vault).toScVal());
+    const footprint = (readWrite: xdr.LedgerKey[]) =>
+      new xdr.LedgerFootprint({ readOnly: [], readWrite });
+    const fee = { extAmount: 0n, fee: 5n, recipient: relayer, relayer };
+    const room = await transactRoom(core, fee)(footprint([]));
+    assert.deepEqual(
+      ids(room.readWrite),
+      ids([balance, accountOf(relayer), exit(3n), exit(4n), exit(5n), exit(6n), exit(7n)]),
+    );
+    assert.equal(room.writeBytes, 400 + 256);
+    // A simulation that queued its exit at 5 names the tail, whatever the vault's is now.
+    const queued = await transactRoom(core, fee)(footprint([exit(5n)]));
+    assert.deepEqual(ids(queued.readWrite.slice(2)), ids([5n, 6n, 7n, 8n, 9n].map(exit)));
+    const nothing = await transactRoom(core, { ...fee, fee: 0n })(footprint([]));
+    assert.deepEqual(nothing.readWrite, []);
+  });
+
+  it("names each payee's pay entry and the tail a simulation queued at, as the relayer does", () => {
+    const token = StrKey.encodeContract(Buffer.alloc(32, 7));
+    const vault = StrKey.encodeContract(Buffer.alloc(32, 9));
+    const holder = keypairFor("payee").publicKey();
+    const issuer = keypairFor("issuer").publicKey();
+    const muxed = new MuxedAccount(new Account(holder, "0"), "7").accountId();
+    const contract = StrKey.encodeContract(Buffer.alloc(32, 5));
+    const usdc = `USDC:${issuer}`;
+    const trustline = xdr.LedgerKey.trustline(
+      new xdr.LedgerKeyTrustLine({
+        accountId: Keypair.fromPublicKey(holder).xdrAccountId(),
+        asset: new Asset("USDC", issuer).toTrustLineXDRObject(),
+      }),
+    );
+    const balance = dataKey(token, xdr.ScVal.scvSymbol("Balance"), new Address(contract).toScVal());
+    assert.deepEqual(ids(payKeys(token, "native", holder)), ids([accountOf(holder)]));
+    assert.deepEqual(ids(payKeys(token, "native", muxed)), ids([accountOf(holder)]));
+    assert.deepEqual(ids(payKeys(token, usdc, muxed)), ids([trustline]));
+    assert.deepEqual(payKeys(token, usdc, issuer), []);
+    assert.deepEqual(ids(payKeys(token, usdc, contract)), ids([balance]));
+    const exit = (id: bigint, of = vault) =>
+      dataKey(of, xdr.ScVal.scvSymbol("Exit"), xdr.ScVal.scvU64(new xdr.Uint64(id)));
+    const footprint = (readWrite: xdr.LedgerKey[]) =>
+      new xdr.LedgerFootprint({ readOnly: [exit(9n)], readWrite });
+    assert.equal(queuedExit(vault, footprint([exit(3n), exit(8n, token), exit(5n), balance])), 5n);
+    assert.equal(queuedExit(vault, footprint([balance])), undefined);
+  });
+
+  it("lands a claim whose exit other transactions moved the tail of", async () => {
+    const { world, alice } = await funded();
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+    const destination = world.signer("closed account").publicKey;
+    await alice.unshield({
+      to: destination,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    world.vault.unpayable.add(destination);
+    world.advance(86_400);
+    await alice.releaseExits(world.signer("anyone"));
+    world.vault.unpayable.delete(destination);
+    world.rpc.enforceFootprint = true;
+    world.rpc.beforeApply = othersFirst(world, 2);
+    const claim = await alice.claimExit(1, world.signer("anyone"));
+    assert.equal(claim.requeuedAs, 4);
+    assert.equal(sentCalls(world, "claim"), 1);
+  });
+
+  it("gives a release the stranded entries of its exits and the entries of the exits after them", async () => {
+    const { world, alice } = await funded();
+    const parties = [0, 1, 2].map((i) => world.signer(`other ${i}`).publicKey);
+    for (const party of parties) world.vault.queueOther(party, 1n * XLM);
+    await alice.releaseExits(world.signer("anyone"), 1);
+    assert.deepEqual(
+      ids(lastData(world)?.resources().footprint().readWrite()),
+      ids([
+        exitAt(world, 1n, "Stranded"),
+        exitAt(world, 2n),
+        exitAt(world, 2n, "Stranded"),
+        accountOf(parties[1] as string),
+        exitAt(world, 3n),
+        exitAt(world, 3n, "Stranded"),
+        accountOf(parties[2] as string),
+      ]),
+    );
   });
 });
