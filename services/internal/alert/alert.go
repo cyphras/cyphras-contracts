@@ -55,6 +55,7 @@ type Webhook struct {
 
 // Send implements Channel.
 func (w Webhook) Send(ctx context.Context, a Alert) error {
+	a = fit(w.Format, a)
 	target := w.URL
 	var body []byte
 	contentType := "application/json"
@@ -94,13 +95,45 @@ func (w Webhook) Send(ctx context.Context, a Alert) error {
 		return fmt.Errorf("alert: %s webhook unreachable", w.Format)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests:
 		return RetryAfter{Wait: retryAfter(resp)}
-	}
-	if resp.StatusCode >= 300 {
+	case resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestTimeout:
+		return Refused{Format: w.Format, Status: resp.StatusCode}
+	case resp.StatusCode >= 300:
 		return fmt.Errorf("alert: %s webhook answered %d", w.Format, resp.StatusCode)
 	}
 	return nil
+}
+
+// Refused is a channel's refusal of one alert, a 4xx answer other than 408 or 429: sending the
+// same alert again would be refused again.
+type Refused struct {
+	Format string
+	Status int
+}
+
+func (r Refused) Error() string {
+	return fmt.Sprintf("alert: %s webhook answered %d", r.Format, r.Status)
+}
+
+// maxText is how long a message each format takes, as the services behind them accept it.
+var maxText = map[string]int{"discord": 2000, "telegram": 4096, "slack": 4000, "json": 4096, "text": 4096}
+
+// fit shortens an alert's message so that what a format sends of it is no longer than it takes.
+func fit(format string, a Alert) Alert {
+	limit := maxText[format]
+	text := a.text()
+	if format == "json" {
+		text = a.Message
+	}
+	if limit == 0 || len(text) <= limit {
+		return a
+	}
+	const mark = " [truncated]"
+	keep := max(len(a.Message)-(len(text)-limit)-len(mark), 0)
+	a.Message = strings.ToValidUTF8(a.Message[:keep], "") + mark // the cut may split a character
+	return a
 }
 
 // RetryAfter is a channel's refusal that says how long to wait before the next send, as a 429
@@ -120,7 +153,7 @@ func retryAfter(resp *http.Response) time.Duration {
 	wait := 30 * time.Second
 	if h := resp.Header.Get("Retry-After"); h != "" {
 		if n, err := strconv.ParseFloat(h, 64); err == nil && n >= 0 {
-			wait = time.Duration(n * float64(time.Second))
+			wait = seconds(n)
 		} else if at, err := http.ParseTime(h); err == nil {
 			wait = time.Until(at)
 		}
@@ -134,13 +167,19 @@ func retryAfter(resp *http.Response) time.Duration {
 		if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body) == nil {
 			switch {
 			case body.RetryAfter != nil:
-				wait = time.Duration(*body.RetryAfter * float64(time.Second))
+				wait = seconds(*body.RetryAfter)
 			case body.Parameters.RetryAfter != nil:
-				wait = time.Duration(*body.Parameters.RetryAfter * float64(time.Second))
+				wait = seconds(*body.Parameters.RetryAfter)
 			}
 		}
 	}
 	return min(max(wait, time.Second), time.Hour)
+}
+
+// seconds converts a wait in seconds, bounded first, since a float too large for a Duration
+// converts to a different value on each architecture.
+func seconds(n float64) time.Duration {
+	return time.Duration(min(n, time.Hour.Seconds()) * float64(time.Second))
 }
 
 // ParseWebhooks reads one "format url" pair per line; blank lines and lines starting with # are

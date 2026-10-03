@@ -3,6 +3,7 @@ package alert
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -315,12 +316,18 @@ func TestA429SaysHowLongToWait(t *testing.T) {
 		resp *http.Response
 		want time.Duration
 	}{
-		"seconds":  {answer("7", ""), 7 * time.Second},
-		"discord":  {answer("", `{"retry_after": 2.5}`), 2500 * time.Millisecond},
-		"telegram": {answer("", `{"ok": false, "parameters": {"retry_after": 9}}`), 9 * time.Second},
-		"nothing":  {answer("", "busy"), 30 * time.Second},
-		"too long": {answer("86400", ""), time.Hour},
-		"zero":     {answer("0", ""), time.Second},
+		"seconds":       {answer("7", ""), 7 * time.Second},
+		"discord":       {answer("", `{"retry_after": 2.5}`), 2500 * time.Millisecond},
+		"telegram":      {answer("", `{"ok": false, "parameters": {"retry_after": 9}}`), 9 * time.Second},
+		"nothing":       {answer("", "busy"), 30 * time.Second},
+		"too long":      {answer("86400", ""), time.Hour},
+		"zero":          {answer("0", ""), time.Second},
+		"huge":          {answer("1e300", ""), time.Hour},
+		"infinite":      {answer("Inf", ""), time.Hour},
+		"negative":      {answer("-5", ""), 30 * time.Second},
+		"nan":           {answer("NaN", ""), 30 * time.Second},
+		"huge body":     {answer("", `{"retry_after": 1e300}`), time.Hour},
+		"huge telegram": {answer("", `{"parameters": {"retry_after": 1e300}}`), time.Hour},
 	} {
 		if got := retryAfter(c.resp); got != c.want {
 			t.Fatalf("%s: %v, want %v", name, got, c.want)
@@ -413,5 +420,88 @@ func TestAFullQueueDropsItsLowestSeverityFirst(t *testing.T) {
 	}
 	if len(q.pending) != maxPending || q.pending[0].alert.Code != "invariant" || q.pending[1].alert.Code != "exit_stranded_1" {
 		t.Fatalf("kept %d copies, from %s", len(q.pending), q.pending[0].alert.Code)
+	}
+}
+
+// discordLike answers as Discord does: 400 to a message over 2000 characters or one it cannot
+// take, 404 once its webhook is deleted, and takes the rest.
+type discordLike struct {
+	mu      sync.Mutex
+	deleted bool
+	got     []string
+}
+
+func (d *discordLike) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Content string `json:"content"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case d.deleted:
+		w.WriteHeader(http.StatusNotFound)
+	case len(body.Content) > 2000 || strings.Contains(body.Content, "malformed"):
+		w.WriteHeader(http.StatusBadRequest)
+	default:
+		d.got = append(d.got, body.Content)
+	}
+}
+
+func (d *discordLike) delivered() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.got)
+}
+
+func TestADigestIsCutToWhatItsChannelTakes(t *testing.T) {
+	ctx := context.Background()
+	discord := &discordLike{}
+	srv := httptest.NewServer(discord)
+	defer srv.Close()
+	now := time.Unix(1_728_000_000, 0)
+	q := &Queue{Name: "operator", Channels: []Channel{Webhook{Format: "discord", URL: srv.URL, HTTP: srv.Client()}}, Now: func() time.Time { return now }}
+	for i := range 12 {
+		q.Put(Alert{Severity: Info, Code: fmt.Sprintf("governance_limits_queued_%d", i), Message: strings.Repeat("m", 250), Time: now})
+	}
+	q.Flush(ctx)
+	got := discord.delivered()
+	if len(got) != 1 || !strings.Contains(got[0], "12 notices") || !strings.HasSuffix(got[0], " [truncated]") || len(got[0]) != 2000 {
+		t.Fatalf("delivered %q", got)
+	}
+	if n, _ := q.Waiting(ctx); n != 0 {
+		t.Fatalf("%d copies wait", n)
+	}
+}
+
+func TestACopyItsChannelRefusesIsDroppedWithoutRestingTheLane(t *testing.T) {
+	ctx := context.Background()
+	discord := &discordLike{}
+	srv := httptest.NewServer(discord)
+	defer srv.Close()
+	now := time.Unix(1_728_000_000, 0)
+	q := &Queue{Name: "operator", Channels: []Channel{Webhook{Format: "discord", URL: srv.URL, HTTP: srv.Client()}}, Now: func() time.Time { return now }}
+	for i := range 2 * failuresToRest {
+		q.Put(Alert{Severity: Critical, Code: fmt.Sprintf("malformed_%d", i), Time: now})
+	}
+	q.Put(Alert{Severity: Critical, Code: "invariant", Time: now})
+	q.Flush(ctx)
+	if got := discord.delivered(); len(got) != 1 || !strings.Contains(got[0], "invariant") {
+		t.Fatalf("delivered %q", got)
+	}
+	if n, _ := q.Waiting(ctx); n != 0 {
+		t.Fatalf("%d refused copies wait for a retry", n)
+	}
+	if q.Stalled(now.Add(time.Hour), 10*time.Minute) {
+		t.Fatal("a channel taking alerts is stalled")
+	}
+	// A deleted webhook refuses every copy, which still stops the heartbeat.
+	discord.mu.Lock()
+	discord.deleted = true
+	discord.mu.Unlock()
+	q.Put(Alert{Severity: Warning, Code: "hot_balance_low", Time: now})
+	q.Flush(ctx)
+	if q.Stalled(now.Add(9*time.Minute), 10*time.Minute) || !q.Stalled(now.Add(11*time.Minute), 10*time.Minute) {
+		t.Fatal("a channel refusing every copy for 11 minutes is not stalled")
 	}
 }

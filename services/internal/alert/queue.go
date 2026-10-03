@@ -18,9 +18,10 @@ import (
 // Queue delivers alerts in the background, on a lane of its own for each channel, so a channel
 // that is slow, down or rate limited holds up only itself. A lane sends Critical alerts before
 // Warnings, each on its own, and gathers Info alerts into one digest at most every DigestEvery.
-// A copy a channel refuses is retried with backoff until the channel takes it; a lane whose
-// channel keeps failing rests, as long as a 429 answer asks or at a backoff. With a Store, the
-// copies not yet delivered survive a restart.
+// A copy a channel fails to take is retried with backoff until the channel takes it, and one it
+// refuses with a 4xx answer other than 408 or 429 is dropped, as it would be refused again; a
+// lane whose channel keeps failing rests, as long as a 429 answer asks or at a backoff. With a
+// Store, the copies not yet delivered survive a restart.
 type Queue struct {
 	// Name tells apart the queues that share a store, such as an operator and a public one.
 	Name     string
@@ -250,8 +251,8 @@ func (q *Queue) flushLane(ctx context.Context, ch int) time.Duration {
 }
 
 // attempt sends one message standing for the copies given, and reports whether the lane may go
-// on. A 429 rests the lane for as long as it asks; another refusal retries the copies later, and
-// a run of them rests the lane.
+// on. A 429 rests the lane for as long as it asks, and a refusal that would repeat drops the
+// copies; any other failure retries them later, and a run of them rests the lane.
 func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds []delivery, a Alert) bool {
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
 	err := q.Channels[ch].Send(sendCtx, a)
@@ -262,6 +263,21 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 		}
 		q.mu.Lock()
 		l.failures, l.failing = 0, time.Time{}
+		q.mu.Unlock()
+		return true
+	}
+	var refused Refused
+	if errors.As(err, &refused) {
+		q.logError("alert refused by its channel and dropped", a.Code, err)
+		for _, d := range ds {
+			q.done(ctx, d)
+		}
+		// The lane goes on without a rest, but until a send succeeds it counts as failing, so a
+		// channel that refuses every copy, such as a deleted webhook, still stalls the heartbeat.
+		q.mu.Lock()
+		if l.failing.IsZero() {
+			l.failing = now
+		}
 		q.mu.Unlock()
 		return true
 	}
