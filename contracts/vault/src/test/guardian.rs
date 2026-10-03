@@ -531,7 +531,7 @@ fn a_stolen_guardian_key_cannot_keep_a_full_pool_from_leaving_within_a_halt_and_
         n += 1;
     }
     s.attest_all_and_wait();
-    // Each admitted pair costs about 12M instructions, so the keeper admits in batches.
+    // Each admitted pair costs about 18M instructions, so the keeper admits in batches.
     let ids = s.pending_ids();
     for batch in [ids.slice(0..5), ids.slice(5..ids.len())] {
         assert_eq!(s.vault.admit(&batch), batch);

@@ -421,24 +421,30 @@ fn a_mistaken_flag_can_be_corrected_before_anyone_else_refunds_it() {
     assert_eq!(s.vault.admit(&ids(&s, &[1])), ids(&s, &[1]));
 }
 
+// The live network's per-transaction limits: instructions and memory. Its 16 KiB limit on events
+// is enforced in tests by default.
+const TX_INSTRUCTIONS: u64 = 400_000_000;
+const TX_MEMORY: u64 = 41_943_040;
+
 #[test]
-fn a_batch_of_sixteen_admissions_fits_the_network_limits() {
-    let s = Setup::new();
-    let depositor = s.account("depositor", 1_000 * XLM);
-    for _ in 0..17 {
-        s.shield(&depositor, XLM).unwrap();
+fn sixteen_or_seventeen_admissions_fit_one_transaction() {
+    for n in [16u64, 17] {
+        let s = Setup::new();
+        let depositor = s.account("depositor", 1_000 * XLM);
+        for _ in 0..n {
+            s.shield(&depositor, XLM).unwrap();
+        }
+        s.vault.attest(&n);
+        s.advance(DELAY_SMALL);
+        s.env
+            .cost_estimate()
+            .budget()
+            .reset_limits(TX_INSTRUCTIONS, TX_MEMORY);
+        let batch = ids(&s, &(1..=n).collect::<std::vec::Vec<_>>());
+        assert_eq!(s.vault.admit(&batch), batch);
+        let resources = s.env.cost_estimate().resources();
+        assert!(resources.instructions <= TX_INSTRUCTIONS as i64);
+        assert!(resources.contract_events_size_bytes <= 16_384);
+        assert_eq!(s.vault.next_leaf_index(), 2 * n);
     }
-    s.vault.attest(&17);
-    s.advance(DELAY_SMALL);
-    // The test budget defaults to 100M instructions; the network allows more per transaction.
-    // Its other limits, such as 16 KiB of events, are enforced by default.
-    s.env
-        .cost_estimate()
-        .budget()
-        .reset_limits(600_000_000, 41_943_040);
-    let sixteen = ids(&s, &(1..=16).collect::<std::vec::Vec<_>>());
-    assert_eq!(s.vault.admit(&sixteen), sixteen);
-    let resources = s.env.cost_estimate().resources();
-    assert!(resources.contract_events_size_bytes <= 16_384);
-    assert_eq!(s.vault.next_leaf_index(), 32);
 }
