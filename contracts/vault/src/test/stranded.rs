@@ -121,6 +121,53 @@ fn an_exit_to_a_recipient_without_a_trustline_strands_and_the_queue_moves_on() {
 }
 
 #[test]
+fn a_refused_part_payment_strands_all_the_exit_still_owes_and_the_window_moves_on() {
+    let c = classic();
+    let s = &c.s;
+    let filler = c.holder("filler", 0);
+    let frozen = c.holder("frozen", 0);
+    let relayer = c.holder("relayer", 0);
+    fill_window(s, &filler);
+    let first = queue(s, 3_000 * XLM, 0, &filler, &filler);
+    let stuck = queue(s, 3_000 * XLM, XLM, &frozen, &relayer);
+    let last = queue(s, 1_000 * XLM, 0, &filler, &filler);
+    c.asset.set_authorized(&frozen, &false);
+    to_midnight(s);
+
+    // What fits of the second exit is refused, so all it owes strands and the third is paid.
+    assert_eq!(s.vault.release(&10), 3);
+    let vault = s.vault.address.clone();
+    let settled = |id: u64, payout: i128| {
+        events::Settled {
+            ext_amount: -payout,
+            fee: 0,
+            recipient: filler.clone().into(),
+            relayer: filler.clone(),
+            exit_id: Some(id),
+        }
+        .to_xdr(&s.env, &vault)
+    };
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&vault),
+        std::vec![
+            settled(first, 3_000 * XLM),
+            events::ExitStranded {
+                id: stuck,
+                payout: 3_000 * XLM,
+                fee: XLM
+            }
+            .to_xdr(&s.env, &vault),
+            settled(last, 1_000 * XLM),
+        ]
+    );
+    let stranded = s.vault.stranded(&stuck).unwrap();
+    assert_eq!((stranded.payout, stranded.fee), (3_000 * XLM, XLM));
+    assert_eq!(used(s), 4_000 * XLM);
+    assert_eq!(s.vault.status().queued_total, 3_001 * XLM);
+    assert_eq!(s.balance(&filler), 9_000 * XLM);
+}
+
+#[test]
 fn a_deauthorized_recipient_strands_and_is_paid_once_authorized_again() {
     let c = classic();
     let s = &c.s;

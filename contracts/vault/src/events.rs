@@ -60,7 +60,8 @@ pub struct NewNullifier {
 
 /// Repeats what the token transfers of a payment show, so a watcher need not join them.
 /// `exit_id` is set when `release` or `claim` completes an exit from the exit queue, and absent
-/// when `transact` paid at once. A claim reports only the parts it paid.
+/// when `transact` paid at once. For an exit paid in several steps, `ext_amount` and `fee` are
+/// the parts of the last step; the earlier ones appear in `exit_paid`.
 #[contractevent]
 pub struct Settled {
     pub ext_amount: i128,
@@ -80,8 +81,18 @@ pub struct ExitQueued {
     pub relayer: Address,
 }
 
-/// A released exit with a part the asset contract refused to transfer. `payout` and `fee` are the
-/// unpaid parts, which stay owed until `claim` pays them.
+/// Part payment of an exit that is not yet paid in full. `payout_left` and `fee_left` stay owed.
+#[contractevent]
+pub struct ExitPaid {
+    pub id: u64,
+    pub payout_paid: i128,
+    pub fee_paid: i128,
+    pub payout_left: i128,
+    pub fee_left: i128,
+}
+
+/// A released exit with a part the asset contract refused to transfer. `payout` and `fee` are
+/// what it still owes, which stays reserved until `claim` pays it.
 #[contractevent]
 pub struct ExitStranded {
     pub id: u64,

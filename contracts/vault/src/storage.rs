@@ -111,8 +111,9 @@ pub struct PendingDeposit {
     pub flagged_at: u64,
 }
 
-/// An exit owed by the vault: what `transact` owes `recipient` and `relayer`, and the time it was
-/// queued. A stranded exit holds only the parts its release could not pay.
+/// An exit owed by the vault: what is still owed to `recipient` and `relayer`, and the time
+/// `transact` queued it. A queued exit holds what is left after any part payment; a stranded one
+/// holds the parts not yet paid.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Exit {

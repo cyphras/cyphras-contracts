@@ -343,12 +343,13 @@ impl Vault {
         Ok(())
     }
 
-    /// Anyone pays queued exits from the head of the exit queue, in ID order, while each fits
-    /// what is left of today's outflow window. It stops at the first exit that does not fit,
-    /// never skipping it, or after `max` exits, and returns how many it released. A part the
-    /// asset contract refuses to transfer is set aside as a stranded exit for `claim`, so that a
-    /// recipient who cannot receive never holds up the exits behind it. Refused while halted;
-    /// works while paused.
+    /// Anyone pays queued exits from the head of the exit queue, in ID order, until today's
+    /// outflow window is full or `max` exits were handled, and returns how many were. Of an exit
+    /// that does not fit, it pays what does, payout first, and the rest stays at the head for the
+    /// next day, so no window goes unused. When the asset contract refuses a transfer, everything
+    /// the exit still owes is set aside as a stranded exit for `claim`, so that a recipient who
+    /// cannot receive never holds up the exits behind it. Refused while halted; works while
+    /// paused.
     pub fn release(env: Env, max: u32) -> Result<u32, Error> {
         let mut status = storage::status(&env);
         let now = env.ledger().timestamp();
@@ -362,43 +363,62 @@ impl Vault {
         let vault = env.current_contract_address();
         let mut count = 0;
         while count < max && status.exit_head < status.exit_tail {
-            let id = status.exit_head;
-            let exit = storage::exit(&env, id).unwrap();
-            let outflow = exit.payout.checked_add(exit.fee).ok_or(Error::Overflow)?;
-            if today.checked_add(outflow).ok_or(Error::Overflow)? > max_daily_outflow {
+            let room = max_daily_outflow
+                .checked_sub(today)
+                .ok_or(Error::Overflow)?;
+            if room == 0 {
                 break;
             }
-            storage::remove_exit(&env, id);
-            status.exit_head = id + 1;
+            let id = status.exit_head;
+            let exit = storage::exit(&env, id).unwrap();
             count += 1;
 
-            let unpaid = Exit {
-                payout: try_pay(&token, &vault, &exit.recipient, exit.payout),
-                fee: try_pay(&token, &vault, &MuxedAddress::from(&exit.relayer), exit.fee),
-                ..exit.clone()
-            };
-            let paid = outflow - unpaid.payout - unpaid.fee;
+            // Payout first, then the fee, as far as the window reaches.
+            let payout = exit.payout.min(room);
+            let fee = exit.fee.min(room - payout);
+            let payout_paid = try_pay(&token, &vault, &exit.recipient, payout);
+            let fee_paid = try_pay(&token, &vault, &MuxedAddress::from(&exit.relayer), fee);
+            let paid = payout_paid + fee_paid;
             today = today.checked_add(paid).ok_or(Error::Overflow)?;
             status.tvl = status.tvl.checked_sub(paid).ok_or(Error::Overflow)?;
             status.queued_total = status
                 .queued_total
                 .checked_sub(paid)
                 .ok_or(Error::Overflow)?;
-            if paid == outflow {
+            let left = Exit {
+                payout: exit.payout - payout_paid,
+                fee: exit.fee - fee_paid,
+                ..exit.clone()
+            };
+            if payout_paid < payout || fee_paid < fee {
+                storage::remove_exit(&env, id);
+                status.exit_head = id + 1;
+                storage::set_stranded(&env, id, &left);
+                events::ExitStranded {
+                    id,
+                    payout: left.payout,
+                    fee: left.fee,
+                }
+                .publish(&env);
+            } else if left.payout == 0 && left.fee == 0 {
+                storage::remove_exit(&env, id);
+                status.exit_head = id + 1;
                 events::Settled {
-                    ext_amount: -exit.payout,
-                    fee: exit.fee,
+                    ext_amount: -payout_paid,
+                    fee: fee_paid,
                     recipient: exit.recipient,
                     relayer: exit.relayer,
                     exit_id: Some(id),
                 }
                 .publish(&env);
             } else {
-                storage::set_stranded(&env, id, &unpaid);
-                events::ExitStranded {
+                storage::set_exit(&env, id, &left);
+                events::ExitPaid {
                     id,
-                    payout: unpaid.payout,
-                    fee: unpaid.fee,
+                    payout_paid,
+                    fee_paid,
+                    payout_left: left.payout,
+                    fee_left: left.fee,
                 }
                 .publish(&env);
             }
@@ -810,14 +830,14 @@ fn outflow_today(status: &Status, day: u64) -> i128 {
     }
 }
 
-/// Pays `amount` from the vault without failing the call, and returns the part left unpaid: all of
-/// it when the asset contract refuses the transfer, for want of a trustline, an authorization or
-/// an account. A refused transfer changes nothing.
+/// Pays `amount` from the vault without failing the call, and returns what was paid: all of it, or
+/// nothing when the asset contract refuses the transfer for want of a trustline, an authorization
+/// or an account. A refused transfer changes nothing.
 fn try_pay(token: &TokenClient, vault: &Address, to: &MuxedAddress, amount: i128) -> i128 {
-    if amount == 0 || matches!(token.try_transfer(vault, to, &amount), Ok(Ok(()))) {
-        0
-    } else {
+    if amount > 0 && matches!(token.try_transfer(vault, to, &amount), Ok(Ok(()))) {
         amount
+    } else {
+        0
     }
 }
 

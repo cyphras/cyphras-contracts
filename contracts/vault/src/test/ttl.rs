@@ -205,4 +205,11 @@ fn the_exit_queue_writes_only_the_entries_it_changes() {
     s.account("missing", XLM);
     s.vault.claim(&2);
     assert_eq!(writes(), 4);
+
+    // Paying part of an exit rewrites it: the instance, the exit and two balances.
+    s.transact(&relayer, &s.ext(-10 * XLM, 0, &user, &relayer))
+        .unwrap();
+    assert_eq!(s.vault.release(&1), 1);
+    assert_eq!(writes(), 4);
+    assert!(s.vault.exit(&3).is_some());
 }

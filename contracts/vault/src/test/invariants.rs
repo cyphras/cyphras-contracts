@@ -398,29 +398,38 @@ impl Model {
                 }
                 let mut count = 0;
                 while count < *max {
-                    let Some(head) = self.exits.front() else {
-                        break;
-                    };
-                    let outflow = head.payout + head.fee;
-                    if self.outflow_today(day) + outflow > self.limits.max_daily_outflow {
+                    let room = self.limits.max_daily_outflow - self.outflow_today(day);
+                    if room == 0 || self.exits.is_empty() {
                         break;
                     }
-                    let mut unpaid = self.exits.pop_front().unwrap();
-                    self.status.exit_head += 1;
+                    let mut exit = self.exits.pop_front().unwrap();
                     count += 1;
-                    if self.can_receive[unpaid.recipient] {
-                        self.received[unpaid.recipient] += unpaid.payout;
-                        unpaid.payout = 0;
-                    }
-                    if self.can_receive[unpaid.relayer] {
-                        self.received[unpaid.relayer] += unpaid.fee;
-                        unpaid.fee = 0;
-                    }
-                    let left = unpaid.payout + unpaid.fee;
-                    self.status.queued_total -= outflow - left;
-                    self.pay(day, outflow - left);
-                    if left > 0 {
-                        self.stranded.insert(unpaid.id, unpaid);
+                    // Payout first, then the fee, as far as the window reaches.
+                    let payout = exit.payout.min(room);
+                    let fee = exit.fee.min(room - payout);
+                    let payout_paid = if self.can_receive[exit.recipient] {
+                        payout
+                    } else {
+                        0
+                    };
+                    let fee_paid = if self.can_receive[exit.relayer] {
+                        fee
+                    } else {
+                        0
+                    };
+                    self.received[exit.recipient] += payout_paid;
+                    self.received[exit.relayer] += fee_paid;
+                    exit.payout -= payout_paid;
+                    exit.fee -= fee_paid;
+                    self.status.queued_total -= payout_paid + fee_paid;
+                    self.pay(day, payout_paid + fee_paid);
+                    if payout_paid < payout || fee_paid < fee {
+                        self.status.exit_head += 1;
+                        self.stranded.insert(exit.id, exit);
+                    } else if exit.payout + exit.fee == 0 {
+                        self.status.exit_head += 1;
+                    } else {
+                        self.exits.push_front(exit);
                     }
                 }
                 Ok(Done::Count(count))
@@ -620,13 +629,13 @@ impl Run {
             };
         }
         let room = m.limits.max_daily_outflow - m.outflow_today(now / DAY);
-        // The head of the queue is released once the window has room for it, and now and then its
-        // recipient loses the right to hold the asset first, so that it strands.
+        // The queue is released while the window has room, and now and then the head's recipient
+        // loses the right to hold the asset first, so that the head strands.
         if let Some(head) = m.exits.front() {
             if s.below(4) == 0 {
                 return if s.below(4) == 0 && m.can_receive[head.recipient] {
                     Op::Authorize(head.recipient, false)
-                } else if head.payout + head.fee <= room {
+                } else if room > 0 {
                     Op::Release(self.pick(&[1, 2, 50]))
                 } else {
                     Op::Advance(DAY - now % DAY)
@@ -978,6 +987,11 @@ fn run(seed: u64, steps: usize) -> BTreeMap<std::string::String, usize> {
         if run.model.stranded.len() > before.stranded.len() {
             *seen.entry("Release stranded".into()).or_insert(0) += 1;
         }
+        if let (Some(old), Some(new)) = (before.exits.front(), run.model.exits.front()) {
+            if old.id == new.id && old.payout + old.fee > new.payout + new.fee {
+                *seen.entry("Release paid in part".into()).or_insert(0) += 1;
+            }
+        }
     }
     seen
 }
@@ -1017,10 +1031,11 @@ fn random_sequences_keep_the_vault_equal_to_the_spec_model() {
             "{op} never refused: {seen:?}"
         );
     }
-    // Exits queued and stranded, and the asset contract refused a payment of each entry point
-    // that makes plain transfers.
+    // Exits queued, paid in part and stranded, and the asset contract refused a payment of each
+    // entry point that makes plain transfers.
     for case in [
         "Transact queued",
+        "Release paid in part",
         "Release stranded",
         "Transact reverted",
         "Claim reverted",

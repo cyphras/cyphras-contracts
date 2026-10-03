@@ -198,25 +198,133 @@ fn anyone_releases_queued_exits_in_order_once_the_window_has_room() {
 }
 
 #[test]
-fn release_stops_at_the_first_exit_that_does_not_fit_and_never_skips_it() {
+fn release_pays_what_fits_of_an_exit_and_keeps_the_rest_at_the_head() {
     let s = funded();
     let filler = s.account("filler", 0);
     let user = s.account("user", 0);
+    let relayer = s.account("relayer", 0);
     fill_window(&s, &filler);
     let a = queue(&s, 3_000 * XLM, 0, &user, &user);
-    let b = queue(&s, 3_000 * XLM, 0, &user, &user);
+    let b = queue(&s, 3_000 * XLM, 2 * XLM, &user, &relayer);
     let c = queue(&s, XLM, 0, &user, &user);
+    let queued_at = s.now();
 
-    // The last exit would fit beside the first, but it does not pass the second.
-    to_midnight(&s);
-    assert_eq!(s.vault.release(&10), 1);
-    assert_eq!(s.vault.exit(&a), None);
-    assert!(s.vault.exit(&b).is_some() && s.vault.exit(&c).is_some());
-    assert_eq!(s.vault.status().exit_head, b);
-    assert_eq!(s.balance(&user), 3_000 * XLM);
+    // The second exit does not fit beside the first, so what fits of it is paid and the rest
+    // waits at the head, still ahead of the third.
     to_midnight(&s);
     assert_eq!(s.vault.release(&10), 2);
-    assert_eq!(s.balance(&user), 6_001 * XLM);
+    let vault = s.vault.address.clone();
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&vault),
+        std::vec![
+            events::Settled {
+                ext_amount: -3_000 * XLM,
+                fee: 0,
+                recipient: user.clone().into(),
+                relayer: user.clone(),
+                exit_id: Some(a)
+            }
+            .to_xdr(&s.env, &vault),
+            events::ExitPaid {
+                id: b,
+                payout_paid: 2_000 * XLM,
+                fee_paid: 0,
+                payout_left: 1_000 * XLM,
+                fee_left: 2 * XLM
+            }
+            .to_xdr(&s.env, &vault),
+        ]
+    );
+    assert_eq!(
+        s.vault.exit(&b),
+        Some(Exit {
+            recipient: user.clone().into(),
+            payout: 1_000 * XLM,
+            relayer: relayer.clone(),
+            fee: 2 * XLM,
+            queued_at,
+        })
+    );
+    assert!(s.vault.exit(&c).is_some());
+    let status = s.vault.status();
+    assert_eq!(status.exit_head, b);
+    assert_eq!(used(&s), s.vault.limits().max_daily_outflow);
+    assert_eq!(status.queued_total, 1_003 * XLM);
+    assert_eq!(s.balance(&user), 5_000 * XLM);
+
+    // The next day pays the rest of the second exit, then the third.
+    to_midnight(&s);
+    assert_eq!(s.vault.release(&10), 2);
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&vault),
+        std::vec![
+            events::Settled {
+                ext_amount: -1_000 * XLM,
+                fee: 2 * XLM,
+                recipient: user.clone().into(),
+                relayer: relayer.clone(),
+                exit_id: Some(b)
+            }
+            .to_xdr(&s.env, &vault),
+            events::Settled {
+                ext_amount: -XLM,
+                fee: 0,
+                recipient: user.clone().into(),
+                relayer: user.clone(),
+                exit_id: Some(c)
+            }
+            .to_xdr(&s.env, &vault),
+        ]
+    );
+    assert_eq!(
+        (s.balance(&user), s.balance(&relayer)),
+        (6_001 * XLM, 2 * XLM)
+    );
+    assert_eq!(s.vault.status().queued_total, 0);
+}
+
+#[test]
+fn a_fee_is_paid_in_part_like_a_payout() {
+    let s = Setup::with_limits(crate::Limits {
+        max_daily_outflow: 10 * XLM,
+        tvl_cap: 70 * XLM,
+        ..limits()
+    });
+    s.fund_pool("funder", 50 * XLM);
+    let user = s.account("user", 0);
+    let relayer = s.account("relayer", 0);
+    fill_window(&s, &user);
+    queue(&s, 2 * XLM, 0, &user, &user);
+    let id = queue(&s, 7 * XLM, 2 * XLM, &user, &relayer);
+
+    // Two units go to the first exit and seven to the payout, which leaves one for the fee.
+    to_midnight(&s);
+    assert_eq!(s.vault.release(&10), 2);
+    let vault = s.vault.address.clone();
+    assert_eq!(
+        s.env
+            .events()
+            .all()
+            .filter_by_contract(&vault)
+            .events()
+            .last(),
+        Some(
+            &events::ExitPaid {
+                id,
+                payout_paid: 7 * XLM,
+                fee_paid: XLM,
+                payout_left: 0,
+                fee_left: XLM
+            }
+            .to_xdr(&s.env, &vault)
+        )
+    );
+    assert_eq!(s.balance(&relayer), XLM);
+    to_midnight(&s);
+    assert_eq!(s.vault.release(&10), 1);
+    assert_eq!(s.balance(&relayer), 2 * XLM);
+    assert_eq!(s.balance(&user), 19 * XLM);
+    assert_eq!(used(&s), XLM);
 }
 
 #[test]
@@ -326,17 +434,17 @@ fn a_transfer_without_a_fee_never_waits() {
 }
 
 #[test]
-fn released_exits_never_take_more_than_a_window_a_day() {
+fn the_queue_takes_a_full_window_a_day_and_no_more() {
     let s = funded();
     let filler = s.account("filler", 0);
     let user = s.account("user", 0);
     let max = s.vault.limits().max_daily_outflow;
     fill_window(&s, &filler);
-    // Seven exits of 700 XLM fit a day's window and an eighth does not.
+    // Seven exits of 700 XLM and part of an eighth fill a day's window.
     for _ in 0..14 {
         queue(&s, 700 * XLM, 0, &user, &user);
     }
-    let mut days = 0;
+    let mut paid_per_day = std::vec::Vec::new();
     while s.vault.status().exit_head < s.vault.status().exit_tail {
         to_midnight(&s);
         let before = s.balance(&user);
@@ -345,12 +453,11 @@ fn released_exits_never_take_more_than_a_window_a_day() {
             s.vault.release(&max);
         }
         let paid = s.balance(&user) - before;
-        assert_eq!(paid, 4_900 * XLM);
         assert_eq!(used(&s), paid);
         assert!(paid <= max);
-        days += 1;
+        paid_per_day.push(paid);
     }
-    assert_eq!(days, 2);
+    assert_eq!(paid_per_day, std::vec![max, 9_800 * XLM - max]);
     assert_eq!(s.vault.status().queued_total, 0);
 }
 
@@ -419,11 +526,12 @@ fn value_owed_to_queued_exits_cannot_leave_twice() {
     );
 }
 
-/// The most days an exit can wait, counted from the day it was queued, with `ahead` queued in
-/// front of it and the keeper releasing at the start of each day: the queue moves by more than a
-/// full window every two days.
-fn longest_wait(ahead: i128, window: i128) -> u64 {
-    2 * (ahead as u64).div_ceil(window as u64) + 1
+/// The days after the first day boundary within which an exit is paid in full, with `ahead` owed
+/// to the exits queued or stranded before it and `own` its own outflow, when every day's window is
+/// used in full until it is paid: everything in front of it and itself must pass through windows
+/// of `window` each.
+fn wait_bound(ahead: i128, own: i128, window: i128) -> u64 {
+    ((ahead + own) as u64).div_ceil(window as u64)
 }
 
 /// An honest exit waiting in the queue.
@@ -431,11 +539,14 @@ struct Waiting {
     id: u64,
     day: u64,
     ahead: i128,
+    own: i128,
 }
 
-/// Pops every honest exit the queue has paid, checking that it went in its turn and in time.
-fn check_paid(s: &Setup, waiting: &mut VecDeque<Waiting>, bound: impl Fn(i128) -> u64) {
+/// Pops every honest exit the queue has paid in full, checking that it went in its turn and in
+/// time.
+fn check_paid(s: &Setup, waiting: &mut VecDeque<Waiting>) {
     let status = s.vault.status();
+    let window = s.vault.limits().max_daily_outflow;
     while let Some(exit) = waiting.front() {
         if s.vault.exit(&exit.id).is_some() {
             break;
@@ -443,14 +554,26 @@ fn check_paid(s: &Setup, waiting: &mut VecDeque<Waiting>, bound: impl Fn(i128) -
         // Every exit queued before it left the queue first.
         assert!(status.exit_head > exit.id);
         let days = s.now() / DAY - exit.day;
+        let bound = wait_bound(exit.ahead, exit.own, window);
         assert!(
-            days <= bound(exit.ahead),
-            "exit {} waited {days} days behind {}",
-            exit.id,
-            exit.ahead
+            days <= bound,
+            "exit {} waited {days} days, more than {bound}",
+            exit.id
         );
         waiting.pop_front();
     }
+}
+
+/// Submits an honest exit that must wait, and records what is ahead of it.
+fn queue_honest(s: &Setup, payout: i128, honest: &Address, waiting: &mut VecDeque<Waiting>) {
+    let ahead = s.vault.status().queued_total;
+    let id = queue(s, payout, 0, honest, honest);
+    waiting.push_back(Waiting {
+        id,
+        day: s.now() / DAY,
+        ahead,
+        own: payout,
+    });
 }
 
 #[test]
@@ -465,10 +588,10 @@ fn one_funded_account_recycling_capital_cannot_keep_an_honest_exit_waiting_past_
     let attacker = s.account("attacker", 0);
     let attacker_source = s.account("attacker source", window);
     // Below the large-deposit threshold a deposit waits only the short delay, so the attacker
-    // can deposit a whole window and have it admitted within the day.
+    // can deposit what it got back and have it admitted within the day.
     let chunk = limits.large_deposit_threshold - XLM;
-    let deposit_window = |s: &Setup| {
-        let mut left = window;
+    let deposit = |s: &Setup, amount: i128| {
+        let mut left = amount;
         let mut last = 0;
         while left > 0 {
             last = s.shield(&attacker_source, left.min(chunk)).unwrap();
@@ -484,45 +607,34 @@ fn one_funded_account_recycling_capital_cannot_keep_an_honest_exit_waiting_past_
             start += batch.len();
         }
     };
-    deposit_window(&s);
+    deposit(&s, window);
     let mut attacker_notes = window;
 
     let mut waiting = VecDeque::new();
     for day in 0..12 {
         to_midnight(&s);
-        // The attacker races for each new window before anyone else. Once an exit waits, the
-        // attacker's exit waits behind it.
-        if day < 8 && attacker_notes == window {
-            let ext = s.ext(-window, 0, &attacker, &attacker);
+        // The attacker races for each new window before anyone else with all it holds. Once an
+        // exit waits, the attacker's exit waits behind it.
+        if day < 8 && attacker_notes > 0 {
+            let ext = s.ext(-attacker_notes, 0, &attacker, &attacker);
             assert_eq!(s.transact(&attacker, &ext), Ok(()));
             attacker_notes = 0;
         }
         // An honest exit follows and waits its turn.
         if day < 8 {
-            let status = s.vault.status();
-            let ext = s.ext(-100 * XLM, 0, &honest, &honest);
-            assert_eq!(s.transact(&honest, &ext), Ok(()));
-            assert!(s.vault.exit(&status.exit_tail).is_some());
-            waiting.push_back(Waiting {
-                id: status.exit_tail,
-                day: s.now() / DAY,
-                ahead: status.queued_total,
-            });
+            queue_honest(&s, 100 * XLM, &honest, &mut waiting);
         }
-        // The keeper releases what fits at the start of the day, however often it is called.
+        // The keeper releases at the start of the day until the window is full.
         s.vault.release(&50);
         s.vault.release(&50);
         assert!(used(&s) <= window);
-        check_paid(&s, &mut waiting, |ahead| {
-            (ahead as u64).div_ceil(window as u64) + 1
-        });
+        check_paid(&s, &mut waiting);
         // Whatever reached the attacker goes straight back into the pool.
         let back = s.balance(&attacker);
         if back > 0 {
-            assert_eq!(back, window);
             s.token.transfer(&attacker, &attacker_source, &back);
-            deposit_window(&s);
-            attacker_notes = window;
+            deposit(&s, back);
+            attacker_notes = back;
         }
     }
     assert!(waiting.is_empty());
@@ -531,7 +643,7 @@ fn one_funded_account_recycling_capital_cannot_keep_an_honest_exit_waiting_past_
 }
 
 #[test]
-fn exits_sized_to_waste_the_window_slow_the_queue_but_never_stop_it() {
+fn exits_sized_to_waste_the_window_still_use_all_of_it() {
     let s = Setup::new();
     for i in 0..9 {
         s.fund_pool(&std::format!("funder {i}"), 2_500 * XLM);
@@ -541,33 +653,69 @@ fn exits_sized_to_waste_the_window_slow_the_queue_but_never_stop_it() {
     let attacker = s.account("attacker", 0);
     let honest = s.account("honest", 0);
     fill_window(&s, &filler);
-    // Two of these never fit one window, so each day pays only one and leaves almost half of
-    // the window unused.
+    // Two of these never fit one window whole, but the second is paid in part.
     let wasteful = window / 2 + 1;
     for _ in 0..6 {
         queue(&s, wasteful, 0, &attacker, &attacker);
     }
-    let status = s.vault.status();
-    let id = queue(&s, 100 * XLM, 0, &honest, &honest);
-    let mut waiting = VecDeque::from([Waiting {
-        id,
-        day: s.now() / DAY,
-        ahead: status.queued_total,
-    }]);
+    let mut waiting = VecDeque::new();
+    queue_honest(&s, 100 * XLM, &honest, &mut waiting);
+    let bound = wait_bound(6 * wasteful, 100 * XLM, window);
+    assert_eq!(bound, 4);
 
     let mut days = 0;
     while !waiting.is_empty() {
         to_midnight(&s);
         days += 1;
         s.vault.release(&50);
-        assert!(used(&s) <= window);
-        check_paid(&s, &mut waiting, |ahead| longest_wait(ahead, window));
+        check_paid(&s, &mut waiting);
+        if !waiting.is_empty() {
+            assert_eq!(used(&s), window);
+        }
     }
-    // Six exits worth a little over three windows took six days, where a full window a day would
-    // have paid them in four, and the honest exit went out beside the last of them.
-    assert_eq!(days, 6);
+    // A little over three windows in front and its own small outflow take exactly the bound.
+    assert_eq!(days, bound);
     assert_eq!(s.balance(&honest), 100 * XLM);
     assert_eq!(s.balance(&attacker), 6 * wasteful);
+}
+
+#[test]
+fn exits_of_any_size_are_paid_in_exactly_their_share_of_full_windows() {
+    let s = Setup::new();
+    for i in 0..10 {
+        s.fund_pool(&std::format!("funder {i}"), 2_500 * XLM);
+    }
+    let window = s.vault.limits().max_daily_outflow;
+    let filler = s.account("filler", 0);
+    let user = s.account("user", 0);
+    fill_window(&s, &filler);
+    // Exits of random sizes, worth four windows in all, wait together.
+    let mut waiting = VecDeque::new();
+    let mut notes = 20_000 * XLM;
+    while notes > 0 {
+        let size = (1 + s.below(window as u64) as i128).min(notes);
+        queue_honest(&s, size, &user, &mut waiting);
+        notes -= size;
+    }
+    let bounds: std::vec::Vec<(u64, u64)> = waiting
+        .iter()
+        .map(|w| (w.id, wait_bound(w.ahead, w.own, window)))
+        .collect();
+    assert_eq!(bounds.last().unwrap().1, 4);
+
+    let mut day = 0;
+    while !waiting.is_empty() {
+        to_midnight(&s);
+        day += 1;
+        s.vault.release(&50);
+        // With every window used in full, each exit is paid on the very day its bound names.
+        for (id, bound) in &bounds {
+            assert_eq!(s.vault.exit(id).is_none(), *bound <= day, "exit {id}");
+        }
+        check_paid(&s, &mut waiting);
+    }
+    assert_eq!(day, 4);
+    assert_eq!(s.balance(&user), 20_000 * XLM);
 }
 
 // The live network's per-transaction limits on instructions and on event bytes. The test
