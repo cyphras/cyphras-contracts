@@ -43,11 +43,16 @@ func TestAProofMustUseOneOfTheNewestRoots(t *testing.T) {
 	if _, f := h.r.Submit(ctx, req); f == nil || f.code != CodeRejected {
 		t.Fatalf("a root 200 insertions old: %v", f)
 	}
+	// A root the vault keeps never grows fresh again, so the same proof is refused from memory; a
+	// proof on a root one insertion younger is taken.
 	h.aged(req.Proof.Root, 199)
 	if err := h.r.readRoots(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, f := h.r.Submit(ctx, req); f != nil {
+	if _, f := h.r.Submit(ctx, req); f == nil || f.code != CodeRejected {
+		t.Fatalf("the refused proof again: %v", f)
+	}
+	if _, f := h.r.Submit(ctx, h.forged(t, dest, -20_000_000, 5_000_000)); f != nil {
 		t.Fatalf("a root 199 insertions old: %v", f)
 	}
 	h.waitIdle()
@@ -209,4 +214,38 @@ func TestTheRPCIsCheckedForDiagnosticEvents(t *testing.T) {
 	if ok, err := h.r.CheckDiagnostics(ctx); err != nil || ok || !h.r.alerts.Open("rpc_no_diagnostics") {
 		t.Fatalf("an RPC without diagnostics: %v %v", ok, err)
 	}
+}
+
+// reforged proves the request again after its public inputs changed.
+func (h *harness) reforged(req Request) Request {
+	p := req.Proof
+	p.A, p.B, p.C = forge([8]fr.Element{p.Root, p.PublicAmount, p.ExtDataHash, h.domain, p.Nullifiers[0], p.Nullifiers[1], p.Commitments[0], p.Commitments[1]})
+	req.Proof = p
+	return req
+}
+
+func TestReplaysOfAProofOnAnUnknownRootShareOneReadOfTheRootHistory(t *testing.T) {
+	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t) })
+	ctx := context.Background()
+	dest := keypair.MustRandom().Address()
+	h.fund(dest)
+	req := h.forged(t, dest, -20_000_000, 5_000_000)
+	req.Proof.Root = fr.SetUint64(12345)
+	req = h.reforged(req)
+	before := h.fake.CallCount("getLedgerEntries")
+	for range 100 {
+		if _, f := h.r.Submit(ctx, req); f == nil || f.code != CodeRejected {
+			t.Fatalf("a proof on an unknown root: %v", f)
+		}
+	}
+	if reads := h.fake.CallCount("getLedgerEntries") - before; reads > 1 {
+		t.Fatalf("%d reads of the root history in one ledger", reads)
+	}
+	// The root comes in the next ledger: its refusal was not kept.
+	h.aged(req.Proof.Root, 0)
+	h.setLatest(h.fake.Latest+1, true)
+	if _, f := h.r.Submit(ctx, req); f != nil {
+		t.Fatalf("a root the next ledger brought: %v", f)
+	}
+	h.waitIdle()
 }

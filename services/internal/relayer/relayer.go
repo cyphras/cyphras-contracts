@@ -179,8 +179,11 @@ type Relayer struct {
 
 	chainMu sync.RWMutex
 	inst    *vault.Instance
-	// roots holds the age of each root the vault keeps, 0 for the newest.
+	// roots holds the age of each root the vault keeps, 0 for the newest, as read at rootsLedger.
 	roots       map[fr.Element]uint32
+	rootsLedger uint32
+	// rootsMu makes concurrent reads of the root history wait for one.
+	rootsMu     sync.Mutex
 	latest      uint32
 	latestClose int64
 }
@@ -336,7 +339,7 @@ func (r *Relayer) readRoots(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	e, _, err := rpc.One(ctx, r.rpc, key)
+	e, latest, err := rpc.One(ctx, r.rpc, key)
 	if err != nil {
 		return err
 	}
@@ -355,29 +358,44 @@ func (r *Relayer) readRoots(ctx context.Context) error {
 		}
 	}
 	r.chainMu.Lock()
-	r.roots = roots
+	r.roots, r.rootsLedger = roots, latest
 	r.chainMu.Unlock()
 	return nil
 }
 
-// freshRoot reports whether a root is among the vault's newest FreshRoots: one older would leave a
-// transaction made against it to fail when insertions push it out of the vault's history before
-// it lands. The root history is read again first when reread is set, and when the root is newer
-// than the last read.
-func (r *Relayer) freshRoot(ctx context.Context, root fr.Element, reread bool) (bool, error) {
+// freshRoot reports whether a root is among the vault's newest FreshRoots, and whether the vault
+// keeps it at all: one older would leave a transaction made against it to fail when insertions
+// push it out of the vault's history before it lands. The root history is read again first when
+// reread is set, and when the root is newer than the last read, unless it was read at ledger.
+func (r *Relayer) freshRoot(ctx context.Context, root fr.Element, ledger uint32, reread bool) (fresh, known bool, err error) {
 	r.chainMu.RLock()
 	age, known := r.roots[root]
 	r.chainMu.RUnlock()
 	if known && !reread {
-		return age < r.cfg.FreshRoots, nil
+		return age < r.cfg.FreshRoots, true, nil
 	}
-	if err := r.readRoots(ctx); err != nil {
-		return false, err
+	if err := r.readRootsAt(ctx, ledger); err != nil {
+		return false, false, err
 	}
 	r.chainMu.RLock()
 	defer r.chainMu.RUnlock()
 	age, known = r.roots[root]
-	return known && age < r.cfg.FreshRoots, nil
+	return known && age < r.cfg.FreshRoots, known, nil
+}
+
+// readRootsAt reads the root history again unless it was read at ledger or later. The history
+// only changes when a ledger closes, so checks of the same ledger, repeated or concurrent, share
+// one read; an unknown ledger, 0, reads it.
+func (r *Relayer) readRootsAt(ctx context.Context, ledger uint32) error {
+	r.rootsMu.Lock()
+	defer r.rootsMu.Unlock()
+	r.chainMu.RLock()
+	read := r.rootsLedger
+	r.chainMu.RUnlock()
+	if ledger > 0 && read >= ledger {
+		return nil
+	}
+	return r.readRoots(ctx)
 }
 
 // spent reports whether either nullifier is already spent.
@@ -410,13 +428,17 @@ func (r *Relayer) local(ctx context.Context, req Request) *failure {
 		p.Root, p.PublicAmount, p.ExtDataHash, inst.Config.Domain, p.Nullifiers[0], p.Nullifiers[1], p.Commitments[0], p.Commitments[1],
 	}
 	if !r.cfg.Key.Verify(p.A, p.B, p.C, inputs) {
-		return fail(http.StatusUnprocessableEntity, CodeRejected)
+		return settledFail(http.StatusUnprocessableEntity, CodeRejected)
 	}
-	ok, err := r.freshRoot(ctx, p.Root, false)
+	fresh, known, err := r.freshRoot(ctx, p.Root, r.clock.ledgerAt(r.now().Unix()), false)
 	switch {
 	case err != nil:
 		return fail(http.StatusServiceUnavailable, CodeUnavailable)
-	case !ok:
+	case known && !fresh:
+		// A root the vault keeps never grows fresh again.
+		return settledFail(http.StatusUnprocessableEntity, CodeRejected)
+	case !fresh:
+		// A root newer than the history this relayer read may still come.
 		return fail(http.StatusUnprocessableEntity, CodeRejected)
 	}
 	return nil
@@ -696,16 +718,20 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	if f := r.check(req); f != nil {
 		return Accepted{}, f
 	}
-	if f := r.local(ctx, req); f != nil {
-		return Accepted{}, f
-	}
-	// A proof already used, or already refused once it had cost the network, is answered from
-	// memory, so replaying public proofs cannot spend the budget honest requests need.
-	if r.known.any(req.Proof.Nullifiers) {
-		return Accepted{}, fail(http.StatusUnprocessableEntity, CodeRejected)
-	}
+	// A proof already refused for good, once it had been verified or had cost the network, is
+	// answered from memory, so replaying public proofs cannot spend the budget, or the reads of
+	// the root history, honest requests need.
 	if f := r.told.recall(proofKey(req), r.now()); f != nil {
 		return Accepted{}, f
+	}
+	if f := r.local(ctx, req); f != nil {
+		if f.settled {
+			r.told.remember(proofKey(req), *f, r.now())
+		}
+		return Accepted{}, f
+	}
+	if r.known.any(req.Proof.Nullifiers) {
+		return Accepted{}, fail(http.StatusUnprocessableEntity, CodeRejected)
 	}
 	if f := r.guard(req); f != nil {
 		return Accepted{}, f
@@ -1010,7 +1036,7 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 			return "", f
 		}
 	}
-	current, err := r.freshRoot(ctx, req.Proof.Root, true)
+	current, _, err := r.freshRoot(ctx, req.Proof.Root, prepared.SimulatedAt, true)
 	if err != nil {
 		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
