@@ -79,8 +79,8 @@ func main() {
 }
 
 // holdReasons reads HOLD_REASONS, the flag reasons the keeper never refunds: by default a written
-// order from an authority only. A screening hold, reason 6, is not one of them, since a hold is
-// harmless only because its deposit goes back to the depositor once the refund delay passes.
+// order from an authority only. A screening hold, reason 6, may not be one of them, since a hold
+// is harmless only because its deposit goes back to the depositor once the refund delay passes.
 func holdReasons() (map[uint32]bool, error) {
 	hold := map[uint32]bool{}
 	for _, r := range strings.Split(config.Env("HOLD_REASONS", "100"), ",") {
@@ -91,7 +91,13 @@ func holdReasons() (map[uint32]bool, error) {
 		if err != nil {
 			return nil, err
 		}
+		if n == screeningHold {
+			return nil, errors.New("HOLD_REASONS may not hold reason 6: a screening hold must be refunded once its delay passes")
+		}
 		hold[uint32(n)] = true
 	}
 	return hold, nil
 }
+
+// screeningHold is the reason of the screening service's holds.
+const screeningHold = 6
