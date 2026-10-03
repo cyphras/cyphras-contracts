@@ -135,6 +135,9 @@ impl Vault {
         proof::check_binding(&env, &ext)?;
 
         let amount = ext.ext_amount;
+        if amount < limits.min_deposit {
+            return Err(Error::DepositTooSmall);
+        }
         if amount > limits.max_deposit {
             return Err(Error::DepositTooLarge);
         }
@@ -466,16 +469,17 @@ impl Vault {
         Ok(())
     }
 
-    /// The guardian changes the limits. A tightening, where no field rises, applies at once and
-    /// cancels any queued loosening; any loosening replaces the queued one and applies 7 days later
-    /// through `apply_limits`. `max_daily_outflow` never decreases, so a full pool can always exit
-    /// within a week.
+    /// The guardian changes the limits. A tightening, where `min_deposit` does not fall and no
+    /// other field rises, applies at once and cancels any queued loosening; any loosening replaces
+    /// the queued one and applies 7 days later through `apply_limits`. `max_daily_outflow` never
+    /// decreases, so a full pool can always exit within a week.
     pub fn set_limits(env: Env, limits: Limits) -> Result<(), Error> {
         storage::config(&env).guardian.require_auth();
         let current = storage::limits(&env);
         check_change(&current, &limits)?;
         let now = env.ledger().timestamp();
-        let tightening = limits.max_deposit <= current.max_deposit
+        let tightening = limits.min_deposit >= current.min_deposit
+            && limits.max_deposit <= current.max_deposit
             && limits.max_daily_per_depositor <= current.max_daily_per_depositor
             && limits.tvl_cap <= current.tvl_cap
             && limits.max_daily_outflow <= current.max_daily_outflow
@@ -638,6 +642,7 @@ fn check_outflow(status: &Status, limits: &Limits, day: u64, outflow: i128) -> R
     Ok(today)
 }
 
+/// `min_deposit` may exceed `max_deposit`: a zero `max_deposit` is how deposits are stopped.
 fn check_limits(limits: &Limits) -> Result<(), Error> {
     let amounts = [
         limits.max_deposit,
@@ -647,9 +652,11 @@ fn check_limits(limits: &Limits) -> Result<(), Error> {
         limits.max_fee,
         limits.large_deposit_threshold,
     ];
+    if limits.min_deposit < 1 || amounts.iter().any(|a| *a < 0) {
+        return Err(Error::BadLimits);
+    }
     // At this outflow a full pool can always leave within a week.
-    if amounts.iter().any(|a| *a < 0) || limits.tvl_cap > limits.max_daily_outflow.saturating_mul(7)
-    {
+    if limits.tvl_cap > limits.max_daily_outflow.saturating_mul(7) {
         return Err(Error::BadLimits);
     }
     Ok(())

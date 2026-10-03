@@ -43,6 +43,7 @@ pub struct Config {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Limits {
+    pub min_deposit: i128,
     pub max_deposit: i128,
     pub max_daily_per_depositor: i128,
     pub tvl_cap: i128,

@@ -74,7 +74,9 @@ fn valid(l: &Limits) -> bool {
         l.max_fee,
         l.large_deposit_threshold,
     ];
-    fields.iter().all(|f| *f >= 0) && l.tvl_cap <= l.max_daily_outflow.saturating_mul(7)
+    l.min_deposit >= 1
+        && fields.iter().all(|f| *f >= 0)
+        && l.tvl_cap <= l.max_daily_outflow.saturating_mul(7)
 }
 
 impl Model {
@@ -125,6 +127,9 @@ impl Model {
                 }
                 if *amount <= 0 {
                     return Err(Error::BadAmount);
+                }
+                if *amount < self.limits.min_deposit {
+                    return Err(Error::DepositTooSmall);
                 }
                 if *amount > self.limits.max_deposit {
                     return Err(Error::DepositTooLarge);
@@ -268,7 +273,8 @@ impl Model {
             Op::SetLimits(next) => {
                 self.check_change(next)?;
                 let l = &self.limits;
-                let tightening = next.max_deposit <= l.max_deposit
+                let tightening = next.min_deposit >= l.min_deposit
+                    && next.max_deposit <= l.max_deposit
                     && next.max_daily_per_depositor <= l.max_daily_per_depositor
                     && next.tvl_cap <= l.tvl_cap
                     && next.max_daily_outflow <= l.max_daily_outflow
@@ -315,6 +321,7 @@ struct Run {
 impl Run {
     fn new(seed: u64) -> Self {
         let limits = Limits {
+            min_deposit: XLM / 10,
             max_deposit: 100 * XLM,
             max_daily_per_depositor: 250 * XLM,
             tvl_cap: 1_000 * XLM,
@@ -370,6 +377,7 @@ impl Run {
             0..=21 => {
                 let amount = self.pick(&[
                     1,
+                    m.limits.min_deposit,
                     10 * XLM,
                     m.limits.large_deposit_threshold - 1,
                     m.limits.large_deposit_threshold,
@@ -411,6 +419,7 @@ impl Run {
                 let l = &m.limits;
                 let max_daily_outflow = self.scaled(l.max_daily_outflow);
                 Op::SetLimits(Limits {
+                    min_deposit: self.scaled(l.min_deposit),
                     max_deposit: self.scaled(l.max_deposit),
                     max_daily_per_depositor: self.scaled(l.max_daily_per_depositor),
                     tvl_cap: self

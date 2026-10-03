@@ -206,7 +206,22 @@ fn the_constructor_refuses_an_unsafe_configuration() {
         ..ok.clone()
     };
     assert_eq!(deploy(&env, &token, delays, past_the_bound), bad_limits);
+    // Deposits can start stopped: min_deposit may exceed a zero max_deposit.
+    let stopped = Limits {
+        min_deposit: XLM,
+        max_deposit: 0,
+        ..ok.clone()
+    };
+    assert!(deploy(&env, &token, delays, stopped).is_ok());
     for negative in [
+        Limits {
+            min_deposit: 0,
+            ..ok.clone()
+        },
+        Limits {
+            min_deposit: -1,
+            ..ok.clone()
+        },
         Limits {
             max_deposit: -1,
             ..ok.clone()

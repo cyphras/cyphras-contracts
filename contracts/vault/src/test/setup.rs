@@ -22,9 +22,10 @@ pub const SEQ0: u32 = 1_000;
 pub const TESTNET: &str = "Test SDF Network ; September 2015";
 pub const MAINNET: &str = "Public Global Stellar Network ; September 2015";
 
-/// The proposed initial limits of the mainnet XLM vault.
+/// The proposed initial limits of the mainnet XLM vault, with the lowest minimum deposit.
 pub fn limits() -> Limits {
     Limits {
+        min_deposit: 1,
         max_deposit: 2_500 * XLM,
         max_daily_per_depositor: 5_000 * XLM,
         tvl_cap: 25_000 * XLM,

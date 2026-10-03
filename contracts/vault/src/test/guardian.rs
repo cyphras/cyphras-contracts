@@ -2,7 +2,7 @@ use soroban_sdk::{testutils::Events as _, Event, Vec};
 
 use super::{
     queue::authorizers,
-    setup::{outcome, Setup, DAY, DELAY_LARGE, XLM},
+    setup::{limits, outcome, Setup, DAY, DELAY_LARGE, XLM},
 };
 use crate::{events, storage, Error, Limits, QueuedLimits};
 
@@ -155,17 +155,23 @@ fn the_guardian_keeps_its_other_powers_while_halted() {
     assert_eq!(s.vault.limits(), tighter);
 }
 
-fn each_field(limits: &Limits, delta: i128) -> std::vec::Vec<Limits> {
+/// One copy of `limits` per field, with that field one unit tighter, or looser. A higher
+/// `min_deposit` is tighter, as is a lower value of any other field. `max_daily_outflow` never
+/// decreases, so it has no tighter copy.
+fn one_field_changed(limits: &Limits, tighter: bool) -> std::vec::Vec<Limits> {
+    let step = if tighter { -1 } else { 1 };
     let mut out = std::vec::Vec::new();
-    for i in 0..6 {
+    for field in 0..7 {
         let mut l = limits.clone();
-        match i {
-            0 => l.max_deposit += delta,
-            1 => l.max_daily_per_depositor += delta,
-            2 => l.tvl_cap += delta,
-            3 => l.max_daily_outflow += delta,
-            4 => l.max_fee += delta,
-            _ => l.large_deposit_threshold += delta,
+        match field {
+            0 => l.min_deposit -= step,
+            1 => l.max_deposit += step,
+            2 => l.max_daily_per_depositor += step,
+            3 => l.tvl_cap += step,
+            4 if tighter => continue,
+            4 => l.max_daily_outflow += step,
+            5 => l.max_fee += step,
+            _ => l.large_deposit_threshold += step,
         }
         out.push(l);
     }
@@ -176,8 +182,8 @@ fn each_field(limits: &Limits, delta: i128) -> std::vec::Vec<Limits> {
 fn a_tightening_applies_at_once() {
     let s = Setup::new();
     let vault = s.vault.address.clone();
-    for field in [0, 1, 2, 4, 5] {
-        let tighter = each_field(&s.vault.limits(), -1).swap_remove(field);
+    for field in 0..6 {
+        let tighter = one_field_changed(&s.vault.limits(), true).swap_remove(field);
         s.vault.set_limits(&tighter);
         assert_eq!(
             s.env.events().all().filter_by_contract(&vault),
@@ -227,6 +233,10 @@ fn limits_always_let_a_full_pool_exit_within_seven_days() {
     let current = s.vault.limits();
     for negative in [
         Limits {
+            min_deposit: 0,
+            ..current.clone()
+        },
+        Limits {
             max_deposit: -1,
             ..current.clone()
         },
@@ -255,11 +265,50 @@ fn limits_always_let_a_full_pool_exit_within_seven_days() {
 }
 
 #[test]
+fn raising_min_deposit_tightens_and_lowering_it_is_queued() {
+    let s = Setup::with_limits(Limits {
+        min_deposit: XLM,
+        ..limits()
+    });
+    let depositor = s.account("depositor", 1_000 * XLM);
+    let mut raised = s.vault.limits();
+    raised.min_deposit = 10 * XLM;
+    s.vault.set_limits(&raised);
+    assert_eq!(s.vault.limits(), raised);
+    assert_eq!(
+        s.shield(&depositor, 10 * XLM - 1),
+        Err(Error::DepositTooSmall)
+    );
+    assert_eq!(s.shield(&depositor, 10 * XLM), Ok(1));
+
+    let mut lowered = raised.clone();
+    lowered.min_deposit = 1;
+    s.vault.set_limits(&lowered);
+    assert_eq!(s.vault.limits(), raised);
+    assert_eq!(s.vault.queued_limits().unwrap().limits, lowered);
+    lowered.min_deposit = 0;
+    assert_eq!(
+        outcome(s.vault.try_set_limits(&lowered)),
+        Err(Error::BadLimits)
+    );
+
+    // A zero max_deposit stops deposits even though min_deposit is above it.
+    let mut stop = raised.clone();
+    stop.max_deposit = 0;
+    s.vault.set_limits(&stop);
+    assert_eq!(s.vault.limits(), stop);
+    assert_eq!(s.shield(&depositor, 10 * XLM), Err(Error::DepositTooLarge));
+}
+
+#[test]
 fn a_loosening_waits_seven_days_and_then_anyone_applies_it() {
-    let s = Setup::new();
+    let s = Setup::with_limits(Limits {
+        min_deposit: XLM,
+        ..limits()
+    });
     let before = s.vault.limits();
     let vault = s.vault.address.clone();
-    for looser in each_field(&before, 1) {
+    for looser in one_field_changed(&before, false) {
         s.vault.set_limits(&looser);
         let ready_at = s.now() + WEEK;
         assert_eq!(
@@ -492,6 +541,7 @@ fn a_stolen_guardian_key_cannot_keep_a_full_pool_from_leaving_within_a_halt_and_
     // Everything the guardian can do at once.
     s.vault.set_pause(&true, &true);
     let tightest = Limits {
+        min_deposit: i128::MAX,
         max_deposit: 0,
         max_daily_per_depositor: 0,
         tvl_cap: 0,
