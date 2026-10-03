@@ -951,17 +951,19 @@ describe("wallet safety: when a payment is dead", () => {
     assert.equal((await alice.balance()).spendable, 100n * XLM);
   });
 
-  it("keeps a payment open past its deadline while the wallet lacks part of the vault's tree", async () => {
-    const { world, alice } = await funded();
+  it("keeps a payment open past its deadline while the wallet lacks part of the vault's tree and of its spends", async () => {
+    const { world, alice, store } = await funded();
     const bob = await openWallet(world, 1);
     world.relayer.failures.push({ error: "unavailable" });
     await assert.rejects(
       alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
     );
-    // Other users' leaves, past the deadline, which a lagging indexer has not taken in yet.
+    // Other users' leaves, past the deadline, and the spends up to it, which a lagging indexer
+    // has not taken in yet.
+    const { deadline } = await storedPlan(store);
     world.advance(121 * 5);
     world.indexer.leafLimit = world.vault.leaves.length;
-    world.indexer.completeTo = world.vault.ledger;
+    world.indexer.completeTo = deadline - 1;
     world.fill(2);
     const summary = await alice.sync();
     assert.equal(summary.rootVerified, true);
@@ -986,6 +988,47 @@ describe("wallet safety: when a payment is dead", () => {
     const [plan] = await alice.plans();
     assert.equal(plan?.state, "dead");
     assert.equal((await alice.balance()).spendable, 100n * XLM);
+  });
+
+  it("frees a refused payment's notes though the indexer always lags one pair behind", async () => {
+    const { world, store } = await funded();
+    // The indexer withholds the newest pair and reports its spends complete only up to the ledger
+    // before it, as an ordinary lag looks, so the wallet never holds the vault's whole tree.
+    const lagging = rewritingFetch(world, {
+      "/v1/leaves": (body) => {
+        const newest = new Set(world.vault.leaves.slice(-2).map((l) => l.index));
+        const leaves = body["leaves"] as { index: number }[];
+        return { ...body, leaves: leaves.filter((l) => !newest.has(l.index)) };
+      },
+      "/v1/nullifiers": (body) => {
+        const before = (world.vault.leaves.at(-2)?.ledger as number) - 1;
+        return { ...body, complete_to: Math.min(body["complete_to"] as number, before) };
+      },
+    });
+    const alice = await openWallet({ ...world, fetch: lagging }, 0, store);
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "refused", reason: 3 });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+      isError("service_rejected"),
+    );
+    world.advance(60);
+    world.fill(1);
+    let summary = await alice.sync();
+    assert.equal(summary.crossChecked, true);
+    assert.equal((await alice.plans())[0]?.state, "prepared");
+    // Other users keep the pool busy; the spends the indexer reports soon pass the deadline.
+    world.advance(121 * 5);
+    world.fill(1);
+    summary = await alice.sync();
+    assert.equal(summary.rootVerified, true);
+    assert.ok(summary.leafCount < world.vault.leaves.length);
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "dead");
+    assert.equal(plan?.needsUserDecision, false);
+    const balance = await alice.balance();
+    assert.equal(balance.spendable, 100n * XLM);
+    assert.equal(balance.locked, 0n);
   });
 
   it("confirms a payment marked dead once its own transaction shows it landed", async () => {
@@ -1228,16 +1271,17 @@ describe("wallet safety: unchecked ledgers", () => {
   });
 
   it("asks for a decision on a payment past its deadline whose fate it cannot tell yet", async () => {
-    const { world, alice } = await funded();
+    const { world, alice, store } = await funded();
     const bob = await openWallet(world, 1);
     world.relayer.failures.push({ error: "unavailable" });
     await assert.rejects(
       alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
     );
     assert.equal((await alice.plans())[0]?.needsUserDecision, false);
+    const { deadline } = await storedPlan(store);
     world.advance(121 * 5);
     world.indexer.leafLimit = world.vault.leaves.length;
-    world.indexer.completeTo = world.vault.ledger;
+    world.indexer.completeTo = deadline - 1;
     world.fill(2);
     await alice.sync();
     const [plan] = await alice.plans();

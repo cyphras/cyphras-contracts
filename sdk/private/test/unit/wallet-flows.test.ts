@@ -329,11 +329,13 @@ describe("wallet: spends", () => {
     const notBefore = Number(world.vault.timestamp) + 600;
     await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
     world.relayer.restart();
-    // Past the deadline the vault refuses the proof, so it goes nowhere again. The indexer has not
-    // served the latest leaves, so the plan stays open, and a sync still asks about it.
-    world.vault.ledger = (world.relayer.submissions[0]?.ext.deadline as number) + 1;
+    // Past the deadline the vault refuses the proof, so it goes nowhere again. The indexer has
+    // served neither the latest leaves nor the spends up to the deadline, so the plan stays open,
+    // and a sync still asks about it.
+    const deadline = world.relayer.submissions[0]?.ext.deadline as number;
+    world.vault.ledger = deadline + 1;
     world.indexer.leafLimit = world.vault.leaves.length;
-    world.indexer.completeTo = world.vault.ledger;
+    world.indexer.completeTo = deadline - 1;
     world.fill(1);
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "submitted");

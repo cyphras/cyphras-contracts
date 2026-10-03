@@ -512,14 +512,31 @@ function landingRefuted(state: WalletState, plan: Plan): boolean {
   });
 }
 
+// The checked spends of every ledger from the plan's building to its deadline show none of its
+// notes spent, and none of its commitments is known: a landing would have spent its notes, so it
+// never landed, and now never will.
+function missedDeadline(state: WalletState, plan: Plan): boolean {
+  if (!checkedBetween(state, plan.builtAt, plan.deadline)) return false;
+  if (plan.evidence.some((e) => e.outputs.some((pos) => pos !== undefined))) return false;
+  return plan.inputs.every((input) => {
+    const spent = state.notes.find((n) => n.pos === input.pos)?.spent;
+    return (
+      state.notes.some((n) => n.pos === input.pos) &&
+      (spent === undefined || spent.ledger > plan.deadline)
+    );
+  });
+}
+
 // Moves each plan along the submission state machine. A plan landed once both its commitments are
 // in the vault's tree. It is superseded once the vault's checked events show another transaction
 // spending one of its notes, or another plan of this wallet that spends the same notes landed. It
-// is dead once the wallet holds the vault's whole tree, as read at `view`, without the plan's
+// is dead once its deadline or its root's place in the vault's history has passed with no sign of
+// it: either the wallet holds the vault's whole tree, as read at `view`, without the plan's
 // commitments in it, at or past the plan's deadline or once the plan's root has left the vault's
-// history: from then on the vault refuses its proof. A dead or superseded plan whose commitments
-// turn up is confirmed all the same. A landed plan whose evidence a rescan dropped takes the
-// transaction the rebuilt leaves show, or starts over once the checked spends refute its landing.
+// history; or the checked spends of every ledger up to its deadline show its notes unspent. From
+// then on the vault refuses its proof. A dead or superseded plan whose commitments turn up is
+// confirmed all the same. A landed plan whose evidence a rescan dropped takes the transaction the
+// rebuilt leaves show, or starts over once the checked spends refute its landing.
 export function advancePlans(state: WalletState, view: ChainView): void {
   for (const plan of state.plans) {
     if (!LANDED_STATES.includes(plan.state)) continue;
@@ -556,8 +573,8 @@ export function advancePlans(state: WalletState, view: ChainView): void {
       plan.state = "superseded";
     } else if (
       isActive(plan) &&
-      whole &&
-      (view.roots.ledger >= plan.deadline || !view.roots.roots.includes(plan.root))
+      ((whole && (view.roots.ledger >= plan.deadline || !view.roots.roots.includes(plan.root))) ||
+        missedDeadline(state, plan))
     ) {
       plan.state = "dead";
     }

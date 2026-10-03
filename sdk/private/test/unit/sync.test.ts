@@ -149,6 +149,32 @@ describe("plan fate", () => {
     assert.equal(plan.state, "dead");
   });
 
+  it("declares a plan dead once the checked spends up to its deadline show its notes unspent", () => {
+    const { state, plan, note } = walletWith(40);
+    // The vault holds leaves the wallet does not, so it lacks the whole tree.
+    const view = viewAt(400, 42);
+    state.nullifierSince = 320;
+    advancePlans(state, view);
+    assert.equal(plan.state, "submitted");
+    state.nullifierSince = 321;
+    state.unchecked = [{ from: 300, to: 310, lost: false }];
+    advancePlans(state, view);
+    assert.equal(plan.state, "submitted");
+    state.unchecked = [];
+    // A spend of its note by the deadline, or a leaf of its, may be its own landing.
+    note.spent = { txHash: "cd".repeat(32), ledger: 320 };
+    advancePlans(state, view);
+    assert.equal(plan.state, "submitted");
+    note.spent = undefined;
+    plan.evidence = [evidence({ outputs: [41, undefined] })];
+    advancePlans(state, view);
+    assert.equal(plan.state, "submitted");
+    plan.evidence = [];
+    note.spent = { txHash: "cd".repeat(32), ledger: 321 };
+    advancePlans(state, view);
+    assert.equal(plan.state, "dead");
+  });
+
   it("declares a plan dead once its root has left the history of the vault's whole tree", () => {
     const kept = walletWith(40, treeOf(38).root());
     advancePlans(kept.state, viewAt(250, 40));
