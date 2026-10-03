@@ -133,14 +133,32 @@ func (s *Screener) Public(reports, checks *httpapi.Limiter) http.Handler {
 
 func ptr[T any](v T) *T { return &v }
 
-// Internal serves the relayer's destination screen. It is reachable only on the internal network
-// and needs the relayer's token; the proxy does not route it.
-func (s *Screener) Internal(tokenSHA256 [32]byte) http.Handler {
+// bearer reports whether a request carries the token whose SHA-256 is given.
+func bearer(r *http.Request, tokenSHA256 [32]byte) bool {
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	sum := sha256.Sum256([]byte(token))
+	return subtle.ConstantTimeCompare(sum[:], tokenSHA256[:]) == 1
+}
+
+// Internal serves the relayer's destination screen and the keeper's list of deposits whose
+// queued unflag waits, each to the holder of its own token. It is reachable only on the internal
+// network; the proxy does not route it.
+func (s *Screener) Internal(relayerSHA256, keeperSHA256 [32]byte) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /internal/v1/unflags", func(w http.ResponseWriter, r *http.Request) {
+		if !bearer(r, keeperSHA256) {
+			httpapi.Fail(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		pending, err := s.PendingUnflags(r.Context())
+		if err != nil {
+			httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
+			return
+		}
+		httpapi.JSON(w, http.StatusOK, map[string]any{"deposits": pending})
+	})
 	mux.HandleFunc("POST /internal/v1/screen", func(w http.ResponseWriter, r *http.Request) {
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		sum := sha256.Sum256([]byte(token))
-		if subtle.ConstantTimeCompare(sum[:], tokenSHA256[:]) != 1 {
+		if !bearer(r, relayerSHA256) {
 			httpapi.Fail(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}

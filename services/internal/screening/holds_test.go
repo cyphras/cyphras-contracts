@@ -3,6 +3,7 @@ package screening
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"net/http"
@@ -63,7 +64,7 @@ func TestHistorySpamHoldsADepositForAPersonAndNeverRefusesIt(t *testing.T) {
 		t.Fatalf("at the final check: %v", got)
 	}
 	// An unshield to the account stays withheld; its owner can still send it without the relayer.
-	api := h.s.Internal(sha256.Sum256([]byte("token")))
+	api := h.s.Internal(sha256.Sum256([]byte("token")), sha256.Sum256([]byte("keeper")))
 	req := httptest.NewRequest(http.MethodPost, "/internal/v1/screen", strings.NewReader(`{"address":"`+victim+`"}`))
 	req.Header.Set("Authorization", "Bearer token")
 	rec := httptest.NewRecorder()
@@ -526,5 +527,41 @@ func TestAQueuedCorrectionWaitsForTheFinalWindow(t *testing.T) {
 	}
 	if got := h.sent(); !slices.Contains(got, "unflag 1") {
 		t.Fatalf("sent %v", got)
+	}
+}
+
+func TestTheKeeperLearnsWhichDepositsAQueuedUnflagWaitsFor(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	dirty := h.shield(thief, 6_000_000_000)
+	h.tick()
+	h.land()
+	h.shield(keypair.MustRandom().Address(), 10_000_000)
+	h.tick()
+	api := h.s.Internal(sha256.Sum256([]byte("relayer")), sha256.Sum256([]byte("keeper")))
+	ask := func(token string) (int, []PendingUnflag) {
+		req := httptest.NewRequest(http.MethodGet, "/internal/v1/unflags", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		api.ServeHTTP(rec, req)
+		var body struct {
+			Deposits []PendingUnflag `json:"deposits"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &body)
+		return rec.Code, body.Deposits
+	}
+	if code, got := ask("keeper"); code != http.StatusOK || len(got) != 0 {
+		t.Fatalf("with nothing queued: %d %v", code, got)
+	}
+	if _, err := h.s.QueueUnflag(ctx, dirty, "reviewer", "false positive"); err != nil {
+		t.Fatal(err)
+	}
+	eligible := h.deposits[dirty].createdAt + 86_400
+	if code, got := ask("keeper"); code != http.StatusOK || len(got) != 1 || got[0].ID != dirty || got[0].Until != eligible {
+		t.Fatalf("with an unflag queued: %d %v", code, got)
+	}
+	// Only the keeper's token reads it.
+	if code, _ := ask("relayer"); code != http.StatusUnauthorized {
+		t.Fatalf("the relayer's token: %d", code)
 	}
 }

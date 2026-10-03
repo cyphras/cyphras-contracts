@@ -247,7 +247,7 @@ func TestOnlyOneProcessWritesAsTheASPAccount(t *testing.T) {
 func TestAnUnclearDestinationIsWithheldWithoutAPublicReason(t *testing.T) {
 	h := newHarness(t)
 	token := "relayer-token"
-	api := h.s.Internal(sha256.Sum256([]byte(token)))
+	api := h.s.Internal(sha256.Sum256([]byte(token)), sha256.Sum256([]byte("keeper")))
 	screen := func(address string) string {
 		req := httptest.NewRequest(http.MethodPost, "/internal/v1/screen", strings.NewReader(`{"address":"`+address+`"}`))
 		req.Header.Set("Authorization", "Bearer "+token)

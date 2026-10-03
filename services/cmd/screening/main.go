@@ -77,6 +77,10 @@ func main() {
 	if err != nil || len(tokenHash) != 32 {
 		service.Fatal(log, "config", errors.New("SCREEN_TOKEN_SHA256 must be 64 hex digits"))
 	}
+	keeperHash, err := hex.DecodeString(config.Env("KEEPER_TOKEN_SHA256", ""))
+	if err != nil || len(keeperHash) != 32 {
+		service.Fatal(log, "config", errors.New("KEEPER_TOKEN_SHA256 must be 64 hex digits"))
+	}
 	poll, err := config.Duration("POLL", time.Second)
 	if err != nil {
 		service.Fatal(log, "config", err)
@@ -88,7 +92,7 @@ func main() {
 	go s.Run(ctx, f, poll, 20*time.Second, 5*time.Minute)
 	go func() {
 		addr := config.Env("INTERNAL_ADDR", "127.0.0.1:8091")
-		if err := httpapi.Serve(ctx, addr, s.Internal([32]byte(tokenHash))); err != nil && ctx.Err() == nil {
+		if err := httpapi.Serve(ctx, addr, s.Internal([32]byte(tokenHash), [32]byte(keeperHash))); err != nil && ctx.Err() == nil {
 			service.Fatal(log, "serve internal", err)
 		}
 	}()

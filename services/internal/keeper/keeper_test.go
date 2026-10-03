@@ -2,6 +2,7 @@ package keeper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -701,5 +702,42 @@ func TestBumpTTLIsSplitToFitATransaction(t *testing.T) {
 	}
 	if len(bumps) != 2 || strings.Count(bumps[0], ",") != 59 || strings.Count(bumps[1], ",") != 9 {
 		t.Fatalf("bump calls %v", bumps)
+	}
+}
+
+func TestARefundWaitsForAQueuedCorrection(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	four := uint32(4)
+	flaggedAt := uint64(h.now.Unix())
+	h.shield(10, &four, flaggedAt)
+	h.shield(10, &four, flaggedAt)
+	h.sync()
+	h.now = h.now.Add(24 * time.Hour)
+	h.sync()
+	until := uint64(h.now.Unix()) + 600
+	var down error
+	h.k.cfg.Unflags = func(context.Context) (map[uint64]uint64, error) { return map[uint64]uint64{1: until}, down }
+	if err := h.k.Refund(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.take(); !equal(got, []string{"refund 2"}) {
+		t.Fatalf("refunds %v", got)
+	}
+	// Unread, the list holds back every refund.
+	down = errors.New("screening down")
+	h.now = h.now.Add(10 * time.Minute)
+	h.sync()
+	if err := h.k.Refund(ctx); err == nil || len(h.take()) != 0 || !h.has("refunds_wait") {
+		t.Fatalf("refunded without the list: %v", err)
+	}
+	// Past the end of its final window, the correction no longer holds the refund back; the
+	// simulated vault still holds deposit 2, as nothing played its refund.
+	down = nil
+	if err := h.k.Refund(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.take(); !equal(got, []string{"refund 1", "refund 2"}) {
+		t.Fatalf("refunds %v", got)
 	}
 }

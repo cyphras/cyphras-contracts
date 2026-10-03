@@ -1,10 +1,11 @@
 // Command keeper keeps one vault's entries alive, admits eligible deposits, refunds deposits that
 // stayed flagged, pays the exit queue and queues stranded exits again, from its own funded
-// account. It serves no API.
+// account. It serves no API, and asks the screening service which refunds wait for an operator.
 package main
 
 import (
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -63,9 +64,19 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
+	// Refunds wait for the operators' queued corrections, which the screening service holds.
+	screenURL, err := config.Required("SCREENING_URL")
+	if err != nil {
+		service.Fatal(log, "config", err)
+	}
+	screenToken, err := config.SecretString("SCREEN_TOKEN")
+	if err != nil {
+		service.Fatal(log, "config", err)
+	}
 	k, err := keeper.New(ctx, keeper.Config{
 		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, Asset: base.Vault.Asset, MaxAdmissions: 16, MaxExtensions: 50,
 		MaxReleases: int(releases), RefundDelay: 24 * time.Hour, HoldReasons: hold, BalanceFloor: floor, ExitKeys: exitKeys,
+		Unflags: keeper.UnflagsFrom(screenURL, screenToken, &http.Client{Timeout: 10 * time.Second}),
 	}, base.RPC, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(key.Address(), key), base.Alerts, log)
 	if err != nil {
 		service.Fatal(log, "load", err)

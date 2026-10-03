@@ -105,6 +105,47 @@ func (s *Screener) QueueUnflag(ctx context.Context, id uint64, reviewer, note st
 	return s.db.queueOp(ctx, op{kind: "unflag", deposit: id, reviewer: reviewer, note: note}, s.now())
 }
 
+// PendingUnflag is a deposit an operator's queued unflag waits to correct, and when its final
+// window, in which the unflag runs, ends: until then a refund would preempt the correction.
+type PendingUnflag struct {
+	ID    uint64 `json:"id"`
+	Until uint64 `json:"until"`
+}
+
+// PendingUnflags lists the deposits with an operator's unflag queued and not carried out yet.
+func (s *Screener) PendingUnflags(ctx context.Context) ([]PendingUnflag, error) {
+	ops, err := s.db.queuedOps(ctx)
+	if err != nil {
+		return nil, err
+	}
+	queued := map[uint64]bool{}
+	for _, o := range ops {
+		if o.kind == "unflag" {
+			queued[o.deposit] = true
+		}
+	}
+	out := []PendingUnflag{}
+	if len(queued) == 0 {
+		return out, nil
+	}
+	inst, _, _, err := rpc.VaultInstance(ctx, s.rpc, s.cfg.Vault)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.pending(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		if !queued[r.id] || r.delay == nil {
+			continue
+		}
+		eligible := vault.PendingDeposit{Amount: r.amountInt(), CreatedAt: r.createdAt, Delay: *r.delay}.EligibleAt(inst.Config, inst.Limits)
+		out = append(out, PendingUnflag{ID: r.id, Until: eligible})
+	}
+	return out, nil
+}
+
 // runOps carries out the operators' queued decisions and records each result. An unflag that
 // must wait for the deposit's final window stays queued until it opens.
 func (s *Screener) runOps(ctx context.Context) error {
