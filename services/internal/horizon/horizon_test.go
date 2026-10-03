@@ -49,27 +49,27 @@ func TestFundersAreTheIncomingSenders(t *testing.T) {
 	}
 }
 
-func TestEffectsStartFromTheNewestAndFollowTheCursor(t *testing.T) {
+func TestOperationsStartFromTheNewestAndFollowTheCursor(t *testing.T) {
 	var queries []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		queries = append(queries, r.URL.RawQuery)
-		records := []map[string]any{{"id": "1-1", "paging_token": "11", "type": "account_debited", "amount": "5.0000000"}}
+		queries = append(queries, r.URL.Path+"?"+r.URL.RawQuery)
+		records := []map[string]any{{"id": "1", "paging_token": "11", "type": "payment", "source_account": clean}}
 		_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": records}})
 	}))
 	defer srv.Close()
 	h := Client{URL: srv.URL + "/key/SECRET", HTTP: srv.Client()}
-	if _, err := h.Effects(context.Background(), clean, ""); err != nil {
+	if _, err := h.Operations(context.Background(), clean, ""); err != nil {
 		t.Fatal(err)
 	}
-	got, err := h.Effects(context.Background(), clean, "11")
-	if err != nil || len(got) != 1 || got[0].Type != "account_debited" || got[0].PagingToken != "11" {
-		t.Fatalf("effects %+v, %v", got, err)
+	got, err := h.Operations(context.Background(), clean, "11")
+	if err != nil || len(got) != 1 || got[0].Type != "payment" || got[0].SourceAccount != clean || got[0].PagingToken != "11" {
+		t.Fatalf("operations %+v, %v", got, err)
 	}
-	if queries[0] != "order=desc&limit=1" || queries[1] != "order=asc&limit=200&cursor=11" {
+	if queries[0] != "/key/SECRET/accounts/"+clean+"/operations?order=desc&limit=1" || queries[1] != "/key/SECRET/accounts/"+clean+"/operations?order=asc&limit=200&cursor=11" {
 		t.Fatalf("queries %v", queries)
 	}
 	srv.Close()
-	if _, err := h.Effects(context.Background(), clean, "11"); err == nil || strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), clean) {
+	if _, err := h.Operations(context.Background(), clean, "11"); err == nil || strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), clean) {
 		t.Fatalf("error %v", err)
 	}
 }

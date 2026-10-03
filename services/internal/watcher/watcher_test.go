@@ -3,11 +3,13 @@ package watcher
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -206,7 +208,9 @@ func (h *harness) activity() {
 	c := h.chain
 	c.Shield(vaulttest.Depositor, 10_000_000)
 	c.Shield(vaulttest.Depositor, 20_000_000)
-	c.NextLedger(5)
+	// The attestation comes when the first deposit becomes eligible, as an honest screening
+	// service's does.
+	c.NextLedger(3600)
 	c.Attest(1)
 	c.Admit(1)
 	c.NextLedger(5)
@@ -494,13 +498,26 @@ func TestHotAccountsAndCyclingCapitalAreWatched(t *testing.T) {
 		hot    = "GCFK3MDGB4MMH3YCPF42DWOQ47JSAMITMIO3UEHYE62XJAJA4KPERZGO"
 		source = "GA53HZCSOZI5ZUDYCMYXXUGHO7XEZSM3BYW4M5FGSTYGKWMGVL7QLFB3"
 	)
-	var effects []map[string]any
+	var operations []map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/operations"):
+			// Horizon pages after the cursor, and the first read asks for the newest only.
+			var page []map[string]any
+			after, _ := strconv.Atoi(r.URL.Query().Get("cursor"))
+			for _, op := range operations {
+				if token, _ := strconv.Atoi(op["paging_token"].(string)); token > after && len(page) < 200 {
+					page = append(page, op)
+				}
+			}
+			if r.URL.Query().Get("order") == "desc" && len(page) > 0 {
+				page = page[len(page)-1:]
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": page}})
 		case strings.HasSuffix(r.URL.Path, "/effects"):
-			_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": effects}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": []any{}}})
 		case strings.HasSuffix(r.URL.Path, "/payments"):
-			records := []map[string]any{{"type": "payment", "created_at": time.Unix(1_728_000_000, 0), "from": source, "to": strings.Split(r.URL.Path, "/")[2]}}
+			records := []map[string]any{{"type": "payment", "created_at": time.Unix(1_728_000_000, 0), "from": source, "to": strings.Split(r.URL.Path, "/")[2], "amount": "100", "asset_type": "native"}}
 			_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": records}})
 		}
 	}))
@@ -511,15 +528,41 @@ func TestHotAccountsAndCyclingCapitalAreWatched(t *testing.T) {
 	h.w.horizon = &horizon.Client{URL: srv.URL, HTTP: srv.Client(), MaxPages: 2}
 	key := mustKey(vault.AccountKey(hot))
 	h.primary.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{AccountId: key.MustAccount().AccountId, Balance: 50}}, 1, nil)
-	effects = []map[string]any{{"id": "1-1", "paging_token": "1", "type": "account_credited"}}
+	operations = []map[string]any{{"id": "1", "paging_token": "1", "type": "invoke_host_function", "source_account": hot}}
 	if err := h.w.CheckHotAccounts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	effects = []map[string]any{{"id": "2-1", "paging_token": "2", "type": "account_debited", "amount": "9.0000000"}}
+	// What others send the account, however much, pages nobody; its own Soroban calls neither.
+	operations = nil
+	for i := range 300 {
+		operations = append(operations, map[string]any{"id": fmt.Sprint(10 + i), "paging_token": fmt.Sprint(10 + i), "type": "create_claimable_balance", "source_account": source})
+	}
+	operations = append(operations, map[string]any{"id": "999", "paging_token": "999", "type": "invoke_host_function", "source_account": hot})
 	if err := h.w.CheckHotAccounts(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !h.pages.has("hot_balance_low_"+hot) || !h.pages.has("hot_account_outflow_2-1") {
+	if h.pages.has("hot_account_activity") {
+		t.Fatalf("unsolicited operations paged: %v", h.pages.codes())
+	}
+	// A payment and a change of signers it made itself page once, in one alert.
+	operations = []map[string]any{
+		{"id": "1000", "paging_token": "1000", "type": "payment", "source_account": hot},
+		{"id": "1001", "paging_token": "1001", "type": "set_options", "source_account": hot},
+		{"id": "1002", "paging_token": "1002", "type": "payment", "source_account": hot},
+	}
+	if err := h.w.CheckHotAccounts(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, a := range h.pages.alerts {
+		if a.Code == "hot_account_activity_"+hot {
+			n++
+			if !strings.Contains(a.Message, "2 payment, 1 set_options") {
+				t.Fatalf("message %q", a.Message)
+			}
+		}
+	}
+	if !h.pages.has("hot_balance_low_"+hot) || n != 1 {
 		t.Fatalf("pages %v", h.pages.codes())
 	}
 

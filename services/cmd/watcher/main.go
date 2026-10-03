@@ -82,6 +82,13 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "load", err)
 	}
+	beat, err := service.LoadHeartbeat()
+	if err != nil {
+		service.Fatal(log, "config", err)
+	}
+	if beat != nil {
+		w.SetHeartbeat(beat.Ping)
+	}
 	f, err := base.Follower(w)
 	if err != nil {
 		service.Fatal(log, "config", err)

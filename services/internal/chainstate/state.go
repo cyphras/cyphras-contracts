@@ -268,6 +268,8 @@ type Notice struct {
 	Ledger   uint32
 	ClosedAt int64
 	TxHash   string
+	// Index tells apart the notices of one transaction, in their order.
+	Index int
 }
 
 // Delta is what one window of transactions changed.
@@ -747,7 +749,13 @@ func (s *State) pay(now uint64, outflow *big.Int) {
 }
 
 func (s *State) notice(tx vault.Tx, name string, body any, d *Delta) {
-	d.Notices = append(d.Notices, Notice{Name: name, Body: body, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
+	index := 0
+	for _, n := range d.Notices {
+		if n.TxHash == tx.Hash && n.Ledger == tx.Ledger {
+			index++
+		}
+	}
+	d.Notices = append(d.Notices, Notice{Name: name, Body: body, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash, Index: index})
 }
 
 func (s *State) spend(tx vault.Tx, nfs [2]vault.NewNullifier, d *Delta, spent map[fr.Element]bool) error {

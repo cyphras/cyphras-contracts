@@ -45,33 +45,56 @@ func (w *Watcher) vaultKeys(token string) ([]xdr.LedgerKey, error) {
 
 // Reconcile compares the watcher's own state with the vault's storage as the primary RPC reports
 // it, checks the vault's balance against tvl, and compares the primary RPC with the second one.
+// The instance, the tree and the balance come from one read, so they describe one ledger and a
+// payment between two reads cannot look like a broken invariant.
 func (w *Watcher) Reconcile(ctx context.Context) error {
-	inst, _, _, err := rpc.VaultInstance(ctx, w.rpc, w.cfg.Vault)
-	if err != nil {
-		return err
+	w.mu.RLock()
+	known := w.inst
+	w.mu.RUnlock()
+	if known == nil {
+		inst, _, _, err := rpc.VaultInstance(ctx, w.rpc, w.cfg.Vault)
+		if err != nil {
+			return err
+		}
+		known = &inst
 	}
-	keys, err := w.vaultKeys(inst.Config.Token)
+	keys, err := w.vaultKeys(known.Config.Token)
 	if err != nil {
 		return err
 	}
 	entries, latest, err := rpc.Entries(ctx, w.rpc, keys)
 	if err != nil {
+		w.methodFailed(ctx, "primary", "getLedgerEntries", err)
+		return err
+	}
+	w.methodAnswered(ctx, "primary", "getLedgerEntries")
+	instEntry, ok := entries[mustKeyString(keys[0])]
+	if !ok {
+		w.alerts.Raise(ctx, alert.Critical, "vault_instance_missing", "the primary RPC reports no vault instance at ledger %d", latest)
+		return errors.New("the vault's instance is missing")
+	}
+	instVal, err := rpc.ContractValue(instEntry)
+	if err != nil {
+		return err
+	}
+	inst, err := vault.DecodeInstance(instVal)
+	if err != nil {
 		return err
 	}
 	health, err := w.rpc.GetHealth(ctx)
 	if err != nil {
+		w.methodFailed(ctx, "primary", "getHealth", err)
 		return err
 	}
+	w.methodAnswered(ctx, "primary", "getHealth")
 	now := uint64(health.LatestLedgerCloseTime)
 	w.mu.Lock()
 	w.inst = &inst
 	w.latest = max(w.latest, latest)
 	cursor := w.cursor
-	if e, ok := entries[mustKeyString(keys[0])]; ok {
-		w.reads = append(w.reads, statusRead{inst: inst, from: e.LastModified, to: latest, now: now})
-		if len(w.reads) > 16 {
-			w.reads = w.reads[1:]
-		}
+	w.reads = append(w.reads, statusRead{inst: inst, from: instEntry.LastModified, to: latest, now: now})
+	if len(w.reads) > 16 {
+		w.reads = w.reads[1:]
 	}
 	w.mu.Unlock()
 
@@ -226,25 +249,41 @@ func (w *Watcher) treeDiff(next, roots rpc.Entry) (string, bool) {
 	return "", true
 }
 
-// compareProviders reads the same entries from the second RPC and pages when an entry that both
-// report at the same last-modified ledger differs, or when the second falls far behind.
+// compareProviders reads the same entries from the second RPC. It pages when either provider
+// falls far behind the other, when an entry both report at the same last-modified ledger differs,
+// and, when both are at the same ledger, when they differ at all: a primary that serves an old or
+// made-up state is then caught by the one that does not.
 func (w *Watcher) compareProviders(ctx context.Context, keys []xdr.LedgerKey, primary map[string]rpc.Entry, latest uint32) {
 	other, otherLatest, err := rpc.Entries(ctx, w.second, keys)
 	if err != nil {
-		w.secondFailed(ctx, err)
+		w.methodFailed(ctx, "second", "getLedgerEntries", err)
 		return
 	}
-	w.secondAnswered(ctx)
-	if otherLatest+60 < latest {
+	w.methodAnswered(ctx, "second", "getLedgerEntries")
+	switch {
+	case otherLatest+60 < latest:
 		w.alerts.Raise(ctx, alert.Warning, "second_rpc_lagging", "the second RPC is at ledger %d, the primary at %d", otherLatest, latest)
-	} else {
+	case latest+60 < otherLatest:
+		w.alerts.Raise(ctx, alert.Critical, "primary_rpc_lagging", "the primary RPC is at ledger %d, the second at %d: the watcher may be reading an old chain", latest, otherLatest)
+	default:
 		w.alerts.Clear(ctx, "second_rpc_lagging", "the second RPC caught up")
+		w.alerts.Clear(ctx, "primary_rpc_lagging", "the primary RPC caught up")
 	}
+	same := latest == otherLatest
 	for _, k := range keys {
 		s := mustKeyString(k)
 		a, okA := primary[s]
 		b, okB := other[s]
-		if !okA || !okB || a.LastModified != b.LastModified {
+		if !okA || !okB {
+			if same && okA != okB {
+				w.alerts.Raise(ctx, alert.Critical, "rpc_disagreement", "at ledger %d one RPC provider reports a vault entry the other does not", latest)
+			}
+			continue
+		}
+		if a.LastModified != b.LastModified {
+			if same {
+				w.alerts.Raise(ctx, alert.Critical, "rpc_disagreement", "at ledger %d the RPC providers report a vault entry last modified in ledgers %d and %d", latest, a.LastModified, b.LastModified)
+			}
 			continue
 		}
 		ra, _ := xdr.MarshalBase64(a.Data)
@@ -255,21 +294,28 @@ func (w *Watcher) compareProviders(ctx context.Context, keys []xdr.LedgerKey, pr
 	}
 }
 
-func (w *Watcher) secondFailed(ctx context.Context, err error) {
+// methodFailed counts failures of one method of one provider in a row, and pages after three:
+// a provider that answers one method can still fail another the checks need.
+func (w *Watcher) methodFailed(ctx context.Context, provider, method string, err error) {
+	key := provider + " " + method
 	w.mu.Lock()
-	w.crossFails++
-	fails := w.crossFails
+	w.rpcFails[key]++
+	fails := w.rpcFails[key]
 	w.mu.Unlock()
 	if fails >= 3 {
-		w.alerts.Raise(ctx, alert.Warning, "second_rpc_unavailable", "the second RPC failed %d times in a row: %v", fails, err)
+		w.alerts.Raise(ctx, alert.Warning, "rpc_failing_"+provider+"_"+method, "the %s RPC's %s failed %d times in a row: %v", provider, method, fails, err)
 	}
 }
 
-func (w *Watcher) secondAnswered(ctx context.Context) {
+func (w *Watcher) methodAnswered(ctx context.Context, provider, method string) {
+	key := provider + " " + method
 	w.mu.Lock()
-	w.crossFails = 0
+	failed := w.rpcFails[key] > 0
+	delete(w.rpcFails, key)
 	w.mu.Unlock()
-	w.alerts.Clear(ctx, "second_rpc_unavailable", "the second RPC answers again")
+	if failed {
+		w.alerts.Clear(ctx, "rpc_failing_"+provider+"_"+method, "the %s RPC's %s answers again", provider, method)
+	}
 }
 
 // crossCheckEvents reads each applied window again from the second RPC once it has reached it,
@@ -277,9 +323,10 @@ func (w *Watcher) secondAnswered(ctx context.Context) {
 func (w *Watcher) crossCheckEvents(ctx context.Context) {
 	h, err := w.second.GetHealth(ctx)
 	if err != nil {
-		w.secondFailed(ctx, err)
+		w.methodFailed(ctx, "second", "getHealth", err)
 		return
 	}
+	w.methodAnswered(ctx, "second", "getHealth")
 	w.mu.Lock()
 	var ready []follow.Batch
 	keep := w.pendingCross[:0]
@@ -299,12 +346,13 @@ func (w *Watcher) crossCheckEvents(ctx context.Context) {
 			continue
 		}
 		if err != nil {
-			w.secondFailed(ctx, err)
+			w.methodFailed(ctx, "second", "getEvents", err)
 			w.mu.Lock()
 			w.pendingCross = append([]follow.Batch{b}, w.pendingCross...)
 			w.mu.Unlock()
 			return
 		}
+		w.methodAnswered(ctx, "second", "getEvents")
 		if !slices.EqualFunc(events, b.Raw, sameEvent) {
 			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("rpc_disagreement_%d", b.To), "the two RPC providers report different vault events in ledgers %d to %d", b.From, b.To)
 		}

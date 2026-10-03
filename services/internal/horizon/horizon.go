@@ -299,30 +299,32 @@ func (c Client) Funders(ctx context.Context, account string, since time.Time) ([
 	return out, complete, nil
 }
 
-// Effect is one effect on an account, as Horizon reports it.
-type Effect struct {
-	ID          string    `json:"id"`
-	PagingToken string    `json:"paging_token"`
-	Type        string    `json:"type"`
-	CreatedAt   time.Time `json:"created_at"`
-	Amount      string    `json:"amount"`
+// Operation is one operation an account took part in, as Horizon reports it. Trustor is set on
+// an issuer's change to the account's trustline flags.
+type Operation struct {
+	ID            string    `json:"id"`
+	PagingToken   string    `json:"paging_token"`
+	Type          string    `json:"type"`
+	SourceAccount string    `json:"source_account"`
+	CreatedAt     time.Time `json:"created_at"`
+	Trustor       string    `json:"trustor"`
 }
 
-type effectsPage struct {
+type operationRecordsPage struct {
 	Embedded struct {
-		Records []Effect `json:"records"`
+		Records []Operation `json:"records"`
 	} `json:"_embedded"`
 }
 
-// Effects returns the account's effects after the cursor, oldest first, at most one page. An empty
-// cursor returns only the newest effect, so a new reader starts from now.
-func (c Client) Effects(ctx context.Context, account, cursor string) ([]Effect, error) {
+// Operations returns the operations the account took part in after the cursor, oldest first, at
+// most one page. An empty cursor returns only the newest one, so a new reader starts from now.
+func (c Client) Operations(ctx context.Context, account, cursor string) ([]Operation, error) {
 	query := fmt.Sprintf("order=asc&limit=%d&cursor=%s", pageSize, url.QueryEscape(cursor))
 	if cursor == "" {
 		query = "order=desc&limit=1"
 	}
-	var p effectsPage
-	found, err := c.get(ctx, c.accountURL(account, "effects", query), &p)
+	var p operationRecordsPage
+	found, err := c.get(ctx, c.accountURL(account, "operations", query), &p)
 	if err != nil || !found {
 		return nil, err
 	}

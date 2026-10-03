@@ -103,10 +103,21 @@ type Watcher struct {
 	inst      *vault.Instance
 	// pendingCross holds windows the second RPC had not reached when they were applied.
 	pendingCross []follow.Batch
-	crossFails   int
-	healthFails  map[string]int
+	// rpcFails counts each provider's failures of each method in a row.
+	rpcFails    map[string]int
+	healthFails map[string]int
 	// authorized is whether the issuer let the vault hold the asset at the last read.
 	authorized *bool
+	// faulted is set while ingest is stopped by a fault.
+	faulted bool
+	// beat, when set, is pinged after each healthy reconciliation.
+	beat func(context.Context) error
+}
+
+// SetHeartbeat makes the watcher ping beat after each reconciliation that ran while ingest was
+// healthy, so a monitor elsewhere notices when the watcher stops or goes blind.
+func (w *Watcher) SetHeartbeat(beat func(context.Context) error) {
+	w.beat = beat
 }
 
 // New loads the stored chain state.
@@ -118,7 +129,7 @@ func New(ctx context.Context, cfg Config, primary, second rpc.Client, chain *cha
 	w := &Watcher{
 		cfg: cfg, rpc: primary, second: second, chain: chain, db: store{chain.Pool}, horizon: hz,
 		http: &http.Client{Timeout: 10 * time.Second}, alerts: alerts, public: public, log: log, now: time.Now,
-		state: state, cursor: cursor, roots: map[uint64]fr.Element{}, healthFails: map[string]int{},
+		state: state, cursor: cursor, roots: map[uint64]fr.Element{}, healthFails: map[string]int{}, rpcFails: map[string]int{},
 		snapshots: []snapshot{snapshotOf(cursor, state)},
 	}
 	w.keepRoot(chainstate.RootAt{LeafCount: state.Tree.Len(), Root: state.Tree.Root()})
@@ -199,7 +210,19 @@ func (w *Watcher) Apply(ctx context.Context, b follow.Batch) error {
 		return err
 	}
 	err = w.chain.Commit(ctx, b.From, b.To, next, delta, func(tx pgx.Tx) error {
-		return w.recordActivity(ctx, tx, b)
+		if err := w.recordActivity(ctx, tx, b); err != nil {
+			return err
+		}
+		// An attestation's timing is judged after the window is stored; until it is, the check
+		// stays in the database, so neither a failed read nor a restart loses it.
+		for _, n := range delta.Notices {
+			if n.Name == "attested" && n.ClosedAt+secondsPerDay >= b.LatestCloseTime {
+				if err := w.db.addAttestCheck(ctx, tx, n.Body.(vault.Attested).UpTo, n.Ledger, n.ClosedAt); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	})
 	if errors.Is(err, chainstate.ErrInconsistent) {
 		w.alerts.Raise(ctx, alert.Critical, "invariant", "ledgers %d to %d break the vault's rules: %v", b.From, b.To, err)
@@ -209,7 +232,7 @@ func (w *Watcher) Apply(ctx context.Context, b follow.Batch) error {
 		return err
 	}
 	w.mu.Lock()
-	w.state, w.cursor = next, b.To
+	w.state, w.cursor, w.faulted = next, b.To, false
 	w.latest = max(w.latest, b.Latest)
 	for _, r := range delta.Roots {
 		w.keepRoot(r)
@@ -251,11 +274,17 @@ func (w *Watcher) recordActivity(ctx context.Context, tx pgx.Tx, b follow.Batch)
 	return nil
 }
 
-// Fault records an ingest failure from the follower; invariant faults have paged already.
+// Fault records an ingest failure from the follower. A fault, such as an event that does not
+// decode, stops the watcher at that ledger, so it pages at once whatever its cause.
 func (w *Watcher) Fault(ctx context.Context, err error) {
-	if !errors.Is(err, follow.ErrFault) {
-		w.log.Warn("ingest retry", "error", err.Error())
+	if errors.Is(err, follow.ErrFault) {
+		w.mu.Lock()
+		w.faulted = true
+		w.mu.Unlock()
+		w.alerts.Raise(ctx, alert.Critical, "ingest_fault", "the watcher stopped at ledger %d: %v", w.Cursor(), err)
+		return
 	}
+	w.log.Warn("ingest retry", "error", err.Error())
 }
 
 // loadInstance reads the vault's instance once, so the first windows at the tip are checked
@@ -308,7 +337,8 @@ func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, late
 			if n.Name == "halted" {
 				severity = alert.Critical
 			}
-			code := fmt.Sprintf("governance_%s_%d", n.Name, n.Ledger)
+			// Each event has its own code, so two in one ledger are both reported.
+			code := fmt.Sprintf("governance_%s_%.16s_%d", n.Name, n.TxHash, n.Index)
 			w.alerts.Raise(ctx, severity, code, "%s", msg)
 			w.public.Raise(ctx, alert.Info, code, "%s", msg)
 		case n.Name == "deposit_flagged" || n.Name == "deposit_unflagged":
@@ -320,7 +350,9 @@ func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, late
 			r := n.Body.(vault.ExitRequeued)
 			w.alerts.Raise(ctx, alert.Info, fmt.Sprintf("exit_requeued_%d", r.NewID), "%v of the payout and %v of the fee of stranded exit %d were queued again as exit %d", r.Payout, r.Fee, r.ID, r.NewID)
 		case n.Name == "attested":
-			w.checkAttestation(ctx, n)
+			if err := w.judgeAttestation(ctx, attestCheck{upTo: n.Body.(vault.Attested).UpTo, ledger: n.Ledger, closedAt: n.ClosedAt}); err != nil {
+				w.log.Warn("attestation check deferred", "ledger", n.Ledger, "error", err.Error())
+			}
 		}
 	}
 }
@@ -355,32 +387,62 @@ func limitsText(l vault.Limits) string {
 // attestSlack allows for ledger close times around the screening service's ten-minute window.
 const attestSlack = 2 * 60
 
-// checkAttestation pages when an attestation covers a deposit more than ten minutes before that
+// attestCheck is an attestation whose timing is still to be judged.
+type attestCheck struct {
+	upTo     uint64
+	ledger   uint32
+	closedAt int64
+}
+
+// errNotYet reports a check that cannot run before the vault's instance has been read.
+var errNotYet = errors.New("the vault's instance is not read yet")
+
+// judgeAttestation pages when an attestation covers a deposit more than ten minutes before that
 // deposit can be admitted: the screening service attests only after the final check, which runs
-// in the last ten minutes, so an earlier one can mean a stolen asp key.
-func (w *Watcher) checkAttestation(ctx context.Context, n chainstate.Notice) {
-	upTo := n.Body.(vault.Attested).UpTo
+// in the last ten minutes, so an earlier one can mean a stolen asp key. Once judged, the check is
+// forgotten; one that cannot be judged now stays for RetryAttestations.
+func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 	w.mu.RLock()
-	dep := w.state.Pending[upTo]
 	inst := w.inst
 	w.mu.RUnlock()
-	if dep == nil || inst == nil {
-		return
+	if inst == nil {
+		return errNotYet
 	}
-	delay, ok, err := w.delayOf(ctx, upTo)
+	amount, createdAt, found, err := w.db.deposit(ctx, c.upTo)
 	if err != nil {
-		w.log.Warn("attestation check incomplete", "deposit", upTo, "error", err.Error())
-		return
+		return err
 	}
-	if !ok {
-		delay = vault.DelayFor(dep.Amount, inst.Config, inst.Limits)
+	if found {
+		delay, ok, err := w.delayOf(ctx, c.upTo)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			delay = vault.DelayFor(amount, inst.Config, inst.Limits)
+		}
+		eligible := vault.PendingDeposit{Amount: amount, CreatedAt: createdAt, Delay: delay}.EligibleAt(inst.Config, inst.Limits)
+		if uint64(c.closedAt)+600+attestSlack < eligible {
+			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("early_attestation_%d", c.upTo),
+				"attestation up to deposit %d at ledger %d came %d seconds before its final-check window; the asp key may be stolen",
+				c.upTo, c.ledger, eligible-600-uint64(c.closedAt))
+		}
 	}
-	eligible := vault.PendingDeposit{Amount: dep.Amount, CreatedAt: dep.CreatedAt, Delay: delay}.EligibleAt(inst.Config, inst.Limits)
-	if uint64(n.ClosedAt)+600+attestSlack < eligible {
-		w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("early_attestation_%d", upTo),
-			"attestation up to deposit %d at ledger %d came %d seconds before its final-check window; the asp key may be stolen",
-			upTo, n.Ledger, eligible-600-uint64(n.ClosedAt))
+	return w.db.dropAttestCheck(ctx, c.upTo, c.ledger)
+}
+
+// RetryAttestations judges the attestations whose check could not run when they were seen.
+func (w *Watcher) RetryAttestations(ctx context.Context) error {
+	checks, err := w.db.attestChecks(ctx)
+	if err != nil {
+		return err
 	}
+	var errs []error
+	for _, c := range checks {
+		if err := w.judgeAttestation(ctx, c); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // delayOf returns the delay a deposit was made under, from the watcher's records or its entry.
@@ -546,6 +608,23 @@ func amountsText(m map[string]*big.Int) string {
 
 var _ follow.Sink = (*Watcher)(nil)
 
+// reconcileAndBeat reconciles, and pings the heartbeat when that succeeded with ingest healthy.
+func (w *Watcher) reconcileAndBeat(ctx context.Context) error {
+	if err := w.Reconcile(ctx); err != nil {
+		return err
+	}
+	w.mu.RLock()
+	healthy := !w.faulted && w.cursor+60 >= w.latest
+	w.mu.RUnlock()
+	if w.beat == nil || !healthy {
+		return nil
+	}
+	if err := w.beat(ctx); err != nil {
+		w.log.Warn("heartbeat failed", "error", err.Error())
+	}
+	return nil
+}
+
 // Run follows the vault and runs each periodic check on its schedule until ctx ends.
 func (w *Watcher) Run(ctx context.Context, f *follow.Follower, poll time.Duration) {
 	go f.Run(ctx, poll, func(err error) { w.Fault(ctx, err) })
@@ -554,14 +633,15 @@ func (w *Watcher) Run(ctx context.Context, f *follow.Follower, poll time.Duratio
 		every time.Duration
 		run   func(context.Context) error
 	}{
-		{"reconcile", 15 * time.Second, w.Reconcile},
+		{"reconcile", 15 * time.Second, w.reconcileAndBeat},
 		{"indexer", time.Minute, w.CheckIndexer},
 		{"health", time.Minute, w.CheckHealth},
 		{"admissions", time.Minute, w.CheckAdmissions},
+		{"attestations", time.Minute, w.RetryAttestations},
 		{"exit queue", time.Minute, w.CheckExitQueue},
 		{"hot accounts", time.Minute, w.CheckHotAccounts},
-		{"governance accounts", 5 * time.Minute, w.CheckGovernanceAccounts},
-		{"freezes", 5 * time.Minute, w.CheckFreezes},
+		{"governance accounts", time.Minute, w.CheckGovernanceAccounts},
+		{"freezes", time.Minute, w.CheckFreezes},
 		{"patterns", 5 * time.Minute, w.CheckPatterns},
 		{"ttl", time.Hour, w.CheckTTL},
 	}

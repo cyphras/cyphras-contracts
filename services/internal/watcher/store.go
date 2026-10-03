@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS watch_meta (
 	key text PRIMARY KEY,
 	value text NOT NULL
 );
+CREATE TABLE IF NOT EXISTS watch_attest_checks (
+	up_to bigint NOT NULL,
+	ledger bigint NOT NULL,
+	closed_at bigint NOT NULL,
+	PRIMARY KEY (up_to, ledger)
+);
 `
 
 type store struct {
@@ -161,4 +167,52 @@ func (s store) payoutsSince(ctx context.Context, since int64) ([]flow, error) {
 		return nil, err
 	}
 	return scanFlows(rows)
+}
+
+func (s store) addAttestCheck(ctx context.Context, tx pgx.Tx, upTo uint64, ledger uint32, closedAt int64) error {
+	_, err := tx.Exec(ctx, `INSERT INTO watch_attest_checks (up_to, ledger, closed_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+		int64(upTo), int64(ledger), closedAt)
+	return err
+}
+
+func (s store) dropAttestCheck(ctx context.Context, upTo uint64, ledger uint32) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM watch_attest_checks WHERE up_to = $1 AND ledger = $2`, int64(upTo), int64(ledger))
+	return err
+}
+
+func (s store) attestChecks(ctx context.Context) ([]attestCheck, error) {
+	rows, err := s.pool.Query(ctx, `SELECT up_to, ledger, closed_at FROM watch_attest_checks ORDER BY ledger, up_to`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []attestCheck
+	for rows.Next() {
+		var c attestCheck
+		var upTo, ledger int64
+		if err := rows.Scan(&upTo, &ledger, &c.closedAt); err != nil {
+			return nil, err
+		}
+		c.upTo, c.ledger = uint64(upTo), uint32(ledger)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// deposit returns a deposit's amount and creation time from the chain state's records.
+func (s store) deposit(ctx context.Context, id uint64) (*big.Int, uint64, bool, error) {
+	var amount string
+	var created int64
+	err := s.pool.QueryRow(ctx, `SELECT amount::text, created_at FROM deposits WHERE id = $1`, int64(id)).Scan(&amount, &created)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, 0, false, nil
+	}
+	if err != nil {
+		return nil, 0, false, err
+	}
+	n, ok := new(big.Int).SetString(amount, 10)
+	if !ok {
+		return nil, 0, false, errors.New("stored deposit amount")
+	}
+	return n, uint64(created), true, nil
 }
