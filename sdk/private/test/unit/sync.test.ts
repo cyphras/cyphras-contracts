@@ -139,6 +139,9 @@ describe("plan fate", () => {
 
   it("confirms a plan once both its commitments are in leaves, whatever transaction they name", () => {
     const { state, plan } = walletWith(40);
+    plan.evidence = [evidence({ txHash: "aa".repeat(32), outputs: [40, undefined] })];
+    advancePlans(state, viewAt(250, 40));
+    assert.equal(plan.state, "submitted");
     plan.evidence = [
       evidence({ txHash: "aa".repeat(32), outputs: [40, undefined] }),
       evidence({ txHash: "bb".repeat(32), outputs: [undefined, 41] }),
