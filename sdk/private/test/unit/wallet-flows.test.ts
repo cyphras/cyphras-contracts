@@ -255,6 +255,50 @@ describe("wallet: a deposit's ID", () => {
   });
 });
 
+describe("wallet: deposit status the indexer alone gives", () => {
+  it("is shown as unconfirmed, and the confirmed tree outweighs it", async () => {
+    const world = await createWorld();
+    let refunding = true;
+    // While refunding, the indexer lists every pending deposit as refunded.
+    const fetch = rewritingFetch(world, {
+      "/v1/deposits": (body) => {
+        if (!refunding) return body;
+        const pending = body["pending"] as Record<string, unknown>[];
+        return {
+          ...body,
+          pending: [],
+          resolved: pending.map((d) => ({ ...d, outcome: "refunded", reason: 1, resolved_at: 1 })),
+        };
+      },
+    });
+    const alice = await openWallet({ ...world, fetch }, 0);
+    const depositor = world.signer("depositor");
+    const byId = async () => new Map((await alice.deposits()).map((d) => [d.id, d]));
+    const first = await shielded(alice, 10n * XLM, depositor);
+    assert.equal((await byId()).get(first.depositId)?.confirmed, true);
+    await alice.sync();
+    let deposits = await byId();
+    assert.equal(deposits.get(first.depositId)?.state, "refunded");
+    assert.equal(deposits.get(first.depositId)?.confirmed, false);
+    refunding = false;
+    const second = await shielded(alice, 20n * XLM, depositor);
+    assert.equal((await byId()).get(second.depositId)?.confirmed, true);
+    await alice.sync();
+    deposits = await byId();
+    assert.equal(deposits.get(second.depositId)?.state, "pending");
+    assert.equal(deposits.get(second.depositId)?.attested, false);
+    assert.equal(deposits.get(second.depositId)?.confirmed, false);
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    deposits = await byId();
+    for (const { depositId } of [first, second]) {
+      assert.equal(deposits.get(depositId)?.state, "admitted");
+      assert.equal(deposits.get(depositId)?.confirmed, true);
+    }
+  });
+});
+
 describe("wallet: screening", () => {
   it("presents a deposit held for review, which may still be admitted, apart from refusals", async () => {
     const world = await createWorld();
@@ -295,6 +339,9 @@ describe("wallet: screening", () => {
     assert.equal(deposits.get(refused.depositId)?.refundKind, "refused_by_reviewer");
     assert.equal(deposits.get(ordered.depositId)?.state, "cancelled");
     assert.equal(deposits.get(ordered.depositId)?.refundKind, "cancelled");
+    // Their own transactions, not the indexer, now say what became of them.
+    assert.equal(deposits.get(refused.depositId)?.confirmed, true);
+    assert.equal(deposits.get(ordered.depositId)?.confirmed, true);
   });
 
   it("presents every refusal code of the policy as a refusal, and a code it does not know as unknown", async () => {

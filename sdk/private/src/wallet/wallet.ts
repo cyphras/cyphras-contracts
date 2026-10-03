@@ -60,7 +60,7 @@ import {
   disclose,
   verifyDisclosure,
 } from "./disclosure.ts";
-import { type ExitPosition, applyExits, exitPosition, payoutLeft } from "./exits.ts";
+import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
 import { updatePace } from "./pace.ts";
 import { type Verification, createServices, verify } from "./services.ts";
@@ -239,10 +239,13 @@ export interface PlanView extends Submission {
   readonly to: string;
   readonly createdAt: number;
   // The exit of an unshield that waits in the vault's exit queue: the ID transact gave it, what
-  // it still owes the recipient, and the exits that owe it, a stranded one until claimed.
+  // it still owes the recipient, and the exits that owe it, a stranded one until claimed; and
+  // whether that rests on the vault's events every RPC provider showed, rather than on the
+  // indexer's account alone.
   readonly exitId: number | undefined;
   readonly payoutLeft: bigint | undefined;
   readonly exitParts: readonly ExitPart[];
+  readonly exitConfirmed: boolean | undefined;
   readonly operationId: string | undefined;
   // The relayer's last word on a pending plan: held until its not_before, pending, success or
   // failed, or unknown when the relayer could not say. The chain's evidence alone confirms it.
@@ -851,7 +854,9 @@ export class PrivateWallet {
       createdAt: p.createdAt,
       exitId: p.exit?.id,
       payoutLeft: p.exit === undefined ? undefined : payoutLeft(p.exit),
-      exitParts: (p.exit?.parts ?? []).map((part) => ({ ...part })),
+      exitParts: (p.exit === undefined ? [] : shownParts(p.exit)).map((part) => ({ ...part })),
+      exitConfirmed:
+        p.exit === undefined ? undefined : p.exit.confirmed && p.exit.account === undefined,
       operationId: p.operationId,
       relayerStatus: p.relayerStatus,
       mustRetry: isActive(p) || p.state === "dead",

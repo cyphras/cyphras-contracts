@@ -14,17 +14,18 @@ import {
   invokeVault,
 } from "../../src/vault/invoke.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
-import { applyExits } from "../../src/wallet/exits.ts";
+import { applyExits, shownParts } from "../../src/wallet/exits.ts";
 import type { ExitEvent } from "../../src/wallet/sources.ts";
 import {
   type Plan,
+  type PlanExit,
   type WalletState,
   emptyState,
   loadState,
   saveState,
 } from "../../src/wallet/state.ts";
 import type { OperationView, PrivateWallet } from "../../src/wallet/wallet.ts";
-import { INDEXER, RPC, XLM, createWorld } from "../support/network.ts";
+import { INDEXER, RPC, XLM, createWorld, rewritingFetch } from "../support/network.ts";
 import { keypairFor } from "../support/rpc.ts";
 import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
 
@@ -1044,6 +1045,27 @@ describe("the exit queue: sources", () => {
     assert.equal((await alice.plans())[0]?.state, "settled");
   });
 
+  it("shows an exit the indexer alone gave as unconfirmed, until the events every provider shows confirm it", async () => {
+    const { world, alice, control } = await withTwoProviders((events) => events);
+    fillWindow(world);
+    await alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    control.busy = true;
+    assert.equal((await alice.sync()).crossChecked, false);
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.exitConfirmed, false);
+    control.busy = false;
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.exitConfirmed, true);
+  });
+
   it("refuses a payout's events that the RPC providers show differently", async () => {
     const settled = xdr.ScVal.scvSymbol("settled").toXDR("base64");
     const { world, alice, control } = await withTwoProviders((events) =>
@@ -1097,6 +1119,60 @@ describe("the exit queue: sources", () => {
     world.indexer.completeTo = undefined;
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "settled");
+  });
+
+  it("shows an exit the indexer's account alone moved as unconfirmed, until checked events take over", async () => {
+    const world = await createWorld({ limits: SMALL });
+    let settled = false;
+    // While forging, the indexer's account has every queued exit paid in full.
+    const forging = rewritingFetch(world, {
+      "/v1/exits": (body) => {
+        if (!settled) return body;
+        const exits = body["exits"] as Record<string, unknown>[];
+        return {
+          ...body,
+          head: body["tail"],
+          exits: exits.map(({ position: _p, paid_by: _b, ...e }) => ({
+            ...e,
+            state: "settled",
+            payout_left: "0",
+            fee_left: "0",
+          })),
+        };
+      },
+    });
+    const alice = await openWallet({ ...world, fetch: forging }, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    fillWindow(world);
+    await alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    await alice.sync();
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.exitConfirmed, true);
+    // The indexer's account reaches a ledger past those the sync checked.
+    settled = true;
+    world.indexer.completeTo = world.vault.ledger - 1;
+    world.fill(1);
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    assert.equal(plan?.payoutLeft, 0n);
+    assert.equal(plan?.exitConfirmed, false);
+    // Once checked events reach that ledger, they decide: the exit still waits in the queue.
+    world.indexer.completeTo = undefined;
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.payoutLeft, 10n * XLM);
+    assert.equal(plan?.exitConfirmed, true);
   });
 
   it("counts a split part that waits in the queue as sent", async () => {
@@ -1326,6 +1402,13 @@ describe("following an exit from the vault's events and the indexer's account", 
     fee: 0n,
     ...at(ledger),
   });
+  const paidPart = (id: number, ledger: number, payoutLeft: bigint, feeLeft = 0n): ExitEvent => ({
+    kind: "exit_paid",
+    id,
+    payoutLeft,
+    feeLeft,
+    ...at(ledger),
+  });
   const events = (from: number, to: number, list: ExitEvent[]) => ({ from, to, events: list });
   const entry = (
     id: number,
@@ -1394,10 +1477,77 @@ describe("following an exit from the vault's events and the indexer's account", 
       const { state, plan } = strandedPlan();
       applyExits(state, [], account(40, exits), 40);
       assert.equal(plan.state, "queued");
-      assert.deepEqual(plan.exit?.parts, [
+      assert.deepEqual(shownParts(plan.exit as PlanExit), [
         { id: 2, payoutLeft: 10n, feeLeft: 0n, stranded: false },
       ]);
     }
+  });
+
+  it("shows the indexer's newer account as unconfirmed, until the vault's events reach its ledger and decide", () => {
+    const { state, plan } = withUnshield();
+    applyExits(state, [events(5, 30, [queued(10)])], undefined, 30);
+    applyExits(state, [], account(50, [entry(1, "settled", 0n)]), 50);
+    assert.equal(plan.state, "settled");
+    assert.equal(plan.exit?.confirmed, true);
+    assert.deepEqual(plan.exit?.account, { parts: [], ledger: 50 });
+    // An account older than the one shown is not taken.
+    applyExits(state, [], account(40, [entry(1, "paid_in_part", 6n, { position: 0 })]), 50);
+    assert.equal(plan.state, "settled");
+    // The events up to the account's ledger have the exit paid in part only.
+    applyExits(state, [events(31, 50, [paidPart(1, 45, 6n, 1n)])], undefined, 50);
+    assert.equal(plan.state, "queued");
+    assert.equal(plan.exit?.account, undefined);
+    assert.deepEqual(plan.exit?.parts, [{ id: 1, payoutLeft: 6n, feeLeft: 1n, stranded: false }]);
+  });
+
+  it("rests an exit on the indexer's account once the vault's events leave a gap in what it follows", () => {
+    const { state, plan } = strandedPlan();
+    // Events of no ledger leave no gap.
+    applyExits(state, [events(40, 35, [])], undefined, 40);
+    assert.equal(plan.exit?.confirmed, true);
+    const requeued = [
+      entry(1, "requeued", 0n, { requeuedTo: [2] }),
+      entry(2, "queued", 10n, { position: 0 }),
+    ];
+    applyExits(state, [], account(40, requeued), 40);
+    // The events from ledger 51 on leave those up to 50 unseen.
+    applyExits(state, [events(51, 60, [paidPart(2, 55, 4n)])], undefined, 60);
+    assert.equal(plan.state, "queued");
+    assert.equal(plan.exit?.confirmed, false);
+    assert.deepEqual(shownParts(plan.exit as PlanExit), [
+      { id: 2, payoutLeft: 4n, feeLeft: 0n, stranded: false },
+    ]);
+  });
+
+  it("gives way to the vault's events where the indexer's account alone gave the plan its exit", () => {
+    const mine = (completeTo: number, entryState: ExitEntry["state"], payoutLeft: bigint) =>
+      account(completeTo, [
+        entry(1, entryState, payoutLeft, {
+          txHash: TX,
+          position: entryState === "settled" ? undefined : 0,
+        }),
+      ]);
+    let { state, plan } = withUnshield();
+    applyExits(state, [], mine(40, "queued", 10n), 40);
+    assert.equal(plan.state, "queued");
+    assert.equal(plan.exit?.confirmed, false);
+    applyExits(state, [], mine(45, "settled", 0n), 45);
+    assert.equal(plan.state, "settled");
+    // Events of older ledgers show the exit queued: the exit follows them, and the account, newer
+    // than they are, stands until they reach it.
+    applyExits(state, [events(5, 30, [queued(10)])], undefined, 45);
+    assert.equal(plan.exit?.confirmed, true);
+    assert.equal(plan.state, "settled");
+    applyExits(state, [events(31, 50, [])], undefined, 50);
+    assert.equal(plan.state, "queued");
+    assert.equal(plan.exit?.account, undefined);
+    // The events show the transaction paid at once: the exit the account gave it never was.
+    ({ state, plan } = withUnshield());
+    applyExits(state, [], mine(30, "queued", 10n), 30);
+    const once: ExitEvent = { kind: "settled", exitId: undefined, ...at(10) };
+    applyExits(state, [events(5, 30, [once])], mine(30, "queued", 10n), 30);
+    assert.equal(plan.state, "settled");
+    assert.equal(plan.exit, undefined);
   });
 
   it("takes no account that contradicts what the wallet knows of the exit", () => {
@@ -1412,7 +1562,9 @@ describe("following an exit from the vault's events and the indexer's account", 
       const { state, plan } = strandedPlan();
       applyExits(state, [], account(40, exits), 40);
       assert.equal(plan.state, "stranded");
-      assert.deepEqual(plan.exit?.parts, [{ id: 1, payoutLeft: 10n, feeLeft: 0n, stranded: true }]);
+      assert.deepEqual(shownParts(plan.exit as PlanExit), [
+        { id: 1, payoutLeft: 10n, feeLeft: 0n, stranded: true },
+      ]);
     }
   });
 });

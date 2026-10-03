@@ -9,16 +9,27 @@ import type { ExitPart, Plan, PlanExit, WalletState } from "./state.ts";
 // a claim moves the parts whose party can receive again back to the tail of the queue as a new
 // exit, which release then pays like any other.
 
+// Unshields whose exit can still move, among them those settled on the indexer's word alone.
 const exitPlans = (state: WalletState): Plan[] =>
   state.plans.filter(
-    (p) => p.kind === "unshield" && ["confirmed", "queued", "stranded"].includes(p.state),
+    (p) =>
+      p.kind === "unshield" &&
+      (["confirmed", "queued", "stranded"].includes(p.state) ||
+        (p.state === "settled" &&
+          p.exit !== undefined &&
+          (!p.exit.confirmed || p.exit.account !== undefined))),
   );
+
+// The parts of an exit as the plan shows them: the indexer's newer account while it stands, else
+// what the vault's events show.
+export const shownParts = (exit: PlanExit): readonly ExitPart[] =>
+  exit.account?.parts ?? exit.parts;
 
 // An unshield is settled once its payout is paid in full, queued while all of what it still owes
 // waits in the queue, and stranded while part of its payout waits for a claim. A fee left owed
 // concerns only the relayer.
 function settle(plan: Plan, exit: PlanExit): void {
-  const owing = exit.parts.filter((p) => p.payoutLeft > 0n);
+  const owing = shownParts(exit).filter((p) => p.payoutLeft > 0n);
   if (owing.length === 0) plan.state = "settled";
   else plan.state = owing.some((p) => p.stranded) ? "stranded" : "queued";
 }
@@ -66,18 +77,45 @@ function apply(plan: Plan, exit: PlanExit, p: ExitPart, event: ExitEvent): void 
   settle(plan, exit);
 }
 
+// The first ledger of which an exit may not have followed every event yet.
+const unfollowed = (exit: PlanExit): number =>
+  exit.event === undefined ? exit.ledger + 1 : exit.ledger;
+
 // The vault's own events, in chain order. exit_queued names the exit of a transaction, and every
 // later event of that exit, or of the exits a claim requeues its parts as, is applied once.
 function applyExitEvents(plans: readonly Plan[], exits: ExitEvents): void {
+  // Events that do not follow on from what an exit followed leave a gap whose events it may never
+  // see: from then on the exit rests on the indexer's account, of the gap where it has one.
+  if (exits.from <= exits.to) {
+    for (const plan of plans) {
+      const exit = plan.exit;
+      if (exit === undefined || exits.from <= unfollowed(exit)) continue;
+      if (exit.account !== undefined) {
+        exit.parts = exit.account.parts;
+        exit.ledger = exit.account.ledger;
+        exit.event = undefined;
+        exit.account = undefined;
+      }
+      exit.confirmed = false;
+    }
+  }
   for (const event of exits.events) {
     if (event.kind === "exit_queued") {
       const plan = plans.find((p) => p.txHash === event.txHash);
-      if (plan === undefined || plan.exit !== undefined) continue;
+      if (plan === undefined || plan.exit?.confirmed === true) continue;
+      // An exit the indexer's account alone showed takes the events from its queueing on, and that
+      // account stands while it is newer than they are.
+      const before = plan.exit;
       const exit: PlanExit = {
         id: event.id,
         parts: [{ id: event.id, payoutLeft: event.payout, feeLeft: event.fee, stranded: false }],
         ledger: event.ledger,
         event: event.eventId,
+        confirmed: true,
+        account:
+          before === undefined || before.ledger <= event.ledger
+            ? undefined
+            : { parts: before.parts, ledger: before.ledger },
       };
       plan.exit = exit;
       settle(plan, exit);
@@ -85,9 +123,12 @@ function applyExitEvents(plans: readonly Plan[], exits: ExitEvents): void {
     }
     const id = event.kind === "settled" ? event.exitId : event.id;
     if (id === undefined) {
-      // transact paid at once
-      const plan = plans.find((p) => p.txHash === event.txHash && p.exit === undefined);
-      if (plan !== undefined) plan.state = "settled";
+      // transact paid at once, so an exit the indexer's account alone gave the plan never was
+      const plan = plans.find((p) => p.txHash === event.txHash && p.exit?.confirmed !== true);
+      if (plan !== undefined) {
+        plan.exit = undefined;
+        plan.state = "settled";
+      }
       continue;
     }
     for (const plan of plans) {
@@ -98,13 +139,19 @@ function applyExitEvents(plans: readonly Plan[], exits: ExitEvents): void {
       }
     }
   }
-  // The events hold every ledger from `from` to `to`, so an exit followed up to one of them is
-  // now followed up to `to`.
+  // The events hold every ledger from `from` to `to`, so an exit followed up to one of them, or
+  // through the whole ledger before `from`, is now followed up to `to`. An account of the
+  // indexer's they now reach stands no more.
   for (const plan of plans) {
     const exit = plan.exit;
-    if (exit !== undefined && exits.from <= exit.ledger && exit.ledger <= exits.to) {
+    if (exit === undefined) continue;
+    if (exits.from <= unfollowed(exit) && exit.ledger <= exits.to) {
       exit.ledger = exits.to;
       exit.event = undefined;
+    }
+    if (exit.account !== undefined && exit.account.ledger <= exit.ledger) {
+      exit.account = undefined;
+      settle(plan, exit);
     }
   }
 }
@@ -151,10 +198,13 @@ function account(exit: PlanExit, queue: ExitQueue): ExitPart[] | undefined {
 
 // The indexer's account of the queue, for what the vault's events of this sync did not cover. A
 // plan learns its exit ID only from the queued entry of its own transaction; from then on the
-// account is taken only when it is newer than what the plan's exit follows.
+// account is taken only when it is newer than what the plan's exit follows. It never moves how
+// far a confirmed exit follows the vault's events, which take over once they reach its ledger.
 function applyExitQueue(plans: readonly Plan[], queue: ExitQueue): void {
   for (const plan of plans) {
     if (plan.exit === undefined) {
+      // paid at once, as the vault's events show
+      if (plan.state === "settled") continue;
       const entry = queue.exits.find((e) => e.txHash === plan.txHash && e.position !== undefined);
       if (entry === undefined) continue;
       plan.exit = {
@@ -164,17 +214,23 @@ function applyExitQueue(plans: readonly Plan[], queue: ExitQueue): void {
         ],
         ledger: queue.completeTo,
         event: undefined,
+        confirmed: false,
+        account: undefined,
       };
       settle(plan, plan.exit);
       continue;
     }
     const exit = plan.exit;
-    if (queue.completeTo <= exit.ledger) continue;
+    if (queue.completeTo <= (exit.account?.ledger ?? exit.ledger)) continue;
     const parts = account(exit, queue);
     if (parts === undefined) continue;
-    exit.parts = parts;
-    exit.ledger = queue.completeTo;
-    exit.event = undefined;
+    if (exit.confirmed) {
+      exit.account = { parts, ledger: queue.completeTo };
+    } else {
+      exit.parts = parts;
+      exit.ledger = queue.completeTo;
+      exit.event = undefined;
+    }
     settle(plan, exit);
   }
 }
@@ -200,7 +256,7 @@ export function applyExits(
 
 // What an unshield's exit still owes its recipient, over every exit that holds part of it.
 export const payoutLeft = (exit: PlanExit): bigint =>
-  exit.parts.reduce((s, p) => s + p.payoutLeft, 0n);
+  shownParts(exit).reduce((s, p) => s + p.payoutLeft, 0n);
 
 /** Where a queued payout stands in the vault's exit queue, by the indexer's account of it. */
 export interface ExitPosition {

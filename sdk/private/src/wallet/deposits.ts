@@ -75,6 +75,10 @@ export interface DepositInfo {
   readonly refundableAt: number | undefined;
   readonly refundReason: number | undefined;
   readonly refundKind: ScreeningKind | undefined;
+  // The state and the entry queue's details rest on the wallet's own transactions, the vault's
+  // events every RPC provider showed and the confirmed tree, rather than on the indexer's account
+  // alone.
+  readonly confirmed: boolean;
 }
 
 // Anyone may refund a flagged deposit only a day after it was flagged; the depositor can cancel
@@ -95,6 +99,7 @@ export function depositInfo(d: Deposit): DepositInfo {
       d.flag?.flaggedAt === undefined ? undefined : d.flag.flaggedAt + REFUND_DELAY_SECONDS,
     refundReason: d.refundReason,
     refundKind: d.refundReason === undefined ? undefined : screeningKind(d.refundReason),
+    confirmed: d.confirmed,
   };
 }
 
@@ -197,6 +202,7 @@ export async function shield(
     flag: undefined,
     leafIndices: undefined,
     refundReason: undefined,
+    confirmed: true,
   };
   core.state.deposits.push(deposit);
   await core.save();
@@ -260,6 +266,7 @@ export async function cancelDeposit(
   if (record !== undefined) {
     record.state = "cancelled";
     record.refundReason = 0;
+    record.confirmed = true;
     await core.save();
   }
   return result.hash;
@@ -292,6 +299,7 @@ export async function refundDeposit(
   if (record !== undefined) {
     record.state = "refunded";
     record.refundReason = pending.flag;
+    record.confirmed = true;
     await core.save();
   }
   return result.hash;
@@ -357,12 +365,15 @@ export async function trackDeposits(
         deposit.state = "failed";
       }
     }
-    if (deposit.state !== "pending" || deposit.id === undefined) continue;
+    if (deposit.state === "submitting" || deposit.state === "failed") continue;
+    // The confirmed tree outweighs whatever the indexer said became of the deposit.
     if (state.notes.some((n) => deposit.commitments.includes(n.cm))) {
       deposit.state = "admitted";
       deposit.flag = undefined;
+      deposit.confirmed = true;
       continue;
     }
+    if (deposit.state !== "pending" || deposit.id === undefined) continue;
     // The indexer's account of the ID counts only for the depositor and amount of this deposit, so
     // no other deposit's state shows under it.
     const ours = (d: { id: number; depositor: string; amount: bigint }): boolean =>
@@ -373,11 +384,13 @@ export async function trackDeposits(
       deposit.attested = queued.attested;
       deposit.earliestAdmission = queued.earliestAdmission;
       deposit.flag = queued.flag;
+      deposit.confirmed = false;
     } else if (resolved !== undefined) {
       deposit.state = resolved.outcome;
       deposit.leafIndices = resolved.leafIndices;
       deposit.refundReason = resolved.reason;
       deposit.flag = undefined;
+      deposit.confirmed = false;
     }
   }
 }

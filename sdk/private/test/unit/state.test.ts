@@ -18,7 +18,7 @@ describe("stored state", () => {
     );
   });
 
-  it("loads a state from before close times, checked ledgers, digests, counts of providers and range statuses", async () => {
+  it("loads a state from before close times, checked ledgers, digests, counts of providers, range statuses and confirmed exits", async () => {
     const store = new SealedStore(new MemoryStore(), testBytes("state/key", 2, 32));
     const state = emptyState(10);
     state.unchecked = [
@@ -38,7 +38,10 @@ describe("stored state", () => {
     delete older.unchecked[0].leaves.chunks;
     // Only what the load reads of a staging and of plans.
     older.staging = { unchecked: { first: 4, ledger: 31 } };
-    older.plans = [{ evidence: [{ outputs: [3, null] }, { outputs: [null, null] }] }];
+    older.plans = [
+      { evidence: [{ outputs: [3, null] }, { outputs: [null, null] }], exit: { id: 1, parts: [] } },
+    ];
+    older.deposits = [{ state: "admitted" }];
     await store.write("state", new TextEncoder().encode(JSON.stringify(older)));
     const loaded = await loadState(store);
     assert.deepEqual(loaded?.ledgerTimes, []);
@@ -59,6 +62,9 @@ describe("stored state", () => {
       loaded?.plans[0]?.evidence.map((e) => e.providers),
       [1, 0],
     );
+    // Exits and deposits kept without what they rest on count as the indexer's word.
+    assert.equal(loaded?.plans[0]?.exit?.confirmed, false);
+    assert.equal(loaded?.deposits[0]?.confirmed, false);
   });
 
   it("refuses a number without its sign", async () => {

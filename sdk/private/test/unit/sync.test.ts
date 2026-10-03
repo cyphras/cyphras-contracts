@@ -297,7 +297,14 @@ describe("plan fate", () => {
   it("takes a landed plan's transaction again from the leaves a rescan finds", () => {
     const { state, plan } = walletWith(40);
     Object.assign(plan, { state: "settled", txHash: "aa".repeat(32), ledger: 205 });
-    plan.exit = { id: 3, parts: [], ledger: 205, event: undefined };
+    plan.exit = {
+      id: 3,
+      parts: [],
+      ledger: 205,
+      event: undefined,
+      confirmed: true,
+      account: undefined,
+    };
     plan.evidence = [evidence({ txHash: "bb".repeat(32), ledger: 206, outputs: [38, 39] })];
     advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "confirmed");
@@ -309,7 +316,14 @@ describe("plan fate", () => {
   it("starts a landed plan over once the checked spends of its ledger refute its landing", () => {
     const { state, plan, note } = walletWith(40);
     Object.assign(plan, { state: "settled", txHash: "aa".repeat(32), ledger: 205 });
-    plan.exit = { id: 3, parts: [], ledger: 205, event: undefined };
+    plan.exit = {
+      id: 3,
+      parts: [],
+      ledger: 205,
+      event: undefined,
+      confirmed: true,
+      account: undefined,
+    };
     // Until the spends of its ledger are checked, nothing refutes it.
     advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "settled");
