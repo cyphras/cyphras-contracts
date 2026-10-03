@@ -29,8 +29,9 @@ Usage:
                      contributed unless the file matches it
   --r1cs, --ptau     first verify the whole chain in <input.zkey> against the frozen circuit and
                      the Hermez powers of tau (recommended, takes about a minute)
-  --extra-entropy    also mix in text you type, which is not shown, or whatever is piped to
-                     stdin, on top of 64 bytes from the operating system's random generator
+  --extra-entropy    also mix in one line you type, which is not shown and ends at Enter
+                     (anything typed after it is dropped), or everything piped to stdin, on
+                     top of 64 bytes from the operating system's random generator
 
 The secret randomness exists only in the memory of this process. It is never printed, passed on a
 command line or written to disk, and it is gone once the process exits. The name is stored in the
@@ -165,13 +166,22 @@ async function readExtraEntropy() {
     for (const chunk of chunks) chunk.fill(0);
     return all;
   }
-  stderr.write("Type random text, then press Enter (nothing is shown): ");
+  stderr.write(
+    "Type one line of random text and press Enter; nothing is shown and only this line is read: ",
+  );
   return new Promise((resolve, reject) => {
     const typed = [];
+    // Input after Enter, such as the rest of a pasted text, is read and dropped for a moment
+    // while the terminal still hides it; otherwise it would appear once echo is back on.
+    const drop = (chunk) => chunk.fill(0);
     const done = (error) => {
       stdin.off("data", onData);
-      stdin.setRawMode(false);
-      stdin.pause();
+      stdin.on("data", drop);
+      setTimeout(() => {
+        stdin.off("data", drop);
+        stdin.setRawMode(false);
+        stdin.pause();
+      }, 500);
       stderr.write("\n");
       const out = Buffer.from(typed);
       typed.fill(0);
