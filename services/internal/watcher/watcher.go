@@ -96,8 +96,8 @@ type Watcher struct {
 	// roots holds the tree's recent roots by leaf count, as the vault's root ring does.
 	roots     map[uint64]fr.Element
 	rootOrder []uint64
-	// snapshots are the states at the end of recent windows, so a read of the vault's status
-	// made at a later ledger than the cursor is compared once the watcher gets there.
+	// snapshots are the replayed status at the end of recent windows, so a read of the vault's
+	// status made at a later ledger than the cursor is compared once the watcher gets there.
 	snapshots []snapshot
 	reads     []statusRead
 	inst      *vault.Instance
@@ -117,17 +117,32 @@ func New(ctx context.Context, cfg Config, primary, second rpc.Client, chain *cha
 		cfg: cfg, rpc: primary, second: second, chain: chain, db: store{chain.Pool}, horizon: hz,
 		http: &http.Client{Timeout: 10 * time.Second}, alerts: alerts, public: public, log: log, now: time.Now,
 		state: state, cursor: cursor, roots: map[uint64]fr.Element{}, healthFails: map[string]int{},
-		snapshots: []snapshot{{ledger: cursor, state: state}},
+		snapshots: []snapshot{snapshotOf(cursor, state)},
 	}
 	w.keepRoot(chainstate.RootAt{LeafCount: state.Tree.Len(), Root: state.Tree.Root()})
 	return w, nil
 }
 
-// snapshot is the replayed state at the end of a window. A state is never changed once applied,
-// so keeping it is safe.
+// snapshot is the replayed status at the end of a window: only what a status read is compared
+// with, rather than a whole state with every pending deposit and exit.
 type snapshot struct {
 	ledger uint32
-	state  *chainstate.State
+	status vault.Status
+	limits *vault.Limits
+}
+
+func snapshotOf(ledger uint32, s *chainstate.State) snapshot {
+	out := snapshot{ledger: ledger, status: vault.Status{
+		DepositsPaused: s.DepositsPaused, TransfersPaused: s.TransfersPaused, HaltedUntil: s.HaltedUntil, NextHaltAt: s.NextHaltAt,
+		NextDepositID: s.NextDepositID, AttestedUpTo: s.AttestedUpTo, Tvl: new(big.Int).Set(s.Tvl),
+		PendingTotal: new(big.Int).Set(s.PendingTotal), QueuedTotal: new(big.Int).Set(s.QueuedTotal), ExitHead: s.ExitHead,
+		ExitTail: s.ExitTail, OutflowDay: s.OutflowDay, Outflow: new(big.Int).Set(s.Outflow),
+	}}
+	if s.Limits != nil {
+		l := *s.Limits
+		out.limits = &l
+	}
+	return out
 }
 
 // statusRead is a read of the vault's instance: valid from the ledger that last modified it to
@@ -197,7 +212,7 @@ func (w *Watcher) Apply(ctx context.Context, b follow.Batch) error {
 	for _, r := range delta.Roots {
 		w.keepRoot(r)
 	}
-	w.snapshots = append(w.snapshots, snapshot{ledger: b.To, state: next})
+	w.snapshots = append(w.snapshots, snapshotOf(b.To, next))
 	if len(w.snapshots) > snapshotHistory {
 		w.snapshots = w.snapshots[1:]
 	}

@@ -122,29 +122,29 @@ func (w *Watcher) Reconcile(ctx context.Context) error {
 }
 
 // statusDiff lists the fields where the vault's status and the watcher's replay differ.
-func statusDiff(inst vault.Instance, s *chainstate.State, now uint64) []string {
-	st := inst.Status
+func statusDiff(inst vault.Instance, s snapshot, now uint64) []string {
+	st, ours := inst.Status, s.status
 	var out []string
-	check := func(name string, equal bool, chain, ours any) {
+	check := func(name string, equal bool, chain, replayed any) {
 		if !equal {
-			out = append(out, fmt.Sprintf("%s is %v on chain, %v replayed", name, chain, ours))
+			out = append(out, fmt.Sprintf("%s is %v on chain, %v replayed", name, chain, replayed))
 		}
 	}
-	check("tvl", st.Tvl.Cmp(s.Tvl) == 0, st.Tvl, s.Tvl)
-	check("pending_total", st.PendingTotal.Cmp(s.PendingTotal) == 0, st.PendingTotal, s.PendingTotal)
-	check("queued_total", st.QueuedTotal.Cmp(s.QueuedTotal) == 0, st.QueuedTotal, s.QueuedTotal)
-	check("exit_head", st.ExitHead == s.ExitHead, st.ExitHead, s.ExitHead)
-	check("exit_tail", st.ExitTail == s.ExitTail, st.ExitTail, s.ExitTail)
-	check("next_deposit_id", st.NextDepositID == s.NextDepositID, st.NextDepositID, s.NextDepositID)
-	check("attested_up_to", st.AttestedUpTo == s.AttestedUpTo, st.AttestedUpTo, s.AttestedUpTo)
-	check("deposits_paused", st.DepositsPaused == s.DepositsPaused, st.DepositsPaused, s.DepositsPaused)
-	check("transfers_paused", st.TransfersPaused == s.TransfersPaused, st.TransfersPaused, s.TransfersPaused)
-	check("halted_until", st.HaltedUntil == s.HaltedUntil, st.HaltedUntil, s.HaltedUntil)
-	check("next_halt_at", st.NextHaltAt == s.NextHaltAt, st.NextHaltAt, s.NextHaltAt)
+	check("tvl", st.Tvl.Cmp(ours.Tvl) == 0, st.Tvl, ours.Tvl)
+	check("pending_total", st.PendingTotal.Cmp(ours.PendingTotal) == 0, st.PendingTotal, ours.PendingTotal)
+	check("queued_total", st.QueuedTotal.Cmp(ours.QueuedTotal) == 0, st.QueuedTotal, ours.QueuedTotal)
+	check("exit_head", st.ExitHead == ours.ExitHead, st.ExitHead, ours.ExitHead)
+	check("exit_tail", st.ExitTail == ours.ExitTail, st.ExitTail, ours.ExitTail)
+	check("next_deposit_id", st.NextDepositID == ours.NextDepositID, st.NextDepositID, ours.NextDepositID)
+	check("attested_up_to", st.AttestedUpTo == ours.AttestedUpTo, st.AttestedUpTo, ours.AttestedUpTo)
+	check("deposits_paused", st.DepositsPaused == ours.DepositsPaused, st.DepositsPaused, ours.DepositsPaused)
+	check("transfers_paused", st.TransfersPaused == ours.TransfersPaused, st.TransfersPaused, ours.TransfersPaused)
+	check("halted_until", st.HaltedUntil == ours.HaltedUntil, st.HaltedUntil, ours.HaltedUntil)
+	check("next_halt_at", st.NextHaltAt == ours.NextHaltAt, st.NextHaltAt, ours.NextHaltAt)
 	day := now / secondsPerDay
-	check("today's outflow", st.OutflowOn(day).Cmp(s.OutflowOn(day)) == 0, st.OutflowOn(day), s.OutflowOn(day))
-	if s.Limits != nil {
-		check("limits", limitsText(*s.Limits) == limitsText(inst.Limits), limitsText(inst.Limits), limitsText(*s.Limits))
+	check("today's outflow", st.OutflowOn(day).Cmp(ours.OutflowOn(day)) == 0, st.OutflowOn(day), ours.OutflowOn(day))
+	if s.limits != nil {
+		check("limits", limitsText(*s.limits) == limitsText(inst.Limits), limitsText(inst.Limits), limitsText(*s.limits))
 	}
 	return out
 }
@@ -158,17 +158,17 @@ func (w *Watcher) compareReads() ([]string, bool) {
 	compared := false
 	keep := w.reads[:0]
 	for _, r := range w.reads {
-		var match *chainstate.State
+		var match *snapshot
 		for i := len(w.snapshots) - 1; i >= 0; i-- {
 			if l := w.snapshots[i].ledger; l >= r.from && l <= r.to {
-				match = w.snapshots[i].state
+				match = &w.snapshots[i]
 				break
 			}
 		}
 		switch {
 		case match != nil:
 			compared = true
-			problems = append(problems, statusDiff(r.inst, match, r.now)...)
+			problems = append(problems, statusDiff(r.inst, *match, r.now)...)
 		case r.to > w.cursor:
 			keep = append(keep, r)
 		}
