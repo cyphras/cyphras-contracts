@@ -8,6 +8,7 @@ import (
 
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
 const secondsPerDay = 86_400
@@ -85,9 +86,9 @@ func fromState(e *chainstate.Exit, state string) Exit {
 
 // paidBy gives each queued exit, in queue order, the end of the UTC day by which it is paid in full
 // at the latest: from the day of max(now, haltedUntil), ceil((V + x) / M) more days, with V what
-// the exits ahead still owe, x what it still owes and M max_daily_outflow. The keeper releases
-// every window in full and a claim queues behind it, so only a new halt, or a vault that cannot
-// pay, makes it later.
+// the exits ahead take from the windows, x what it takes and M max_daily_outflow. The keeper
+// releases every window in full and a claim queues behind it, so only a new halt, or a vault that
+// cannot pay, makes it later.
 func paidBy(owed []*big.Int, now, haltedUntil uint64, maxDaily *big.Int) []*uint64 {
 	out := make([]*uint64, len(owed))
 	if maxDaily.Sign() <= 0 {
@@ -101,6 +102,19 @@ func paidBy(owed []*big.Int, now, haltedUntil uint64, maxDaily *big.Int) []*uint
 		out[i] = ptr((day+days.Uint64()+1)*secondsPerDay - 1)
 	}
 	return out
+}
+
+// takes is what an exit can take from the windows: what it owes and, in a vault of the native
+// asset, the rest of a window that release leaves unused rather than pay a first part below
+// MinNewAccountPayout to an account that may not exist yet. That happens at most once an exit, as
+// the first part paid creates the account.
+func (ix *Indexer) takes(e *chainstate.Exit) *big.Int {
+	t := e.Outflow()
+	first := e.Payout.Sign() > 0 && e.Payout.Cmp(e.QueuedPayout) == 0
+	if ix.cfg.Native && first && (e.Recipient[0] == 'G' || e.Recipient[0] == 'M') {
+		t.Add(t, big.NewInt(vault.MinNewAccountPayout-1))
+	}
+	return t
 }
 
 // exits serves the whole exit queue, every stranded exit and the exits resolved in the last week,
@@ -135,7 +149,7 @@ func (ix *Indexer) exits(w http.ResponseWriter, r *http.Request) {
 		x := fromState(e, state)
 		x.Position = ptr(id - head)
 		list = append(list, x)
-		owed = append(owed, e.Outflow())
+		owed = append(owed, ix.takes(e))
 	}
 	queued := len(list)
 	for _, e := range s.Stranded {

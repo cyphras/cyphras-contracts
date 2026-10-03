@@ -46,7 +46,7 @@ func main() {
 	}
 	ix, err := indexer.New(ctx, indexer.Config{
 		Vault: base.Vault.Vault, NetworkID: base.NetworkID, DeployLedger: base.Vault.DeployLedger,
-		ArchiveDir: config.Env("ARCHIVE_DIR", ""), MaxLag: 12, ProbeMaxAge: 30 * time.Second,
+		ArchiveDir: config.Env("ARCHIVE_DIR", ""), MaxLag: 12, ProbeMaxAge: 30 * time.Second, Native: base.Vault.Asset == "native",
 	}, base.RPC, chain, base.Alerts, log)
 	if err != nil {
 		service.Fatal(log, "load", err)

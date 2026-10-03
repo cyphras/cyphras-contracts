@@ -419,6 +419,39 @@ func TestExitsArePaidByTheBoundTheWindowSets(t *testing.T) {
 	}
 }
 
+func TestAFirstPayoutToANewAccountMayWaitForTheNextWindow(t *testing.T) {
+	n := func(v int64) *big.Int { return big.NewInt(v) }
+	exit := func(left, queued int64, recipient string) *chainstate.Exit {
+		return &chainstate.Exit{Payout: n(left), Fee: n(0), QueuedPayout: n(queued), QueuedFee: n(0), Recipient: recipient}
+	}
+	native, issued := &Indexer{cfg: Config{Native: true}}, &Indexer{}
+	slack := int64(vault.MinNewAccountPayout - 1)
+	for name, c := range map[string]struct {
+		ix   *Indexer
+		e    *chainstate.Exit
+		want int64
+	}{
+		"nothing paid yet":   {native, exit(300_000_000, 300_000_000, vaulttest.Depositor), 300_000_000 + slack},
+		"paid in part":       {native, exit(200_000_000, 300_000_000, vaulttest.Depositor), 200_000_000},
+		"a contract":         {native, exit(300_000_000, 300_000_000, vaulttest.Vault), 300_000_000},
+		"an issued asset":    {issued, exit(300_000_000, 300_000_000, vaulttest.Depositor), 300_000_000},
+		"a fee only is left": {native, exit(0, 0, vaulttest.Depositor), 0},
+	} {
+		if got := c.ix.takes(c.e); got.Int64() != c.want {
+			t.Fatalf("%s takes %v, want %d", name, got, c.want)
+		}
+	}
+	// Three such exits that would fill one window of 100 XLM between them may need a second.
+	const day = 20_000 * secondsPerDay
+	owed := []*big.Int{}
+	for range 3 {
+		owed = append(owed, native.takes(exit(333_000_000, 333_000_000, vaulttest.Depositor)))
+	}
+	if got := paidBy(owed, day, 0, n(1_000_000_000)); *got[2] != day+3*secondsPerDay-1 {
+		t.Fatalf("the third is paid by %d", *got[2])
+	}
+}
+
 func TestTheExitQueueIsServedWithReleaseTimes(t *testing.T) {
 	h := newHarness(t)
 	c := h.chain

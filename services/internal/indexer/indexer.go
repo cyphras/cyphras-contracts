@@ -32,6 +32,8 @@ type Config struct {
 	MaxLag uint32
 	// ProbeMaxAge is how old the last successful probe of the RPC may be.
 	ProbeMaxAge time.Duration
+	// Native is set for a vault of the native asset.
+	Native bool
 }
 
 // Not-ready codes of the health endpoint.
