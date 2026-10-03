@@ -15,6 +15,7 @@ import { noteCommitment, randomFieldElement, randomScalar } from "../../src/note
 import type { FetchLike } from "../../src/net/http.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
 import { keySource } from "../../src/keysource.ts";
+import { NETWORK_PASSPHRASES } from "../../src/keys.ts";
 import { type Plan, type WalletState, loadState, saveState } from "../../src/wallet/state.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
 import { RPC, XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
@@ -504,6 +505,114 @@ describe("wallet safety: an RPC that lies about the vault's events", () => {
     assert.equal(rebuilt?.state, "dead");
     assert.equal(rebuilt?.mustRetry, true);
     assert.equal((await reopened.balance()).spendable, 100n * XLM);
+  });
+});
+
+describe("wallet safety: a second RPC provider", () => {
+  const SECOND = "http://rpc2.test";
+
+  // A fetch that sends what the wallet asks of the second provider to `second`, as the first.
+  function viaSecond(world: World, second: FetchLike): FetchLike {
+    return async (input, init) =>
+      new URL(input).origin === SECOND ? second(RPC, init) : world.fetch(input, init);
+  }
+
+  it("checks a second RPC provider as it checks the first", async () => {
+    const world = await createWorld();
+    const mainnet: FetchLike = async (input, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.method !== "getNetwork") return world.fetch(input, init);
+      const result = { passphrase: NETWORK_PASSPHRASES.mainnet };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+    };
+    const wallet = await openWallet(
+      { ...world, fetch: viaSecond(world, mainnet) },
+      0,
+      undefined,
+      undefined,
+      {
+        secondRpcUrl: SECOND,
+      },
+    );
+    assert.equal(wallet.verification().secondRpc, "mismatch");
+    assert.equal(wallet.verification().state, "mismatch");
+    const honest = await openWallet(
+      { ...world, fetch: viaSecond(world, world.fetch) },
+      0,
+      undefined,
+      undefined,
+      {
+        secondRpcUrl: SECOND,
+      },
+    );
+    assert.equal(honest.verification().secondRpc, "ok");
+    assert.equal(honest.verification().state, "verified");
+    const single = await openWallet(world, 0);
+    assert.equal(single.verification().secondRpc, "not_set");
+    assert.equal(single.verification().secondRpcRecommended, false);
+  });
+
+  it("declares a payment dead only once a second RPC provider agrees", async () => {
+    const { world, store } = await funded();
+    let stale: string | undefined;
+    let mode: "live" | "down" | "lagging" = "live";
+    const second: FetchLike = async (input, init) => {
+      if (mode === "down") throw new TypeError("connection refused");
+      const body = JSON.parse(String(init?.body));
+      const view = body.method === "getLedgerEntries" && body.params.keys.length === 3;
+      if (mode === "lagging" && view && stale !== undefined) {
+        return new Response(JSON.stringify({ ...JSON.parse(stale), id: body.id }));
+      }
+      const res = await world.fetch(input, init);
+      if (view) stale = await res.clone().text();
+      return res;
+    };
+    const alice = await openWallet(
+      { ...world, fetch: viaSecond(world, second) },
+      0,
+      store,
+      undefined,
+      { secondRpcUrl: SECOND },
+    );
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
+    );
+    // The second provider's view of the vault is from before the payment's deadline.
+    mode = "lagging";
+    world.advance(121 * 5);
+    world.fill(1);
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "prepared");
+    // A second provider that cannot answer lets no payment die either.
+    mode = "down";
+    world.fill(1);
+    assert.equal((await alice.sync()).rootVerified, true);
+    assert.equal((await alice.plans())[0]?.state, "prepared");
+    mode = "live";
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "dead");
+    assert.equal((await alice.balance()).spendable, 100n * XLM);
+  });
+
+  it("refuses a tree a second RPC provider contradicts", async () => {
+    const { world, store } = await funded();
+    // Another vault at the same address, with other leaves.
+    const other = await createWorld();
+    other.fill(5);
+    const alice = await openWallet(
+      { ...world, fetch: viaSecond(world, other.fetch) },
+      0,
+      store,
+      undefined,
+      {
+        secondRpcUrl: SECOND,
+      },
+    );
+    world.fill(1);
+    await assert.rejects(alice.sync(), isError("tree_unverified"));
+    assert.equal(alice.treeStatus().fault, true);
   });
 });
 

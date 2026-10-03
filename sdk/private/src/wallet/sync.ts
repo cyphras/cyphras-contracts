@@ -597,13 +597,14 @@ function missedDeadline(state: WalletState, plan: Plan): boolean {
 // in the vault's tree. It is superseded once the vault's checked events show another transaction
 // spending one of its notes, or another plan of this wallet that spends the same notes landed. It
 // is dead once its deadline or its root's place in the vault's history has passed with no sign of
-// it: either the wallet holds the vault's whole tree, as read at `view`, without the plan's
-// commitments in it, at or past the plan's deadline or once the plan's root has left the vault's
-// history; or the checked spends of every ledger up to its deadline show its notes unspent. From
-// then on the vault refuses its proof. A dead or superseded plan whose commitments turn up is
-// confirmed all the same. A landed plan whose evidence a rescan dropped takes the transaction the
-// rebuilt leaves show, or starts over once the checked spends refute its landing.
-export function advancePlans(state: WalletState, view: ChainView): void {
+// it, as every one of `views`, the vault read from each RPC provider, shows: either each holds the
+// tree the wallet holds, without the plan's commitments in it, at or past the plan's deadline or
+// with the plan's root gone from the vault's history; or the checked spends of every ledger up to
+// its deadline show its notes unspent, and each view is past the deadline. From then on the vault
+// refuses its proof. A dead or superseded plan whose commitments turn up is confirmed all the
+// same. A landed plan whose evidence a rescan dropped takes the transaction the rebuilt leaves
+// show, or starts over once the checked spends refute its landing.
+export function advancePlans(state: WalletState, views: readonly ChainView[]): void {
   for (const plan of state.plans) {
     if (!LANDED_STATES.includes(plan.state)) continue;
     if (landed(plan)) {
@@ -632,15 +633,20 @@ export function advancePlans(state: WalletState, view: ChainView): void {
     plan.txHash = e.txHash;
     plan.ledger = e.ledger;
   }
-  const whole = view.roots.nextLeaf === state.tree.leafCount;
+  // A view whose NextLeaf is the wallet's leaf count holds the wallet's tree: the sync refuses a
+  // view whose root history contradicts it.
+  const whole = (v: ChainView): boolean => v.roots.nextLeaf === state.tree.leafCount;
+  const gone = (plan: Plan) => (v: ChainView) =>
+    whole(v) && (v.roots.ledger >= plan.deadline || !v.roots.roots.includes(plan.root));
   for (const plan of open) {
     if (plan.state === "confirmed" || plan.state === "superseded") continue;
     if (superseded(state, plan)) {
       plan.state = "superseded";
     } else if (
       isActive(plan) &&
-      ((whole && (view.roots.ledger >= plan.deadline || !view.roots.roots.includes(plan.root))) ||
-        missedDeadline(state, plan))
+      views.length > 0 &&
+      (views.every(gone(plan)) ||
+        (missedDeadline(state, plan) && views.every((v) => v.ledger >= plan.deadline)))
     ) {
       plan.state = "dead";
     }

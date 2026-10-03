@@ -101,6 +101,9 @@ export interface ConnectionOptions {
   readonly allowUnpinnedDeployment?: boolean;
   readonly storage: KeyValueStore;
   readonly rpcUrl: string;
+  // A second RPC provider, read on every sync: a payment is declared dead only when both show it,
+  // and a tree it contradicts is not taken. Recommended on mainnet.
+  readonly secondRpcUrl?: string;
   // Every request goes through it, so the caller can route private-payment traffic via a proxy.
   readonly fetch?: FetchLike;
   // Service URLs other than the pinned ones; each must report the pinned vault and network.
@@ -409,6 +412,7 @@ export class PrivateWallet {
       fetchFn,
       options.indexers,
       options.relayers,
+      options.secondRpcUrl,
     );
     const store = new SealedStore(options.storage, storeKey);
     const states = new StateStore(store);
@@ -482,6 +486,7 @@ export class PrivateWallet {
       options.fetch ?? defaultFetch,
       options.indexers,
       [],
+      undefined,
     );
     return verifyDisclosure(
       doc,
@@ -649,6 +654,11 @@ export class PrivateWallet {
       download = await downloadChain(core.state, source, core.services.vault, limits.leafPages);
     }
     const { view, data } = download;
+    // The second provider's view, when one is set; a provider that cannot answer lets no plan die.
+    const second = await core.services.second?.vault.view().catch((err: unknown) => {
+      if (err instanceof CyphrasError) return undefined;
+      throw err;
+    });
     let crossChecked = false;
     // The vault's own events, from RPC, for the ledgers of this sync, when RPC held them.
     let events: VaultEvents | undefined;
@@ -665,7 +675,10 @@ export class PrivateWallet {
       events = await source.events();
     }
     const check = checkRoot(data.tree, view.roots);
-    if (check.state === "mismatch") {
+    if (
+      check.state === "mismatch" ||
+      (second !== undefined && checkRoot(data.tree, second.roots).state === "mismatch")
+    ) {
       fail(
         "tree_unverified",
         "the synced tree contradicts the vault; nothing of this sync was kept",
@@ -693,7 +706,11 @@ export class PrivateWallet {
       limits.eventPages,
     );
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
-    if (check.state === "verified") advancePlans(core.state, view);
+    if (check.state === "verified") {
+      const views =
+        core.services.second === undefined ? [view] : second === undefined ? [] : [view, second];
+      advancePlans(core.state, views);
+    }
     const live = source.kind === "indexer" ? indexer : undefined;
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
     onReads({ view, stats: await live?.stats().catch(() => undefined) });

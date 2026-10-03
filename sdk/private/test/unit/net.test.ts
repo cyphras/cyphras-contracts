@@ -8,6 +8,7 @@ import { Fields, type FetchLike, MAX_REPLY_BYTES } from "../../src/net/http.ts";
 import { IndexerClient } from "../../src/net/indexer.ts";
 import { RelayerClient } from "../../src/net/relayer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
+import { xdr } from "@stellar/stellar-base";
 import { IndexerSource } from "../../src/wallet/sources.ts";
 import { vaultErrorName } from "../../src/vault/errors.ts";
 import { parseVaultErrors } from "../../scripts/vault-errors.ts";
@@ -565,6 +566,44 @@ describe("RPC client", () => {
       assert.ok(!(err as Error).message.includes("secret detail"));
       return true;
     });
+  });
+
+  it("refuses a ledger entry modified after the ledger the reply is of", async () => {
+    const key = xdr.LedgerKey.account(
+      new xdr.LedgerKeyAccount({
+        accountId: xdr.PublicKey.publicKeyTypeEd25519(Buffer.alloc(32, 1)),
+      }),
+    );
+    const data = xdr.LedgerEntryData.contractData(
+      new xdr.ContractDataEntry({
+        ext: new xdr.ExtensionPoint(0),
+        contract: xdr.ScAddress.scAddressTypeContract(Buffer.alloc(32, 2) as never),
+        key: xdr.ScVal.scvU32(1),
+        durability: xdr.ContractDataDurability.persistent(),
+        val: xdr.ScVal.scvU32(2),
+      }),
+    );
+    const entries = (modified: number) =>
+      reply(200, {
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          entries: [
+            {
+              key: key.toXDR("base64"),
+              xdr: data.toXDR("base64"),
+              lastModifiedLedgerSeq: modified,
+            },
+          ],
+          latestLedger: 100,
+        },
+      });
+    const read = await new SorobanRpc("http://rpc", entries(100)).getLedgerEntries([key]);
+    assert.equal(read.entries.size, 1);
+    await assert.rejects(
+      new SorobanRpc("http://rpc", entries(101)).getLedgerEntries([key]),
+      isCode("rpc_error"),
+    );
   });
 
   it("reads the vault error of a failed simulation", async () => {

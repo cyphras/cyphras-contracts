@@ -97,9 +97,11 @@ export class SorobanRpc {
     return (await this.call("getLatestLedger")).integer("sequence", 1);
   }
 
+  // An entry modified after the ledger the reply claims to be of contradicts the reply.
   async getLedgerEntries(keys: readonly xdr.LedgerKey[]): Promise<LedgerEntries> {
     const wanted = new Map(keys.map((k) => [keyId(k), k]));
     const result = await this.call("getLedgerEntries", { keys: [...wanted.keys()] });
+    const latestLedger = result.integer("latestLedger", 1);
     const entries = new Map<string, LedgerEntry>();
     const list = result.has("entries") ? result.array("entries") : [];
     list.forEach((raw, i) => {
@@ -113,14 +115,17 @@ export class SorobanRpc {
       } catch {
         return e.fault("an entry is not LedgerEntryData XDR");
       }
+      const lastModifiedLedger = e.integer("lastModifiedLedgerSeq");
+      if (lastModifiedLedger > latestLedger)
+        e.fault("an entry was modified after the reply's ledger");
       entries.set(id, {
         key,
         data,
-        lastModifiedLedger: e.integer("lastModifiedLedgerSeq"),
+        lastModifiedLedger,
         liveUntilLedger: e.has("liveUntilLedgerSeq") ? e.integer("liveUntilLedgerSeq") : undefined,
       });
     });
-    return { latestLedger: result.integer("latestLedger", 1), entries };
+    return { latestLedger, entries };
   }
 
   async simulateTransaction(envelope: string): Promise<Simulation> {

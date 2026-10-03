@@ -132,20 +132,20 @@ describe("plan fate", () => {
   it("keeps a plan alive on a lagging node's view from before the plan was built", () => {
     const { state, plan } = walletWith(40);
     // The node's tree is older than the wallet's: its history may well lack the plan's root.
-    advancePlans(state, viewAt(150, 38));
+    advancePlans(state, [viewAt(150, 38)]);
     assert.equal(plan.state, "submitted");
-    advancePlans(state, viewAt(150, 38 - 2 * 256));
+    advancePlans(state, [viewAt(150, 38 - 2 * 256)]);
     assert.equal(plan.state, "submitted");
   });
 
   it("declares a plan dead only with the vault's whole tree, at or past its deadline", () => {
     const { state, plan } = walletWith(40);
-    advancePlans(state, viewAt(319, 40));
+    advancePlans(state, [viewAt(319, 40)]);
     assert.equal(plan.state, "submitted");
     // Leaves the wallet does not hold yet may be the plan's.
-    advancePlans(state, viewAt(320, 42));
+    advancePlans(state, [viewAt(320, 42)]);
     assert.equal(plan.state, "submitted");
-    advancePlans(state, viewAt(320, 40));
+    advancePlans(state, [viewAt(320, 40)]);
     assert.equal(plan.state, "dead");
   });
 
@@ -154,46 +154,46 @@ describe("plan fate", () => {
     // The vault holds leaves the wallet does not, so it lacks the whole tree.
     const view = viewAt(400, 42);
     state.nullifierSince = 320;
-    advancePlans(state, view);
+    advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
     state.nullifierSince = 321;
     state.unchecked = [{ from: 300, to: 310, leaves: undefined, lost: false }];
-    advancePlans(state, view);
+    advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
     state.unchecked = [];
     // A spend of its note by the deadline, or a leaf of its, may be its own landing.
     note.spent = { txHash: "cd".repeat(32), ledger: 320 };
-    advancePlans(state, view);
+    advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
     note.spent = undefined;
     plan.evidence = [evidence({ outputs: [41, undefined] })];
-    advancePlans(state, view);
+    advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
     plan.evidence = [];
     note.spent = { txHash: "cd".repeat(32), ledger: 321 };
-    advancePlans(state, view);
+    advancePlans(state, [view]);
     assert.equal(plan.state, "dead");
   });
 
   it("declares a plan dead once its root has left the history of the vault's whole tree", () => {
     const kept = walletWith(40, treeOf(38).root());
-    advancePlans(kept.state, viewAt(250, 40));
+    advancePlans(kept.state, [viewAt(250, 40)]);
     assert.equal(kept.plan.state, "submitted");
     const evicted = walletWith(40, 7n);
-    advancePlans(evicted.state, viewAt(250, 40));
+    advancePlans(evicted.state, [viewAt(250, 40)]);
     assert.equal(evicted.plan.state, "dead");
   });
 
   it("confirms a plan once both its commitments are in leaves, whatever transaction they name", () => {
     const { state, plan } = walletWith(40);
     plan.evidence = [evidence({ txHash: "aa".repeat(32), outputs: [40, undefined] })];
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "submitted");
     plan.evidence = [
       evidence({ txHash: "aa".repeat(32), outputs: [40, undefined] }),
       evidence({ txHash: "bb".repeat(32), outputs: [undefined, 41] }),
     ];
-    advancePlans(state, viewAt(400, 40));
+    advancePlans(state, [viewAt(400, 40)]);
     assert.equal(plan.state, "confirmed");
     assert.equal(plan.txHash, "aa".repeat(32));
   });
@@ -213,7 +213,7 @@ describe("plan fate", () => {
       nullifiers: [{ nullifier: 101n, ledger: 211, txHash: tx }],
     });
     assert.deepEqual(plan.evidence[0]?.outputs, [undefined, undefined]);
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "submitted");
   });
 
@@ -228,18 +228,18 @@ describe("plan fate", () => {
     // The indexer's word alone, or a spend whose leaves are unknown, proves nothing.
     plan.evidence = [evidence({ nullifiers: [true, false], foreign: true })];
     note.spent = { txHash: tx, ledger: 210 };
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "submitted");
     plan.evidence = [evidence({ nullifiers: [true, false], checked: true })];
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "submitted");
     // Nor does a spend the note's own record does not show.
     plan.evidence = [evidence({ nullifiers: [true, false], foreign: true, checked: true })];
     note.spent = undefined;
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "submitted");
     note.spent = { txHash: tx, ledger: 210 };
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "superseded");
   });
 
@@ -248,7 +248,7 @@ describe("plan fate", () => {
     Object.assign(plan, { state: "settled", txHash: "aa".repeat(32), ledger: 205 });
     plan.exit = { id: 3, parts: [], ledger: 205, event: undefined };
     plan.evidence = [evidence({ txHash: "bb".repeat(32), ledger: 206, outputs: [38, 39] })];
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "confirmed");
     assert.equal(plan.txHash, "bb".repeat(32));
     assert.equal(plan.ledger, 206);
@@ -259,18 +259,18 @@ describe("plan fate", () => {
     const { state, plan, note } = walletWith(40);
     Object.assign(plan, { state: "settled", txHash: "aa".repeat(32), ledger: 205 });
     // Until the spends of its ledger are checked, nothing refutes it.
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "settled");
     state.nullifierSince = 230;
     state.unchecked = [{ from: 200, to: 229, leaves: undefined, lost: false }];
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "settled");
     state.unchecked = [];
     note.spent = { txHash: "aa".repeat(32), ledger: 205 };
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "settled");
     note.spent = undefined;
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "submitted");
     assert.equal(plan.ledger, undefined);
   });
@@ -279,7 +279,7 @@ describe("plan fate", () => {
     const { state, plan } = walletWith(40);
     const retry: Plan = { ...plan, id: "retry", nullifiers: [101n, 103n], state: "settled" };
     state.plans.push(retry);
-    advancePlans(state, viewAt(250, 40));
+    advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "superseded");
   });
 });
