@@ -932,6 +932,72 @@ describe("wallet safety: a second RPC provider", () => {
     await assert.rejects(alice.sync(), isError("indexer_fault"));
   });
 
+  // An RPC reply carrying a JSON-RPC error: -32600 as from a node that no longer holds the ledgers
+  // asked for, -32601 as from one that does not serve the method, -32603 as from a busy one.
+  const rpcError = (id: number, code: number): Response =>
+    new Response(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message: "no" } }));
+
+  // A fetch whose indexer serves a zeroed ciphertext for the leaves in `hidden`, which hides the
+  // notes in them from their owner.
+  function hiding(fetch: FetchLike, hidden: () => ReadonlySet<number>): FetchLike {
+    return async (input, init) => {
+      const res = await fetch(input, init);
+      const url = new URL(input);
+      if (url.origin !== INDEXER || url.pathname !== "/v1/leaves") return res;
+      const body = await res.json();
+      body.leaves = body.leaves.map((l: { index: number }) =>
+        hidden().has(l.index) ? { ...l, ciphertext: "00".repeat(181) } : l,
+      );
+      return new Response(JSON.stringify(body), { status: 200 });
+    };
+  }
+
+  it("finds through the second RPC provider a payment the indexer hid, once the first disowns its events", async () => {
+    const { world, alice } = await funded();
+    const address = (await openWallet(world, 1)).generateAddress();
+    let phase: "honest" | "busy" | "disowning" = "honest";
+    let hidden = new Set<number>();
+    const providers: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (body?.method === "getEvents" && phase === "busy" && url.origin !== INDEXER) {
+        return rpcError(body.id, -32603);
+      }
+      if (url.origin === SECOND) return world.fetch(RPC, init);
+      if (url.origin === RPC && body?.method === "getEvents" && phase === "disowning") {
+        return rpcError(body.id, -32600);
+      }
+      return world.fetch(input, init);
+    };
+    const bob = await openWallet(
+      { ...world, fetch: hiding(providers, () => (phase === "busy" ? hidden : new Set())) },
+      1,
+      new MemoryStore(),
+      undefined,
+      { secondRpcUrl: SECOND },
+    );
+    await bob.sync();
+    await alice.send({ to: address, amount: 10n * XLM, maxFee: 2n * XLM });
+    hidden = new Set(world.vault.leaves.slice(-2).map((l) => l.index));
+    // Both providers are busy while the indexer hides the payment.
+    phase = "busy";
+    const summary = await bob.sync();
+    assert.equal(summary.uncheckedLeaves, 2);
+    assert.equal(summary.lostLeaves, 0);
+    assert.equal((await bob.balance()).spendable, 0n);
+    // The first provider then claims it no longer holds those ledgers; the second still does.
+    phase = "disowning";
+    world.fill(1);
+    await assert.rejects(bob.sync(), isError("indexer_fault"));
+    phase = "honest";
+    world.fill(1);
+    await assert.rejects(bob.sync(), isError("indexer_fault"));
+    const rescanned = await bob.rescan();
+    assert.equal(rescanned.lostLeaves, 0);
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
   it("refuses a tree a second RPC provider contradicts", async () => {
     const { world, store } = await funded();
     // Another vault at the same address, with other leaves.
@@ -1888,12 +1954,16 @@ describe("wallet safety: unchecked ledgers", () => {
     const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, store);
     world.fill(1);
     rpc.down = true;
-    const unchecked = (await alice.sync()).uncheckedLedgers;
+    const first = await alice.sync();
+    const unchecked = first.uncheckedLedgers;
+    assert.equal(first.lostLeaves, 0);
     rpc.down = false;
     // RPC now holds only the ledgers after that sync.
     world.rpc.oldestLedger = world.vault.ledger + 1;
     world.fill(1);
-    assert.equal((await alice.sync()).uncheckedLedgers, unchecked);
+    const later = await alice.sync();
+    assert.equal(later.uncheckedLedgers, unchecked);
+    assert.equal(later.lostLeaves, 2);
     const asked = world.rpc.calls.filter((m) => m === "getEvents").length;
     world.fill(1);
     assert.equal((await alice.sync()).uncheckedLedgers, unchecked);

@@ -443,7 +443,7 @@ export function applyDownload(
       : { ...staging.unchecked, end: staging.tree.leafCount };
   const to = checked ? data.since - 1 : data.horizon;
   if (to >= data.since || leaves !== undefined) {
-    addUnchecked(state, { from: data.since, to, leaves, lost: false });
+    addUnchecked(state, { from: data.since, to, leaves, status: "open" });
   }
   state.nullifierSince = data.horizon + 1;
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
@@ -459,7 +459,7 @@ function addUnchecked(state: WalletState, range: UncheckedRange): void {
   const [a, b] = [last?.leaves, range.leaves];
   if (
     last === undefined ||
-    last.lost ||
+    last.status !== "open" ||
     last.to + 1 < range.from ||
     (a !== undefined && b !== undefined && a.end !== b.first)
   ) {
@@ -473,7 +473,7 @@ function addUnchecked(state: WalletState, range: UncheckedRange): void {
       a === undefined || b === undefined
         ? (a ?? b)
         : { first: a.first, end: b.end, ledger: a.ledger, chunks: [...a.chunks, ...b.chunks] },
-    lost: false,
+    status: "open",
   };
 }
 
@@ -497,52 +497,76 @@ function confirmedRuns(
   return next;
 }
 
-// Checks what the wallet kept from the oldest range a sync took unchecked, against the vault's own
-// events from every RPC provider while each still holds them: every leaf the sync took, by the
-// digests of runs of them, and the spends of the wallet's notes in the range's ledgers. A
-// difference is the indexer's. The ledgers of the leaves checked become the vault's own. Returns
-// the first provider's events of the ledgers whose spends were checked; what a provider does not
-// reach yet stays in the range, and a range a provider no longer holds is kept, as lost.
+// Checks what the wallet kept from the oldest open range a sync took unchecked, against the
+// vault's own events from every RPC provider that still holds them: every leaf the sync took, by
+// the digests of runs of them, and the spends of the wallet's notes in the range's ledgers. A
+// difference is the indexer's. Nothing moves while a provider is busy. What every provider shows
+// alike is cleared, the ledgers of its leaves become the vault's own, and the first provider's
+// events of the ledgers whose spends were cleared are returned. A range some provider no longer
+// holds can never be confirmed by every one: what every other provider shows alike is kept as
+// partial, and a range none of them holds is kept as lost.
 export async function recheck(
   state: WalletState,
   rpcs: readonly SorobanRpc[],
   vault: string,
   maxPages: number,
 ): Promise<VaultEvents | undefined> {
-  const at = state.unchecked.findIndex((r) => !r.lost);
+  const at = state.unchecked.findIndex((r) => r.status === "open");
   const range = state.unchecked[at];
   if (range === undefined) return undefined;
   const start = Math.min(
     range.from <= range.to ? range.from : Number.POSITIVE_INFINITY,
     range.leaves?.ledger ?? Number.POSITIVE_INFINITY,
   );
-  const all: VaultEvents[] = [];
+  // The events of each provider that still holds the range.
+  const held: VaultEvents[] = [];
+  let busy = false;
   for (const rpc of rpcs) {
     try {
-      all.push(await new RpcEventSource(rpc, vault, start, maxPages).events());
+      held.push(await new RpcEventSource(rpc, vault, start, maxPages).events());
     } catch (err) {
       if (!(err instanceof CyphrasError)) throw err;
       // A busy RPC is asked again in the next sync.
-      if (err.code === "history_unavailable") state.unchecked[at] = { ...range, lost: true };
-      return undefined;
+      busy ||= err.code !== "history_unavailable";
     }
   }
-  const events = all[0] as VaultEvents;
-  const latest = Math.min(...all.map((e) => e.latest));
+  if (held.length === 0) {
+    if (!busy) state.unchecked[at] = { ...range, status: "lost" };
+    return undefined;
+  }
   const differ = (): never =>
     fail("indexer_fault", "the vault's events contradict what an unchecked sync took");
+  const within = <T extends { readonly ledger: number }>(xs: readonly T[], to: number): T[] =>
+    xs.filter((x) => x.ledger >= range.from && x.ledger <= to);
   const taken = range.leaves;
+  const shownBy = (e: VaultEvents): Leaf[] =>
+    taken === undefined
+      ? []
+      : e.leaves.filter((l) => l.index >= taken.first && l.index < taken.end);
+  const confirmed: number[] = [];
+  for (const e of held) {
+    if (taken !== undefined) confirmed.push(confirmedRuns(taken, shownBy(e), differ));
+    const to = Math.min(range.to, e.latest);
+    const spends = new Map(within(e.nullifiers, to).map((n) => [n.nullifier, n]));
+    for (const note of state.notes) {
+      if (note.nf === undefined) continue;
+      const chain = spends.get(note.nf);
+      const kept =
+        note.spent !== undefined && note.spent.ledger >= range.from && note.spent.ledger <= to;
+      if (chain === undefined ? kept : chain.txHash !== note.spent?.txHash) differ();
+    }
+  }
+  if (busy) return undefined;
+  const events = held[0] as VaultEvents;
+  const latest = Math.min(...held.map((e) => e.latest));
+  const to = Math.min(range.to, latest);
   let leaves = taken;
+  let done = taken;
   if (taken !== undefined) {
     const { first, end } = taken;
-    const shownBy = (e: VaultEvents): Leaf[] =>
-      e.leaves.filter((l) => l.index >= first && l.index < end);
-    const next = Math.min(...all.map((e) => confirmedRuns(taken, shownBy(e), differ)));
+    const next = Math.min(...confirmed);
     const shown = shownBy(events);
-    const lastChecked = shown[next - 1 - first];
-    if (lastChecked !== undefined) {
-      state.checkedLeafLedger = Math.max(state.checkedLeafLedger, lastChecked.ledger);
-    }
+    done = next === first ? undefined : { first, end: next, ledger: taken.ledger, chunks: [] };
     leaves =
       next === end
         ? undefined
@@ -552,33 +576,35 @@ export async function recheck(
             ledger: shown[next - first]?.ledger ?? (next === first ? taken.ledger : latest + 1),
             chunks: taken.chunks.filter((c) => c.end > next),
           };
-  }
-  const to = Math.min(range.to, latest);
-  const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
-    xs.filter((x) => x.ledger >= range.from && x.ledger <= to);
-  for (const e of all) {
-    const spends = new Map(within(e.nullifiers).map((n) => [n.nullifier, n]));
-    for (const note of state.notes) {
-      if (note.nf === undefined) continue;
-      const chain = spends.get(note.nf);
-      const kept =
-        note.spent !== undefined && note.spent.ledger >= range.from && note.spent.ledger <= to;
-      if (chain === undefined ? kept : chain.txHash !== note.spent?.txHash) differ();
+    const lastChecked = shown[next - 1 - first];
+    if (held.length === rpcs.length && lastChecked !== undefined) {
+      state.checkedLeafLedger = Math.max(state.checkedLeafLedger, lastChecked.ledger);
     }
   }
   const rest: UncheckedRange = {
-    from: range.from <= range.to ? to + 1 : range.from,
+    from: range.from <= range.to ? Math.max(range.from, to + 1) : range.from,
     to: range.to,
     leaves,
-    lost: false,
+    status: "open",
   };
-  state.unchecked.splice(at, 1, ...(rest.from <= rest.to || leaves !== undefined ? [rest] : []));
+  const kept = rest.from <= rest.to || leaves !== undefined ? [rest] : [];
+  if (held.length < rpcs.length) {
+    const seen: UncheckedRange = { from: range.from, to, leaves: done, status: "partial" };
+    state.unchecked.splice(
+      at,
+      1,
+      ...(seen.from <= seen.to || done !== undefined ? [seen] : []),
+      ...kept,
+    );
+    return undefined;
+  }
+  state.unchecked.splice(at, 1, ...kept);
   return {
     ...events,
-    leaves: within(events.leaves),
-    nullifiers: within(events.nullifiers),
-    deposits: within(events.deposits),
-    exits: within(events.exits),
+    leaves: within(events.leaves, to),
+    nullifiers: within(events.nullifiers, to),
+    deposits: within(events.deposits, to),
+    exits: within(events.exits, to),
     latest: to,
   };
 }

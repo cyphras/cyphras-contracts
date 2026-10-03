@@ -14,6 +14,7 @@ import {
   type LeafChunk,
   type OwnedNote,
   type Plan,
+  type UncheckedRange,
   type WalletState,
   emptyState,
 } from "../../src/wallet/state.ts";
@@ -172,7 +173,7 @@ describe("plan fate", () => {
     advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
     state.nullifierSince = 321;
-    state.unchecked = [{ from: 300, to: 310, leaves: undefined, lost: false }];
+    state.unchecked = [{ from: 300, to: 310, leaves: undefined, status: "open" }];
     advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
     state.unchecked = [];
@@ -310,7 +311,7 @@ describe("plan fate", () => {
     advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "settled");
     state.nullifierSince = 230;
-    state.unchecked = [{ from: 200, to: 229, leaves: undefined, lost: false }];
+    state.unchecked = [{ from: 200, to: 229, leaves: undefined, status: "open" }];
     advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "settled");
     state.unchecked = [];
@@ -387,6 +388,17 @@ describe("unchecked ranges", () => {
     });
   }
 
+  // An RPC that answers getEvents with a JSON-RPC error: -32600 as one that no longer holds the
+  // ledgers asked for, -32603 as a busy one.
+  function refusing(code: number): SorobanRpc {
+    return new SorobanRpc("http://rpc", async (_input, init) => {
+      const { id } = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message: "no" } }));
+    });
+  }
+  const isFault = (err: unknown): boolean =>
+    err instanceof CyphrasError && err.code === "indexer_fault";
+
   // A wallet that took the leaves at positions 4 to 7 unchecked, in two runs, the first of them
   // added at ledger 60, in a sync whose spends, from ledger 100 on, were checked.
   function walletAfter(taken: readonly Leaf[]): WalletState {
@@ -394,7 +406,7 @@ describe("unchecked ranges", () => {
     state.nullifierSince = 120;
     const chunks = [chunk(taken.slice(0, 2)), chunk(taken.slice(2))];
     state.unchecked = [
-      { from: 100, to: 99, leaves: { first: 4, end: 8, ledger: 60, chunks }, lost: false },
+      { from: 100, to: 99, leaves: { first: 4, end: 8, ledger: 60, chunks }, status: "open" },
     ];
     return state;
   }
@@ -419,6 +431,15 @@ describe("unchecked ranges", () => {
     assert.equal(rest?.leaves?.first, 6);
     assert.equal(rest?.leaves?.ledger, 60);
     assert.equal(rest?.leaves?.chunks.length, 1);
+    // A range whose leaves were added before its spends' ledgers keeps those ledgers whole when RPC
+    // reaches none of them yet.
+    const spends = walletAfter(four);
+    spends.unchecked = [{ ...(spends.unchecked[0] as UncheckedRange), to: 110 }];
+    await recheck(spends, [showing(four.slice(0, 3), 80)], VAULT, 1);
+    assert.deepEqual(
+      spends.unchecked.map((r) => [r.from, r.to]),
+      [[100, 110]],
+    );
   });
 
   it("refuses a leaf whose ledger or transaction the sync took otherwise", async () => {
@@ -437,7 +458,7 @@ describe("unchecked ranges", () => {
   it("takes a range's spends as checked only up to the ledger every RPC provider reaches", async () => {
     const state = emptyState(1);
     state.nullifierSince = 120;
-    state.unchecked = [{ from: 60, to: 100, leaves: undefined, lost: false }];
+    state.unchecked = [{ from: 60, to: 100, leaves: undefined, status: "open" }];
     await recheck(state, [showing([], 90), showing([], 80)], VAULT, 1);
     assert.deepEqual(
       state.unchecked.map((r) => [r.from, r.to]),
@@ -457,6 +478,59 @@ describe("unchecked ranges", () => {
       recheck(walletAfter(forged), [showing(forged), showing(four)], VAULT, 1),
       (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
     );
+  });
+
+  it("checks a range against the RPC providers that still hold it when another no longer does", async () => {
+    const hidden = [...four.slice(0, 3), { ...leafAt(7), ciphertext: new Uint8Array(181) }];
+    await assert.rejects(
+      recheck(walletAfter(hidden), [refusing(-32600), showing(four)], VAULT, 1),
+      isFault,
+    );
+    await assert.rejects(
+      recheck(walletAfter(hidden), [showing(four), refusing(-32600)], VAULT, 1),
+      isFault,
+    );
+  });
+
+  it("keeps what the providers that still hold a range show alike as partial, never cleared", async () => {
+    const state = walletAfter(four);
+    state.unchecked.push({ from: 130, to: 140, leaves: undefined, status: "open" });
+    assert.equal(await recheck(state, [refusing(-32600), showing(four)], VAULT, 1), undefined);
+    assert.deepEqual(
+      state.unchecked.map((r) => r.status),
+      ["partial", "open"],
+    );
+    assert.equal(state.checkedLeafLedger, 0);
+    // The next recheck goes on with the next open range.
+    await recheck(state, [showing([], 150), refusing(-32600)], VAULT, 1);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.from, r.to, r.status]),
+      [
+        [100, 70, "partial"],
+        [130, 140, "partial"],
+      ],
+    );
+    assert.equal(checkedBetween(state, 130, 140), false);
+  });
+
+  it("keeps a range as lost only once no RPC provider holds it, and moves nothing while one is busy", async () => {
+    const state = walletAfter(four);
+    await recheck(state, [refusing(-32600), refusing(-32603)], VAULT, 1);
+    await recheck(state, [refusing(-32603), showing(four)], VAULT, 1);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.leaves?.first, r.status]),
+      [[4, "open"]],
+    );
+    const hidden = [...four.slice(0, 3), { ...leafAt(7), ciphertext: new Uint8Array(181) }];
+    await assert.rejects(
+      recheck(walletAfter(hidden), [refusing(-32603), showing(four)], VAULT, 1),
+      isFault,
+    );
+    await recheck(state, [refusing(-32600), refusing(-32600)], VAULT, 1);
+    assert.equal(state.unchecked[0]?.status, "lost");
+    const alone = walletAfter(four);
+    await recheck(alone, [refusing(-32600)], VAULT, 1);
+    assert.equal(alone.unchecked[0]?.status, "lost");
   });
 
   it("refuses leaves RPC shows with a gap after the range's first, in full runs or not", async () => {

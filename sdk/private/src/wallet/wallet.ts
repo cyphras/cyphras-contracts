@@ -80,6 +80,7 @@ import {
   type Plan,
   type RootCheck,
   StateStore,
+  type UncheckedRange,
   type WalletState,
   emptyState,
 } from "./state.ts";
@@ -160,10 +161,14 @@ export interface SyncSummary {
   // The new data matched the vault's events from every RPC provider other than the one it came
   // from, for the same ledgers.
   readonly crossChecked: boolean;
-  // Ledgers whose spends, and leaves whose contents, came from the indexer alone: later syncs check
-  // them against the vault's events while RPC still holds them.
+  // Ledgers whose spends, and leaves whose contents, not every RPC provider confirmed: later syncs
+  // check them against the vault's events while the providers still hold them.
   readonly uncheckedLedgers: number;
   readonly uncheckedLeaves: number;
+  // Of those leaves, the ones no RPC provider holds any more, so that nothing can check them: an
+  // incoming payment an indexer hid among them stays hidden until a rescan through an indexer the
+  // user trusts.
+  readonly lostLeaves: number;
 }
 
 /** A shielded payment through a relayer. */
@@ -264,6 +269,9 @@ function randomGap(): number {
   const r = new DataView(randomBytes(4).buffer).getUint32(0) / 2 ** 32;
   return SPLIT_GAP_MS.min + Math.floor(r * (SPLIT_GAP_MS.max - SPLIT_GAP_MS.min));
 }
+
+const leavesOf = (range: UncheckedRange): number =>
+  range.leaves === undefined ? 0 : range.leaves.end - range.leaves.first;
 
 // What became of the part an operation awaits. It landed, itself or as a retry by the same notes;
 // it is dead with all its notes free, to go again with them; one of its notes was spent by a
@@ -749,8 +757,9 @@ export class PrivateWallet {
         (n, r) => n + Math.max(0, r.to - r.from + 1),
         0,
       ),
-      uncheckedLeaves: core.state.unchecked.reduce(
-        (n, r) => n + (r.leaves === undefined ? 0 : r.leaves.end - r.leaves.first),
+      uncheckedLeaves: core.state.unchecked.reduce((n, r) => n + leavesOf(r), 0),
+      lostLeaves: core.state.unchecked.reduce(
+        (n, r) => n + (r.status === "lost" ? leavesOf(r) : 0),
         0,
       ),
     };
