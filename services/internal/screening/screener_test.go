@@ -436,3 +436,110 @@ func TestHealthIsReadyOnlyWithFreshSourcesAndARecentRound(t *testing.T) {
 		t.Fatalf("with stale sources: %+v", got)
 	}
 }
+
+func TestAttestationIsWithheldWhenTheChainHoldsADepositTheReplayMissed(t *testing.T) {
+	h := newHarness(t)
+	h.shield(clean, 10_000_000)
+	missed := h.shield(clean, 10_000_000)
+	h.shield(clean, 10_000_000)
+	// The replay sees the second deposit cancelled, while the chain still holds it pending.
+	h.chain.Refund(missed, 0)
+	h.chain.NextLedger(5)
+	h.tick()
+	h.now = h.now.Add(55 * time.Minute)
+	h.setVault(h.attest)
+	h.sync()
+	h.s.RefreshSources(context.Background())
+	if err := h.s.Tick(context.Background()); err == nil || !strings.Contains(err.Error(), "without a first check") {
+		t.Fatalf("round: %v", err)
+	}
+	for _, c := range h.sent() {
+		if strings.HasPrefix(c, "attest") {
+			t.Fatalf("attested past a deposit the replay missed: %s", c)
+		}
+	}
+	found := false
+	for _, p := range h.pages {
+		found = found || p.Code == "attest_withheld"
+	}
+	if !found {
+		t.Fatalf("pages %+v", h.pages)
+	}
+}
+
+type countingFunders struct {
+	funderMap
+	calls int
+}
+
+func (c *countingFunders) Funders(ctx context.Context, account string, since time.Time) ([]string, bool, error) {
+	c.calls++
+	return c.funderMap.Funders(ctx, account, since)
+}
+
+func TestRequestsCannotSpendTheLookupsDepositsNeed(t *testing.T) {
+	h := newHarness(t)
+	counter := &countingFunders{funderMap: h.funders}
+	h.s.check.Funders = counter
+	h.s.requestCheck.Funders = BudgetedFunders{Inner: counter, Budget: httpapi.NewLimiter(60, 1)}
+	public := h.s.Public(httpapi.NewLimiter(60, 10), httpapi.NewLimiter(60, 10))
+	rec := httptest.NewRecorder()
+	public.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/check?address="+clean, nil))
+	if rec.Code != http.StatusOK || counter.calls != 0 {
+		t.Fatalf("a public check cost %d lookups: %d %s", counter.calls, rec.Code, rec.Body.String())
+	}
+	token := "relayer-token"
+	api := h.s.Internal(sha256.Sum256([]byte(token)))
+	screen := func() int {
+		req := httptest.NewRequest(http.MethodPost, "/internal/v1/screen", strings.NewReader(`{"address":"`+clean+`"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		api.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := screen(); code != http.StatusOK {
+		t.Fatalf("first screen answered %d", code)
+	}
+	if code := screen(); code != http.StatusServiceUnavailable {
+		t.Fatalf("a screen over budget answered %d", code)
+	}
+	// Deposit screening still has its lookups.
+	h.shield(clean, 10_000_000)
+	h.tick()
+	if got := h.decisions(); len(got) == 0 || got[len(got)-1] != "first_check pass -" {
+		t.Fatalf("decisions %v", got)
+	}
+}
+
+func TestFunderLookupsAreCachedBriefly(t *testing.T) {
+	now := time.Unix(1_728_000_000, 0)
+	counter := &countingFunders{funderMap: funderMap{clean: {funder}}}
+	c := &CachedFunders{Inner: counter, TTL: 10 * time.Minute, Now: func() time.Time { return now }}
+	for range 3 {
+		got, complete, err := c.Funders(context.Background(), clean, now.Add(-FunderWindow))
+		if err != nil || !complete || len(got) != 1 {
+			t.Fatalf("funders %v %v", got, err)
+		}
+	}
+	now = now.Add(11 * time.Minute)
+	if _, _, err := c.Funders(context.Background(), clean, now.Add(-FunderWindow)); err != nil || counter.calls != 2 {
+		t.Fatalf("%d lookups, %v", counter.calls, err)
+	}
+}
+
+func TestAContractDepositorIsReviewedAndAnUnflagIsRechecked(t *testing.T) {
+	h := newHarness(t)
+	id := h.shield(contract, 10_000_000)
+	h.tick()
+	reviews, err := h.s.Reviews(context.Background())
+	if err != nil || len(reviews) != 1 || reviews[0].ID != id {
+		t.Fatalf("reviews %v %v", reviews, err)
+	}
+	dirty := h.shield(thief, 10_000_000)
+	h.tick()
+	h.land()
+	h.tick()
+	if err := h.s.Unflag(context.Background(), dirty, "reviewer", "mistake"); err == nil {
+		t.Fatal("a deposit the checks still refuse was unflagged")
+	}
+}

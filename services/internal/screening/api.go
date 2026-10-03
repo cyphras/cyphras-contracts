@@ -114,7 +114,9 @@ func (s *Screener) Public(reports, checks *httpapi.Limiter) http.Handler {
 			httpapi.Fail(w, http.StatusBadRequest, "bad_request")
 			return
 		}
-		v, err := s.check.Check(r.Context(), address, 1, s.now().Add(-FunderWindow))
+		// The lists only: a public question must not cost Horizon lookups. Funders are checked when
+		// the deposit is made.
+		v, err := s.check.Check(r.Context(), address, 0, s.now())
 		if err != nil {
 			httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 			return
@@ -148,7 +150,7 @@ func (s *Screener) Internal(tokenSHA256 [32]byte) http.Handler {
 			httpapi.Fail(w, http.StatusBadRequest, "bad_request")
 			return
 		}
-		v, err := s.check.Check(r.Context(), body.Address, 1, s.now().Add(-FunderWindow))
+		v, err := s.requestCheck.Check(r.Context(), body.Address, 1, s.now().Add(-FunderWindow))
 		if err != nil {
 			if !errors.Is(err, ErrUnavailable) {
 				httpapi.Fail(w, http.StatusBadRequest, "bad_request")

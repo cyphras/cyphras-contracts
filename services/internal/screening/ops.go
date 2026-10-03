@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
@@ -79,8 +81,9 @@ func (s *Screener) FlagManually(ctx context.Context, id uint64, reason uint32, r
 	return s.Flag(ctx, id, reason, "manual", fmt.Sprintf("reviewer: %s; %s", reviewer, note))
 }
 
-// Unflag corrects a mistaken flag while the deposit is pending. The deposit then goes through its
-// final check again before it can be attested.
+// Unflag corrects a mistaken flag while the deposit is pending. A deposit inside the attested
+// range is admitted as soon as the flag is gone, so the automated checks run again first, and the
+// unflag is refused unless they pass.
 func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string) error {
 	r, err := s.pendingRow(ctx, id)
 	if err != nil {
@@ -88,6 +91,18 @@ func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string)
 	}
 	if r.flag == nil {
 		return ErrNotPending
+	}
+	inst, _, _, err := rpc.VaultInstance(ctx, s.rpc, s.cfg.Vault)
+	if err != nil {
+		return err
+	}
+	since := time.Unix(int64(r.createdAt), 0).Add(-FunderWindow)
+	verdict, err := s.check.Check(ctx, r.depositor, s.hops(r, inst.Limits), since)
+	if err != nil {
+		return err
+	}
+	if verdict.Refused {
+		return fmt.Errorf("screening: the checks refuse deposit %d now: %s", id, verdict.Detail)
 	}
 	res, err := s.send(ctx, "unflag", vault.U64(id))
 	if err != nil {

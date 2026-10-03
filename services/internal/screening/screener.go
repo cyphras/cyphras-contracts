@@ -9,12 +9,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/follow"
+	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
@@ -35,21 +37,25 @@ type Config struct {
 	Cutoff time.Duration
 	// FirstCheckWithin is the time the policy allows for a deposit's first check.
 	FirstCheckWithin time.Duration
+	// RequestLookups bounds the funder lookups per minute that relayed unshields may cause.
+	RequestLookups int
 }
 
 // Screener follows the vault's deposits and decides each one.
 type Screener struct {
-	cfg     Config
-	rpc     rpc.Client
-	chain   *chainstate.Store
-	db      store
-	check   *Checker
-	reports *ReportSource
-	engine  *submit.Engine
-	asp     *submit.Account
-	alerts  *alert.Alerter
-	log     *slog.Logger
-	now     func() time.Time
+	cfg   Config
+	rpc   rpc.Client
+	chain *chainstate.Store
+	db    store
+	check *Checker
+	// requestCheck screens the destinations requests ask about, on its own lookup budget.
+	requestCheck *Checker
+	reports      *ReportSource
+	engine       *submit.Engine
+	asp          *submit.Account
+	alerts       *alert.Alerter
+	log          *slog.Logger
+	now          func() time.Time
 
 	mu       sync.RWMutex
 	state    *chainstate.State
@@ -66,6 +72,11 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 	s := &Screener{cfg: cfg, rpc: client, chain: chain, db: store{chain.Pool}, check: check, engine: engine, asp: asp, alerts: alerts, log: log, now: time.Now}
 	s.reports = &ReportSource{list: list{name: "self_reports", maxAge: 365 * 24 * time.Hour}, load: s.db.selfReports, now: s.clock}
 	check.Sources = append(check.Sources, s.reports)
+	lookups := max(cfg.RequestLookups, 1)
+	s.requestCheck = &Checker{
+		Sources: check.Sources, MaxFunders: check.MaxFunders, Now: check.Now,
+		Funders: BudgetedFunders{Inner: check.Funders, Budget: httpapi.NewLimiter(lookups, lookups/3+1)},
+	}
 	state, cursor, err := chain.Load(ctx, cfg.Vault, cfg.DeployLedger)
 	if err != nil {
 		return nil, err
@@ -301,11 +312,16 @@ func (s *Screener) decide(ctx context.Context, v vaultView, r *row) error {
 			}
 			return err
 		}
+		// A contract has no payment history to read its funders from, so a person reviews it.
+		contract := strkey.IsValidContractAddress(r.depositor)
+		if contract && !verdict.Refused && !verdict.Refer {
+			verdict.Detail = "a contract depositor, whose funders cannot be read"
+		}
 		outcome := "pass"
 		switch {
 		case verdict.Refused:
 			outcome = "refuse"
-		case verdict.Refer || large:
+		case verdict.Refer || large || contract:
 			outcome = "refer"
 		}
 		var reason *uint32
@@ -413,6 +429,10 @@ func (s *Screener) attest(ctx context.Context, v vaultView, rows []row) error {
 	if upTo == 0 || upTo >= v.inst.Status.NextDepositID {
 		return nil
 	}
+	if err := s.chainAgrees(ctx, v.inst.Status.AttestedUpTo, upTo, rows); err != nil {
+		s.alerts.Raise(ctx, alert.Critical, "attest_withheld", "attestation up to %d withheld: %v", upTo, err)
+		return err
+	}
 	res, err := s.send(ctx, "attest", vault.U64(upTo))
 	if err != nil {
 		s.alerts.Raise(ctx, alert.Critical, "attest_failed", "attestation up to %d failed: %v", upTo, err)
@@ -420,6 +440,51 @@ func (s *Screener) attest(ctx context.Context, v vaultView, rows []row) error {
 	}
 	s.record(ctx, Decision{Kind: "attest", DepositID: &upTo, Outcome: "attest", Detail: fmt.Sprintf("attested up to %d", upTo), Sources: s.check.Statuses(), TxHash: res.Hash})
 	s.log.Info("attested", "up_to", upTo, "tx", res.Hash)
+	return nil
+}
+
+// chainAgrees reads every deposit an attestation would cover from the chain, not from the replay
+// the candidate came from: each one still pending must be flagged on chain or have passed its
+// first check here. A replay that missed a deposit, or saw it resolved when it is not, would
+// otherwise attest it unscreened.
+func (s *Screener) chainAgrees(ctx context.Context, attested, upTo uint64, rows []row) error {
+	decided := make(map[uint64]bool, len(rows))
+	for _, r := range rows {
+		if r.firstCheck == "pass" || r.firstCheck == "refer" || r.flag != nil || r.flagSent != nil {
+			decided[r.id] = true
+		}
+	}
+	var ids []uint64
+	var keys []xdr.LedgerKey
+	for id := attested + 1; id <= upTo; id++ {
+		k, err := vault.PendingKey(s.cfg.Vault, id)
+		if err != nil {
+			return err
+		}
+		ids, keys = append(ids, id), append(keys, k)
+	}
+	entries, _, err := rpc.Entries(ctx, s.rpc, keys)
+	if err != nil {
+		return err
+	}
+	for i, id := range ids {
+		name, _ := rpc.KeyString(keys[i])
+		e, ok := entries[name]
+		if !ok {
+			continue
+		}
+		v, err := rpc.ContractValue(e)
+		if err != nil {
+			return err
+		}
+		d, err := vault.DecodePendingDeposit(v)
+		if err != nil {
+			return err
+		}
+		if d.Flag == nil && !decided[id] {
+			return fmt.Errorf("deposit %d is pending on chain without a first check here", id)
+		}
+	}
 	return nil
 }
 

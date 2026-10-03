@@ -110,15 +110,22 @@ func build(ctx context.Context, base *service.Base) (*screening.Screener, error)
 	if err != nil {
 		return nil, err
 	}
+	lookups, err := config.Int("REQUEST_LOOKUPS_PER_MINUTE", 30)
+	if err != nil {
+		return nil, err
+	}
 	check := &screening.Checker{
-		Sources:    sources,
-		Funders:    horizon.Client{URL: horizonURL, HTTP: &http.Client{Timeout: 20 * time.Second}, MaxPages: 10},
+		Sources: sources,
+		Funders: &screening.CachedFunders{
+			Inner: horizon.Client{URL: horizonURL, HTTP: &http.Client{Timeout: 20 * time.Second}, MaxPages: 10},
+			TTL:   10 * time.Minute, Now: time.Now,
+		},
 		MaxFunders: int(maxFunders),
 	}
 	return screening.New(ctx, screening.Config{
 		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, NetworkID: base.NetworkID, Network: base.Deployment.Network,
 		PolicyVersion: config.Env("POLICY_VERSION", "1"),
-		RecheckWindow: 10 * time.Minute, Cutoff: 2 * time.Minute, FirstCheckWithin: 10 * time.Minute,
+		RecheckWindow: 10 * time.Minute, Cutoff: 2 * time.Minute, FirstCheckWithin: 10 * time.Minute, RequestLookups: int(lookups),
 	}, base.RPC, &chainstate.Store{Pool: pool}, check, engine, submit.NewAccount(inst.Config.ASP, hot), base.Alerts, base.Log)
 }
 
