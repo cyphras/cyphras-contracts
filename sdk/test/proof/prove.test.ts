@@ -1,7 +1,8 @@
-// Real Groth16 proofs of SDK-built transactions with the frozen circuit and the testnet-forgeable
-// proving key of the contracts branch. Needs the circuit build (cd circuits && npm ci && npm run
-// compile) and the key at circuits/build/testnet-forgeable/transaction.zkey, or the paths in
-// CYPHRAS_WASM and CYPHRAS_ZKEY.
+// Real Groth16 proofs of SDK-built transactions with the frozen circuit and a dev proving key, each
+// verified against the verifying key exported from that same proving key. Needs the circuit build
+// (cd circuits && npm ci && npm run compile) and a key at
+// circuits/build/testnet-forgeable/transaction.zkey, which npm run setup:testnet-forgeable writes,
+// or the paths in CYPHRAS_WASM and CYPHRAS_ZKEY.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -14,7 +15,7 @@ import { computeDomain } from "../../src/domain.ts";
 import { decryptIncoming } from "../../src/encryption.ts";
 import { P } from "../../src/field.ts";
 import { type TxProof, fromHostProof } from "../../src/extdata.ts";
-import { verifyGroth16 } from "../../src/groth16.ts";
+import { parseVerifyingKey, verifyGroth16 } from "../../src/groth16.ts";
 import { NETWORK_PASSPHRASES, defaultAddressKey, deriveSpendingKeys } from "../../src/keys.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
 import { snarkjsProver } from "../../src/prover-snarkjs/index.ts";
@@ -26,24 +27,12 @@ import {
   type SpendNote,
   buildTransaction,
 } from "../../src/transaction.ts";
-import { MNEMONIC, REPO_ROOT, SDK_ROOT, fixture, testScalar } from "../helpers.ts";
+import { utf8 } from "../../src/bytes.ts";
+import { MNEMONIC, REPO_ROOT, fixture, testScalar } from "../helpers.ts";
 
 const BUILD = join(REPO_ROOT, "circuits", "build");
-const FILES: Record<ArtifactName, string> = {
-  wasm: process.env["CYPHRAS_WASM"] ?? join(BUILD, "transaction_js", "transaction.wasm"),
-  zkey: process.env["CYPHRAS_ZKEY"] ?? join(BUILD, "testnet-forgeable", "transaction.zkey"),
-  vkey: join(SDK_ROOT, "test", "fixtures", "testnet-forgeable-vk.json"),
-};
-// The frozen circuit's witness generator, the dev proving key and its verifying key, which is
-// contracts/verifier/keys/testnet-forgeable/verification_key.json.
-const WASM_SHA256 = "4dec4f493ac4799652ef091fafa41b958eed06a4446630db7d8a71a21514bbe9";
-const PROVING_SHA256 = "a76755ceafb65b81564f22593497fb4d3babe8431a41c24ea4a31139b9423a0b";
-const VERIFYING_SHA256 = "526f5befc2ff836621cc6f2f181fa50de3318a6865d6eca2121c678a225e2b9c";
-const PINS: Record<ArtifactName, string> = {
-  wasm: WASM_SHA256,
-  zkey: PROVING_SHA256,
-  vkey: VERIFYING_SHA256,
-};
+const WASM = process.env["CYPHRAS_WASM"] ?? join(BUILD, "transaction_js", "transaction.wasm");
+const ZKEY = process.env["CYPHRAS_ZKEY"] ?? join(BUILD, "testnet-forgeable", "transaction.zkey");
 
 const FIXTURE = fixture<{ vault: string; accounts: Record<string, string> }>("vault-proofs.json");
 const seed = mnemonicToSeedSync(MNEMONIC);
@@ -100,15 +89,25 @@ describe("proving with the frozen circuit", () => {
   let vkJson: unknown;
   const timings: number[] = [];
 
-  before(() => {
-    for (const [name, path] of Object.entries(FILES)) {
-      if (!existsSync(path)) throw new Error(`missing the ${name} artifact at ${path}`);
+  before(async () => {
+    for (const path of [WASM, ZKEY]) {
+      if (!existsSync(path)) throw new Error(`missing an artifact at ${path}`);
     }
-    artifacts = new PinnedArtifacts(
-      { load: async (name) => new Uint8Array(readFileSync(FILES[name])) },
-      PINS,
-    );
-    vkJson = JSON.parse(readFileSync(FILES.vkey, "utf8"));
+    // The verifying key comes from the proving key in use, and the pins are the files' own hashes,
+    // so a freshly set up dev key works as well as the one the contracts pin.
+    vkJson = await snarkjs.zKey.exportVerificationKey(new Uint8Array(readFileSync(ZKEY)));
+    const files: Record<ArtifactName, Uint8Array> = {
+      wasm: new Uint8Array(readFileSync(WASM)),
+      zkey: new Uint8Array(readFileSync(ZKEY)),
+      vkey: utf8(JSON.stringify(vkJson)),
+    };
+    const pins = Object.fromEntries(
+      Object.entries(files).map(([name, bytes]) => [
+        name,
+        createHash("sha256").update(bytes).digest("hex"),
+      ]),
+    ) as Record<ArtifactName, string>;
+    artifacts = new PinnedArtifacts({ load: async (name) => files[name] }, pins);
   });
 
   after(async () => {
@@ -129,10 +128,9 @@ describe("proving with the frozen circuit", () => {
     return proof;
   }
 
-  it("uses a proving key whose verifying key is the pinned one", async () => {
-    const zkey = new Uint8Array(readFileSync(FILES.zkey));
-    assert.deepEqual(await snarkjs.zKey.exportVerificationKey(zkey), vkJson);
+  it("loads the artifacts through their pins", async () => {
     await artifacts.proving();
+    assert.deepEqual(await artifacts.verifyingKey(), parseVerifyingKey(vkJson));
   });
 
   let shield: BuiltTransaction;

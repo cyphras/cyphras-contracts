@@ -63,3 +63,46 @@ jobs:
           key: circomspect-0.9.0-${{ runner.os }}
       - run: command -v circomspect || cargo install circomspect --version 0.9.0 --locked
       - run: npm run circomspect
+
+  sdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            sdk/package-lock.json
+            circuits/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run format:check
+      - run: npm test
+      # Real proofs need the frozen circuit and a dev proving key, set up fresh here; the proof
+      # tests verify against the key exported from it.
+      - name: Install circom 2.2.3
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -sSfL -o "$RUNNER_TEMP/bin/circom" \
+            https://github.com/iden3/circom/releases/download/v2.2.3/circom-linux-amd64
+          echo "85342c7ff332d948df7c0c50ecf201e6129349aef550ce873f3c811b79fe53a3  $RUNNER_TEMP/bin/circom" \
+            | sha256sum --check
+          chmod +x "$RUNNER_TEMP/bin/circom"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: npm ci
+        working-directory: circuits
+      - id: ptau
+        working-directory: circuits
+        run: |
+          node --input-type=module -e 'import { PTAU_BLAKE2B } from "./scripts/ptau.mjs"; console.log(`blake2b=${PTAU_BLAKE2B}`)' >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: circuits/build/ptau
+          key: ptau-${{ steps.ptau.outputs.blake2b }}
+      - run: npm run setup:testnet-forgeable
+        working-directory: circuits
+      - run: npm run test:proof

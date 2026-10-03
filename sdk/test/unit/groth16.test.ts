@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { type ArtifactName, PinnedArtifacts, sha256Hex } from "../../src/artifacts.ts";
@@ -9,9 +9,17 @@ import { CyphrasError } from "../../src/errors.ts";
 import { type TxProofJson, fromHostProof, txProofFromJson } from "../../src/extdata.ts";
 import { P } from "../../src/field.ts";
 import { parseVerifyingKey, verifyGroth16 } from "../../src/groth16.ts";
-import { SDK_ROOT, fixture, wireProof } from "../helpers.ts";
+import { REPO_ROOT, SDK_ROOT, fixture, wireProof } from "../helpers.ts";
 
 const VK_FILE = join(SDK_ROOT, "test", "fixtures", "testnet-forgeable-vk.json");
+const CONTRACT_VK = join(
+  REPO_ROOT,
+  "contracts",
+  "verifier",
+  "keys",
+  "testnet-forgeable",
+  "verification_key.json",
+);
 const VK_BYTES = readFileSync(VK_FILE);
 // The SHA-256 of contracts/verifier/keys/testnet-forgeable/verification_key.json.
 const VK_SHA256 = "526f5befc2ff836621cc6f2f181fa50de3318a6865d6eca2121c678a225e2b9c";
@@ -44,6 +52,14 @@ describe("Groth16 verification", () => {
   it("uses the testnet-forgeable key of the contracts branch", () => {
     assert.equal(createHash("sha256").update(VK_BYTES).digest("hex"), VK_SHA256);
   });
+
+  it(
+    "is the verifying key the contract pins, byte for byte",
+    { skip: existsSync(CONTRACT_VK) ? false : "the contracts tree is not in this checkout" },
+    () => {
+      assert.deepEqual(VK_BYTES, readFileSync(CONTRACT_VK));
+    },
+  );
 
   for (const step of STEPS) {
     it(`verifies the vault fixture proof of ${step.name}`, () => {
