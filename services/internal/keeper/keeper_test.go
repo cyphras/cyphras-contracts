@@ -504,3 +504,33 @@ func TestStrandedExitsAreClaimedWhenTheyCanBePaid(t *testing.T) {
 		t.Fatalf("exit entries %+v, %v", exits, err)
 	}
 }
+
+func TestBumpTTLIsSplitToFitATransaction(t *testing.T) {
+	h := newHarness(t)
+	var ids []uint64
+	for range 70 {
+		ids = append(ids, h.shield(10, nil, 0))
+	}
+	h.sync()
+	near, far := h.chain.Ledger+100_000, h.chain.Ledger+3_000_000
+	for _, id := range ids {
+		h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)), vaulttest.Pending(id, vaulttest.Depositor, 10, 0, 3600, nil, 0), 10, &near)
+	}
+	for _, key := range mustKey(vault.TreeKeys(vaulttest.Vault)) {
+		h.fake.SetContractData(key, vault.U64(0), 10, &far)
+	}
+	h.fake.SetEntry(vault.CodeKey([32]byte{9}), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeContractCode, ContractCode: &xdr.ContractCodeEntry{Hash: xdr.Hash{9}}}, 10, &far)
+	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Token)), vault.U64(0), 10, &far)
+	if err := h.k.TTLCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var bumps []string
+	for _, s := range h.take() {
+		if strings.HasPrefix(s, "bump_ttl") {
+			bumps = append(bumps, s)
+		}
+	}
+	if len(bumps) != 2 || strings.Count(bumps[0], ",") != 59 || strings.Count(bumps[1], ",") != 9 {
+		t.Fatalf("bump calls %v", bumps)
+	}
+}

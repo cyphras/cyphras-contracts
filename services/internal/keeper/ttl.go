@@ -20,6 +20,8 @@ import (
 const (
 	renewWithin = 30 * ledgersPerDay
 	warnWithin  = 14 * ledgersPerDay
+	// bumpFootprint is the most pending or exit entries one bump_ttl call lists.
+	bumpFootprint = 60
 )
 
 // tracked is an entry the cycle looked at.
@@ -135,12 +137,20 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 			dueExits = append(dueExits, vault.U64(t.id))
 		}
 	}
-	if bump {
+	// Each call extends the instance and the tree; the IDs are split so that a call's footprint
+	// stays within the transaction limits, an exit ID counting twice for its two possible keys.
+	for bump {
+		nPending := min(len(duePending), bumpFootprint)
+		nExits := min(len(dueExits), (bumpFootprint-nPending)/2)
+		pending, exits := duePending[:nPending], dueExits[:nExits]
 		if _, err := k.call(ctx, "bump_ttl", func() (txnbuild.Operation, error) {
-			return k.invoke("bump_ttl", vault.Vec(duePending...), vault.Vec(dueExits...))
+			return k.invoke("bump_ttl", vault.Vec(pending...), vault.Vec(exits...))
 		}); err != nil {
 			failures = append(failures, "bump_ttl")
+			break
 		}
+		duePending, dueExits = duePending[nPending:], dueExits[nExits:]
+		bump = len(duePending)+len(dueExits) > 0
 	}
 
 	// Entries only a footprint extension reaches.
