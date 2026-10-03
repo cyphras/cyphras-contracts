@@ -848,6 +848,20 @@ describe("wallet safety: network fees", () => {
 });
 
 describe("wallet safety: secrets", () => {
+  it("keeps the private balance out of errors", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const err = await alice
+      .send({ to: bob.generateAddress(), amount: 500n * XLM, maxFee: 2n * XLM })
+      .then(
+        () => assert.fail("the send went through"),
+        (e: unknown) => e as CyphrasError,
+      );
+    assert.equal(err.code, "insufficient_funds");
+    assert.deepEqual(err.details, {});
+    assert.ok(!err.message.includes((100n * XLM).toString()));
+  });
+
   it("keeps keys out of errors and of the store", async () => {
     const world = await createWorld();
     const storage = new MemoryStore();

@@ -111,15 +111,12 @@ export function selectNotes(notes: readonly OwnedNote[], total: bigint): OwnedNo
     }
   }
   if (best !== undefined) return best;
+  // Errors can reach logs and crash reports, so they never carry the private balance.
   const available = notes.reduce((s, n) => s + n.value, 0n);
   if (available >= total) {
-    fail("needs_consolidation", "no two notes cover the amount; consolidate notes first", {
-      available: available.toString(),
-    });
+    fail("needs_consolidation", "no two notes cover the amount; consolidate notes first");
   }
-  return fail("insufficient_funds", "the spendable balance does not cover the amount and fee", {
-    available: available.toString(),
-  });
+  return fail("insufficient_funds", "the spendable balance does not cover the amount and fee");
 }
 
 export function spendNote(state: WalletState, note: OwnedNote, address: AddressKey): SpendNote {

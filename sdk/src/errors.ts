@@ -1,6 +1,6 @@
 /**
  * Every error the SDK raises on purpose. Messages and details never carry a seed, a key, a
- * signature, a viewing key or note plaintext.
+ * signature, a viewing key, note plaintext or a private balance.
  */
 export type ErrorCode =
   | "invalid_argument"
