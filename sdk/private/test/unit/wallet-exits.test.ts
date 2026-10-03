@@ -476,11 +476,11 @@ describe("following an exit from the vault's events and the indexer's account", 
     fee: 1n,
     ...at(ledger),
   });
-  const stranded = (ledger: number): ExitEvent => ({
+  const stranded = (ledger: number, feeLeft = 0n): ExitEvent => ({
     kind: "exit_stranded",
     id: 1,
     payoutLeft: 10n,
-    feeLeft: 0n,
+    feeLeft,
     ...at(ledger),
   });
   const requeued = (ledger: number): ExitEvent => ({
@@ -526,11 +526,15 @@ describe("following an exit from the vault's events and the indexer's account", 
 
   it("applies a requeue once, however often its event is seen", () => {
     const { state, plan } = withUnshield();
-    const once = [queued(10), stranded(20), requeued(25)];
+    // The relayer still cannot receive, so its fee stays stranded and the claim moves the payout.
+    const once = [queued(10), stranded(20, 1n), requeued(25)];
     applyExits(state, events(5, 30, once), undefined, 30);
     applyExits(state, events(5, 40, once), undefined, 40);
     assert.equal(plan.state, "queued");
-    assert.deepEqual(plan.exit?.parts, [{ id: 2, payoutLeft: 10n, feeLeft: 0n, stranded: false }]);
+    assert.deepEqual(plan.exit?.parts, [
+      { id: 1, payoutLeft: 0n, feeLeft: 1n, stranded: true },
+      { id: 2, payoutLeft: 10n, feeLeft: 0n, stranded: false },
+    ]);
     applyExits(state, events(41, 50, [{ kind: "settled", exitId: 2, ...at(45) }]), undefined, 50);
     assert.equal(plan.state, "settled");
   });
