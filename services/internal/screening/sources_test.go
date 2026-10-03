@@ -365,3 +365,79 @@ func TestADirectoryPageWithoutRecordsIsRefused(t *testing.T) {
 		t.Fatal("a page without records was read as an empty directory")
 	}
 }
+
+func TestTheFirstUpdateAfterARestartIsGuarded(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	var entries []string
+	for range 10 {
+		entries = append(entries, `{"address": "`+keypair.MustRandom().Address()+`", "reason": 2, "source": "incident"}`)
+	}
+	canary := `{"address": "` + thief + `", "reason": 2, "source": "incident"}`
+	path := writeList(t, strings.Join(append(slices.Clone(entries), canary), ","))
+	src := NewFileSource("curated_list", path, 30*24*time.Hour)
+	src.Guard(&Guard{MaxShrinkPct: 20, Canaries: []string{thief}})
+	h.s.check.Sources = append(h.s.check.Sources, src)
+	h.s.RefreshSources(ctx)
+	// The service restarts: its list has no copy yet, and its guard no canaries of its own.
+	restarted := NewFileSource("curated_list", path, 30*24*time.Hour)
+	restarted.Guard(&Guard{MaxShrinkPct: 20})
+	check := &Checker{Sources: []Source{h.sources, restarted}, Inflows: h.funders, MaxFunders: 25, Now: func() time.Time { return h.now }}
+	if _, err := New(ctx, h.s.cfg, h.fake, h.s.chain, check, h.s.engine, h.s.asp, h.s.alerts, h.s.log); err != nil {
+		t.Fatal(err)
+	}
+	write := func(list []string) {
+		doc := fmt.Sprintf(`{"version": "8", "updated_at": "2026-10-02T00:00:00Z", "entries": [%s]}`, strings.Join(list, ","))
+		if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A first update that lost a third of the list is refused.
+	write(append(slices.Clone(entries[:7]), canary))
+	if err := restarted.Refresh(ctx); !errors.Is(err, ErrSuspect) || !strings.Contains(err.Error(), "from 11") {
+		t.Fatalf("a shrunk first update: %v", err)
+	}
+	// So is one without the canary the last good copy held.
+	write(entries)
+	if err := restarted.Refresh(ctx); !errors.Is(err, ErrSuspect) || !strings.Contains(err.Error(), "canary") {
+		t.Fatalf("a first update without the canary: %v", err)
+	}
+	write(append(slices.Clone(entries), canary))
+	if err := restarted.Refresh(ctx); err != nil {
+		t.Fatalf("a good first update: %v", err)
+	}
+}
+
+func TestTheSanctionsGuardCountsTheStellarAddresses(t *testing.T) {
+	var listed []string
+	for range 3 {
+		listed = append(listed, keypair.MustRandom().Address())
+	}
+	sdn := func(withStellar bool) string {
+		var rows []string
+		for n := range 20 {
+			remarks := "Digital Currency Address - XBT 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+			if withStellar && n < len(listed) {
+				remarks += "; Digital Currency Address - XLM " + listed[n]
+			}
+			rows = append(rows, fmt.Sprintf(`%d,"ENTITY %d","entity","CYBER2",-0- ,-0- ,-0- ,-0- ,-0- ,-0- ,-0- ,"%s."`, n+1, n, remarks))
+		}
+		return strings.Join(rows, "\n")
+	}
+	body := sdn(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+	defer srv.Close()
+	src := NewOFACSource(srv.URL, time.Hour)
+	src.Guard(&Guard{MaxShrinkPct: 20, Canaries: []string{"Digital Currency Address - XBT"}})
+	if err := src.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Every record is still there, but the Stellar addresses are gone.
+	body = sdn(false)
+	if err := src.Refresh(context.Background()); !errors.Is(err, ErrSuspect) || !strings.Contains(err.Error(), "from 3 to 0") {
+		t.Fatalf("an update without the Stellar addresses: %v", err)
+	}
+	if _, ok := src.Lookup(listed[0]); !ok {
+		t.Fatal("the previous list was dropped")
+	}
+}

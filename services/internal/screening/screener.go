@@ -110,6 +110,17 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 		return nil, err
 	}
 	s.state, s.cursor = state, cursor
+	guards, err := s.db.guards(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, src := range check.Sources {
+		if g, ok := src.(guarded); ok {
+			if last, ok := guards[src.Name()]; ok {
+				g.restore(last.size, last.canaries)
+			}
+		}
+	}
 	if err := s.reports.Refresh(ctx); err != nil {
 		return nil, err
 	}
@@ -155,8 +166,15 @@ func (s *Screener) Apply(ctx context.Context, b follow.Batch) error {
 	return nil
 }
 
+// guarded is a source whose guard compares each update with the last good copy.
+type guarded interface {
+	lastGood() (int, []string, bool)
+	restore(size int, canaries []string)
+}
+
 // RefreshSources fetches every source again; a failure leaves the old data, which then ages, and
-// an update the source's guard refuses pages.
+// an update the source's guard refuses pages. What a guard compares the next update with is kept,
+// so the first update after a restart is checked too.
 func (s *Screener) RefreshSources(ctx context.Context) {
 	for _, src := range s.check.Sources {
 		err := src.Refresh(ctx)
@@ -167,6 +185,13 @@ func (s *Screener) RefreshSources(ctx context.Context) {
 			s.log.Warn("source refresh failed", "source", src.Name(), "error", err.Error())
 		default:
 			s.alerts.Clear(ctx, "source_update_refused_"+src.Name(), "%s updated again", src.Name())
+			if g, ok := src.(guarded); ok {
+				if size, canaries, ok := g.lastGood(); ok {
+					if err := s.db.saveGuard(ctx, src.Name(), guardState{size, canaries}); err != nil {
+						s.log.Warn("source guard not saved", "source", src.Name(), "error", err.Error())
+					}
+				}
+			}
 		}
 	}
 	if err := s.check.Fresh(); err != nil {

@@ -230,8 +230,8 @@ func list(s, sep string) []string {
 }
 
 // guard is a source's update guard: SOURCE_MAX_SHRINK_PCT, 20 unless set, and the canaries in the
-// variable named, separated by "|".
-func guard(canaries string) (*screening.Guard, error) {
+// variable named, separated by "|", or else the defaults given.
+func guard(canaries, defaults string) (*screening.Guard, error) {
 	shrink, err := config.Int("SOURCE_MAX_SHRINK_PCT", 20)
 	if err != nil {
 		return nil, err
@@ -239,8 +239,12 @@ func guard(canaries string) (*screening.Guard, error) {
 	if shrink < 0 || shrink > 100 {
 		return nil, errors.New("SOURCE_MAX_SHRINK_PCT must be 0 to 100")
 	}
-	return &screening.Guard{MaxShrinkPct: int(shrink), Canaries: list(config.Env(canaries, ""), "|")}, nil
+	return &screening.Guard{MaxShrinkPct: int(shrink), Canaries: list(config.Env(canaries, defaults), "|")}, nil
 }
+
+// ofacCanaries is text every good copy of the SDN list holds: two kinds of digital-currency
+// address it has carried for years, and an entity listed since 2019.
+const ofacCanaries = "Digital Currency Address - XBT|Digital Currency Address - ETH|LAZARUS GROUP"
 
 func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 	frozenAge, err := config.Duration("FROZEN_MAX_AGE", 15*time.Minute)
@@ -253,7 +257,7 @@ func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 		if err != nil {
 			return nil, err
 		}
-		g, err := guard("EXPLOIT_LIST_CANARIES")
+		g, err := guard("EXPLOIT_LIST_CANARIES", "")
 		if err != nil {
 			return nil, err
 		}
@@ -266,7 +270,7 @@ func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 		if err != nil {
 			return nil, err
 		}
-		g, err := guard("OFAC_CANARIES")
+		g, err := guard("OFAC_CANARIES", ofacCanaries)
 		if err != nil {
 			return nil, err
 		}
@@ -279,7 +283,7 @@ func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 		if err != nil {
 			return nil, err
 		}
-		g, err := guard("DIRECTORY_CANARIES")
+		g, err := guard("DIRECTORY_CANARIES", "")
 		if err != nil {
 			return nil, err
 		}
