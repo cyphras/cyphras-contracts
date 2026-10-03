@@ -257,6 +257,17 @@ describe("wallet safety: services that lie", () => {
 });
 
 describe("wallet safety: cross-checks with RPC events", () => {
+  it("takes RPC events that stop short of the indexer's data as no cross-check, not a fault", async () => {
+    const { world, store } = await funded();
+    // More events in one ledger than one page holds.
+    world.fill(600);
+    const alice = await openWallet(world, 0, store, undefined, { syncLimits: { eventPages: 1 } });
+    const summary = await alice.sync();
+    assert.equal(summary.rootVerified, true);
+    assert.equal(summary.crossChecked, false);
+    assert.ok(summary.uncheckedLedgers > 0);
+  });
+
   it("confirms the indexer's new leaves and nullifiers against the vault's events", async () => {
     const world = await createWorld();
     const alice = await openWallet(world, 0);

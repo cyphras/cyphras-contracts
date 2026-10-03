@@ -406,6 +406,32 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 2);
   });
 
+  it("never pays twice when a held payment is sent again, its ID forgotten and then retried", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
+    world.relayer.restart();
+    await alice.sync();
+    // Another instance behind the same address knows no IDs, but still holds the request.
+    world.relayer.forgetIds();
+    await alice.sync();
+    const [held] = await alice.plans();
+    assert.equal(held?.mustRetry, true);
+    // A retry spends the same notes, which the held request still claims.
+    await assert.rejects(
+      alice.retry(held?.planId as string, { maxFee: 2n * XLM, confirm: confirmAll }),
+      (err: unknown) => err instanceof CyphrasError && err.details["code"] === "duplicate",
+    );
+    world.advance(700);
+    world.relayer.releaseHeld();
+    await alice.sync();
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+    const states = (await alice.plans()).map((p) => p.state).sort();
+    assert.deepEqual(states, ["settled", "superseded"]);
+  });
+
   it("stops following a held payment that was cancelled, and never sends it again", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
