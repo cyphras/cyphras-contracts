@@ -476,7 +476,13 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	}
 	release = false
 	r.setStatus(signed.Hash, txStatus{Status: "pending"})
-	r.log.Info("submitted", "tx", signed.Hash, "fee", req.Ext.Fee.String())
+	rec := Record{Hash: signed.Hash, Kind: "transfer", Fee: req.Ext.Fee.String()}
+	if req.Ext.ExtAmount.Sign() < 0 {
+		rec.Kind, rec.Destination, rec.Screening = "unshield", req.Ext.Recipient, "allow"
+	}
+	if err := r.db.sent(ctx, rec); err != nil {
+		r.alerts.Raise(r.ctx, alert.Critical, "relay_record_failed", "relay record of %s not stored: %v", signed.Hash, err)
+	}
 	go r.track(signed, ch, req)
 	return signed.Hash, nil
 }
@@ -489,27 +495,52 @@ func (r *Relayer) track(s *submit.Signed, ch *submit.Account, req Request) {
 		r.log.Warn("tracking stopped", "tx", s.Hash, "error", err.Error())
 		return
 	}
+	r.finish(res)
+}
+
+// finish records a relayed transaction's outcome. Only here is a relay logged, so no log line
+// carries the time of the request that caused it.
+func (r *Relayer) finish(res submit.Result) {
+	rec := Record{Hash: res.Hash, Ledger: res.Ledger, NetworkFee: res.FeeCharged, ResourceFee: res.ResourceFeeCharged}
 	switch res.Outcome {
 	case submit.Success:
-		exitID := r.queuedExit(res.Events)
-		r.setStatus(s.Hash, txStatus{Status: "success", ExitID: exitID})
+		rec.Outcome, rec.ExitID = outcomeSuccess, r.queuedExit(res.Events)
+		r.setStatus(res.Hash, txStatus{Status: "success", ExitID: rec.ExitID})
 		r.costs.Add(res.ResourceFeeCharged)
-		rec := Record{Hash: s.Hash, Ledger: res.Ledger, Fee: req.Ext.Fee.String(), NetworkFee: res.FeeCharged, ResourceFee: res.ResourceFeeCharged, Kind: "transfer", ExitID: exitID}
-		if req.Ext.ExtAmount.Sign() < 0 {
-			rec.Kind, rec.Destination, rec.Screening = "unshield", req.Ext.Recipient, "allow"
-		}
-		if err := r.db.record(r.ctx, rec); err != nil {
-			r.alerts.Raise(r.ctx, alert.Critical, "relay_record_failed", "relay record of %s not stored: %v", s.Hash, err)
-		}
-		r.log.Info("confirmed", "tx", s.Hash, "ledger", res.Ledger, "fee", rec.Fee, "network_fee", res.FeeCharged)
+		r.log.Info("confirmed", "tx", res.Hash, "ledger", res.Ledger, "network_fee", res.FeeCharged)
 	case submit.Failed:
-		r.setStatus(s.Hash, txStatus{Status: "failed", Code: CodeRejected})
-		r.log.Warn("failed on chain", "tx", s.Hash, "result", res.Code, "network_fee", res.FeeCharged)
-		r.alerts.Raise(r.ctx, alert.Warning, "relay_failed", "relayed transaction %s failed on chain: %s", s.Hash, res.Code)
+		rec.Outcome = outcomeFailed
+		r.setStatus(res.Hash, txStatus{Status: "failed", Code: CodeRejected})
+		r.log.Warn("failed on chain", "tx", res.Hash, "result", res.Code, "network_fee", res.FeeCharged)
+		r.alerts.Raise(r.ctx, alert.Warning, "relay_failed", "relayed transaction %s failed on chain: %s", res.Hash, res.Code)
 	case submit.Expired:
-		r.setStatus(s.Hash, txStatus{Status: "failed", Code: CodeUnavailable})
-		r.log.Warn("expired unconfirmed", "tx", s.Hash)
+		rec.Outcome = outcomeExpired
+		r.setStatus(res.Hash, txStatus{Status: "failed", Code: CodeUnavailable})
+		r.log.Warn("expired unconfirmed", "tx", res.Hash)
 	}
+	if err := r.db.finish(r.ctx, rec); err != nil {
+		r.alerts.Raise(r.ctx, alert.Critical, "relay_record_failed", "relay record of %s not completed: %v", res.Hash, err)
+	}
+}
+
+// Resume follows the transactions a previous run sent but did not see to an outcome.
+func (r *Relayer) Resume() error {
+	hashes, err := r.db.pending(r.ctx)
+	if err != nil {
+		return err
+	}
+	for _, hash := range hashes {
+		r.setStatus(hash, txStatus{Status: "pending"})
+		go func() {
+			res, err := r.engine.Lookup(r.ctx, hash)
+			if err != nil {
+				r.log.Warn("tracking stopped", "tx", hash, "error", err.Error())
+				return
+			}
+			r.finish(res)
+		}()
+	}
+	return nil
 }
 
 // queuedExit returns the exit ID of a transact whose payment joined the exit queue: its fee, like
@@ -538,10 +569,19 @@ func (r *Relayer) Status(ctx context.Context, hash string) (txStatus, bool) {
 	if ok {
 		return s, true
 	}
-	if found, exitID, err := r.db.has(ctx, hash); err == nil && found {
-		return txStatus{Status: "success", ExitID: exitID}, true
+	outcome, exitID, found, err := r.db.lookup(ctx, hash)
+	if err != nil || !found {
+		return txStatus{}, false
 	}
-	return txStatus{}, false
+	switch outcome {
+	case outcomeSuccess:
+		return txStatus{Status: "success", ExitID: exitID}, true
+	case outcomeFailed:
+		return txStatus{Status: "failed", Code: CodeRejected}, true
+	case outcomeExpired:
+		return txStatus{Status: "failed", Code: CodeUnavailable}, true
+	}
+	return txStatus{Status: "pending"}, true
 }
 
 // channelPool hands each channel account to one transaction at a time.

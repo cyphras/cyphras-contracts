@@ -377,6 +377,28 @@ func (e *Engine) Track(ctx context.Context, s *Signed) (Result, error) {
 	}
 }
 
+// Lookup follows a transaction known only by its hash, such as one sent before a restart, until it
+// succeeded or failed, or until it has been unknown for longer than its time bound allows.
+func (e *Engine) Lookup(ctx context.Context, hash string) (Result, error) {
+	giveUp := e.now().Add(e.Validity + time.Minute)
+	for {
+		resp, err := e.RPC.GetTransaction(ctx, protocol.GetTransactionRequest{Hash: hash})
+		if err == nil {
+			switch resp.Status {
+			case protocol.TransactionStatusSuccess, protocol.TransactionStatusFailed:
+				return e.result(&Signed{Hash: hash}, resp), nil
+			case protocol.TransactionStatusNotFound:
+				if e.now().After(giveUp) {
+					return Result{Hash: hash, Outcome: Expired}, nil
+				}
+			}
+		}
+		if err := wait(ctx, e.poll()); err != nil {
+			return Result{}, err
+		}
+	}
+}
+
 func (e *Engine) result(s *Signed, resp protocol.GetTransactionResponse) Result {
 	r := Result{Hash: s.Hash, Outcome: Success, Ledger: resp.Ledger}
 	var tr xdr.TransactionResult

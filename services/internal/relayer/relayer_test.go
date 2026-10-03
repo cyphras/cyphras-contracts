@@ -488,3 +488,29 @@ func TestHealthAndQuoteReportIdentity(t *testing.T) {
 		t.Fatal("a client's quote request reached the RPC")
 	}
 }
+
+func TestARelaySentBeforeARestartIsFollowedToItsOutcome(t *testing.T) {
+	h := newHarness(t, vault.Status{})
+	hash := strings.Repeat("cd", 32)
+	if err := h.r.db.sent(context.Background(), Record{Hash: hash, Kind: "transfer", Fee: "5000000"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.r.Resume(); err != nil {
+		t.Fatal(err)
+	}
+	for range 500 {
+		if outcome, _, _, _ := h.r.db.lookup(context.Background(), hash); outcome == outcomeSuccess {
+			if _, st := h.get("/v1/tx/" + hash); st["status"] != "success" {
+				t.Fatalf("status %v", st)
+			}
+			var fee int64
+			_ = h.r.db.pool.QueryRow(context.Background(), `SELECT resource_fee FROM relays WHERE tx_hash = $1`, hash).Scan(&fee)
+			if fee != 900_000 {
+				t.Fatalf("resource fee %d", fee)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("the pending relay was never completed")
+}

@@ -36,6 +36,9 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "start", err)
 	}
+	if err := r.Resume(); err != nil {
+		service.Fatal(log, "resume", err)
+	}
 	go r.Run(10 * time.Second)
 	addr := config.Env("LISTEN_ADDR", "127.0.0.1:8081")
 	log.Info("serving", "vault", base.Vault.Vault, "addr", addr)
