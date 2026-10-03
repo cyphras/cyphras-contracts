@@ -240,8 +240,10 @@ func TestALumenTransferOutOfAHotAccountPages(t *testing.T) {
 
 func TestTheVaultsAssetLeavingAHotAccountPages(t *testing.T) {
 	lumens := strkey.MustEncode(strkey.VersionByteContract, make([]byte, 32))
+	// Three accounts ask for more topic filters than one request takes.
 	h := newHarness(t, func(c *Config) {
-		c.HotAccounts = []HotAccount{{Name: "channel-1", Address: hotAccount}}
+		c.HotAccounts = []HotAccount{{Name: "channel-1", Address: hotAccount}, {Name: "channel-2", Address: keypair.MustRandom().Address()},
+			{Name: "channel-3", Address: keypair.MustRandom().Address()}}
 		c.Lumens = lumens
 	})
 	h.activity()

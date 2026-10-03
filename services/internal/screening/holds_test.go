@@ -336,8 +336,8 @@ func (g gapped) Inflows(ctx context.Context, account string, since time.Time) ([
 }
 
 func TestTheReviewQueueIsMeasuredAndPagedPastItsTime(t *testing.T) {
+	// The review time is the default, 2 hours.
 	h := newHarness(t)
-	h.s.cfg.ReviewSLA = 2 * time.Hour
 	victim := keypair.MustRandom().Address()
 	h.s.check.Inflows = gapped{inner: h.s.check.Inflows, account: victim}
 	big := h.shield(victim, 6_000_000_000)
@@ -403,12 +403,14 @@ func TestAnOperatorLiftsAHoldOnlyAsItsFinalCheckWould(t *testing.T) {
 	if err := h.s.Unflag(ctx, big, "reviewer", "looked fine"); err != nil {
 		t.Fatal(err)
 	}
+	lifted := h.now
+	h.now = h.now.Add(time.Minute)
 	h.tick()
 	if got := h.sent(); !equal(got, []string{"unflag 1"}) {
 		t.Fatalf("sent %v", got)
 	}
 	rows, err := h.s.db.pending(ctx)
-	if err != nil || rows[0].recheck != "pass" || rows[0].recheckAt == nil || *rows[0].recheckAt != uint64(h.now.Unix()) {
+	if err != nil || rows[0].recheck != "pass" || rows[0].recheckAt == nil || *rows[0].recheckAt != uint64(lifted.Unix()) {
 		t.Fatalf("rows %+v %v", rows, err)
 	}
 }

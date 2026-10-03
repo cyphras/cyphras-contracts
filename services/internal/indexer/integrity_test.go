@@ -431,7 +431,7 @@ func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
 	if kept, err = (archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}).Events(context.Background(), from, to); err != nil || !maps.Equal(digests(kept, from, to), digests(good, from, to)) {
 		t.Fatalf("the archive kept a copy that does not apply: %v", err)
 	}
-	if !h.paged("archive_replaced") {
+	if !h.pagedAs("archive_replaced", alert.Critical) {
 		t.Fatalf("pages %+v", h.pages.alerts)
 	}
 	// An archive that cannot be read back pages.
@@ -455,6 +455,15 @@ func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
 func (h *harness) paged(code string) bool {
 	for _, a := range h.pages.alerts {
 		if a.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *harness) pagedAs(code string, sev alert.Severity) bool {
+	for _, a := range h.pages.alerts {
+		if a.Code == code && a.Severity == sev {
 			return true
 		}
 	}
@@ -557,7 +566,7 @@ func TestAnEventTooLargeForTheArchivePages(t *testing.T) {
 	if _, err := h.ix.ArchiveStep(context.Background(), oversized{}); err != nil {
 		t.Fatal(err)
 	}
-	if !h.paged(fmt.Sprintf("archive_event_too_large_%d", first)) {
+	if !h.pagedAs(fmt.Sprintf("archive_event_too_large_%d", first), alert.Critical) {
 		t.Fatalf("pages %+v", h.pages.alerts)
 	}
 	if _, err := (archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}).Events(context.Background(), 10, h.ix.archivedTo); err != nil {

@@ -63,10 +63,10 @@ func TestARootThatAgesPastTheWindowBeforeTheSendIsNotSent(t *testing.T) {
 	if err := h.r.readRoots(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// Insertions land while the call is simulated.
+	// Insertions land while the call is simulated, and take the root to the end of the window.
 	simulate := h.fake.Simulate
 	h.fake.Simulate = func(r protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
-		h.aged(req.Proof.Root, 230)
+		h.aged(req.Proof.Root, 200)
 		return simulate(r)
 	}
 	if _, f := h.r.Submit(ctx, req); f == nil || f.code != CodeRejected || h.sends() != 0 {
@@ -153,12 +153,15 @@ func TestAnAccountGrownAfterTheSimulationIsARaceItsOwnerRestsFor(t *testing.T) {
 		t.Fatal("a fee address that changed was taken for the relayer's fault or the destination's")
 	}
 
-	// Nothing changed: the simulation fell short on its own, which is the relayer's to answer for.
+	// Nothing changed after the simulation, which saw the destination's last change: the
+	// simulation fell short on its own, which is the relayer's to answer for.
 	h = newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
 	h.simulatedAt(1000)
 	h.setTxStatus(failedAs(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded, vaulttest.Vault, 0))
 	dest = keypair.MustRandom().Address()
 	h.fund(dest)
+	key := mustKey(vault.AccountKey(dest))
+	h.fake.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{AccountId: key.MustAccount().AccountId, Balance: 10_000_000}}, 1000, nil)
 	h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
 	if !h.r.brk.open(h.clock()) {
 		t.Fatal("a resource shortfall of the relayer's own did not count")
