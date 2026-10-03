@@ -582,6 +582,9 @@ func TestARefusedCriticalGoesToTheOtherChannelsAndATestClearsTheRefusal(t *testi
 	if discord.got("early_attestation_7") != 2 || discord.got("the "+name+" channel refused this alert") != 1 || telegram.got("early_attestation_7") != 0 {
 		t.Fatalf("discord took %d copies, telegram %d", discord.got("early_attestation_7"), telegram.got("early_attestation_7"))
 	}
+	if telegram.got("channel_test") != 0 {
+		t.Fatal("tested right after the refusal")
+	}
 	// Nothing else comes: a test of the refusing channel, which takes it, clears its refusal.
 	for range 20 {
 		now = now.Add(time.Minute)
