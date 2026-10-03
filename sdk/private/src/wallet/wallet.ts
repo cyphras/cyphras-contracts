@@ -190,6 +190,8 @@ export interface PlanView extends Submission {
   readonly payoutLeft: bigint | undefined;
   readonly exitParts: readonly ExitPart[];
   readonly operationId: string | undefined;
+  // The relayer's last word on a pending plan: held until its not_before, pending, success or
+  // failed, or unknown when the relayer could not say. The chain's evidence alone confirms it.
   readonly relayerStatus: string | undefined;
   // The payment may still land, or failed by the wallet's last reading of the chain only: paying
   // it again must go through retry, which spends the same notes, never through a new send.
