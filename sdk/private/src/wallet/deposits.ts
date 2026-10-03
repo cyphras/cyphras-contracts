@@ -133,9 +133,13 @@ async function checkDepositLimits(
   }
 }
 
-/** A submitted deposit: its ID in the entry queue and its transaction. */
+/**
+ * A submitted deposit: its ID in the entry queue and its transaction. The ID is undefined while the
+ * RPC providers do not all report the transaction alike; a later sync takes it from the vault's
+ * checked events.
+ */
 export interface ShieldReceipt {
-  readonly depositId: number;
+  readonly depositId: number | undefined;
   readonly txHash: string;
 }
 
@@ -218,11 +222,13 @@ export async function shield(
         await core.save();
       },
     );
-    if (result.returnValue?.switch().name !== "scvU64") {
-      fail("rpc_error", "the shield returned no deposit ID");
+    // The deposit's ID counts once every RPC provider reports its transaction alike; until then the
+    // deposit stays submitting, and a sync takes its ID from the vault's checked events.
+    const outcome = await depositOutcome(core, result.hash);
+    if (typeof outcome === "number") {
+      deposit.id = outcome;
+      deposit.state = "pending";
     }
-    deposit.id = Number(scValToBigInt(result.returnValue));
-    deposit.state = "pending";
     await core.save();
     return { depositId: deposit.id, txHash: result.hash };
   } catch (err) {
@@ -357,8 +363,12 @@ export async function trackDeposits(
       deposit.flag = undefined;
       continue;
     }
-    const queued = queue?.pending.find((d) => d.id === deposit.id);
-    const resolved = queue?.resolved.find((d) => d.id === deposit.id);
+    // The indexer's account of the ID counts only for the depositor and amount of this deposit, so
+    // no other deposit's state shows under it.
+    const ours = (d: { id: number; depositor: string; amount: bigint }): boolean =>
+      d.id === deposit.id && d.depositor === deposit.depositor && d.amount === deposit.amount;
+    const queued = queue?.pending.find(ours);
+    const resolved = queue?.resolved.find(ours);
     if (queued !== undefined) {
       deposit.attested = queued.attested;
       deposit.earliestAdmission = queued.earliestAdmission;

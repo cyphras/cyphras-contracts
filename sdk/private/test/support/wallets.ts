@@ -3,6 +3,7 @@ import { CyphrasError } from "../../src/errors.ts";
 import { deriveStoreKey } from "../../src/keys.ts";
 import { keySource } from "../../src/keysource.ts";
 import { type KeyValueStore, MemoryStore } from "../../src/storage.ts";
+import type { TransactionSigner } from "../../src/vault/invoke.ts";
 import { type OpenOptions, PrivateWallet } from "../../src/wallet/wallet.ts";
 import { MNEMONIC } from "../helpers.ts";
 import { RPC, type World } from "./network.ts";
@@ -39,4 +40,15 @@ export function isError(code: string): (err: unknown) => boolean {
 /** The store key of a test account, to read and change its sealed state as an attacker could not. */
 export function storeKeyOf(account: number): Uint8Array {
   return deriveStoreKey(mnemonicToSeedSync(MNEMONIC), "testnet", account);
+}
+
+// A deposit made through the wallet, with the ID every RPC provider reported for it.
+export async function shielded(
+  wallet: PrivateWallet,
+  amount: bigint,
+  signer: TransactionSigner,
+): Promise<{ readonly depositId: number; readonly txHash: string }> {
+  const { depositId, txHash } = await wallet.shield({ amount, signer });
+  if (depositId === undefined) throw new Error("the providers did not confirm the deposit's ID");
+  return { depositId, txHash };
 }

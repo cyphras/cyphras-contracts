@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Account, MuxedAccount, StrKey } from "@stellar/stellar-base";
+import { Account, MuxedAccount, StrKey, xdr } from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
 import { MemoryStore } from "../../src/storage.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
-import { INDEXER, RELAYER, RPC, XLM, createWorld } from "../support/network.ts";
+import { INDEXER, RELAYER, RPC, XLM, createWorld, rewritingFetch } from "../support/network.ts";
 import { keypairFor } from "../support/rpc.ts";
-import { confirmAll, isError, openWallet } from "../support/wallets.ts";
+import { confirmAll, isError, openWallet, shielded } from "../support/wallets.ts";
 
 async function funded(amount = 100n * XLM) {
   const world = await createWorld();
@@ -111,8 +111,8 @@ describe("wallet: deposits", () => {
     const world = await createWorld();
     const alice = await openWallet(world, 0);
     const depositor = world.signer("alice depositor");
-    const first = await alice.shield({ amount: 10n * XLM, signer: depositor });
-    const second = await alice.shield({ amount: 20n * XLM, signer: depositor });
+    const first = await shielded(alice, 10n * XLM, depositor);
+    const second = await shielded(alice, 20n * XLM, depositor);
     const stranger = world.signer("anyone");
     await assert.rejects(
       alice.cancelDeposit(first.depositId, stranger),
@@ -187,14 +187,82 @@ describe("wallet: deposits seen through two RPC providers", () => {
   });
 });
 
+describe("wallet: a deposit's ID", () => {
+  it("is taken from the shield only as every RPC provider reports it, and never shows another deposit", async () => {
+    const world = await createWorld();
+    const second = "http://rpc2.test";
+    let lying = false;
+    // While lying, the first provider reports every deposit's transaction as making deposit 1.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (url.origin === second) return world.fetch(RPC, init);
+      const res = await world.fetch(input, init);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (!lying || url.origin !== RPC || body?.method !== "getTransaction") return res;
+      const reply = await res.json();
+      if (reply.result?.status !== "SUCCESS") return new Response(JSON.stringify(reply));
+      const meta = xdr.TransactionMeta.fromXDR(reply.result.resultMetaXdr, "base64");
+      meta
+        .v4()
+        .sorobanMeta()
+        ?.returnValue(xdr.ScVal.scvU64(new xdr.Uint64(1n)));
+      reply.result.resultMetaXdr = meta.toXDR("base64");
+      return new Response(JSON.stringify(reply));
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    // Someone else's deposit 1, which screening flagged.
+    const other = await openWallet(world, 1);
+    const { depositId: theirs } = await shielded(other, 50n * XLM, world.signer("someone"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(theirs, 1));
+    lying = true;
+    const receipt = await alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") });
+    assert.equal(receipt.depositId, undefined);
+    let [mine] = await alice.deposits();
+    assert.equal(mine?.state, "submitting");
+    assert.equal(mine?.id, undefined);
+    await alice.sync();
+    [mine] = await alice.deposits();
+    assert.equal(mine?.state, "pending");
+    assert.equal(mine?.id, 2);
+    assert.equal(mine?.flag, undefined);
+  });
+
+  it("takes the indexer's account of a deposit only for its own depositor and amount", async () => {
+    const world = await createWorld();
+    let forged: Record<string, unknown> = {};
+    const fetch = rewritingFetch(world, {
+      "/v1/deposits": (body) => {
+        const pending = body["pending"] as Record<string, unknown>[];
+        return { ...body, pending: pending.map((d) => ({ ...d, ...forged })) };
+      },
+    });
+    const alice = await openWallet({ ...world, fetch }, 0);
+    const { depositId } = await shielded(alice, 10n * XLM, world.signer("depositor"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(depositId, 1));
+    for (const field of [{ amount: "1" }, { depositor: world.signer("someone").publicKey }]) {
+      forged = field;
+      await alice.sync();
+      const [mine] = await alice.deposits();
+      assert.equal(mine?.flag, undefined);
+    }
+    forged = {};
+    await alice.sync();
+    const [mine] = await alice.deposits();
+    assert.equal(mine?.flag?.reason, 1);
+  });
+});
+
 describe("wallet: screening", () => {
   it("presents a deposit held for review, which may still be admitted, apart from refusals", async () => {
     const world = await createWorld();
     const alice = await openWallet(world, 0);
     const depositor = world.signer("alice depositor");
-    const held = await alice.shield({ amount: 10n * XLM, signer: depositor });
-    const refused = await alice.shield({ amount: 20n * XLM, signer: depositor });
-    const ordered = await alice.shield({ amount: 30n * XLM, signer: depositor });
+    const held = await shielded(alice, 10n * XLM, depositor);
+    const refused = await shielded(alice, 20n * XLM, depositor);
+    const ordered = await shielded(alice, 30n * XLM, depositor);
     world.rpc.run("ab".repeat(32), () => world.vault.flag(held.depositId, 6));
     world.rpc.run("ac".repeat(32), () => world.vault.flag(refused.depositId, 5));
     world.rpc.run("ad".repeat(32), () => world.vault.flag(ordered.depositId, 100));
@@ -236,7 +304,7 @@ describe("wallet: screening", () => {
     const codes = [1, 2, 3, 4, 99, 7, 101];
     const ids: number[] = [];
     for (const [i, code] of codes.entries()) {
-      const { depositId } = await alice.shield({ amount: 10n * XLM, signer: depositor });
+      const { depositId } = await shielded(alice, 10n * XLM, depositor);
       world.rpc.run(String(i).padStart(64, "f"), () => world.vault.flag(depositId, code));
       ids.push(depositId);
     }
