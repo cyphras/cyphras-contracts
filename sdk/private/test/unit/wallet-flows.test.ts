@@ -290,6 +290,10 @@ describe("wallet: spends", () => {
     await alice.sync();
     let [plan] = await alice.plans();
     assert.equal(plan?.relayerStatus, "held");
+    // A rescan rebuilds the plan's fate from the chain, and the relayer still holds the request.
+    await alice.rescan();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
     // A restarted relayer has forgotten the request: the same proof goes to it again, still held.
     world.relayer.restart();
     await alice.sync();
@@ -314,6 +318,21 @@ describe("wallet: spends", () => {
     [plan] = await alice.plans();
     assert.equal(plan?.state, "settled");
     assert.equal(world.relayer.submissions.length, 2);
+  });
+
+  it("sends a forgotten held payment again only while its deadline allows", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    world.relayer.restart();
+    // Past the deadline the vault refuses the proof, so it goes nowhere again. RPC no longer holds
+    // the ledgers since, so the plan stays open, and a sync still asks about it.
+    world.vault.ledger = (world.relayer.submissions[0]?.ext.deadline as number) + 1;
+    world.rpc.oldestLedger = world.vault.ledger;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "submitted");
+    assert.equal(world.relayer.submissions.length, 1);
   });
 
   it("stops following a held payment the relayer dropped when it was due", async () => {
