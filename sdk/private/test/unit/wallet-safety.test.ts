@@ -1115,6 +1115,48 @@ describe("wallet safety: a second RPC provider", () => {
     assert.equal((await alice.balance()).spendable, 100n * XLM);
   });
 
+  it("asks every provider again each hour about leaves the first no longer holds and the second confirmed", async () => {
+    const { world, store } = await funded();
+    let first: "busy" | "disowning" | "honest" = "honest";
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (url.origin === RPC && body?.method === "getEvents" && first !== "honest") {
+        return rpcError(body.id, first === "busy" ? -32603 : -32600);
+      }
+      return url.origin === SECOND ? world.fetch(RPC, init) : world.fetch(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, store, undefined, {
+      secondRpcUrl: SECOND,
+    });
+    first = "busy";
+    world.fill(1);
+    assert.equal((await alice.sync()).uncheckedLeaves, 2);
+    // The leaves of both syncs, in one range, which the second provider confirms.
+    first = "disowning";
+    world.fill(1);
+    let summary = await alice.sync();
+    assert.equal(summary.partialLeaves, 4);
+    assert.equal(summary.lostLeaves, 0);
+    first = "busy";
+    world.fill(1);
+    summary = await alice.sync();
+    assert.equal(summary.uncheckedLeaves, 6);
+    assert.equal(summary.partialLeaves, 4);
+    // The first provider holds them all again, but is asked about the partial ones only an hour on.
+    first = "honest";
+    world.fill(1);
+    summary = await alice.sync();
+    assert.equal(summary.uncheckedLeaves, 4);
+    assert.equal(summary.partialLeaves, 4);
+    world.advance(3_600);
+    world.fill(1);
+    summary = await alice.sync();
+    assert.equal(summary.uncheckedLeaves, 0);
+    assert.equal(summary.partialLeaves, 0);
+  });
+
   it("refuses a tree a second RPC provider contradicts", async () => {
     const { world, store } = await funded();
     // Another vault at the same address, with other leaves.
@@ -2081,6 +2123,7 @@ describe("wallet safety: unchecked ledgers", () => {
     const later = await alice.sync();
     assert.equal(later.uncheckedLedgers, unchecked);
     assert.equal(later.lostLeaves, 2);
+    assert.equal(later.partialLeaves, 0);
     const asked = world.rpc.calls.filter((m) => m === "getEvents").length;
     world.fill(1);
     assert.equal((await alice.sync()).uncheckedLedgers, unchecked);

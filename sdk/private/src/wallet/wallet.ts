@@ -175,6 +175,9 @@ export interface SyncSummary {
   // check them against the vault's events while the providers still hold them.
   readonly uncheckedLedgers: number;
   readonly uncheckedLeaves: number;
+  // Of those leaves, the ones some RPC provider no longer holds while every other one confirmed
+  // them: syncs ask every provider about them again each hour.
+  readonly partialLeaves: number;
   // Of those leaves, the ones no RPC provider holds any more, so that nothing can check them: an
   // incoming payment an indexer hid among them stays hidden until a rescan through an indexer the
   // user trusts.
@@ -746,7 +749,7 @@ export class PrivateWallet {
       stageDownload(core.state, core.scan, data, checked);
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
-    const rechecked = await recheck(core.state, rpcs, vault, limits.eventPages);
+    const rechecked = await recheck(core.state, rpcs, vault, limits.eventPages, core.now());
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
     if (verified) advancePlans(core.state, views as [ChainView, ...ChainView[]]);
     const live = source.kind === "indexer" ? indexer : undefined;
@@ -788,6 +791,10 @@ export class PrivateWallet {
         0,
       ),
       uncheckedLeaves: core.state.unchecked.reduce((n, r) => n + leavesOf(r), 0),
+      partialLeaves: core.state.unchecked.reduce(
+        (n, r) => n + (r.status === "partial" ? leavesOf(r) : 0),
+        0,
+      ),
       lostLeaves: core.state.unchecked.reduce(
         (n, r) => n + (r.status === "lost" ? leavesOf(r) : 0),
         0,

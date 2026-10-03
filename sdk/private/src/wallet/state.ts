@@ -230,9 +230,10 @@ export interface FoundLeaf {
 // What syncs took from the indexer while not every RPC provider could confirm it: the spends of
 // the ledgers from `from` to `to`, none when `from` is past `to`, and the leaves at positions from
 // `first` up to `end`, the first of them added at `ledger`, kept as digests of runs of them. "open"
-// while the providers may still confirm it; "partial" once some provider no longer holds it and
-// every other one showed it as the syncs took it, so that it can never be confirmed by every
-// provider; "lost" once none holds it, so that nothing can check it any more.
+// while the providers may still confirm it; "partial" while some provider no longer holds it and
+// every other one showed it as the syncs took it, asked about again an hour after `askedAt`, in
+// milliseconds of the wallet's clock, in case every provider holds it once more; "lost" once none
+// holds it, so that nothing can check it any more.
 export interface UncheckedRange {
   readonly from: number;
   readonly to: number;
@@ -245,6 +246,7 @@ export interface UncheckedRange {
       }
     | undefined;
   readonly status: "open" | "partial" | "lost";
+  readonly askedAt: number | undefined;
 }
 
 // A ledger and the Unix second it closed at.
@@ -344,15 +346,19 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   const state = JSON.parse(new TextDecoder().decode(bytes), reviver) as WalletState;
   if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
   // A state need not hold close times yet, nor a checked leaf's ledger; its next syncs record them.
-  // Leaves it took unchecked without the digests a recheck compares can no longer be checked, and
-  // leaves it staged without them the next sync takes again. A range kept as lost without a status
-  // was given up on the first RPC provider's word alone, and is open again for every provider to be
-  // asked.
+  // Leaves it took unchecked without digests a recheck compares up to the last of them can no
+  // longer be checked, and leaves it staged without them the next sync takes again. A range kept
+  // as lost without a status was given up on the first RPC provider's word alone, and is open again
+  // for every provider to be asked.
   state.ledgerTimes ??= [];
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {
     const { lost: _lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };
-    const undigested = range.leaves !== undefined && range.leaves.chunks === undefined;
+    const { leaves } = range;
+    const undigested =
+      leaves !== undefined &&
+      (leaves.chunks === undefined ||
+        (leaves.chunks[leaves.chunks.length - 1]?.end ?? leaves.first) !== leaves.end);
     return { ...range, status: undigested ? "lost" : (range.status ?? "open") };
   });
   if (state.staging?.unchecked !== undefined && state.staging.unchecked.chunks === undefined) {

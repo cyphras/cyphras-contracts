@@ -22,9 +22,15 @@ describe("stored state", () => {
     const store = new SealedStore(new MemoryStore(), testBytes("state/key", 2, 32));
     const state = emptyState(10);
     state.unchecked = [
-      { from: 20, to: 30, leaves: { first: 0, end: 4, ledger: 15, chunks: [] }, status: "open" },
-      { from: 31, to: 40, leaves: undefined, status: "open" },
-      { from: 41, to: 50, leaves: undefined, status: "open" },
+      {
+        from: 20,
+        to: 30,
+        leaves: { first: 0, end: 4, ledger: 15, chunks: [] },
+        status: "open",
+        askedAt: undefined,
+      },
+      { from: 31, to: 40, leaves: undefined, status: "open", askedAt: undefined },
+      { from: 41, to: 50, leaves: undefined, status: "open", askedAt: undefined },
     ];
     await saveState(store, state);
     const text = new TextDecoder().decode((await store.read("state")) as Uint8Array);
@@ -36,6 +42,13 @@ describe("stored state", () => {
       range["lost"] = i === 1;
     });
     delete older.unchecked[0].leaves.chunks;
+    // A partial range of leaves kept without their digests.
+    older.unchecked.push({
+      from: 51,
+      to: 60,
+      leaves: { first: 8, end: 10, ledger: 55, chunks: [] },
+      status: "partial",
+    });
     // Only what the load reads of a staging and of plans.
     older.staging = { unchecked: { first: 4, ledger: 31 } };
     older.plans = [
@@ -51,7 +64,7 @@ describe("stored state", () => {
     // taken again.
     assert.deepEqual(
       loaded?.unchecked.map((r) => r.status),
-      ["lost", "open", "open"],
+      ["lost", "open", "open", "lost"],
     );
     assert.equal(
       loaded?.unchecked.some((r) => "lost" in r),
