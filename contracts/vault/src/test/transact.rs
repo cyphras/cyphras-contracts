@@ -204,6 +204,36 @@ fn ciphertexts_and_binding_are_checked_for_transact_too() {
 }
 
 #[test]
+fn a_spent_nullifier_is_refused_in_either_slot() {
+    let s = funded();
+    let relayer = s.account("relayer", 0);
+    let ext = s.ext(-10 * XLM, 0, &relayer, &relayer);
+    let first = s.prove(&ext);
+    s.vault.transact(&first, &ext, &relayer);
+
+    for slot in 0..2 {
+        let spent = first.input_nullifiers.get_unchecked(slot);
+        let fresh = s.field();
+        let nullifiers = if slot == 0 {
+            [spent, fresh.clone()]
+        } else {
+            [fresh.clone(), spent]
+        };
+        let ext = s.ext(-10 * XLM, 0, &relayer, &relayer);
+        let proof = s.prove_with(
+            &ext,
+            s.vault.current_root(),
+            nullifiers,
+            [s.field(), s.field()],
+        );
+        let result = outcome(s.vault.try_transact(&proof, &ext, &relayer));
+        assert_eq!(result, Err(Error::NullifierSpent), "slot {slot}");
+        assert!(!s.vault.is_spent(&fresh));
+    }
+    assert_eq!(s.balance(&relayer), 10 * XLM);
+}
+
+#[test]
 fn a_transfer_names_its_relayer_as_the_recipient() {
     let s = funded();
     let relayer = s.account("relayer", 0);

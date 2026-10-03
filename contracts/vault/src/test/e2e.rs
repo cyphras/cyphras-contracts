@@ -7,6 +7,7 @@ use soroban_sdk::{
     crypto::bn254::Bn254Fr, testutils::Events as _, xdr::ToXdr, Address, Bytes, Event,
     MuxedAddress, U256,
 };
+use types::TxProof;
 use verifier::VerifyingKey;
 
 use super::{
@@ -310,19 +311,9 @@ fn an_unshield_to_a_muxed_address_pays_its_base_account_and_reports_the_muxed_id
     );
 }
 
-#[test]
-fn a_shield_cannot_spend_a_real_note() {
-    let flow = Flow::at("transfer");
-    let s = &flow.s;
+/// Whether `proof` verifies under the embedded key, with the vault's domain.
+fn verifies(s: &Setup, proof: &TxProof) -> bool {
     let env = &s.env;
-    let refused = &fixtures::proofs()["refused"][0];
-    assert_eq!(refused["name"], "shield_spending_a_note");
-    assert_eq!(refused["after"], "admit");
-    let ext = fixtures::ext(env, refused);
-    let mut proof = fixtures::proof(env, refused);
-
-    // The proof is valid: it spends Alice's admitted note against the current root.
-    assert_eq!(proof.root, s.vault.current_root());
     let mut inputs = soroban_sdk::Vec::new(env);
     for x in [
         &proof.root,
@@ -337,12 +328,22 @@ fn a_shield_cannot_spend_a_real_note() {
             inputs.push_back(Bn254Fr::from_u256(x));
         }
     }
-    assert!(verifier::verify(
-        env,
-        &VerifyingKey::embedded(env),
-        &proof.proof,
-        inputs
-    ));
+    verifier::verify(env, &VerifyingKey::embedded(env), &proof.proof, inputs)
+}
+
+#[test]
+fn a_shield_cannot_spend_a_real_note() {
+    let flow = Flow::at("transfer");
+    let s = &flow.s;
+    let env = &s.env;
+    let refused = fixtures::refused("shield_spending_a_note");
+    assert_eq!(refused["after"], "admit");
+    let ext = fixtures::ext(env, &refused);
+    let mut proof = fixtures::proof(env, &refused);
+
+    // The proof is valid: it spends Alice's admitted note against the current root.
+    assert_eq!(proof.root, s.vault.current_root());
+    assert!(verifies(s, &proof));
 
     // As a shield it is refused, and no proof of that spend can name the empty root.
     let alice = flow.alice.clone();
@@ -359,4 +360,24 @@ fn a_shield_cannot_spend_a_real_note() {
 
     // The note it tried to spend is still spendable: the transfer that spends it goes through.
     flow.run(&fixtures::step("transfer")).unwrap();
+}
+
+#[test]
+fn a_real_proof_spending_a_spent_note_in_either_slot_is_refused() {
+    for (name, slot) in [("double_spend_slot0", 0), ("double_spend_slot1", 1)] {
+        let flow = Flow::at("unshield_self");
+        let s = &flow.s;
+        let refused = fixtures::refused(name);
+        assert_eq!(refused["after"], "unshield_muxed");
+        let proof = fixtures::proof(&s.env, &refused);
+        assert!(verifies(s, &proof), "{name}");
+        let spent = proof.input_nullifiers.get_unchecked(slot);
+        let fresh = proof.input_nullifiers.get_unchecked(1 - slot);
+        assert!(s.vault.is_spent(&spent) && !s.vault.is_spent(&fresh));
+        let balance = s.balance(&flow.bob);
+
+        assert_eq!(flow.run(&refused), Err(Error::NullifierSpent), "{name}");
+        assert!(!s.vault.is_spent(&fresh));
+        assert_eq!(s.balance(&flow.bob), balance);
+    }
 }

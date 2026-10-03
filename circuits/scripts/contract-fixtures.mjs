@@ -196,12 +196,13 @@ steps.push(
 );
 
 // Bob spends both of his notes into an exchange deposit address that carries a muxed ID.
+const bobChange = note(90_000_000n, bob.address);
 steps.push(
   await transact(
     "unshield_muxed",
     ACCOUNTS.relayer,
     [spend(bob, bobFunds, 2n, tree.path(2n)), spend(bob, toBob, 4n, tree.path(4n))],
-    [note(90_000_000n, bob.address), note(0n, bob.address)],
+    [bobChange, note(0n, bob.address)],
     {
       extAmount: -700_000_000n,
       fee: 10_000_000n,
@@ -210,6 +211,37 @@ steps.push(
     },
   ),
 );
+
+// Valid proofs that spend Bob's fresh change together with the note he has already spent, in
+// either input slot. The vault must refuse both on the spent nullifier alone.
+for (const [name, spends] of [
+  [
+    "double_spend_slot0",
+    [spend(bob, toBob, 4n, tree.path(4n)), spend(bob, bobChange, 6n, tree.path(6n))],
+  ],
+  [
+    "double_spend_slot1",
+    [spend(bob, bobChange, 6n, tree.path(6n)), spend(bob, toBob, 4n, tree.path(4n))],
+  ],
+]) {
+  const terms = {
+    extAmount: -390_000_000n,
+    fee: 0n,
+    recipient: ACCOUNTS.bob,
+    relayer: ACCOUNTS.bob,
+  };
+  const ext = extData(terms);
+  const proof = await prove(tree, spends, [note(0n, bob.address), note(0n, bob.address)], ext);
+  refused.push({
+    name,
+    call: "transact",
+    after: "unshield_muxed",
+    caller: ACCOUNTS.bob,
+    ext: ext.json,
+    ext_xdr: ext.xdr,
+    proof,
+  });
+}
 
 // Alice self-relays all of her change to a contract, paying no fee.
 steps.push(

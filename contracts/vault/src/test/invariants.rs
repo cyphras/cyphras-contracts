@@ -27,7 +27,7 @@ enum Op {
     Transact {
         payout: i128,
         fee: i128,
-        reuse: bool,
+        reuse: Option<u32>,
     },
     Attest(u64),
     Flag(u64, u32),
@@ -179,7 +179,7 @@ impl Model {
                 if outflow > self.status.tvl - self.status.pending_total {
                     return Err(Error::ExceedsAdmittedValue);
                 }
-                if *reuse {
+                if reuse.is_some() {
                     return Err(Error::NullifierSpent);
                 }
                 self.notes -= outflow;
@@ -365,6 +365,22 @@ impl Run {
         self.s.below(self.model.status.next_deposit_id + 2)
     }
 
+    /// Half of the time a pending deposit for which `wanted` holds, if there is one; otherwise
+    /// any ID, pending or not.
+    fn id_where(&self, wanted: impl Fn(&Deposit) -> bool) -> u64 {
+        let ids: std::vec::Vec<u64> = self
+            .model
+            .pending
+            .iter()
+            .filter(|(_, d)| wanted(d))
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() || self.s.below(2) == 0 {
+            return self.some_id();
+        }
+        ids[self.s.below(ids.len() as u64) as usize]
+    }
+
     fn scaled(&self, value: i128) -> i128 {
         let percent = self.pick(&[50, 80, 100, 100, 120, 150]);
         value * percent / 100
@@ -373,6 +389,20 @@ impl Run {
     fn random_op(&self) -> Op {
         let s = &self.s;
         let m = &self.model;
+        let now = s.now();
+        // Some calls can only succeed in a state that random calls rarely leave the vault in.
+        if m.halted(now) && s.below(4) == 0 {
+            return Op::Resume;
+        }
+        if let Some(queued) = &m.queued {
+            if s.below(4) == 0 {
+                return if now >= queued.ready_at {
+                    Op::ApplyLimits
+                } else {
+                    Op::Advance(queued.ready_at - now)
+                };
+            }
+        }
         match s.below(100) {
             0..=21 => {
                 let amount = self.pick(&[
@@ -389,8 +419,22 @@ impl Run {
                 Op::Shield(s.below(3) as usize, amount)
             }
             22..=39 => {
+                // A third of the attempts also spend a nullifier already in the set, in a random
+                // slot, with a payout and fee small enough to pass every earlier check.
+                let reuse = (s.below(3) == 0 && !self.spent.is_empty()).then(|| s.below(2) as u32);
+                if reuse.is_some() {
+                    let payout = if m.status.transfers_paused {
+                        m.notes.min(1)
+                    } else {
+                        0
+                    };
+                    return Op::Transact {
+                        payout,
+                        fee: 0,
+                        reuse,
+                    };
+                }
                 let fee = self.pick(&[0, 1, XLM, m.limits.max_fee, m.limits.max_fee + 1]);
-                let reuse = s.below(10) == 0 && !self.spent.is_empty();
                 let payout = match s.below(10) {
                     0 => m.status.tvl + 1,
                     1 => 0,
@@ -399,8 +443,8 @@ impl Run {
                 Op::Transact { payout, fee, reuse }
             }
             40..=46 => Op::Attest(self.some_id()),
-            47..=51 => Op::Flag(self.some_id(), self.pick(&[0, 1, 2, 3, 4, 5, 99])),
-            52..=54 => Op::Unflag(self.some_id()),
+            47..=51 => Op::Flag(self.id_where(|_| true), self.pick(&[0, 1, 2, 3, 4, 5, 99])),
+            52..=54 => Op::Unflag(self.id_where(|d| d.flag.is_some())),
             55..=63 => {
                 let mut ids: std::vec::Vec<u64> =
                     (0..1 + s.below(4)).map(|_| self.some_id()).collect();
@@ -410,8 +454,8 @@ impl Run {
                 }
                 Op::Admit(ids)
             }
-            64..=67 => Op::Cancel(self.some_id()),
-            68..=71 => Op::Refund(self.some_id()),
+            64..=67 => Op::Cancel(self.id_where(|_| true)),
+            68..=71 => Op::Refund(self.id_where(|d| d.flag.is_some() && now >= d.flagged_at + DAY)),
             72..=73 => Op::SetPause(s.below(4) == 0, s.below(4) == 0),
             74..=76 => Op::Halt,
             77..=78 => Op::Resume,
@@ -462,10 +506,14 @@ impl Run {
             Op::Transact { payout, fee, reuse } => {
                 let ext = s.ext(-payout, *fee, &self.relayer, &self.relayer);
                 let mut proof = s.prove(&ext);
-                if *reuse {
+                if let Some(slot) = reuse {
                     let spent = self.spent[s.below(self.spent.len() as u64) as usize].clone();
-                    proof =
-                        s.prove_with(&ext, proof.root, [s.field(), spent], [s.field(), s.field()]);
+                    let nullifiers = if *slot == 0 {
+                        [spent, s.field()]
+                    } else {
+                        [s.field(), spent]
+                    };
+                    proof = s.prove_with(&ext, proof.root, nullifiers, [s.field(), s.field()]);
                 }
                 let result =
                     outcome(v.try_transact(&proof, &ext, &self.relayer)).map(|_| Done::Unit);
@@ -553,6 +601,8 @@ impl Run {
     }
 }
 
+/// Runs `steps` random calls and counts each entry point's outcomes, with the refusals of a spent
+/// nullifier counted per slot.
 fn run(seed: u64, steps: usize) -> BTreeMap<std::string::String, usize> {
     let mut run = Run::new(seed);
     let mut seen = BTreeMap::new();
@@ -572,6 +622,17 @@ fn run(seed: u64, steps: usize) -> BTreeMap<std::string::String, usize> {
             std::string::String::from(std::format!("{op:?}").split(['(', ' ']).next().unwrap());
         let key = std::format!("{name} {}", if actual.is_ok() { "ok" } else { "refused" });
         *seen.entry(key).or_insert(0) += 1;
+        if let (
+            Op::Transact {
+                reuse: Some(slot), ..
+            },
+            Err(Error::NullifierSpent),
+        ) = (&op, &actual)
+        {
+            *seen
+                .entry(std::format!("spent nullifier in slot {slot}"))
+                .or_insert(0) += 1;
+        }
     }
     seen
 }
@@ -607,6 +668,13 @@ fn random_sequences_keep_the_vault_equal_to_the_spec_model() {
         assert!(
             seen.contains_key(&std::format!("{op} refused")),
             "{op} never refused: {seen:?}"
+        );
+    }
+    // A transaction spending an already spent nullifier reached the check in both slots.
+    for slot in 0..2 {
+        assert!(
+            seen.contains_key(&std::format!("spent nullifier in slot {slot}")),
+            "no spent nullifier refused in slot {slot}: {seen:?}"
         );
     }
 }

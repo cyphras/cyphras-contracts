@@ -33,6 +33,17 @@ pub fn step(name: &str) -> Value {
         .clone()
 }
 
+/// A valid proof the vault must refuse, made against the tree after the step named `after`.
+pub fn refused(name: &str) -> Value {
+    proofs()["refused"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == name)
+        .unwrap_or_else(|| panic!("no refused fixture {name}"))
+        .clone()
+}
+
 pub fn vault_address(env: &Env) -> Address {
     Address::from_str(env, proofs()["vault"].as_str().unwrap())
 }
