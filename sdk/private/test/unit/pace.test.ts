@@ -19,8 +19,10 @@ describe("ledger pace", () => {
     const times = [at(1_000, 0), at(101_800, 604_800), at(102_700, 604_800 + 3_600)];
     assert.equal(updatePace(state, times), 4);
     assert.equal(updatePace(emptyState(1), [at(1_000, 0), at(2_000, 6_000)]), 5);
-    // A reply whose times run backwards gives a pace no faster than a second.
-    assert.equal(updatePace(emptyState(1), [at(1_000, 600), at(2_000, 0)]), 1);
+    // Close times that claim faster ledgers than half the fallback, or that run backwards, give a
+    // pace no faster than that.
+    assert.equal(updatePace(emptyState(1), [at(1_000, 0), at(2_000, 1_000)]), 2.5);
+    assert.equal(updatePace(emptyState(1), [at(1_000, 600), at(2_000, 0)]), 2.5);
   });
 
   it("keeps the close times of the last hour, spaced by 60 ledgers, for the next sync", () => {

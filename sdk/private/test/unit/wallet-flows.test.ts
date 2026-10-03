@@ -300,6 +300,24 @@ describe("wallet: spends", () => {
     assert.equal((await alice.plans())[0]?.state, "submitted");
   });
 
+  it("at most doubles a held payment's validity when close times claim faster ledgers", async () => {
+    const world = await createWorld();
+    // RPC's close times claim a ledger a second; the relayer goes by five.
+    world.rpc.secondsPerLedger = 1;
+    world.relayer.pace = 5;
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 3_600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    const deadline = world.relayer.submissions[0]?.ext.deadline as number;
+    // the hold and the relayer's window at five seconds a ledger, twice over, and the usual 120
+    assert.ok(deadline <= world.vault.ledger + 2 * 840 + 120);
+  });
+
   it("follows a held payment by its ID, sends it again to a relayer that restarted, and takes its hash", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
