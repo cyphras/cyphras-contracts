@@ -1,6 +1,4 @@
 import type { ExitEntry, ExitQueue } from "../net/indexer.ts";
-import type { MetaEvent } from "../net/rpc.ts";
-import { decodeVaultEvent } from "../vault/events.ts";
 import type { ExitEvent } from "./sources.ts";
 import type { Plan, PlanExit, PlanState, WalletState } from "./state.ts";
 
@@ -9,26 +7,6 @@ import type { Plan, PlanExit, PlanState, WalletState } from "./state.ts";
 // pays the head exit as far as the window reaches, payout first, so an exit can be paid in parts
 // over several days. A part the asset contract refuses strands the exit with what it still owes,
 // until a claim pays each part.
-
-// What a transact's own events say about its payout: paid inside the transaction, or queued
-// with an exit ID.
-export function payoutFromEvents(
-  events: readonly MetaEvent[],
-  vault: string,
-): { readonly kind: "settled" } | { readonly kind: "queued"; readonly exit: PlanExit } | undefined {
-  for (const event of events) {
-    if (event.contractId !== vault) continue;
-    const decoded = decodeVaultEvent(event);
-    if (decoded.kind === "settled") return { kind: "settled" };
-    if (decoded.kind === "exit_queued") {
-      return {
-        kind: "queued",
-        exit: { id: decoded.id, payoutLeft: decoded.payout, feeLeft: decoded.fee },
-      };
-    }
-  }
-  return undefined;
-}
 
 const exitPlans = (state: WalletState): Plan[] =>
   state.plans.filter(

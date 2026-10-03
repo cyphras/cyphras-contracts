@@ -218,11 +218,13 @@ describe("wallet: spends", () => {
       },
     });
     assert.ok(warned);
-    assert.ok("planId" in result && result.state === "settled");
+    // Like a relayed one, it is confirmed by the chain's evidence in a sync, not by RPC's word.
+    assert.ok("planId" in result && result.state === "submitted");
     assert.equal(world.relayer.submissions.length, 0);
-    // the spent note is gone at once; the change counts once a sync has found its leaf
+    // the spent note is locked at once; the change counts once a sync has found its leaf
     assert.equal((await alice.balance()).spendable, 0n);
     await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
     assert.equal((await alice.balance()).spendable, 75n * XLM);
   });
 

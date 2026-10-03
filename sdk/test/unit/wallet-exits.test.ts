@@ -258,7 +258,7 @@ describe("the exit queue: sources", () => {
     assert.equal(plan?.state, "claimed");
   });
 
-  it("takes the exit ID of a self-relayed unshield from its own transaction", async () => {
+  it("follows a self-relayed unshield's exit through the vault's events", async () => {
     const { world, alice } = await funded();
     fillWindow(world);
     const destination = world.signer("merchant").publicKey;
@@ -268,7 +268,9 @@ describe("the exit queue: sources", () => {
       selfRelay: world.signer("my account"),
       confirm: confirmAll,
     });
-    assert.ok("planId" in result && result.state === "queued");
+    assert.ok("planId" in result && result.state === "submitted");
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "queued");
     assert.equal((await alice.plans())[0]?.exitId, 1);
     world.advance(86_400);
     await alice.releaseExits(world.signer("anyone"));

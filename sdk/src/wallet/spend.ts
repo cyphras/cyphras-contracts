@@ -30,7 +30,6 @@ import {
   spendableNotes,
   spendingKeys,
 } from "./core.ts";
-import { payoutFromEvents } from "./exits.ts";
 import { type Warning, unshieldWarnings } from "./nudges.ts";
 import type { OwnedNote, Plan, PlanState, RootCheck, Route } from "./state.ts";
 
@@ -449,41 +448,37 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
   }
 }
 
-// F-35: the user's own account submits the unshield and pays the network fee.
+// F-35: the user's own account submits the unshield and pays the network fee. The plan stays
+// submitted until a sync shows its nullifiers and commitments in one transaction, as for a relayed
+// one; the RPC's word that the transaction succeeded does not confirm it.
 async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Promise<Submission> {
   const ext: ExtData = extDataFromJson(plan.ext);
-  const result = await invokeVault(
-    invokeContext(core),
-    signer,
-    {
-      fn: "transact",
-      args: [
-        txProofToScVal(txProofFromJson(plan.proof)),
-        extDataToScVal(ext),
-        new Address(signer.publicKey).toScVal(),
-      ],
-      transfers: [],
-    },
-    async (hash) => {
-      plan.state = "submitted";
-      plan.txHash = hash;
+  try {
+    await invokeVault(
+      invokeContext(core),
+      signer,
+      {
+        fn: "transact",
+        args: [
+          txProofToScVal(txProofFromJson(plan.proof)),
+          extDataToScVal(ext),
+          new Address(signer.publicKey).toScVal(),
+        ],
+        transfers: [],
+      },
+      async (hash) => {
+        plan.state = "submitted";
+        plan.txHash = hash;
+        await core.save();
+      },
+    );
+  } catch (err) {
+    if (err instanceof CyphrasError) {
+      plan.error = err.code;
       await core.save();
-    },
-  );
-  plan.state = "confirmed";
-  plan.ledger = result.ledger;
-  const payout = payoutFromEvents(result.events, core.deployment.vault);
-  if (payout?.kind === "settled") plan.state = "settled";
-  if (payout?.kind === "queued") {
-    plan.state = "queued";
-    plan.exit = payout.exit;
+    }
+    throw err;
   }
-  for (const input of plan.inputs) {
-    const note = core.state.notes.find((n) => n.pos === input.pos);
-    if (note !== undefined && note.spent === undefined)
-      note.spent = { txHash: result.hash, ledger: result.ledger };
-  }
-  await core.save();
   return view(plan);
 }
 
