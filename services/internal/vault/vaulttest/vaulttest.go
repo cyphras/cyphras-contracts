@@ -223,11 +223,16 @@ func (c *Chain) Strand(e Exit, unpaidPayout, unpaidFee int64) {
 	)
 }
 
-// Claim emits a claim that pays the unpaid parts of a stranded exit.
-func (c *Chain) Claim(e Exit, unpaidPayout, unpaidFee int64) {
-	c.Tx()
-	id := e.ID
-	c.settled(-unpaidPayout, unpaidFee, e.Recipient, &id)
+// Requeue emits a claim that moves parts of a stranded exit back into the queue as the exit newID,
+// and returns that exit.
+func (c *Chain) Requeue(e Exit, newID uint64, payout, fee int64) Exit {
+	c.Tx().Emit("exit_requeued",
+		vault.Field{Name: "id", Value: vault.U64(e.ID)},
+		vault.Field{Name: "new_id", Value: vault.U64(newID)},
+		vault.Field{Name: "payout", Value: i128(big.NewInt(payout))},
+		vault.Field{Name: "fee", Value: i128(big.NewInt(fee))},
+	)
+	return Exit{ID: newID, ExtAmount: -payout, Fee: fee, Recipient: e.Recipient}
 }
 
 // Attest emits attested.

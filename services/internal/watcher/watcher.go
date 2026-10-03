@@ -292,9 +292,9 @@ var governance = map[string]bool{
 	"limits_queued": true, "limits_applied": true, "limits_cancelled": true, "paused": true, "halted": true, "resumed": true,
 }
 
-// notices reports governance events to the operator and the public channel, flags as information,
-// stranded exits, and checks every attestation against the screening policy's timing. Events
-// older than a day, met while rebuilding, are not reported again.
+// notices reports governance events to the operator and the public channel, flags and requeued
+// exits as information, stranded exits, and checks every attestation against the screening
+// policy's timing. Events older than a day, met while rebuilding, are not reported again.
 func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, latestClose int64) {
 	for _, n := range notices {
 		if n.ClosedAt+secondsPerDay < latestClose {
@@ -315,7 +315,10 @@ func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, late
 			w.alerts.Raise(ctx, alert.Info, fmt.Sprintf("%s_%d", n.Name, n.Ledger), "%s at ledger %d: %s", n.Name, n.Ledger, describe(n.Body))
 		case n.Name == "exit_stranded":
 			s := n.Body.(vault.ExitStranded)
-			w.alerts.Raise(ctx, alert.Warning, fmt.Sprintf("exit_stranded_%d", s.ID), "exit %d was released with %v of its payout and %v of its fee unpaid; claim pays them once the parties can receive", s.ID, s.Payout, s.Fee)
+			w.alerts.Raise(ctx, alert.Warning, fmt.Sprintf("exit_stranded_%d", s.ID), "exit %d was released with %v of its payout and %v of its fee unpaid; claim queues them again once the parties can receive", s.ID, s.Payout, s.Fee)
+		case n.Name == "exit_requeued":
+			r := n.Body.(vault.ExitRequeued)
+			w.alerts.Raise(ctx, alert.Info, fmt.Sprintf("exit_requeued_%d", r.NewID), "%v of the payout and %v of the fee of stranded exit %d were queued again as exit %d", r.Payout, r.Fee, r.ID, r.NewID)
 		case n.Name == "attested":
 			w.checkAttestation(ctx, n)
 		}

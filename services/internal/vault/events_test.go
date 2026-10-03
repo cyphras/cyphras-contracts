@@ -265,7 +265,7 @@ func TestExitsParseIntoQueuedTransactsAndReleases(t *testing.T) {
 	b := newBuilder(t)
 	b.nextTx("01").nullifier(1).nullifier(2).commitment(0, 11).commitment(1, 12).queued(1, -10, 1)
 	b.nextTx("02").released(1, -10, 1).stranded(2, 5, 0).released(3, -5, 0)
-	b.nextTx("03").released(2, -5, 0)
+	b.nextTx("03").emit("exit_requeued", Field{"id", U64(2)}, Field{"new_id", U64(4)}, Field{"payout", i128(t, 5)}, Field{"fee", i128(t, 0)})
 	txs, err := ParseTxs(b.events)
 	if err != nil {
 		t.Fatal(err)
@@ -279,8 +279,12 @@ func TestExitsParseIntoQueuedTransactsAndReleases(t *testing.T) {
 	if st := txs[1].Calls[1].(ExitStranded); st.ID != 2 || st.Payout.Int64() != 5 || st.Fee.Sign() != 0 {
 		t.Fatalf("stranded %+v", st)
 	}
-	if c := txs[2].Calls[0].(ExitSettled); *c.Settled.ExitID != 2 {
+	if c := txs[2].Calls[0].(ExitRequeued); c.ID != 2 || c.NewID != 4 || c.Payout.Int64() != 5 {
 		t.Fatalf("claim %+v", c)
+	}
+	if _, err := Decode(newBuilder(t).nextTx("aa").raw("exit_requeued", Struct(
+		Field{"id", U64(4)}, Field{"new_id", U64(4)}, Field{"payout", i128(t, 1)}, Field{"fee", i128(t, 0)}))); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("requeued in place: %v", err)
 	}
 	for name, v := range map[string][2]int64{"nothing unpaid": {0, 0}, "negative part": {-1, 2}} {
 		if _, err := Decode(newBuilder(t).nextTx("aa").raw("exit_stranded", Struct(

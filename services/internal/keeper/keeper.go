@@ -1,6 +1,6 @@
 // Package keeper keeps the vault's entries alive, admits eligible deposits, refunds deposits that
-// stayed flagged and pays queued and stranded exits as the outflow window allows. Every call it
-// makes is permissionless, so its key only risks its float.
+// stayed flagged, pays the exit queue as the outflow window allows and queues stranded exits again
+// once they can be paid. Every call it makes is permissionless, so its key only risks its float.
 package keeper
 
 import (
@@ -29,6 +29,8 @@ const ledgersPerDay = 17_280
 type Config struct {
 	Vault        string
 	DeployLedger uint32
+	// Asset is the vault's asset as its asset contract names it: native, or CODE:ISSUER.
+	Asset string
 	// MaxAdmissions is the most deposits one admit call carries; the event size limit of a
 	// transaction allows 17.
 	MaxAdmissions int
@@ -61,8 +63,7 @@ type Keeper struct {
 	state     *chainstate.State
 	cursor    uint32
 	lastCycle time.Time
-	// claimedDay is the UTC day of the last round of claims.
-	claimedDay uint64
+	claims    map[uint64]claimTry
 }
 
 // New loads the stored chain state.
@@ -71,7 +72,10 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 	if err != nil {
 		return nil, err
 	}
-	return &Keeper{cfg: cfg, rpc: client, chain: chain, engine: engine, account: account, alerts: alerts, log: log, now: time.Now, state: state, cursor: cursor}, nil
+	return &Keeper{
+		cfg: cfg, rpc: client, chain: chain, engine: engine, account: account, alerts: alerts, log: log, now: time.Now,
+		state: state, cursor: cursor, claims: map[uint64]claimTry{},
+	}, nil
 }
 
 // Cursor implements follow.Sink.
@@ -310,7 +314,8 @@ func (k *Keeper) Run(ctx context.Context, f *follow.Follower, poll time.Duration
 		next  func(time.Time, time.Duration) time.Duration
 	}{
 		{"admission", 30 * time.Second, k.Admit, nil},
-		{"exits", 30 * time.Second, k.Exits, untilRelease},
+		{"releases", 30 * time.Second, k.Release, untilRelease},
+		{"claims", 10 * time.Minute, k.Claims, nil},
 		{"refunds", 5 * time.Minute, k.Refund, nil},
 		{"ttl", time.Hour, k.TTLCycle, nil},
 		{"balance", 10 * time.Minute, k.CheckBalance, nil},

@@ -1,5 +1,6 @@
 // Command keeper keeps one vault's entries alive, admits eligible deposits, refunds deposits that
-// stayed flagged and pays queued and stranded exits, from its own funded account. It serves no API.
+// stayed flagged, pays the exit queue and queues stranded exits again, from its own funded
+// account. It serves no API.
 package main
 
 import (
@@ -63,7 +64,7 @@ func main() {
 		service.Fatal(log, "config", err)
 	}
 	k, err := keeper.New(ctx, keeper.Config{
-		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, MaxAdmissions: 17, MaxExtensions: 50,
+		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, Asset: base.Vault.Asset, MaxAdmissions: 17, MaxExtensions: 50,
 		MaxReleases: int(releases), RefundDelay: 24 * time.Hour, HoldReasons: hold, BalanceFloor: floor,
 	}, base.RPC, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(key.Address(), key), base.Alerts, log)
 	if err != nil {

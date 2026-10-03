@@ -20,7 +20,7 @@ type Transact struct {
 }
 
 // ExitSettled is a settled event that carries an exit ID: the step of release that completes a
-// queued exit, or the unpaid parts of a stranded exit that claim paid.
+// queued exit.
 type ExitSettled struct {
 	Settled Settled
 }
@@ -38,7 +38,8 @@ type Tx struct {
 	ClosedAt int64
 	Hash     string
 	// Calls holds Shield, Transact, Admission and ExitSettled values, and the bodies of the other
-	// single events, such as the ExitPaid or ExitStranded of a release.
+	// single events, such as the ExitPaid or ExitStranded of a release or the ExitRequeued of a
+	// claim.
 	Calls []any
 }
 

@@ -86,12 +86,16 @@ CREATE TABLE IF NOT EXISTS exits (
 	released_tx text,
 	unpaid_payout numeric,
 	unpaid_fee numeric,
-	claimed_ledger bigint,
-	claimed_at bigint,
-	claimed_tx text
+	requeued_from bigint,
+	requeued_ledger bigint,
+	requeued_at bigint,
+	requeued_tx text
 );
 CREATE INDEX IF NOT EXISTS exits_waiting ON exits (id) WHERE released_ledger IS NULL;
-CREATE INDEX IF NOT EXISTS exits_stranded ON exits (id) WHERE unpaid_payout IS NOT NULL AND claimed_ledger IS NULL;
+CREATE INDEX IF NOT EXISTS exits_stranded ON exits (id) WHERE unpaid_payout IS NOT NULL AND requeued_ledger IS NULL;
+CREATE INDEX IF NOT EXISTS exits_requeued ON exits (requeued_from) WHERE requeued_from IS NOT NULL;
+CREATE INDEX IF NOT EXISTS exits_released_at ON exits (released_at) WHERE released_ledger IS NOT NULL;
+CREATE INDEX IF NOT EXISTS exits_requeued_at ON exits (requeued_at) WHERE requeued_ledger IS NOT NULL;
 `
 
 // Store persists a State and what each window changed in one Postgres database.
@@ -320,8 +324,11 @@ func (st *Store) Load(ctx context.Context, vaultID string, deployLedger uint32) 
 func (st *Store) loadExits(ctx context.Context, s *State) error {
 	rows, err := st.Pool.Query(ctx, `SELECT id, coalesce(payout_left, payout)::text, coalesce(fee_left, fee)::text, payout::text, fee::text,
 		recipient, relayer, queued_at, ledger, tx_hash, released_ledger IS NOT NULL, coalesce(unpaid_payout, 0)::text, coalesce(unpaid_fee, 0)::text,
-		coalesce(released_ledger, 0), coalesce(released_at, 0), coalesce(released_tx, '')
-		FROM exits WHERE released_ledger IS NULL OR (unpaid_payout IS NOT NULL AND claimed_ledger IS NULL) ORDER BY id`)
+		coalesce(released_ledger, 0), coalesce(released_at, 0), coalesce(released_tx, ''), requeued_from,
+		(SELECT coalesce(sum(m.payout), 0)::text FROM exits m WHERE m.requeued_from = exits.id),
+		(SELECT coalesce(sum(m.fee), 0)::text FROM exits m WHERE m.requeued_from = exits.id),
+		ARRAY(SELECT m.id FROM exits m WHERE m.requeued_from = exits.id ORDER BY m.id)
+		FROM exits WHERE released_ledger IS NULL OR (unpaid_payout IS NOT NULL AND requeued_ledger IS NULL) ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -329,10 +336,12 @@ func (st *Store) loadExits(ctx context.Context, s *State) error {
 	for rows.Next() {
 		var e Exit
 		var id, queuedAt, ledger, strandedLedger int64
-		var payout, fee, queuedPayout, queuedFee, unpaidPayout, unpaidFee string
+		var payout, fee, queuedPayout, queuedFee, unpaidPayout, unpaidFee, movedPayout, movedFee string
 		var released bool
+		var from *int64
+		var to []int64
 		if err := rows.Scan(&id, &payout, &fee, &queuedPayout, &queuedFee, &e.Recipient, &e.Relayer, &queuedAt, &ledger, &e.TxHash, &released,
-			&unpaidPayout, &unpaidFee, &strandedLedger, &e.StrandedAt, &e.StrandedTx); err != nil {
+			&unpaidPayout, &unpaidFee, &strandedLedger, &e.StrandedAt, &e.StrandedTx, &from, &movedPayout, &movedFee, &to); err != nil {
 			return err
 		}
 		e.ID, e.QueuedAt, e.Ledger = uint64(id), uint64(queuedAt), uint32(ledger)
@@ -340,7 +349,14 @@ func (st *Store) loadExits(ctx context.Context, s *State) error {
 			payout, fee = unpaidPayout, unpaidFee
 			e.StrandedLedger = uint32(strandedLedger)
 		}
-		amounts := []*string{&payout, &fee, &queuedPayout, &queuedFee}
+		if from != nil {
+			f := uint64(*from)
+			e.RequeuedFrom = &f
+		}
+		for _, t := range to {
+			e.RequeuedTo = append(e.RequeuedTo, uint64(t))
+		}
+		amounts := []*string{&payout, &fee, &queuedPayout, &queuedFee, &movedPayout, &movedFee}
 		parsed := make([]*big.Int, len(amounts))
 		for i, a := range amounts {
 			n, ok := new(big.Int).SetString(*a, 10)
@@ -349,7 +365,7 @@ func (st *Store) loadExits(ctx context.Context, s *State) error {
 			}
 			parsed[i] = n
 		}
-		e.Payout, e.Fee, e.QueuedPayout, e.QueuedFee = parsed[0], parsed[1], parsed[2], parsed[3]
+		e.Payout, e.Fee, e.QueuedPayout, e.QueuedFee, e.MovedPayout, e.MovedFee = parsed[0], parsed[1], parsed[2], parsed[3], parsed[4], parsed[5]
 		if released {
 			s.Stranded[e.ID] = &e
 		} else {
@@ -480,23 +496,24 @@ func commitExit(ctx context.Context, tx pgx.Tx, d Delta, c exitChange) error {
 	switch c.kind {
 	case queuedChange:
 		e := d.Queued[c.index]
-		_, err := tx.Exec(ctx, `INSERT INTO exits (id, payout, fee, recipient, relayer, queued_at, ledger, tx_hash)
-			VALUES ($1, $2::numeric, $3::numeric, $4, $5, $6, $7, $8)`,
-			int64(e.ID), e.Payout.String(), e.Fee.String(), e.Recipient, e.Relayer, int64(e.QueuedAt), int64(e.Ledger), e.TxHash)
+		var from *int64
+		if e.RequeuedFrom != nil {
+			f := int64(*e.RequeuedFrom)
+			from = &f
+		}
+		_, err := tx.Exec(ctx, `INSERT INTO exits (id, payout, fee, recipient, relayer, queued_at, ledger, tx_hash, requeued_from)
+			VALUES ($1, $2::numeric, $3::numeric, $4, $5, $6, $7, $8, $9)`,
+			int64(e.ID), e.Payout.String(), e.Fee.String(), e.Recipient, e.Relayer, int64(e.QueuedAt), int64(e.Ledger), e.TxHash, from)
 		return err
 	case partPaidChange:
 		p := d.PartPaid[c.index]
-		query := `UPDATE exits SET payout_left = $2::numeric, fee_left = $3::numeric WHERE id = $1 AND released_ledger IS NULL`
-		if p.Stranded {
-			query = `UPDATE exits SET unpaid_payout = $2::numeric, unpaid_fee = $3::numeric
-				WHERE id = $1 AND unpaid_payout IS NOT NULL AND claimed_ledger IS NULL`
-		}
-		tag, err := tx.Exec(ctx, query, int64(p.ID), p.PayoutLeft.String(), p.FeeLeft.String())
+		tag, err := tx.Exec(ctx, `UPDATE exits SET payout_left = $2::numeric, fee_left = $3::numeric WHERE id = $1 AND released_ledger IS NULL`,
+			int64(p.ID), p.PayoutLeft.String(), p.FeeLeft.String())
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() != 1 {
-			return inconsistent("exit %d part paid while neither queued nor stranded", p.ID)
+			return inconsistent("exit %d part paid while not queued", p.ID)
 		}
 	case releasedChange:
 		e := d.Released[c.index]
@@ -514,16 +531,24 @@ func commitExit(ctx context.Context, tx pgx.Tx, d Delta, c exitChange) error {
 		if tag.RowsAffected() != 1 {
 			return inconsistent("exit %d released twice", e.ID)
 		}
-	case claimedChange:
-		cl := d.Claimed[c.index]
-		tag, err := tx.Exec(ctx, `UPDATE exits SET claimed_ledger = $2, claimed_at = $3, claimed_tx = $4
-			WHERE id = $1 AND unpaid_payout IS NOT NULL AND claimed_ledger IS NULL`,
-			int64(cl.ID), int64(cl.Ledger), cl.ClosedAt, cl.TxHash)
+	case requeuedChange:
+		r := d.Requeued[c.index]
+		// Once nothing is left stranded, the row records when its last part moved.
+		var ledger, at *int64
+		var hash *string
+		if r.PayoutLeft.Sign() == 0 && r.FeeLeft.Sign() == 0 {
+			l, a, h := int64(r.Ledger), r.ClosedAt, r.TxHash
+			ledger, at, hash = &l, &a, &h
+		}
+		tag, err := tx.Exec(ctx, `UPDATE exits SET unpaid_payout = $2::numeric, unpaid_fee = $3::numeric,
+			requeued_ledger = $4, requeued_at = $5, requeued_tx = $6
+			WHERE id = $1 AND unpaid_payout IS NOT NULL AND requeued_ledger IS NULL`,
+			int64(r.From), r.PayoutLeft.String(), r.FeeLeft.String(), ledger, at, hash)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() != 1 {
-			return inconsistent("stranded exit %d claimed twice", cl.ID)
+			return inconsistent("exit %d requeued while not stranded", r.From)
 		}
 	}
 	return nil

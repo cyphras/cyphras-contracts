@@ -51,16 +51,17 @@ func (d *Deposit) clone() *Deposit {
 }
 
 // Exit is a payment the vault owes: one waiting in the exit queue, or, among the stranded exits,
-// the parts a release could not pay. Payout and Fee are what is still owed, less any part
-// payment.
+// the parts a release could not pay. Payout and Fee are what is still owed under this ID.
 type Exit struct {
 	ID     uint64
 	Payout *big.Int
 	Fee    *big.Int
-	// QueuedPayout and QueuedFee are what the exit owed when it was queued; the difference to
-	// Payout and Fee has been paid.
+	// QueuedPayout and QueuedFee are what the exit owed when it was queued. What a release paid is
+	// that less what is still owed and what a claim moved to a new exit.
 	QueuedPayout *big.Int
 	QueuedFee    *big.Int
+	MovedPayout  *big.Int
+	MovedFee     *big.Int
 	Recipient    string
 	Relayer      string
 	QueuedAt     uint64
@@ -71,6 +72,10 @@ type Exit struct {
 	StrandedLedger uint32
 	StrandedAt     int64
 	StrandedTx     string
+	// RequeuedFrom is the stranded exit a claim moved this one from; RequeuedTo, on a stranded
+	// exit, the exits claims moved its parts to.
+	RequeuedFrom *uint64
+	RequeuedTo   []uint64
 }
 
 // Outflow is what the exit takes from a day's window.
@@ -93,7 +98,8 @@ type State struct {
 	ExitHead     uint64
 	ExitTail     uint64
 	Exits        map[uint64]*Exit
-	// Stranded holds the unpaid parts of released exits until claim pays them.
+	// Stranded holds the unpaid parts of released exits until claims move them back into the
+	// queue.
 	Stranded   map[uint64]*Exit
 	OutflowDay uint64
 	Outflow    *big.Int
@@ -120,12 +126,16 @@ func (e *Exit) clone() *Exit {
 	c := *e
 	c.Payout, c.Fee = new(big.Int).Set(e.Payout), new(big.Int).Set(e.Fee)
 	c.QueuedPayout, c.QueuedFee = new(big.Int).Set(e.QueuedPayout), new(big.Int).Set(e.QueuedFee)
+	c.MovedPayout, c.MovedFee = new(big.Int).Set(e.MovedPayout), new(big.Int).Set(e.MovedFee)
+	c.RequeuedTo = append([]uint64(nil), e.RequeuedTo...)
 	return &c
 }
 
-// Paid is what the exit has been paid so far.
+// Paid is what releases have paid under this ID.
 func (e Exit) Paid() (payout, fee *big.Int) {
-	return new(big.Int).Sub(e.QueuedPayout, e.Payout), new(big.Int).Sub(e.QueuedFee, e.Fee)
+	payout = new(big.Int).Sub(e.QueuedPayout, e.Payout)
+	fee = new(big.Int).Sub(e.QueuedFee, e.Fee)
+	return payout.Sub(payout, e.MovedPayout), fee.Sub(fee, e.MovedFee)
 }
 
 // Clone returns a deep copy, so a window can be applied and discarded on failure.
@@ -204,9 +214,9 @@ type Resolution struct {
 	LeafIndex1 uint64
 }
 
-// Settlement records one payment out of the vault: a transact paid at once, a queued exit paid by
-// release, what a release paid of an exit it stranded, or a claim. Only the stranded case has no
-// settled event of its own.
+// Settlement records one payment out of the vault: a transact paid at once, or a step of release
+// that completed, paid part of or stranded a queued exit. Only the last step that completes an
+// exit has a settled event of its own.
 type Settlement struct {
 	vault.Settled
 	Ledger   uint32
@@ -225,21 +235,23 @@ type Released struct {
 	PaidTx       string
 }
 
-// PartPaid is what an exit still owes after a part payment: by release of the exit at the head
-// of the queue, or by claim of a stranded exit.
+// PartPaid is what the exit at the head of the queue still owes after release paid part of it.
 type PartPaid struct {
 	ID         uint64
-	Stranded   bool
 	PayoutLeft *big.Int
 	FeeLeft    *big.Int
 }
 
-// Claimed is a stranded exit that claim paid.
-type Claimed struct {
-	ID       uint64
-	Ledger   uint32
-	ClosedAt int64
-	TxHash   string
+// Requeued is a claim that moved parts of the stranded exit From back into the queue as the exit
+// To. PayoutLeft and FeeLeft are what stays stranded.
+type Requeued struct {
+	From       uint64
+	To         uint64
+	PayoutLeft *big.Int
+	FeeLeft    *big.Int
+	Ledger     uint32
+	ClosedAt   int64
+	TxHash     string
 }
 
 // RootAt is the tree's root once it holds LeafCount leaves. The vault keeps the same roots in its
@@ -270,11 +282,11 @@ type Delta struct {
 	Queued      []Exit
 	PartPaid    []PartPaid
 	Released    []Released
-	Claimed     []Claimed
+	Requeued    []Requeued
 	Notices     []Notice
 	// exitOrder is the order the exit changes above happened in, which the store follows: one
-	// window can queue an exit, strand it and pay part of it by claim, each change building on
-	// the one before.
+	// window can queue an exit, strand it and move it back into the queue by claim, each change
+	// building on the one before.
 	exitOrder []exitChange
 }
 
@@ -284,7 +296,7 @@ const (
 	queuedChange exitChangeKind = iota
 	partPaidChange
 	releasedChange
-	claimedChange
+	requeuedChange
 )
 
 type exitChange struct {
@@ -307,9 +319,9 @@ func (d *Delta) released(r Released) {
 	d.Released = append(d.Released, r)
 }
 
-func (d *Delta) claimed(c Claimed) {
-	d.exitOrder = append(d.exitOrder, exitChange{claimedChange, len(d.Claimed)})
-	d.Claimed = append(d.Claimed, c)
+func (d *Delta) requeued(r Requeued) {
+	d.exitOrder = append(d.exitOrder, exitChange{requeuedChange, len(d.Requeued)})
+	d.Requeued = append(d.Requeued, r)
 }
 
 // Apply applies the transactions in chain order and returns what changed. On error the state is
@@ -361,15 +373,11 @@ func (s *State) apply(tx vault.Tx, call any, d *Delta, spent map[fr.Element]bool
 	case vault.Transact:
 		return s.transact(tx, c, d, spent)
 	case vault.ExitSettled:
-		if _, ok := s.Stranded[*c.Settled.ExitID]; ok {
-			return s.claim(tx, c.Settled, d)
-		}
 		return s.release(tx, c.Settled, d)
 	case vault.ExitPaid:
-		if _, ok := s.Stranded[c.ID]; ok {
-			return s.claimPart(tx, c, d)
-		}
 		return s.payPart(tx, c, d)
+	case vault.ExitRequeued:
+		return s.requeue(tx, c, d)
 	case vault.ExitStranded:
 		return s.strand(tx, c, d)
 	case vault.Admission:
@@ -523,7 +531,8 @@ func (s *State) transact(tx vault.Tx, c vault.Transact, d *Delta, spent map[fr.E
 		}
 		e := &Exit{
 			ID: q.ID, Payout: new(big.Int).Neg(q.ExtAmount), Fee: new(big.Int).Set(q.Fee), QueuedPayout: new(big.Int).Neg(q.ExtAmount),
-			QueuedFee: new(big.Int).Set(q.Fee), Recipient: q.Recipient, Relayer: q.Relayer, QueuedAt: now, Ledger: tx.Ledger, TxHash: tx.Hash,
+			QueuedFee: new(big.Int).Set(q.Fee), MovedPayout: new(big.Int), MovedFee: new(big.Int), Recipient: q.Recipient,
+			Relayer: q.Relayer, QueuedAt: now, Ledger: tx.Ledger, TxHash: tx.Hash,
 		}
 		s.Exits[q.ID] = e
 		s.ExitTail++
@@ -604,37 +613,6 @@ func (s *State) payPart(tx vault.Tx, c vault.ExitPaid, d *Delta) error {
 	return nil
 }
 
-// claimPart pays one part of a stranded exit, as claim does when the other part does not fit
-// today's window or the asset contract refuses it. Each part is paid whole or not at all.
-func (s *State) claimPart(tx vault.Tx, c vault.ExitPaid, d *Delta) error {
-	now := uint64(tx.ClosedAt)
-	if s.halted(now) {
-		return inconsistent("a claim while halted")
-	}
-	e := s.Stranded[c.ID]
-	whole := func(paid, owed *big.Int) bool { return paid.Sign() == 0 || paid.Cmp(owed) == 0 }
-	if !whole(c.PayoutPaid, e.Payout) || !whole(c.FeePaid, e.Fee) ||
-		new(big.Int).Add(c.PayoutPaid, c.PayoutLeft).Cmp(e.Payout) != 0 || new(big.Int).Add(c.FeePaid, c.FeeLeft).Cmp(e.Fee) != 0 {
-		return inconsistent("stranded exit %d part claimed differently from what it owes", c.ID)
-	}
-	paid := new(big.Int).Add(c.PayoutPaid, c.FeePaid)
-	if !s.fits(now, paid) {
-		return inconsistent("stranded exit %d claimed beyond today's window", c.ID)
-	}
-	e.Payout, e.Fee = new(big.Int).Set(c.PayoutLeft), new(big.Int).Set(c.FeeLeft)
-	s.QueuedTotal.Sub(s.QueuedTotal, paid)
-	s.pay(now, paid)
-	if s.Tvl.Sign() < 0 || s.QueuedTotal.Sign() < 0 {
-		return inconsistent("stranded exit %d pays more than the vault holds", c.ID)
-	}
-	id := c.ID
-	part := vault.Settled{ExtAmount: new(big.Int).Neg(c.PayoutPaid), Fee: new(big.Int).Set(c.FeePaid), Recipient: e.Recipient, Relayer: e.Relayer, ExitID: &id}
-	d.partPaid(PartPaid{ID: c.ID, Stranded: true, PayoutLeft: e.Payout, FeeLeft: e.Fee})
-	d.Settlements = append(d.Settlements, Settlement{Settled: part, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
-	s.notice(tx, "exit_paid", c, d)
-	return nil
-}
-
 // strand releases the exit at the head of the queue with the parts the asset contract refused
 // left owed.
 func (s *State) strand(tx vault.Tx, c vault.ExitStranded, d *Delta) error {
@@ -688,30 +666,42 @@ func (s *State) takeOff(now uint64, id uint64, paid *big.Int) error {
 	return nil
 }
 
-// claim pays what a stranded exit still owes and completes it.
-func (s *State) claim(tx vault.Tx, settled vault.Settled, d *Delta) error {
+// requeue moves the parts of a stranded exit whose parties can receive again back into the queue,
+// at its tail, as a new exit. Each part moves whole, and the value stays owed, so neither the
+// totals nor the window change.
+func (s *State) requeue(tx vault.Tx, c vault.ExitRequeued, d *Delta) error {
 	now := uint64(tx.ClosedAt)
 	if s.halted(now) {
 		return inconsistent("a claim while halted")
 	}
-	id := *settled.ExitID
-	e := s.Stranded[id]
-	if new(big.Int).Neg(settled.ExtAmount).Cmp(e.Payout) != 0 || settled.Fee.Cmp(e.Fee) != 0 || settled.Recipient != e.Recipient || settled.Relayer != e.Relayer {
-		return inconsistent("stranded exit %d claimed differently from what it owes", id)
+	e, ok := s.Stranded[c.ID]
+	if !ok {
+		return inconsistent("exit %d requeued while not stranded", c.ID)
 	}
-	outflow := e.Outflow()
-	if !s.fits(now, outflow) {
-		return inconsistent("stranded exit %d claimed beyond today's window", id)
+	whole := func(moved, owed *big.Int) bool { return moved.Sign() == 0 || moved.Cmp(owed) == 0 }
+	if !whole(c.Payout, e.Payout) || !whole(c.Fee, e.Fee) {
+		return inconsistent("stranded exit %d requeued with parts it does not owe", c.ID)
 	}
-	delete(s.Stranded, id)
-	s.QueuedTotal.Sub(s.QueuedTotal, outflow)
-	s.pay(now, outflow)
-	if s.Tvl.Sign() < 0 || s.QueuedTotal.Sign() < 0 {
-		return inconsistent("stranded exit %d pays more than the vault holds", id)
+	if c.NewID != s.ExitTail {
+		return inconsistent("stranded exit %d requeued as %d where %d was next", c.ID, c.NewID, s.ExitTail)
 	}
-	d.claimed(Claimed{ID: id, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
-	d.Settlements = append(d.Settlements, Settlement{Settled: settled, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
-	s.notice(tx, "exit_claimed", settled, d)
+	from := c.ID
+	moved := &Exit{
+		ID: c.NewID, Payout: new(big.Int).Set(c.Payout), Fee: new(big.Int).Set(c.Fee), QueuedPayout: new(big.Int).Set(c.Payout),
+		QueuedFee: new(big.Int).Set(c.Fee), MovedPayout: new(big.Int), MovedFee: new(big.Int), Recipient: e.Recipient,
+		Relayer: e.Relayer, QueuedAt: now, Ledger: tx.Ledger, TxHash: tx.Hash, RequeuedFrom: &from,
+	}
+	s.Exits[c.NewID] = moved
+	s.ExitTail++
+	e.Payout, e.Fee = new(big.Int).Sub(e.Payout, c.Payout), new(big.Int).Sub(e.Fee, c.Fee)
+	e.MovedPayout, e.MovedFee = new(big.Int).Add(e.MovedPayout, c.Payout), new(big.Int).Add(e.MovedFee, c.Fee)
+	e.RequeuedTo = append(e.RequeuedTo, c.NewID)
+	if e.Payout.Sign() == 0 && e.Fee.Sign() == 0 {
+		delete(s.Stranded, c.ID)
+	}
+	d.queued(*moved)
+	d.requeued(Requeued{From: c.ID, To: c.NewID, PayoutLeft: e.Payout, FeeLeft: e.Fee, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
+	s.notice(tx, "exit_requeued", c, d)
 	return nil
 }
 

@@ -162,7 +162,7 @@ func newHarness(t *testing.T) *harness {
 	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, Validity: time.Minute, Poll: time.Millisecond, Now: func() time.Time { return h.now }}
 	alerts := &alert.Alerter{Service: "keeper", Channels: []alert.Channel{h}, Cooldown: time.Hour, Now: func() time.Time { return h.now }}
 	k, err := New(context.Background(), Config{
-		Vault: vaulttest.Vault, DeployLedger: 10, MaxAdmissions: 17, MaxExtensions: 50, MaxReleases: 10, RefundDelay: 24 * time.Hour,
+		Vault: vaulttest.Vault, DeployLedger: 10, Asset: "native", MaxAdmissions: 17, MaxExtensions: 50, MaxReleases: 10, RefundDelay: 24 * time.Hour,
 		HoldReasons: map[uint32]bool{99: true}, BalanceFloor: 1_000_000_000,
 	}, h.fake, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(kp.Address(), kp), alerts, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -469,39 +469,72 @@ func TestReleasePaysWhatFitsTheWindowAndWaitsForMidnight(t *testing.T) {
 	}
 }
 
-func TestStrandedExitsAreClaimedWhenTheyCanBePaid(t *testing.T) {
+func TestStrandedExitsAreClaimedOnceAPartyCanReceive(t *testing.T) {
 	h := newHarness(t)
-	h.limit = 1000
 	h.chain.Shield(vaulttest.Depositor, 5000)
 	h.chain.Attest(1)
 	h.chain.Admit(1)
 	first := h.chain.QueueExit(1, -400, 0, vaulttest.Depositor)
-	second := h.chain.QueueExit(2, -300, 0, vaulttest.Depositor)
+	second := h.chain.QueueExit(2, -300, 0, vaulttest.Relayer)
 	h.chain.NextLedger(5)
 	h.chain.Strand(first, 400, 0)
 	h.chain.Strand(second, 300, 0)
 	h.chain.NextLedger(5)
 	h.status.ExitHead, h.status.ExitTail = 3, 3
-	h.status.OutflowDay, h.status.Outflow = uint64(h.now.Unix())/secondsPerDay, big.NewInt(500)
 	for id, payout := range map[uint64]int64{1: 400, 2: 300} {
 		h.fake.SetContractData(mustKey(vault.StrandedKey(vaulttest.Vault, id)), vaulttest.ExitEntry(vaulttest.Depositor, payout, 0, 1), h.chain.Ledger, h.live(500_000))
 	}
 	h.sync()
-	// Exit 1 cannot be paid yet; exit 2 can, and fits the 500 left.
-	h.simFail = func(d string) bool { return d == "claim 1" }
-	if err := h.k.Claim(context.Background()); err != nil {
+	tries := 0
+	h.simFail = func(d string) bool {
+		if d == "claim 1" {
+			tries++
+			return true
+		}
+		return false
+	}
+	// The depositor cannot receive yet, the relayer can.
+	if err := h.k.Claims(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.take(); !equal(got, []string{"claim 2"}) {
-		t.Fatalf("claims %v", got)
-	}
-	if len(h.pages) != 0 {
-		t.Fatalf("a claim that cannot pay yet paged: %+v", h.pages)
+	if got := h.take(); !equal(got, []string{"claim 2"}) || tries != 1 || len(h.pages) != 0 {
+		t.Fatalf("claims %v after %d tries, pages %+v", got, tries, h.pages)
 	}
 	// Both stranded entries are kept alive by the TTL cycle.
 	exits, err := h.k.exitEntries()
 	if err != nil || len(exits) != 2 || exits[0].name != "stranded exit 1" {
 		t.Fatalf("exit entries %+v, %v", exits, err)
+	}
+	h.chain.NextLedger(5)
+	h.chain.Requeue(second, 3, 300, 0)
+	h.chain.NextLedger(5)
+	h.status.ExitTail = 4
+	h.sync()
+	// Nothing the depositor holds has changed, so exit 1 waits for the hourly retry.
+	if err := h.k.Claims(context.Background()); err != nil || tries != 1 || len(h.take()) != 0 {
+		t.Fatalf("tried again unchanged: %d tries, %v", tries, err)
+	}
+	h.now = h.now.Add(time.Hour)
+	if err := h.k.Claims(context.Background()); err != nil || tries != 2 {
+		t.Fatalf("not tried after an hour: %d tries, %v", tries, err)
+	}
+	// The depositor's account changes, and the claim goes through at once.
+	h.simFail = nil
+	key := mustKey(vault.AccountKey(vaulttest.Depositor))
+	h.fake.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{AccountId: key.MustAccount().AccountId, SeqNum: 1, Balance: 10_000_000}}, h.chain.Ledger, nil)
+	if err := h.k.Claims(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.take(); !equal(got, []string{"claim 1"}) {
+		t.Fatalf("claims %v", got)
+	}
+	// Nothing is claimed while the vault is halted.
+	h.now = h.now.Add(2 * time.Hour)
+	h.status.HaltedUntil = uint64(h.now.Add(time.Hour).Unix())
+	h.sync()
+	before := h.fake.CallCount("simulateTransaction")
+	if err := h.k.Claims(context.Background()); err != nil || h.fake.CallCount("simulateTransaction") != before {
+		t.Fatalf("claimed while halted: %v", err)
 	}
 }
 
@@ -532,48 +565,5 @@ func TestBumpTTLIsSplitToFitATransaction(t *testing.T) {
 	}
 	if len(bumps) != 2 || strings.Count(bumps[0], ",") != 59 || strings.Count(bumps[1], ",") != 9 {
 		t.Fatalf("bump calls %v", bumps)
-	}
-}
-
-func TestStrandedExitsAreClaimedBeforeTheDaysReleases(t *testing.T) {
-	h := newHarness(t)
-	h.limit = 1000
-	h.chain.Shield(vaulttest.Depositor, 5000)
-	h.chain.Attest(1)
-	h.chain.Admit(1)
-	first := h.chain.QueueExit(1, -400, 0, vaulttest.Depositor)
-	h.chain.NextLedger(5)
-	h.chain.Strand(first, 400, 0)
-	h.chain.NextLedger(5)
-	h.status.ExitHead, h.status.ExitTail = 2, 2
-	h.queueExits(700)
-	h.fake.SetContractData(mustKey(vault.StrandedKey(vaulttest.Vault, 1)), vaulttest.ExitEntry(vaulttest.Depositor, 400, 0, 1), h.chain.Ledger, h.live(500_000))
-	h.partial = true
-	h.sentHook = func(d string) {
-		var n uint64
-		if _, err := fmt.Sscanf(d, "release %d", &n); err == nil {
-			h.release(n)
-		}
-		if d == "claim 1" {
-			h.status.OutflowDay = uint64(h.now.Unix()) / secondsPerDay
-			h.status.Outflow = big.NewInt(400)
-			h.setInstance()
-		}
-	}
-	h.sync()
-	if err := h.k.Exits(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := h.take(); !equal(got, []string{"claim 1", "release 1"}) {
-		t.Fatalf("first run of the day %v", got)
-	}
-	// Later runs the same day only release.
-	if err := h.k.Exits(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	for _, c := range h.take() {
-		if strings.HasPrefix(c, "claim") {
-			t.Fatalf("claimed again the same day: %s", c)
-		}
 	}
 }

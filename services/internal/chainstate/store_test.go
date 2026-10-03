@@ -157,7 +157,9 @@ func TestQueuedExitsReload(t *testing.T) {
 		t.Fatalf("stranded exits reloaded as %+v", got.Stranded)
 	}
 	next = got.Clone()
-	d, err = next.Apply([]vault.Tx{{Ledger: 13, ClosedAt: 1_728_000_015, Hash: "d", Calls: []any{release(2, -100, 0)}}})
+	d, err = next.Apply([]vault.Tx{{Ledger: 13, ClosedAt: 1_728_000_015, Hash: "d", Calls: []any{
+		vault.ExitRequeued{ID: 2, NewID: 3, Payout: big.NewInt(100), Fee: new(big.Int)},
+	}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,13 +167,13 @@ func TestQueuedExitsReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _, err = st.Load(ctx, testVault, 10)
-	if err != nil || len(got.Stranded) != 0 || got.QueuedTotal.Sign() != 0 {
-		t.Fatalf("after the claim: %+v, %v", got.Stranded, err)
+	if err != nil || len(got.Stranded) != 0 || got.QueuedTotal.Int64() != 100 || got.Exits[3] == nil || *got.Exits[3].RequeuedFrom != 2 || got.ExitTail != 4 {
+		t.Fatalf("after the claim: %+v %+v, %v", got.Stranded, got.Exits, err)
 	}
-	var claims int
-	_ = st.Pool.QueryRow(ctx, `SELECT count(*) FROM settlements WHERE exit_id = 2`).Scan(&claims)
-	if claims != 1 {
-		t.Fatalf("%d settlements of exit 2", claims)
+	var requeuedAt int64
+	_ = st.Pool.QueryRow(ctx, `SELECT requeued_at FROM exits WHERE id = 2`).Scan(&requeuedAt)
+	if requeuedAt != 1_728_000_015 {
+		t.Fatalf("requeue time %d", requeuedAt)
 	}
 }
 
@@ -232,20 +234,25 @@ func TestOneWindowCanQueueStrandAndPartClaimAnExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Queued, stranded with both parts refused, then the fee paid by a claim: all in one window.
+	// Queued, stranded with both parts refused, then the fee moved back by a claim, and that new
+	// exit paid in part: all in one window.
 	d, err := s.Apply([]vault.Tx{
 		{Ledger: 10, ClosedAt: 1_728_000_000, Hash: "a", Calls: []any{shield(1, 1, 1000), vault.Attested{UpTo: 1}, admission(1, 0), queued(10, 2, 1, -300, 5)}},
 		{Ledger: 11, ClosedAt: 1_728_000_005, Hash: "b", Calls: []any{vault.ExitStranded{ID: 1, Payout: big.NewInt(300), Fee: big.NewInt(5)}}},
-		{Ledger: 12, ClosedAt: 1_728_000_010, Hash: "c", Calls: []any{vault.ExitPaid{ID: 1, PayoutPaid: new(big.Int), FeePaid: big.NewInt(5), PayoutLeft: big.NewInt(300), FeeLeft: new(big.Int)}}},
+		{Ledger: 12, ClosedAt: 1_728_000_010, Hash: "c", Calls: []any{vault.ExitRequeued{ID: 1, NewID: 2, Payout: new(big.Int), Fee: big.NewInt(5)}}},
+		{Ledger: 13, ClosedAt: 1_728_000_015, Hash: "e", Calls: []any{vault.ExitPaid{ID: 2, PayoutPaid: new(big.Int), FeePaid: big.NewInt(2), PayoutLeft: new(big.Int), FeeLeft: big.NewInt(3)}}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Commit(ctx, 10, 12, s, d, nil); err != nil {
-		t.Fatalf("a window that strands and part claims an exit: %v", err)
+	if err := st.Commit(ctx, 10, 13, s, d, nil); err != nil {
+		t.Fatalf("a window that strands and requeues an exit: %v", err)
 	}
 	got, _, err := st.Load(ctx, testVault, 10)
-	if err != nil || got.Stranded[1] == nil || got.Stranded[1].Payout.Int64() != 300 || got.Stranded[1].Fee.Sign() != 0 || got.QueuedTotal.Int64() != 300 {
+	if err != nil || got.Stranded[1] == nil || got.Stranded[1].Payout.Int64() != 300 || got.Stranded[1].Fee.Sign() != 0 || got.Stranded[1].MovedFee.Int64() != 5 {
 		t.Fatalf("reloaded as %+v, %v", got.Stranded, err)
+	}
+	if e := got.Exits[2]; e == nil || *e.RequeuedFrom != 1 || e.Fee.Int64() != 3 || e.QueuedFee.Int64() != 5 || len(got.Stranded[1].RequeuedTo) != 1 {
+		t.Fatalf("requeued exit reloaded as %+v", e)
 	}
 }

@@ -215,37 +215,49 @@ func (s store) stats(ctx context.Context, upTo uint32) (Stats, error) {
 	return Stats{AdmittedDeposits: uint64(admitted), DistinctDepositors: uint64(distinct), PendingDeposits: uint64(pending)}, nil
 }
 
-// settledExits lists the exits paid in full since a time, up to a ledger: by release, which may
-// have paid parts before, or by claim after a release stranded them.
-func (s store) settledExits(ctx context.Context, since int64, upTo uint32) ([]Exit, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, payout::text, fee::text, recipient, relayer, queued_at, ledger, tx_hash,
-		released_ledger, released_at, released_tx, unpaid_payout IS NOT NULL, claimed_ledger, claimed_at, claimed_tx
-		FROM exits
-		WHERE (unpaid_payout IS NULL AND released_ledger <= $2 AND released_at >= $1)
-		   OR (claimed_ledger <= $2 AND claimed_at >= $1)
-		ORDER BY id`, since, int64(upTo))
+// resolvedExits lists the exits resolved since a time, up to a ledger: those a release paid in
+// full, which may have paid parts before, and those a release stranded whose unpaid parts claims
+// have all moved back into the queue.
+func (s store) resolvedExits(ctx context.Context, since int64, upTo uint32) ([]Exit, error) {
+	rows, err := s.pool.Query(ctx, `SELECT e.id, e.payout::text, e.fee::text, (e.payout - m.payout)::text, (e.fee - m.fee)::text,
+		m.payout::text, m.fee::text, m.ids, e.recipient, e.relayer, e.queued_at, e.ledger, e.tx_hash, e.requeued_from,
+		e.released_ledger, e.released_at, e.released_tx, e.requeued_ledger, e.requeued_at, e.requeued_tx
+		FROM exits e, LATERAL (SELECT coalesce(sum(c.payout), 0) AS payout, coalesce(sum(c.fee), 0) AS fee,
+			coalesce(array_agg(c.id ORDER BY c.id), '{}') AS ids FROM exits c WHERE c.requeued_from = e.id) m
+		WHERE (e.unpaid_payout IS NULL AND e.released_ledger <= $2 AND e.released_at >= $1)
+		   OR (e.requeued_ledger <= $2 AND e.requeued_at >= $1)
+		ORDER BY e.id`, since, int64(upTo))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Exit
 	for rows.Next() {
-		e := Exit{State: ExitSettled, PayoutLeft: "0", FeeLeft: "0"}
+		e := Exit{PayoutLeft: "0", FeeLeft: "0"}
 		var id, queuedAt, ledger, releasedLedger, releasedAt int64
 		var releasedTx string
-		var stranded bool
-		var claimedLedger, claimedAt *int64
-		var claimedTx *string
-		if err := rows.Scan(&id, &e.Payout, &e.Fee, &e.Recipient, &e.Relayer, &queuedAt, &ledger, &e.TxHash,
-			&releasedLedger, &releasedAt, &releasedTx, &stranded, &claimedLedger, &claimedAt, &claimedTx); err != nil {
+		var from, requeuedLedger, requeuedAt *int64
+		var requeuedTx *string
+		var to []int64
+		if err := rows.Scan(&id, &e.Payout, &e.Fee, &e.PayoutPaid, &e.FeePaid, &e.PayoutRequeued, &e.FeeRequeued, &to,
+			&e.Recipient, &e.Relayer, &queuedAt, &ledger, &e.TxHash, &from,
+			&releasedLedger, &releasedAt, &releasedTx, &requeuedLedger, &requeuedAt, &requeuedTx); err != nil {
 			return nil, err
 		}
 		e.ID, e.QueuedAt, e.QueuedLedger = uint64(id), uint64(queuedAt), uint32(ledger)
-		e.PayoutPaid, e.FeePaid = e.Payout, e.Fee
-		e.SettledLedger, e.SettledAt, e.SettledTx = ptr(uint32(releasedLedger)), ptr(uint64(releasedAt)), ptr(releasedTx)
-		if stranded {
-			e.StrandedLedger, e.StrandedAt, e.StrandedTx = e.SettledLedger, e.SettledAt, e.SettledTx
-			e.SettledLedger, e.SettledAt, e.SettledTx = ptr(uint32(*claimedLedger)), ptr(uint64(*claimedAt)), claimedTx
+		if from != nil {
+			e.RequeuedFrom = ptr(uint64(*from))
+		}
+		for _, t := range to {
+			e.RequeuedTo = append(e.RequeuedTo, uint64(t))
+		}
+		if requeuedLedger == nil {
+			e.State = ExitSettled
+			e.SettledLedger, e.SettledAt, e.SettledTx = ptr(uint32(releasedLedger)), ptr(uint64(releasedAt)), ptr(releasedTx)
+		} else {
+			e.State = ExitRequeued
+			e.StrandedLedger, e.StrandedAt, e.StrandedTx = ptr(uint32(releasedLedger)), ptr(uint64(releasedAt)), ptr(releasedTx)
+			e.RequeuedLedger, e.RequeuedAt, e.RequeuedTx = ptr(uint32(*requeuedLedger)), ptr(uint64(*requeuedAt)), requeuedTx
 		}
 		out = append(out, e)
 	}

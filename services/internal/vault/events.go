@@ -106,8 +106,7 @@ type NewNullifier struct {
 }
 
 // Settled is emitted by transact when it pays at once. With the exit's ID it is emitted by release
-// for the step that completes a queued exit, and by claim for the step that completes a stranded
-// one; it then carries only what that step paid.
+// for the step that completes a queued exit; it then carries only what that step paid.
 type Settled struct {
 	ExtAmount *big.Int
 	Fee       *big.Int
@@ -125,9 +124,8 @@ type ExitQueued struct {
 	Relayer   string
 }
 
-// ExitPaid is emitted for a part payment of an exit: by release for the exit at the head of the
-// queue when the day's window cannot pay all it owes, the rest staying at the head, and by claim
-// for the parts of a stranded exit it could pay, the rest staying stranded.
+// ExitPaid is emitted by release for a part payment of the exit at the head of the queue, when the
+// day's window cannot pay all it owes; the rest stays at the head.
 type ExitPaid struct {
 	ID         uint64
 	PayoutPaid *big.Int
@@ -137,9 +135,18 @@ type ExitPaid struct {
 }
 
 // ExitStranded is emitted by release for a queued exit with a part the asset contract refused.
-// Payout and Fee are what it still owes, which claim pays.
+// Payout and Fee are what it still owes, which claim moves back into the queue.
 type ExitStranded struct {
 	ID     uint64
+	Payout *big.Int
+	Fee    *big.Int
+}
+
+// ExitRequeued is emitted by claim for the parts of the stranded exit ID whose parties can receive
+// again, moved back into the queue, at its tail, as the exit NewID.
+type ExitRequeued struct {
+	ID     uint64
+	NewID  uint64
 	Payout *big.Int
 	Fee    *big.Int
 }
@@ -356,6 +363,17 @@ var decoders = map[string]func(xdr.ScVal) (any, error){
 			return nil, malformed("exit part payment that pays nothing or leaves nothing")
 		}
 		return e, nil
+	},
+	"exit_requeued": func(v xdr.ScVal) (any, error) {
+		d := newDecoder(v, []string{"id", "new_id", "payout", "fee"})
+		if d.err != nil {
+			return nil, d.err
+		}
+		e := ExitRequeued{ID: d.u64("id"), NewID: d.u64("new_id"), Payout: d.i128("payout"), Fee: d.i128("fee")}
+		if d.err == nil && (e.Payout.Sign() < 0 || e.Fee.Sign() < 0 || e.Payout.Sign()+e.Fee.Sign() == 0 || e.NewID <= e.ID) {
+			return nil, malformed("requeued exit %d as %d with payout %v and fee %v", e.ID, e.NewID, e.Payout, e.Fee)
+		}
+		return e, d.err
 	},
 	"exit_stranded": func(v xdr.ScVal) (any, error) {
 		d := newDecoder(v, []string{"id", "payout", "fee"})

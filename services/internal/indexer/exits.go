@@ -17,36 +17,46 @@ const (
 	ExitQueued     = "queued"
 	ExitPaidInPart = "paid_in_part"
 	ExitStranded   = "stranded"
+	ExitRequeued   = "requeued"
 	ExitSettled    = "settled"
 )
 
 // Exit is one exit of the vault's exit queue as the API shows it. Payout and Fee are what it owed
-// when transact queued it; the paid and left amounts split that into what reached the recipient
-// and relayer so far and what the vault still owes. Position and PaidBy are set while the exit is
-// in the queue, the stranded fields once a release stranded it, and the settled fields once it was
-// paid in full.
+// when it was queued; the paid, requeued and left amounts split that into what reached the
+// recipient and relayer so far, what claims moved back into the queue as the exits RequeuedTo, and
+// what the vault still owes under this ID. Position and PaidBy are set while the exit is in the
+// queue, RequeuedFrom when a claim queued it from a stranded exit, the stranded fields once a
+// release stranded it, the requeued fields once claims moved all it still owed, and the settled
+// fields once it was paid in full.
 type Exit struct {
-	ID             uint64  `json:"id"`
-	State          string  `json:"state"`
-	Position       *uint64 `json:"position,omitempty"`
-	Payout         string  `json:"payout"`
-	Fee            string  `json:"fee"`
-	PayoutPaid     string  `json:"payout_paid"`
-	FeePaid        string  `json:"fee_paid"`
-	PayoutLeft     string  `json:"payout_left"`
-	FeeLeft        string  `json:"fee_left"`
-	Recipient      string  `json:"recipient"`
-	Relayer        string  `json:"relayer"`
-	QueuedAt       uint64  `json:"queued_at"`
-	QueuedLedger   uint32  `json:"queued_ledger"`
-	TxHash         string  `json:"tx_hash"`
-	PaidBy         *uint64 `json:"paid_by,omitempty"`
-	StrandedLedger *uint32 `json:"stranded_ledger,omitempty"`
-	StrandedAt     *uint64 `json:"stranded_at,omitempty"`
-	StrandedTx     *string `json:"stranded_tx,omitempty"`
-	SettledLedger  *uint32 `json:"settled_ledger,omitempty"`
-	SettledAt      *uint64 `json:"settled_at,omitempty"`
-	SettledTx      *string `json:"settled_tx,omitempty"`
+	ID             uint64   `json:"id"`
+	State          string   `json:"state"`
+	Position       *uint64  `json:"position,omitempty"`
+	Payout         string   `json:"payout"`
+	Fee            string   `json:"fee"`
+	PayoutPaid     string   `json:"payout_paid"`
+	FeePaid        string   `json:"fee_paid"`
+	PayoutRequeued string   `json:"payout_requeued"`
+	FeeRequeued    string   `json:"fee_requeued"`
+	PayoutLeft     string   `json:"payout_left"`
+	FeeLeft        string   `json:"fee_left"`
+	Recipient      string   `json:"recipient"`
+	Relayer        string   `json:"relayer"`
+	QueuedAt       uint64   `json:"queued_at"`
+	QueuedLedger   uint32   `json:"queued_ledger"`
+	TxHash         string   `json:"tx_hash"`
+	RequeuedFrom   *uint64  `json:"requeued_from,omitempty"`
+	PaidBy         *uint64  `json:"paid_by,omitempty"`
+	StrandedLedger *uint32  `json:"stranded_ledger,omitempty"`
+	StrandedAt     *uint64  `json:"stranded_at,omitempty"`
+	StrandedTx     *string  `json:"stranded_tx,omitempty"`
+	RequeuedTo     []uint64 `json:"requeued_to,omitempty"`
+	RequeuedLedger *uint32  `json:"requeued_ledger,omitempty"`
+	RequeuedAt     *uint64  `json:"requeued_at,omitempty"`
+	RequeuedTx     *string  `json:"requeued_tx,omitempty"`
+	SettledLedger  *uint32  `json:"settled_ledger,omitempty"`
+	SettledAt      *uint64  `json:"settled_at,omitempty"`
+	SettledTx      *string  `json:"settled_tx,omitempty"`
 }
 
 // Window is the day's outflow window: what it has paid and when it resets.
@@ -60,18 +70,24 @@ func ptr[T any](v T) *T { return &v }
 
 func fromState(e *chainstate.Exit, state string) Exit {
 	payoutPaid, feePaid := e.Paid()
-	return Exit{
+	x := Exit{
 		ID: e.ID, State: state, Payout: e.QueuedPayout.String(), Fee: e.QueuedFee.String(),
-		PayoutPaid: payoutPaid.String(), FeePaid: feePaid.String(), PayoutLeft: e.Payout.String(), FeeLeft: e.Fee.String(),
+		PayoutPaid: payoutPaid.String(), FeePaid: feePaid.String(), PayoutRequeued: e.MovedPayout.String(), FeeRequeued: e.MovedFee.String(),
+		PayoutLeft: e.Payout.String(), FeeLeft: e.Fee.String(),
 		Recipient: e.Recipient, Relayer: e.Relayer, QueuedAt: e.QueuedAt, QueuedLedger: e.Ledger, TxHash: e.TxHash,
+		RequeuedTo: slices.Clone(e.RequeuedTo),
 	}
+	if e.RequeuedFrom != nil {
+		x.RequeuedFrom = ptr(*e.RequeuedFrom)
+	}
+	return x
 }
 
 // paidBy gives each queued exit, in queue order, the end of the UTC day by which it is paid in full
 // at the latest: from the day of max(now, haltedUntil), ceil((V + x) / M) more days, with V what
-// the exits ahead still owe, x what it still owes and M max_daily_outflow. Releases use every
-// window in full, so only claims of stranded exits, which the keeper pays first at each midnight,
-// or a new halt can make it later.
+// the exits ahead still owe, x what it still owes and M max_daily_outflow. The keeper releases
+// every window in full and a claim queues behind it, so only a new halt, or a vault that cannot
+// pay, makes it later.
 func paidBy(owed []*big.Int, now, haltedUntil uint64, maxDaily *big.Int) []*uint64 {
 	out := make([]*uint64, len(owed))
 	if maxDaily.Sign() <= 0 {
@@ -87,9 +103,9 @@ func paidBy(owed []*big.Int, now, haltedUntil uint64, maxDaily *big.Int) []*uint
 	return out
 }
 
-// exits serves the whole exit queue, every stranded exit and the exits settled in the last week,
-// so a client finds its own exit by the ID or the transaction hash its transaction gave it,
-// without asking for it.
+// exits serves the whole exit queue, every stranded exit and the exits resolved in the last week,
+// so a client finds its own exit by the ID or the transaction hash its transaction gave it, and
+// follows it across claims by requeued_to, without asking for it.
 func (ix *Indexer) exits(w http.ResponseWriter, r *http.Request) {
 	if _, ok := ix.serving(w); !ok {
 		return
@@ -135,12 +151,12 @@ func (ix *Indexer) exits(w http.ResponseWriter, r *http.Request) {
 	for i, at := range paidBy(owed, now, haltedUntil, maxDaily) {
 		list[i].PaidBy = at
 	}
-	settled, err := ix.db.settledExits(r.Context(), ix.now().Add(-resolvedWindow).Unix(), upTo)
+	resolved, err := ix.db.resolvedExits(r.Context(), ix.now().Add(-resolvedWindow).Unix(), upTo)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
-	list = append(list, settled...)
+	list = append(list, resolved...)
 	slices.SortFunc(list[queued:], func(a, b Exit) int { return cmp.Compare(a.ID, b.ID) })
 	if list == nil {
 		list = []Exit{}

@@ -7,6 +7,7 @@ import (
 	"maps"
 	"math/big"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/txnbuild"
@@ -124,51 +125,119 @@ func handledAny(ret *xdr.ScVal) bool {
 	return !ok || n > 0
 }
 
-// Exits pays the exit queue. At the first run of each UTC day it claims stranded exits before
-// anything else: a stranded part is paid only whole, so it fits only before releases fill the
-// new window, and an exit whose parties can receive again should not wait behind the queue. Then,
-// on every run, it releases queued exits while the window has room, which during the day happens
-// only after the limits are raised.
-func (k *Keeper) Exits(ctx context.Context) error {
-	now, _, err := k.chainTime(ctx)
+// claimRetry is how often a stranded exit is tried again although nothing its parties hold has
+// changed: whether a contract may hold the asset also depends on the issuer's flags.
+const claimRetry = time.Hour
+
+// claimTry is the keeper's last claim of a stranded exit: the parties' entries it saw, and when.
+type claimTry struct {
+	seen string
+	at   time.Time
+}
+
+// Claims moves stranded exits back into the exit queue once their recipient or relayer can
+// receive again. It simulates claim for a stranded exit when an entry that decides whether a party
+// it still owes can receive has changed since the last try, and at least every claimRetry, and
+// sends the claims that would move a part; one that would move nothing fails in simulation and is
+// not sent. A requeued exit waits behind every exit queued before it, so claims never compete
+// with the queue for the window.
+func (k *Keeper) Claims(ctx context.Context) error {
+	inst, _, _, err := rpc.VaultInstance(ctx, k.rpc, k.cfg.Vault)
 	if err != nil {
 		return err
 	}
-	day := now / secondsPerDay
-	k.mu.RLock()
-	claimed := k.claimedDay
-	k.mu.RUnlock()
-	if day != claimed {
-		if err := k.Claim(ctx); err != nil {
-			return err
-		}
-		k.mu.Lock()
-		k.claimedDay = day
-		k.mu.Unlock()
+	now, _, err := k.chainTime(ctx)
+	if err != nil || inst.Status.Halted(now) {
+		return err
 	}
-	return k.Release(ctx)
-}
-
-// Claim pays stranded exits whose recipient or relayer can receive again, oldest first, while
-// today's window has room. A claim pays each part that fits on its own; one that would pay
-// nothing fails in simulation and costs nothing.
-func (k *Keeper) Claim(ctx context.Context) error {
 	k.mu.RLock()
 	ids := slices.Sorted(maps.Keys(k.state.Stranded))
-	k.mu.RUnlock()
+	parties := make(map[uint64][]string, len(ids))
 	for _, id := range ids {
-		_, room, open, err := k.window(ctx)
-		if err != nil || !open || room.Sign() <= 0 {
-			return err
+		e := k.state.Stranded[id]
+		if e.Payout.Sign() > 0 {
+			parties[id] = append(parties[id], e.Recipient)
 		}
-		_, err = k.call(ctx, fmt.Sprintf("claim of exit %d", id), func() (txnbuild.Operation, error) {
+		if e.Fee.Sign() > 0 {
+			parties[id] = append(parties[id], e.Relayer)
+		}
+	}
+	k.mu.RUnlock()
+	keys := make(map[uint64][]string, len(ids))
+	var all []xdr.LedgerKey
+	known := map[string]bool{}
+	for _, id := range ids {
+		for _, p := range parties[id] {
+			ks, err := k.receiveKeys(inst.Config.Token, p)
+			if err != nil {
+				return err
+			}
+			for _, key := range ks {
+				s, err := rpc.KeyString(key)
+				if err != nil {
+					return err
+				}
+				keys[id] = append(keys[id], s)
+				if !known[s] {
+					known[s] = true
+					all = append(all, key)
+				}
+			}
+		}
+	}
+	entries, _, err := rpc.Entries(ctx, k.rpc, all)
+	if err != nil {
+		return err
+	}
+	at := k.now()
+	for _, id := range ids {
+		var seen strings.Builder
+		for _, s := range keys[id] {
+			if e, ok := entries[s]; ok {
+				fmt.Fprintf(&seen, "%d,", e.LastModified)
+			} else {
+				seen.WriteString("-,")
+			}
+		}
+		k.mu.Lock()
+		last, tried := k.claims[id]
+		due := !tried || last.seen != seen.String() || at.Sub(last.at) >= claimRetry
+		if due {
+			k.claims[id] = claimTry{seen: seen.String(), at: at}
+		}
+		k.mu.Unlock()
+		if !due {
+			continue
+		}
+		_, err := k.call(ctx, fmt.Sprintf("claim of exit %d", id), func() (txnbuild.Operation, error) {
 			return k.invoke("claim", vault.U64(id))
 		})
 		if err != nil && !errors.Is(err, submit.ErrSimulation) {
 			return err
 		}
 	}
+	k.mu.Lock()
+	for id := range k.claims {
+		if _, ok := parties[id]; !ok {
+			delete(k.claims, id)
+		}
+	}
+	k.mu.Unlock()
 	return nil
+}
+
+// receiveKeys are the entries that decide whether a party can receive the asset: for an account,
+// the account and its trustline; for a contract, its balance in the asset contract.
+func (k *Keeper) receiveKeys(token, address string) ([]xdr.LedgerKey, error) {
+	account, err := vault.AccountOf(address)
+	if err != nil {
+		return nil, err
+	}
+	if account[0] != 'G' {
+		key, err := vault.BalanceKey(token, account)
+		return []xdr.LedgerKey{key}, err
+	}
+	return vault.ReceiveKeys(k.cfg.Asset, account)
 }
 
 // untilRelease is how long the release job sleeps: its interval, or until just after the next UTC

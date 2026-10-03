@@ -380,6 +380,17 @@ func TestTheExitQueueIsWatched(t *testing.T) {
 			t.Fatalf("missing %s in %v", want, h.pages.codes())
 		}
 	}
+	// A claim queues the stranded exit again, at the tail.
+	c.NextLedger(8 * 24 * 3600)
+	c.Requeue(first, 6, 1_000, 0)
+	c.NextLedger(5)
+	h.sync()
+	if err := h.w.CheckExitQueue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !h.pages.has("exit_requeued_6") || h.w.alerts.Open("exit_stranded_old") {
+		t.Fatalf("after the claim %v", h.pages.codes())
+	}
 }
 
 func TestLateAdmissionsAndExpiringEntriesPage(t *testing.T) {

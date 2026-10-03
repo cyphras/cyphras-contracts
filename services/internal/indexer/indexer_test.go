@@ -467,6 +467,30 @@ func TestTheExitQueueIsServedWithReleaseTimes(t *testing.T) {
 	if done["id"].(float64) != 2 || done["state"] != ExitSettled || done["settled_tx"] == nil || done["payout_paid"] != "1000000000" || done["payout_left"] != "0" {
 		t.Fatalf("settled exit %v", done)
 	}
+
+	// A claim moves the stranded payout back into the queue, at its tail, as exit 4.
+	c.NextLedger(5)
+	c.Requeue(first, 4, 2_000_000_000, 0)
+	c.NextLedger(5)
+	h.publish()
+	h.drain()
+	h.ix.Probe(context.Background())
+	h.now = time.Unix(c.ClosedAt, 0)
+	_, body = h.get("/v1/exits")
+	exits = body["exits"].([]any)
+	if len(exits) != 4 || body["tail"].(float64) != 5 || body["queued_total"] != "2400000000" {
+		t.Fatalf("after the claim %v", body)
+	}
+	moved := exits[1].(map[string]any)
+	if moved["id"].(float64) != 4 || moved["state"] != ExitQueued || moved["position"].(float64) != 1 || moved["requeued_from"].(float64) != 1 ||
+		moved["payout"] != "2000000000" || moved["paid_by"] == nil {
+		t.Fatalf("requeued exit %v", moved)
+	}
+	old := exits[2].(map[string]any)
+	if old["id"].(float64) != 1 || old["state"] != ExitRequeued || old["requeued_to"].([]any)[0].(float64) != 4 || old["payout_requeued"] != "2000000000" ||
+		old["payout_paid"] != "0" || old["fee_paid"] != "1000" || old["payout_left"] != "0" || old["requeued_tx"] != moved["tx_hash"] || old["stranded_tx"] == nil {
+		t.Fatalf("exit after its claim %v", old)
+	}
 }
 
 func TestPagesStopAtTheLedgerTheyReport(t *testing.T) {

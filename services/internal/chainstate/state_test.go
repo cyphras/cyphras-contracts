@@ -384,23 +384,32 @@ func TestAStrandedExitLeavesTheQueueAndIsClaimedLater(t *testing.T) {
 	if len(d.Released) != 2 || d.Released[0].UnpaidPayout.Int64() != 300 || len(d.Settlements) != 2 || d.Settlements[0].Fee.Int64() != 5 || d.Settlements[0].ExtAmount.Sign() != 0 {
 		t.Fatalf("delta %+v", d)
 	}
-	if _, err := applyAt(s.Clone(), day2, paidAtOnce(40, 8, -300, 0), release(1, -300, 0)); !errors.Is(err, ErrInconsistent) {
-		t.Fatalf("a claim beyond the window: %v", err)
+	// A claim moves a whole stranded part back into the queue, at its tail; it pays nothing.
+	for name, c := range map[string]vault.ExitRequeued{
+		"part of a part": {ID: 1, NewID: 3, Payout: big.NewInt(150), Fee: new(big.Int)},
+		"out of place":   {ID: 1, NewID: 7, Payout: big.NewInt(300), Fee: new(big.Int)},
+		"not stranded":   {ID: 2, NewID: 3, Payout: big.NewInt(100), Fee: new(big.Int)},
+	} {
+		if _, err := applyAt(s.Clone(), day2, c); !errors.Is(err, ErrInconsistent) {
+			t.Fatalf("requeue of %s: %v", name, err)
+		}
 	}
-	if _, err := applyAt(s.Clone(), day2, release(1, -300, 5)); !errors.Is(err, ErrInconsistent) {
-		t.Fatalf("a claim of more than is owed: %v", err)
-	}
-	// A claim can pay a part on its own, and only a whole part.
-	half := vault.ExitPaid{ID: 1, PayoutPaid: big.NewInt(150), FeePaid: new(big.Int), PayoutLeft: big.NewInt(150), FeeLeft: new(big.Int)}
-	if _, err := applyAt(s.Clone(), day2, half); !errors.Is(err, ErrInconsistent) {
-		t.Fatalf("a claim of part of a part: %v", err)
-	}
-	d, err = applyAt(s, day2, release(1, -300, 0))
+	d, err = applyAt(s, day2, vault.ExitRequeued{ID: 1, NewID: 3, Payout: big.NewInt(300), Fee: new(big.Int)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(s.Stranded) != 0 || s.QueuedTotal.Sign() != 0 || s.Outflow.Int64() != 405 || len(d.Claimed) != 1 || d.Notices[0].Name != "exit_claimed" {
-		t.Fatalf("after the claim: stranded %+v, queued %v, outflow %v", s.Stranded, s.QueuedTotal, s.Outflow)
+	if len(s.Stranded) != 0 || s.ExitTail != 4 || s.Exits[3] == nil || *s.Exits[3].RequeuedFrom != 1 || s.QueuedTotal.Int64() != 300 || s.Outflow.Int64() != 105 {
+		t.Fatalf("after the claim: stranded %+v, exits %+v, queued %v, outflow %v", s.Stranded, s.Exits, s.QueuedTotal, s.Outflow)
+	}
+	if len(d.Requeued) != 1 || len(d.Queued) != 1 || d.Notices[0].Name != "exit_requeued" {
+		t.Fatalf("delta %+v", d)
+	}
+	// The requeued exit is paid in its turn like any other.
+	if _, err := applyAt(s, day2, release(3, -300, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if s.QueuedTotal.Sign() != 0 || s.ExitHead != 4 || s.Outflow.Int64() != 405 {
+		t.Fatalf("after its release: queued %v, head %d, outflow %v", s.QueuedTotal, s.ExitHead, s.Outflow)
 	}
 }
 
@@ -479,7 +488,7 @@ func TestACloneIsIndependent(t *testing.T) {
 	}
 }
 
-func TestAClaimPaysEachStrandedPartOnItsOwn(t *testing.T) {
+func TestAClaimMovesEachPartThatCanBePaidBackIntoTheQueue(t *testing.T) {
 	const day1, day2 = 1_728_000_000, 1_728_000_000 + 86_400
 	big1 := big.NewInt(1_000_000)
 	limits := vault.Limits{
@@ -496,18 +505,21 @@ func TestAClaimPaysEachStrandedPartOnItsOwn(t *testing.T) {
 	if _, err := applyAt(s, day2, vault.ExitStranded{ID: 1, Payout: big.NewInt(80), Fee: big.NewInt(20)}); err != nil {
 		t.Fatal(err)
 	}
-	// The relayer can receive again, the recipient not yet.
-	d, err := applyAt(s, day2, vault.ExitPaid{ID: 1, PayoutPaid: new(big.Int), FeePaid: big.NewInt(20), PayoutLeft: big.NewInt(80), FeeLeft: new(big.Int)})
-	if err != nil {
+	// The relayer can receive again, the recipient not yet: only the fee moves.
+	if _, err := applyAt(s, day2, vault.ExitRequeued{ID: 1, NewID: 2, Payout: new(big.Int), Fee: big.NewInt(20)}); err != nil {
 		t.Fatal(err)
 	}
-	if s.Stranded[1].Fee.Sign() != 0 || s.Stranded[1].Payout.Int64() != 80 || s.QueuedTotal.Int64() != 80 || s.Outflow.Int64() != 20 || !d.PartPaid[0].Stranded {
-		t.Fatalf("after the fee: %+v, queued %v, outflow %v", s.Stranded[1], s.QueuedTotal, s.Outflow)
+	st := s.Stranded[1]
+	if st == nil || st.Payout.Int64() != 80 || st.Fee.Sign() != 0 || st.MovedFee.Int64() != 20 || len(st.RequeuedTo) != 1 || s.QueuedTotal.Int64() != 100 {
+		t.Fatalf("after the fee moved: %+v, queued %v", st, s.QueuedTotal)
 	}
-	if _, err := applyAt(s, day2, release(1, -80, 0)); err != nil {
+	if paidPayout, paidFee := st.Paid(); paidPayout.Sign() != 0 || paidFee.Sign() != 0 {
+		t.Fatalf("a moved part counted as paid: %v %v", paidPayout, paidFee)
+	}
+	if _, err := applyAt(s, day2, vault.ExitRequeued{ID: 1, NewID: 3, Payout: big.NewInt(80), Fee: new(big.Int)}); err != nil {
 		t.Fatal(err)
 	}
-	if len(s.Stranded) != 0 || s.QueuedTotal.Sign() != 0 || s.Outflow.Int64() != 100 {
-		t.Fatalf("after the payout: %+v, queued %v, outflow %v", s.Stranded, s.QueuedTotal, s.Outflow)
+	if len(s.Stranded) != 0 || s.ExitTail != 4 || s.Exits[3].Payout.Int64() != 80 || s.Outflow.Sign() != 0 {
+		t.Fatalf("after the payout moved: stranded %+v, tail %d, outflow %v", s.Stranded, s.ExitTail, s.Outflow)
 	}
 }
