@@ -66,6 +66,7 @@ import {
   type ExitPart,
   LANDED_STATES,
   type Operation,
+  type OwnedNote,
   type Plan,
   StateStore,
   type WalletState,
@@ -178,6 +179,8 @@ export interface OperationView {
   readonly sent: bigint;
   readonly parts: number;
   readonly state: Operation["state"];
+  // The part that blocks a blocked operation: it did not land, and its notes were spent elsewhere.
+  readonly blockedBy: string | undefined;
   // Milliseconds since the epoch from which the next part may go.
   readonly nextAt: number;
   readonly plans: readonly Submission[];
@@ -823,10 +826,11 @@ export class PrivateWallet {
       awaiting: undefined,
       nextAt: this.#core.now(),
       state: "active",
+      blockedBy: undefined,
     };
     this.#core.state.operations.push(op);
     await this.#core.save();
-    await this.#nextPart(op, request.selfRelay, request.confirm);
+    await this.#nextPart(op, request.selfRelay, undefined, undefined, request.confirm);
     return this.#operationView(op);
   }
 
@@ -836,27 +840,41 @@ export class PrivateWallet {
       .reduce((s, p) => s + p.amount, 0n);
   }
 
+  // Sends the next part of an operation, or a dead one again with its own notes.
   async #nextPart(
     op: Operation,
     signer: TransactionSigner | undefined,
-    confirm: ConfirmSpend | undefined,
+    inputs: OwnedNote[] | undefined,
+    again: Plan | undefined,
+    confirm?: ConfirmSpend,
   ): Promise<void> {
     const remaining = op.total - this.#sent(op);
-    const submission = await spend(this.#core, {
-      kind: "unshield",
-      to: op.to,
-      amount: remaining < op.partSize ? remaining : op.partSize,
-      maxFee: op.maxFee,
-      relayers: op.route.kind === "relayers" ? this.#relayerClients(op.route.urls) : [],
-      selfRelay: signer,
-      // Later parts were confirmed with the whole operation; their warnings cannot stop them.
-      confirm: confirm ?? (() => true),
-      notBefore: undefined,
-      inputs: undefined,
-      retryOf: undefined,
-      operationId: op.id,
-      parts: Number((op.total + op.partSize - 1n) / op.partSize),
-    });
+    let submission: Submission;
+    try {
+      submission = await spend(this.#core, {
+        kind: "unshield",
+        to: op.to,
+        amount: again?.amount ?? (remaining < op.partSize ? remaining : op.partSize),
+        maxFee: op.maxFee,
+        relayers: op.route.kind === "relayers" ? this.#relayerClients(op.route.urls) : [],
+        selfRelay: signer,
+        // Later parts were confirmed with the whole operation; their warnings cannot stop them.
+        confirm: confirm ?? (() => true),
+        notBefore: undefined,
+        inputs,
+        retryOf: again?.id,
+        operationId: op.id,
+        parts: Number((op.total + op.partSize - 1n) / op.partSize),
+      });
+    } catch (err) {
+      // A part refused once it was saved is still the one whose fate the operation follows.
+      const planId = err instanceof CyphrasError ? err.details["planId"] : undefined;
+      if (typeof planId === "string") {
+        op.awaiting = planId;
+        await this.#core.save();
+      }
+      throw err;
+    }
     op.awaiting = submission.planId;
     await this.#core.save();
   }
@@ -868,6 +886,7 @@ export class PrivateWallet {
       sent: this.#sent(op),
       parts: Number((op.total + op.partSize - 1n) / op.partSize),
       state: op.state,
+      blockedBy: op.blockedBy,
       nextAt: op.nextAt,
       plans: this.#core.state.plans.filter((p) => p.operationId === op.id).map(submissionOf),
     };
@@ -875,7 +894,9 @@ export class PrivateWallet {
 
   /**
    * Sends the next part of each split unshield whose previous part has landed and whose random
-   * gap has passed. A self-relayed operation needs its signer again.
+   * gap has passed. A part that is dead goes again with its own notes, as retry sends it; one that
+   * did not land and whose notes were spent elsewhere blocks the operation for the caller to
+   * decide. A self-relayed operation needs its signer again.
    */
   continueOperations(signer?: TransactionSigner): Promise<OperationView[]> {
     return this.#run(async () => {
@@ -883,22 +904,41 @@ export class PrivateWallet {
       const { state } = this.#core;
       for (const op of state.operations) {
         if (op.state !== "active") continue;
-        const awaiting = state.plans.find((p) => p.id === op.awaiting);
-        if (awaiting !== undefined && isActive(awaiting)) continue;
+        const parts = state.plans.filter((p) => p.operationId === op.id);
+        if (parts.some(isActive)) continue;
+        if (op.route.kind === "self" && signer?.publicKey !== op.route.account) continue;
+        const relay = op.route.kind === "self" ? signer : undefined;
+        const awaiting = parts.find((p) => p.id === op.awaiting);
         if (awaiting !== undefined) {
+          // A retry of the part, by the same notes, that landed stands for it.
+          const landed =
+            LANDED_STATES.includes(awaiting.state) ||
+            parts.some(
+              (p) =>
+                LANDED_STATES.includes(p.state) &&
+                p.nullifiers.some((nf) => awaiting.nullifiers.includes(nf)),
+            );
+          if (!landed) {
+            const free = awaiting.inputs
+              .map((i) => state.notes.find((n) => n.pos === i.pos))
+              .filter((n): n is OwnedNote => n !== undefined && n.spent === undefined);
+            if (awaiting.state !== "dead" || free.length !== awaiting.inputs.length) {
+              op.state = "blocked";
+              op.blockedBy = awaiting.id;
+              continue;
+            }
+            await this.#nextPart(op, relay, free, awaiting);
+            continue;
+          }
           op.awaiting = undefined;
-          // A part that never landed goes again at once; one that landed starts the gap.
-          op.nextAt = LANDED_STATES.includes(awaiting.state)
-            ? this.#core.now() + randomGap()
-            : this.#core.now();
+          op.nextAt = this.#core.now() + randomGap();
         }
         if (this.#sent(op) >= op.total) {
           op.state = "done";
           continue;
         }
         if (this.#core.now() < op.nextAt) continue;
-        if (op.route.kind === "self" && signer?.publicKey !== op.route.account) continue;
-        await this.#nextPart(op, op.route.kind === "self" ? signer : undefined, undefined);
+        await this.#nextPart(op, relay, undefined, undefined);
       }
       await this.#core.save();
       return state.operations.map((op) => this.#operationView(op));

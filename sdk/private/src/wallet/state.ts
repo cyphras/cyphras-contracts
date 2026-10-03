@@ -176,7 +176,10 @@ export interface Operation {
   // The part whose landing starts the gap before the next one.
   awaiting: string | undefined;
   nextAt: number;
-  state: "active" | "done";
+  // Blocked by a part that did not land whose notes are gone: sending it again with other notes
+  // could pay twice, so the caller decides.
+  state: "active" | "done" | "blocked";
+  blockedBy: string | undefined;
 }
 
 // Leaves taken past the confirmed tree, and what this wallet found in them, held until the vault's
