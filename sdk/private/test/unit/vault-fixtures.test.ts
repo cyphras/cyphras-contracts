@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { xdr } from "@stellar/stellar-base";
 import { bytesToHex, toHex32 } from "../../src/bytes.ts";
@@ -19,7 +21,7 @@ import {
   txProofToScVal,
 } from "../../src/extdata.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
-import { fixture, wireProof } from "../helpers.ts";
+import { REPO_ROOT, SDK_ROOT, fixture, wireProof } from "../helpers.ts";
 
 // contracts/vault/fixtures/proofs.json of the contracts branch, which the vault's tests replay.
 interface Step {
@@ -120,4 +122,25 @@ describe("vault fixtures", () => {
       assert.equal(toHex32(tree.root()), step.root_after, step.name);
     }
   });
+});
+
+describe("fixture copies", () => {
+  // Each copy and the file of the contracts or circuits tree it was taken from.
+  for (const [copy, source] of [
+    ["vault-error.rs", ["contracts", "vault", "src", "error.rs"]],
+    ["vault-proofs.json", ["contracts", "vault", "fixtures", "proofs.json"]],
+    ["domains.json", ["circuits", "test", "vectors", "domains.json"]],
+  ] as const) {
+    const original = join(REPO_ROOT, ...source);
+    it(
+      `${copy} is ${source.join("/")}, byte for byte`,
+      { skip: existsSync(original) ? false : "that tree is not in this checkout" },
+      () => {
+        assert.deepEqual(
+          readFileSync(join(SDK_ROOT, "test", "fixtures", copy)),
+          readFileSync(original),
+        );
+      },
+    );
+  }
 });
