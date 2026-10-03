@@ -29,6 +29,7 @@ import { RelayerClient } from "../net/relayer.ts";
 import type { Prover } from "../prover.ts";
 import { type AccountLock, lockName, soleInstance, webLock } from "../lock.ts";
 import { type KeyValueStore, SealedStore } from "../storage.ts";
+import type { ChainView } from "../vault/state.ts";
 import {
   DEFAULT_NETWORK_FEE_CAPS,
   type NetworkFeeCaps,
@@ -77,6 +78,7 @@ import {
   type Operation,
   type OwnedNote,
   type Plan,
+  type RootCheck,
   StateStore,
   type WalletState,
   emptyState,
@@ -90,6 +92,7 @@ import {
   downloadChain,
   eventsUpTo,
   isActive,
+  landingProviders,
   recheck,
   recordEvents,
   resetEvidence,
@@ -263,12 +266,14 @@ function randomGap(): number {
 
 // What became of the part an operation awaits. It landed, itself or as a retry by the same notes;
 // it is dead with all its notes free, to go again with them; one of its notes was spent by a
-// landed payment of this wallet that is no part of the operation, so it can never land and never
-// paid; or it did not land and its notes were spent elsewhere, which only the caller can judge.
+// payment of this wallet that is no part of the operation and whose landing each of `providers`
+// RPC providers confirmed, so the part can never land and never paid; or it did not land and its
+// notes were spent elsewhere, which only the caller can judge.
 function partFate(
   state: WalletState,
   parts: readonly Plan[],
   part: Plan,
+  providers: number,
 ): "landed" | "again" | "unpaid" | "blocked" {
   const landed = (p: Plan): boolean => LANDED_STATES.includes(p.state);
   if (
@@ -284,7 +289,7 @@ function partFate(
   const ours = state.plans.some(
     (q) =>
       !parts.includes(q) &&
-      landed(q) &&
+      landingProviders(q) >= providers &&
       q.inputs.some((i) => part.inputs.some((input) => input.nf === i.nf)),
   );
   return ours ? "unpaid" : "blocked";
@@ -639,9 +644,12 @@ export class PrivateWallet {
       indexer === undefined
         ? this.#rpcSource(core)
         : new IndexerSource(indexer, limits.nullifierPages);
+    const second = core.services.second;
+    const vaults =
+      second === undefined ? [core.services.vault] : [core.services.vault, second.vault];
     let download;
     try {
-      download = await downloadChain(core.state, source, core.services.vault, limits.leafPages);
+      download = await downloadChain(core.state, source, vaults, limits.leafPages);
     } catch (err) {
       // An indexer that becomes unreachable is passed over for the vault's RPC events; one that
       // served inconsistent data is a fault the caller must see.
@@ -653,14 +661,10 @@ export class PrivateWallet {
         throw err;
       }
       source = this.#rpcSource(core);
-      download = await downloadChain(core.state, source, core.services.vault, limits.leafPages);
+      download = await downloadChain(core.state, source, vaults, limits.leafPages);
     }
-    const { view, data } = download;
-    // The second provider's view, when one is set; a provider that cannot answer lets no plan die.
-    const second = await core.services.second?.vault.view().catch((err: unknown) => {
-      if (err instanceof CyphrasError) return undefined;
-      throw err;
-    });
+    const { views, data } = download;
+    const view = views[0] as ChainView;
     let crossChecked = false;
     // The vault's own events, from RPC, for the ledgers of this sync, when RPC held them.
     let events: VaultEvents | undefined;
@@ -676,21 +680,22 @@ export class PrivateWallet {
     } else {
       events = await source.events();
     }
-    const check = checkRoot(data.tree, view.roots);
-    if (
-      check.state === "mismatch" ||
-      (second !== undefined && checkRoot(data.tree, second.roots).state === "mismatch")
-    ) {
+    const checks = views.map((v) => (v === undefined ? undefined : checkRoot(data.tree, v.roots)));
+    if (checks.some((c) => c?.state === "mismatch")) {
       fail(
         "tree_unverified",
         "the synced tree contradicts the vault; nothing of this sync was kept",
       );
     }
+    const check = checks[0] as RootCheck;
+    // Only leaves under a root every RPC provider confirms count: notes at them, spends of notes and
+    // where payments landed. While a provider is behind or cannot answer, they wait in staging, and
+    // no payment's fate moves.
+    const verified = checks.every((c) => c?.state === "verified");
     let newNotes = 0;
-    if (check.state === "verified") {
-      // Only leaves under a root the vault confirms count: notes at them, and spends of notes.
+    if (verified) {
       const checked = source.kind === "rpc" || crossChecked;
-      newNotes = applyDownload(core.state, core.scan, data, checked);
+      newNotes = applyDownload(core.state, core.scan, data, checked, views.length);
       core.state.rootCheck = check;
       // RPC's events count towards a plan's fate only where they matched the indexer's data.
       if (crossChecked && events !== undefined) {
@@ -708,11 +713,7 @@ export class PrivateWallet {
       limits.eventPages,
     );
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
-    if (check.state === "verified") {
-      const views =
-        core.services.second === undefined ? [view] : second === undefined ? [] : [view, second];
-      advancePlans(core.state, views);
-    }
+    if (verified) advancePlans(core.state, views as [ChainView, ...ChainView[]]);
     const live = source.kind === "indexer" ? indexer : undefined;
     const pace = updatePace(core.state, events?.times ?? []);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
@@ -1021,7 +1022,8 @@ export class PrivateWallet {
     const relay = op.route.kind === "self" ? signer : undefined;
     const awaiting = parts.find((p) => p.id === op.awaiting);
     if (awaiting !== undefined) {
-      const fate = partFate(state, parts, awaiting);
+      const providers = this.#core.services.second === undefined ? 1 : 2;
+      const fate = partFate(state, parts, awaiting, providers);
       if (fate === "blocked" && !resume) {
         op.state = "blocked";
         op.blockedBy = awaiting.id;

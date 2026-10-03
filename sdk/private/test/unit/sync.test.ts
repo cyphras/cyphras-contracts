@@ -136,6 +136,7 @@ describe("plan fate", () => {
     txHash: "ab".repeat(32),
     ledger: 210,
     outputs: [undefined, undefined],
+    providers: 1,
     nullifiers: [false, false],
     foreign: false,
     checked: false,

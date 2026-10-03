@@ -18,7 +18,7 @@ import { keySource } from "../../src/keysource.ts";
 import { NETWORK_PASSPHRASES } from "../../src/keys.ts";
 import { type Plan, type WalletState, loadState, saveState } from "../../src/wallet/state.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
-import { RPC, XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
+import { INDEXER, RPC, XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
 import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
 import { TrapdoorProver, trapdoorArtifacts } from "../support/trapdoor.ts";
 import { map } from "../support/vault.ts";
@@ -491,7 +491,14 @@ describe("wallet safety: an RPC that lies about the vault's events", () => {
     const fake = { txHash: "ee".repeat(32), ledger: world.vault.ledger };
     Object.assign(plan, { ...fake, state: "settled" });
     plan.evidence = [
-      { ...fake, outputs: [90, 91], nullifiers: [false, false], foreign: false, checked: true },
+      {
+        ...fake,
+        outputs: [90, 91],
+        providers: 1,
+        nullifiers: [false, false],
+        foreign: false,
+        checked: true,
+      },
     ];
     await saveState(sealed, state);
     world.advance(121 * 5);
@@ -579,13 +586,18 @@ describe("wallet safety: a second RPC provider", () => {
     await assert.rejects(
       alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
     );
-    // The second provider's view of the vault is from before the payment's deadline.
-    mode = "lagging";
     world.advance(121 * 5);
+    // A second provider that cannot answer lets no payment die, though the first shows the
+    // wallet's whole tree past the payment's deadline.
+    mode = "down";
+    assert.equal((await alice.sync()).rootVerified, true);
+    assert.equal((await alice.plans())[0]?.state, "prepared");
+    // Nor does one whose view of the vault is from before the payment's deadline.
+    mode = "lagging";
     world.fill(1);
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "prepared");
-    // A second provider that cannot answer lets no payment die either.
+    // Nor one that cannot answer while new leaves arrive.
     mode = "down";
     world.fill(1);
     assert.equal((await alice.sync()).rootVerified, true);
@@ -594,6 +606,126 @@ describe("wallet safety: a second RPC provider", () => {
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "dead");
     assert.equal((await alice.balance()).spendable, 100n * XLM);
+  });
+
+  it("counts nothing of a tree while the second RPC provider cannot answer", async () => {
+    // The vault's own chain, as the second provider reads it.
+    const world = await createWorld();
+    world.fill(3);
+    // Another vault at the same address with other leaves, which the first RPC and the indexer
+    // serve.
+    const other = await createWorld();
+    other.fill(5);
+    let down = true;
+    const liars: FetchLike = async (input, init) => {
+      if (new URL(input).origin !== SECOND) return other.fetch(input, init);
+      if (down) throw new TypeError("connection refused");
+      return world.fetch(RPC, init);
+    };
+    const wallet = await openWallet({ ...world, fetch: liars }, 0, undefined, undefined, {
+      secondRpcUrl: SECOND,
+    });
+    let summary = await wallet.sync();
+    assert.equal(summary.leafCount, 0);
+    assert.equal(summary.staged, other.vault.leaves.length);
+    // The second provider's view is behind the leaves taken: nothing counts yet.
+    down = false;
+    summary = await wallet.sync();
+    assert.equal(summary.leafCount, 0);
+    // Once it holds as many leaves, it contradicts them.
+    world.fill(3);
+    await assert.rejects(wallet.sync(), isError("tree_unverified"));
+  });
+
+  it("counts the leaves every RPC provider holds while the second lags", async () => {
+    const world = await createWorld();
+    let stale: string | undefined;
+    let lagging = false;
+    const second: FetchLike = async (input, init) => {
+      const body = JSON.parse(String(init?.body));
+      const view = body.method === "getLedgerEntries" && body.params.keys.length === 3;
+      if (lagging && view && stale !== undefined) {
+        return new Response(JSON.stringify({ ...JSON.parse(stale), id: body.id }));
+      }
+      const res = await world.fetch(input, init);
+      if (view) stale = await res.clone().text();
+      return res;
+    };
+    const options = { secondRpcUrl: SECOND };
+    const fetch = viaSecond(world, second);
+    const wallet = await openWallet({ ...world, fetch }, 0, undefined, undefined, options);
+    world.fill(2);
+    // Another wallet's sync is the last view of the vault the second provider gives.
+    await (await openWallet({ ...world, fetch }, 1, undefined, undefined, options)).sync();
+    const held = world.vault.leaves.length;
+    lagging = true;
+    world.fill(2);
+    const summary = await wallet.sync();
+    assert.equal(summary.leafCount, held);
+    assert.equal(summary.staged, 0);
+  });
+
+  it("takes no landing from leaves past what the second RPC provider holds", async () => {
+    const { world, store } = await funded();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    const plain = await openWallet(world, 0, store);
+    await assert.rejects(
+      plain.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    // The liars' chain: the vault's own, then a pair holding the refused payment's commitments,
+    // which its relayer saw.
+    const plan = await storedPlan(store);
+    const fake = await createWorld();
+    const real = world.vault;
+    const copy = fake.vault;
+    copy.leaves.push(...real.leaves.map((l) => ({ ...l })));
+    copy.tree.append(real.leaves.map((l) => l.cm));
+    real.roots.forEach((r, i) => (copy.roots[i] = r));
+    for (const [nf, at] of real.nullifiers) copy.nullifiers.set(nf, at);
+    Object.assign(copy, {
+      newest: real.newest,
+      ledger: real.ledger,
+      timestamp: real.timestamp,
+      tvl: real.tvl,
+      nextDepositId: real.nextDepositId,
+      attestedUpTo: real.attestedUpTo,
+    });
+    const at = copy.leaves.length;
+    plan.commitments.forEach((cm, i) =>
+      copy.leaves.push({
+        index: at + i,
+        cm,
+        ciphertext: new Uint8Array(181),
+        ledger: real.ledger,
+        txHash: "ef".repeat(32),
+      }),
+    );
+    copy.tree.append([...plan.commitments]);
+    copy.newest = (copy.newest + 1) % 256;
+    copy.roots[copy.newest] = copy.tree.root();
+    const liars: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (url.origin === SECOND) return world.fetch(RPC, init);
+      const body =
+        init?.body === undefined || init.body === null ? {} : JSON.parse(String(init.body));
+      if (url.origin === RPC && body.method === "getEvents") {
+        const error = { code: -32603, message: "busy" };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+      }
+      if (url.origin === RPC || url.origin === INDEXER) return fake.fetch(input, init);
+      return world.fetch(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch: liars }, 0, store, undefined, {
+      secondRpcUrl: SECOND,
+    });
+    const summary = await alice.sync();
+    assert.equal(summary.leafCount, real.leaves.length);
+    const [p] = await alice.plans();
+    assert.equal(p?.state, "prepared");
+    assert.equal(p?.mustRetry, true);
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 0n);
   });
 
   it("refuses a tree a second RPC provider contradicts", async () => {
@@ -740,6 +872,7 @@ describe("wallet safety: syncs that fail", () => {
         ledger: 1,
         nullifiers: [true, false],
         outputs: [undefined, undefined],
+        providers: 0,
         foreign: true,
         checked: true,
       },
@@ -777,6 +910,7 @@ describe("wallet safety: syncs that fail", () => {
         ledger: 1,
         nullifiers: [true, false],
         outputs: [undefined, undefined],
+        providers: 0,
         foreign: true,
         checked: true,
       },

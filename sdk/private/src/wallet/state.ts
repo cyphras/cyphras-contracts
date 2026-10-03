@@ -11,12 +11,14 @@ export interface SpentBy {
 
 // What one transaction showed of a plan: the leaf positions at which it added the plan's two output
 // commitments, which of the plan's two nullifiers it spent, and whether it added a leaf that is not
-// the plan's. Positions come only from leaves the vault's root confirmed; the spends of the plan's
-// notes and the other leaves only from the vault's events the wallet checked, when `checked`.
+// the plan's. Positions come only from leaves the vault's root confirmed, as read from `providers`
+// RPC providers; the spends of the plan's notes and the other leaves only from the vault's events
+// the wallet checked, when `checked`.
 export interface Evidence {
   readonly txHash: string;
   readonly ledger: number;
   outputs: [number | undefined, number | undefined];
+  providers: number;
   nullifiers: [boolean, boolean];
   foreign: boolean;
   checked: boolean;
@@ -314,6 +316,11 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
   // A state need not hold close times yet; its next sync records them.
   state.ledgerTimes ??= [];
+  // A landing kept without the count of RPC providers that confirmed it rests on the first one's
+  // root alone.
+  for (const e of state.plans.flatMap((p) => p.evidence)) {
+    e.providers ??= e.outputs.some((pos) => pos !== undefined) ? 1 : 0;
+  }
   return state;
 }
 

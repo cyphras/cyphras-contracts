@@ -14,7 +14,7 @@ import {
   saveState,
 } from "../../src/wallet/state.ts";
 import type { OperationView, PrivateWallet } from "../../src/wallet/wallet.ts";
-import { XLM, createWorld } from "../support/network.ts";
+import { RPC, XLM, createWorld } from "../support/network.ts";
 import { keypairFor } from "../support/rpc.ts";
 import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
 
@@ -419,6 +419,55 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal(owedTo(world, destination), 90n * XLM);
     await bob.sync();
     assert.equal((await bob.balance()).spendable, 30n * XLM);
+  });
+
+  it("blocks a split whose part's note a payment spent that not every RPC provider saw land", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const { alice, store } = await withNotes(world, undefined, [50n * XLM, 60n * XLM, 70n * XLM]);
+    const destination = world.signer("exchange").publicKey;
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: destination,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+    );
+    world.advance(3600);
+    world.fill(1);
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    await alice.send({
+      to: bob.generateAddress(),
+      amount: 30n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    // The payment's landing is taken while the wallet reads the vault from one RPC provider.
+    await alice.sync();
+    const second = "http://rpc2.test";
+    const both = await openWallet(
+      {
+        ...world,
+        fetch: (input, init) =>
+          new URL(input).origin === second ? world.fetch(RPC, init) : world.fetch(input, init),
+      },
+      0,
+      store,
+      undefined,
+      { secondRpcUrl: second },
+    );
+    let [view] = await both.continueOperations();
+    assert.equal(view?.state, "blocked");
+    assert.equal(view?.plans.length, 1);
+    // The caller, who knows the part never paid, goes on.
+    view = await both.resumeOperation(view?.operationId as string);
+    assert.equal(view.plans.length, 2);
+    view = await finish(world, both);
+    assert.equal(view?.state, "done");
+    assert.equal(owedTo(world, destination), 90n * XLM);
   });
 
   it("goes on with a blocked split once its part turns out to have landed", async () => {

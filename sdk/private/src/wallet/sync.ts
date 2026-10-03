@@ -47,24 +47,35 @@ export interface Download {
   readonly pages: readonly { readonly page: number; readonly leaves: readonly bigint[] }[];
 }
 
-// Downloads the nullifiers spent since the last sync, then reads the vault, then the leaves after
-// the local tree's last one, staged or confirmed, up to the vault's NextLeaf. A leaf past NextLeaf
-// cannot be checked against the vault yet, so the next sync takes it. Nullifiers count only up to
-// the ledger the vault was read at, so every transaction whose nullifiers are kept has its leaves
-// below NextLeaf; and when the page cap stops the leaves short, only up to the ledger before the
-// last leaf taken.
+// Downloads the nullifiers spent since the last sync, then reads the vault from each RPC provider,
+// then the leaves after the local tree's last one, staged or confirmed, up to the smallest NextLeaf
+// the providers that answered read. A leaf past it cannot be checked against every provider yet,
+// so a later sync takes it. Nullifiers count only up to the earliest ledger those providers read
+// the vault at, so every transaction whose nullifiers are kept has its leaves below that NextLeaf;
+// and when the page cap stops the leaves short, only up to the ledger before the last leaf taken.
+// A provider after the first that cannot answer has no view.
 export async function downloadChain(
   state: WalletState,
   source: ChainSource,
-  vault: VaultReader,
+  vaults: readonly VaultReader[],
   maxPages: number,
-): Promise<{ readonly view: ChainView; readonly data: Download }> {
+): Promise<{ readonly views: readonly (ChainView | undefined)[]; readonly data: Download }> {
   const since = state.nullifierSince;
   const served = await source.nullifiers(since);
-  const view = await vault.view();
+  const views = await Promise.all(
+    vaults.map((vault, i) =>
+      i === 0
+        ? vault.view()
+        : vault.view().catch((err: unknown) => {
+            if (err instanceof CyphrasError) return undefined;
+            throw err;
+          }),
+    ),
+  );
+  const answered = views.filter((v): v is ChainView => v !== undefined);
   const tree = CommitmentTree.fromSnapshot(state.staging?.tree ?? state.tree);
   const firstIndex = tree.leafCount;
-  const nextLeaf = view.roots.nextLeaf;
+  const nextLeaf = Math.min(...answered.map((v) => v.roots.nextLeaf));
   const leaves: Leaf[] = [];
   const pages: { page: number; leaves: readonly bigint[] }[] = [];
   let capped = false;
@@ -82,11 +93,11 @@ export async function downloadChain(
     leaves.push(...accepted);
     if (batch.done || accepted.length < batch.leaves.length) break;
   }
-  let horizon = Math.min(served.completeToLedger, view.ledger);
+  let horizon = Math.min(served.completeToLedger, ...answered.map((v) => v.ledger));
   const last = leaves[leaves.length - 1];
   if (capped && last !== undefined) horizon = Math.min(horizon, last.ledger - 1);
   return {
-    view,
+    views,
     data: {
       since,
       completeTo: served.completeToLedger,
@@ -220,6 +231,7 @@ function evidenceOf(plan: Plan, txHash: string, ledger: number): Evidence {
       txHash,
       ledger,
       outputs: [undefined, undefined],
+      providers: 0,
       nullifiers: [false, false],
       foreign: false,
       checked: false,
@@ -233,14 +245,22 @@ function evidenceOf(plan: Plan, txHash: string, ledger: number): Evidence {
 const landed = (plan: Plan): boolean =>
   [0, 1].every((slot) => plan.evidence.some((e) => e.outputs[slot] !== undefined));
 
-// Records where the plans' output commitments landed, among leaves the vault's root confirmed:
-// those positions hold the commitments whatever transaction the source names for them. Only these
-// leaves show where a plan landed; a plan already shown to land takes none again.
-function recordOutputs(plans: readonly Plan[], found: readonly FoundLeaf[]): void {
+// Records where the plans' output commitments landed, among leaves the root history of each of
+// `providers` RPC providers confirmed: those positions hold the commitments whatever transaction
+// the source names for them. Only these leaves show where a plan landed; a plan already shown to
+// land takes none again.
+function recordOutputs(
+  plans: readonly Plan[],
+  found: readonly FoundLeaf[],
+  providers: number,
+): void {
   for (const plan of plans.filter((p) => !landed(p))) {
     for (const leaf of found) {
       const slot = plan.commitments.indexOf(leaf.commitment);
-      if (slot >= 0) evidenceOf(plan, leaf.txHash, leaf.ledger).outputs[slot] = leaf.index;
+      if (slot < 0) continue;
+      const e = evidenceOf(plan, leaf.txHash, leaf.ledger);
+      e.outputs[slot] = leaf.index;
+      e.providers = providers;
     }
   }
 }
@@ -360,15 +380,16 @@ export function stageDownload(
   if (data.leaves.length > 0) state.staging = scanDownload(state, keys, data, checked).staging;
 }
 
-// Applies a download whose tree the vault's root history has confirmed, with anything staged
-// before it: the notes found count from now, spent notes are marked, and where plans' commitments
-// landed is recorded. Spends and leaves the cross-check did not confirm stay unchecked. Returns how
-// many notes this sync found.
+// Applies a download whose tree the root history of each of `providers` RPC providers has
+// confirmed, with anything staged before it: the notes found count from now, spent notes are
+// marked, and where plans' commitments landed is recorded. Spends and leaves the cross-check did
+// not confirm stay unchecked. Returns how many notes this sync found.
 export function applyDownload(
   state: WalletState,
   keys: ScanKeys,
   data: Download,
   checked: boolean,
+  providers: number,
 ): number {
   const { staging, newNotes } = scanDownload(state, keys, data, checked);
   for (const { pos, pagePath: path } of staging.paths) {
@@ -391,7 +412,7 @@ export function applyDownload(
     const hit = spent.get(note.nf);
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
-  recordOutputs(state.plans, staging.found);
+  recordOutputs(state.plans, staging.found, providers);
   const leaves =
     staging.unchecked === undefined
       ? undefined
@@ -545,6 +566,12 @@ function landing(plan: Plan): Evidence {
   return both ?? (plan.evidence.find((e) => e.outputs[0] !== undefined) as Evidence);
 }
 
+// How many RPC providers confirmed the tree that holds the plan's landing, none for a plan whose
+// landing the wallet does not hold.
+export function landingProviders(plan: Plan): number {
+  return landed(plan) ? landing(plan).providers : 0;
+}
+
 // The vault's checked events show another transaction that spent one of the plan's notes, as the
 // note's own record of its spend agrees, and added outputs that are not the plan's; or a plan of
 // this wallet that spends the same notes has landed.
@@ -603,10 +630,13 @@ function missedDeadline(state: WalletState, plan: Plan): boolean {
 // tree the wallet holds, without the plan's commitments in it, at or past the plan's deadline or
 // with the plan's root gone from the vault's history; or each view is past the deadline, and the
 // wallet's tree, or the checked spends, cover every ledger up to it with no sign of the plan. From
-// then on the vault refuses its proof. A dead or superseded plan whose commitments turn up is confirmed all the
-// same. A landed plan whose evidence a rescan dropped takes the transaction the rebuilt leaves
-// show, or starts over once the checked spends refute its landing.
-export function advancePlans(state: WalletState, views: readonly ChainView[]): void {
+// then on the vault refuses its proof. A dead or superseded plan whose commitments turn up is
+// confirmed all the same. A landed plan whose evidence a rescan dropped takes the transaction the
+// rebuilt leaves show, or starts over once the checked spends refute its landing.
+export function advancePlans(
+  state: WalletState,
+  views: readonly [ChainView, ...ChainView[]],
+): void {
   for (const plan of state.plans) {
     if (!LANDED_STATES.includes(plan.state)) continue;
     if (landed(plan)) {
@@ -646,7 +676,6 @@ export function advancePlans(state: WalletState, views: readonly ChainView[]): v
       plan.state = "superseded";
     } else if (
       isActive(plan) &&
-      views.length > 0 &&
       (views.every(gone(plan)) ||
         (missedDeadline(state, plan) && views.every((v) => v.ledger >= plan.deadline)))
     ) {
