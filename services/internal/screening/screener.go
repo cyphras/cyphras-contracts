@@ -65,6 +65,8 @@ type Screener struct {
 	alerts       *alert.Alerter
 	log          *slog.Logger
 	now          func() time.Time
+	// lock is the asp account's lock, without which nothing is sent as the account.
+	lock *Lock
 
 	mu       sync.RWMutex
 	state    *chainstate.State
@@ -108,6 +110,17 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 		return nil, err
 	}
 	s.state, s.cursor = state, cursor
+	guards, err := s.db.guards(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, src := range check.Sources {
+		if g, ok := src.(guarded); ok {
+			if last, ok := guards[src.Name()]; ok {
+				g.restore(last.size, last.canaries)
+			}
+		}
+	}
 	if err := s.reports.Refresh(ctx); err != nil {
 		return nil, err
 	}
@@ -115,6 +128,9 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 }
 
 func (s *Screener) clock() time.Time { return s.now() }
+
+// UseLock sets the lock of the asp account; the screener sends nothing as the account without it.
+func (s *Screener) UseLock(l *Lock) { s.lock = l }
 
 // Cursor implements follow.Sink.
 func (s *Screener) Cursor() uint32 {
@@ -144,14 +160,21 @@ func (s *Screener) Apply(ctx context.Context, b follow.Batch) error {
 	s.mu.Unlock()
 	for _, n := range delta.Notices {
 		if n.Name == "attested" {
-			s.log.Info("attestation on chain", "up_to", n.Body.(vault.Attested).UpTo, "ledger", n.Ledger)
+			s.log.Info("attestation on chain", "up_to", n.Body.(chainstate.Attestation).UpTo, "ledger", n.Ledger)
 		}
 	}
 	return nil
 }
 
+// guarded is a source whose guard compares each update with the last good copy.
+type guarded interface {
+	lastGood() (int, []string, bool)
+	restore(size int, canaries []string)
+}
+
 // RefreshSources fetches every source again; a failure leaves the old data, which then ages, and
-// an update the source's guard refuses pages.
+// an update the source's guard refuses pages. What a guard compares the next update with is kept,
+// so the first update after a restart is checked too.
 func (s *Screener) RefreshSources(ctx context.Context) {
 	for _, src := range s.check.Sources {
 		err := src.Refresh(ctx)
@@ -162,6 +185,13 @@ func (s *Screener) RefreshSources(ctx context.Context) {
 			s.log.Warn("source refresh failed", "source", src.Name(), "error", err.Error())
 		default:
 			s.alerts.Clear(ctx, "source_update_refused_"+src.Name(), "%s updated again", src.Name())
+			if g, ok := src.(guarded); ok {
+				if size, canaries, ok := g.lastGood(); ok {
+					if err := s.db.saveGuard(ctx, src.Name(), guardState{size, canaries}); err != nil {
+						s.log.Warn("source guard not saved", "source", src.Name(), "error", err.Error())
+					}
+				}
+			}
 		}
 	}
 	if err := s.check.Fresh(); err != nil {
@@ -194,7 +224,15 @@ func (s *Screener) invoke(fn string, args ...xdr.ScVal) (txnbuild.Operation, err
 	}}, nil
 }
 
+var errNoLock = errors.New("screening: sending as the asp account needs its lock")
+
 func (s *Screener) send(ctx context.Context, fn string, args ...xdr.ScVal) (submit.Result, error) {
+	if s.lock == nil {
+		return submit.Result{}, errNoLock
+	}
+	if err := s.lock.Held(ctx); err != nil {
+		return submit.Result{}, err
+	}
 	res, err := s.engine.Do(ctx, s.asp, func() (txnbuild.Operation, error) { return s.invoke(fn, args...) }, 4)
 	if err != nil {
 		return res, err
@@ -237,7 +275,7 @@ const (
 	taskNone task = iota
 	// taskFlag is a flag that must be sent, the most urgent work there is.
 	taskFlag
-	// taskLift unflags a deposit flagged because its review was late, once the review cleared it.
+	// taskLift lifts a hold once the deposit passed its own final check.
 	taskLift
 	taskRecheck
 	taskFirst
@@ -264,12 +302,13 @@ func (s *Screener) plan(v vaultView, r *row) plan {
 		p.task, p.reason, p.kind, p.detail = taskFlag, reason, kind, detail
 		return p
 	}
-	// A flag this service sent counts before the follower has seen it land.
-	if r.flag != nil || r.flagSent != nil {
-		if r.flagKind == "review_timeout" && r.review == "cleared" && r.flag != nil {
-			p.task = taskLift
+	// A refusal stands; a hold waits for what it holds the deposit for.
+	held := false
+	if f := r.reason(); f != nil {
+		if *f != ReasonHeld {
+			return p
 		}
-		return p
+		held = true
 	}
 	if h, ok := s.reports.Lookup(r.depositor); ok && !h.Refer {
 		return flag(ReasonFraud, "self_report", "the depositor reported its key compromised")
@@ -285,20 +324,24 @@ func (s *Screener) plan(v vaultView, r *row) plan {
 		return flag(refusal, "first_check", "refused at the first check")
 	case r.review == "refused":
 		return flag(ReasonReview, "review", "refused by the reviewer")
-	case r.review == "needed" && inRecheck:
-		// The deposit blocks every later attestation while it waits, and it must not become
-		// eligible unreviewed; the flag is lifted once the review clears it.
-		return flag(ReasonReview, "review_timeout", "the review was not finished before the final check")
 	case r.recheck == "refuse":
 		return flag(refusal, "recheck", "refused at the final check")
-	case r.recheck == "refer":
-		return flag(ReasonReview, "recheck", "the final check found what needs a person, with no time left for one")
 	case r.firstCheck == "":
 		p.task = taskFirst
-	case r.review == "needed", !inRecheck:
+	case r.review == "needed":
+		// The deposit must not become eligible unreviewed, and it would hold back every later
+		// attestation while it waits; the hold is lifted once a review clears it.
+		if inRecheck && !held {
+			return flag(ReasonHeld, "hold", "the review was not finished before the final check")
+		}
+	case !inRecheck:
+	case held && r.recheck == "pass" && s.fresh(v.now, r):
+		p.task = taskLift
+	case held:
+		p.task = taskRecheck
 	case r.recheck == "pass" && (attested || s.fresh(v.now, r)):
 	case attested && v.now+uint64(s.cfg.Cutoff.Seconds()) >= p.eligibleAt && s.retrying(r.id):
-		return flag(ReasonReview, "recheck", "the final check could not run in time")
+		return flag(ReasonHeld, "hold", "the final check could not run in time")
 	default:
 		p.task = taskRecheck
 	}
@@ -366,37 +409,14 @@ func (s *Screener) Tick(ctx context.Context) error {
 	if rows, err = s.db.pending(ctx); err != nil {
 		return err
 	}
-	var flags, lifts, checks []plan
-	for i := range rows {
-		p := s.plan(view, &rows[i])
-		switch p.task {
-		case taskFlag:
-			flags = append(flags, p)
-		case taskLift:
-			lifts = append(lifts, p)
-		case taskRecheck, taskFirst:
-			if s.due(p.r.id) {
-				checks = append(checks, p)
-			}
-		}
-	}
-	for _, p := range flags {
-		if err := s.Flag(ctx, p.r.id, p.reason, p.kind, p.detail); err != nil {
-			p.r.needsFlag = true
-			s.log.Warn("flag not sent", "deposit", p.r.id, "error", err.Error())
-			continue
-		}
-		reason := p.reason
-		p.r.flagSent, p.r.flagKind = &reason, p.kind
-	}
+	s.settle(ctx, view, rows, true, false)
 	if err := s.runOps(ctx); err != nil {
 		s.log.Warn("operator decisions incomplete", "error", err.Error())
 	}
-	for _, p := range lifts {
-		if err := s.lift(ctx, view, p.r); err != nil {
-			s.log.Warn("review flag not lifted", "deposit", p.r.id, "error", err.Error())
-		}
+	if rows, err = s.db.pending(ctx); err != nil {
+		return err
 	}
+	checks := s.settle(ctx, view, rows, false, true)
 	slices.SortStableFunc(checks, func(a, b plan) int {
 		if a.task != b.task {
 			return int(a.task) - int(b.task)
@@ -407,12 +427,30 @@ func (s *Screener) Tick(ctx context.Context) error {
 		return cmp.Compare(a.r.createdAt, b.r.createdAt)
 	})
 	s.runChecks(ctx, view, checks, start)
-	// What the checks refused is flagged in the same round, so it holds up no attestation.
+	// What the checks refused is flagged, and what they cleared lifted, in the same round, so it
+	// holds up no attestation.
 	if rows, err = s.db.pending(ctx); err != nil {
 		return err
 	}
+	s.settle(ctx, view, rows, true, true)
+	if err := s.attest(ctx, view, rows); err != nil {
+		return err
+	}
+	s.remind(ctx, rows)
+	s.mu.Lock()
+	s.tickedAt = s.now()
+	s.mu.Unlock()
+	return nil
+}
+
+// settle sends the flags the deposits' state calls for and lifts the holds whose deposits passed
+// their final check, as asked, and returns the checks that are due.
+func (s *Screener) settle(ctx context.Context, v vaultView, rows []row, flags, lifts bool) []plan {
+	var checks []plan
 	for i := range rows {
-		if p := s.plan(view, &rows[i]); p.task == taskFlag {
+		p := s.plan(v, &rows[i])
+		switch {
+		case p.task == taskFlag && flags:
 			if err := s.Flag(ctx, p.r.id, p.reason, p.kind, p.detail); err != nil {
 				p.r.needsFlag = true
 				s.log.Warn("flag not sent", "deposit", p.r.id, "error", err.Error())
@@ -420,15 +458,33 @@ func (s *Screener) Tick(ctx context.Context) error {
 			}
 			reason := p.reason
 			p.r.flagSent, p.r.flagKind = &reason, p.kind
+		case p.task == taskLift && lifts:
+			if err := s.lift(ctx, p.r); err != nil {
+				s.log.Warn("hold not lifted", "deposit", p.r.id, "error", err.Error())
+			}
+		case p.task == taskRecheck, p.task == taskFirst:
+			if s.due(p.r.id) {
+				checks = append(checks, p)
+			}
 		}
 	}
-	if err := s.attest(ctx, view, rows); err != nil {
-		return err
+	return checks
+}
+
+// remind pages while deposits wait for a person. A review not finished before a deposit's final
+// check holds the deposit, and the keeper refunds it a day after the hold.
+func (s *Screener) remind(ctx context.Context, rows []row) {
+	var waiting []uint64
+	for i := range rows {
+		if rows[i].awaitsReview() {
+			waiting = append(waiting, rows[i].id)
+		}
 	}
-	s.mu.Lock()
-	s.tickedAt = s.now()
-	s.mu.Unlock()
-	return nil
+	if len(waiting) == 0 {
+		s.alerts.Clear(ctx, "review_needed", "no deposit waits for a review")
+		return
+	}
+	s.alerts.Raise(ctx, alert.Warning, "review_needed", "%d deposits wait for a review: %v", len(waiting), waiting[:min(len(waiting), 20)])
 }
 
 // runChecks runs the planned checks on a bounded pool of workers until the round's budget is
@@ -572,8 +628,8 @@ func (s *Screener) firstCheck(ctx context.Context, v vaultView, p plan) (string,
 }
 
 // recheck runs a deposit's final check with current sources. A refusal is flagged; anything a
-// person would have to look at is flagged with reason 5, since no review fits in the time left,
-// unless a review already cleared exactly what the check finds now.
+// person must look at goes to review, unless a review already cleared exactly what the check finds
+// now, and the deposit is held until the review clears it.
 func (s *Screener) recheck(ctx context.Context, v vaultView, p plan) error {
 	r, id := p.r, p.r.id
 	since := time.Unix(int64(r.createdAt), 0).Add(-FunderWindow)
@@ -586,7 +642,7 @@ func (s *Screener) recheck(ctx context.Context, v vaultView, p plan) error {
 	switch {
 	case verdict.Refused:
 		outcome, reason = "refuse", &verdict.Reason
-	case !verdict.Clear() && !(r.review == "cleared" && subset(verdict.Findings, r.firstFindings)):
+	case !verdict.Clear() && !(r.review == "cleared" && subset(verdict.Findings, r.findings)):
 		outcome = "refer"
 	}
 	s.record(ctx, Decision{Kind: "recheck", DepositID: &id, Address: r.depositor, Amount: r.amount, Outcome: outcome, Reason: reason, Detail: verdict.Detail, Sources: verdict.Sources})
@@ -594,6 +650,15 @@ func (s *Screener) recheck(ctx context.Context, v vaultView, p plan) error {
 		if err := s.db.update(ctx, id, "refuse_reason", int32(verdict.Reason)); err != nil {
 			return err
 		}
+	}
+	if outcome == "refer" {
+		if err := s.db.update(ctx, id, "first_findings", strings.Join(verdict.Findings, "\n")); err != nil {
+			return err
+		}
+		if err := s.db.update(ctx, id, "review", "needed"); err != nil {
+			return err
+		}
+		r.findings, r.review = verdict.Findings, "needed"
 	}
 	if err := s.db.update(ctx, id, "recheck", outcome); err != nil {
 		return err
@@ -615,62 +680,55 @@ func subset(found, cleared []string) bool {
 	return true
 }
 
-// lift unflags a deposit whose review came after its review deadline flagged it, once the review
-// cleared it and a new check finds nothing the review did not see. It then needs its final check
-// again before it can be attested. A check that finds something new sends the deposit back to
-// review, still flagged, with what it found; a check that refuses keeps the flag for good.
-func (s *Screener) lift(ctx context.Context, v vaultView, r *row) error {
-	since := time.Unix(int64(r.createdAt), 0).Add(-FunderWindow)
-	verdict, err := s.check.Check(ctx, r.depositor, s.hops(*r, v.inst.Limits), since)
-	if err != nil {
-		return err
-	}
-	id := r.id
-	switch {
-	case verdict.Refused:
-		return s.db.update(ctx, id, "flag_kind", "review_lift_refused")
-	case !verdict.Clear() && !subset(verdict.Findings, r.firstFindings):
-		s.record(ctx, Decision{Kind: "lift", DepositID: &id, Address: r.depositor, Amount: r.amount, Outcome: "refer",
-			Detail: "found since the review: " + verdict.Detail, Sources: verdict.Sources})
-		if err := s.db.update(ctx, id, "first_findings", strings.Join(verdict.Findings, "\n")); err != nil {
-			return err
-		}
-		return s.db.update(ctx, id, "review", "needed")
-	}
+// lift unflags a held deposit once its own final check passed, as recently as an attestation
+// needs: a deposit inside the attested range is admitted on that check once it is eligible.
+func (s *Screener) lift(ctx context.Context, r *row) error {
 	res, err := s.send(ctx, "unflag", vault.U64(r.id))
 	if err != nil {
 		return err
 	}
-	for column, value := range map[string]any{"recheck": nil, "recheck_at": nil, "flag_sent": nil, "flag_kind": nil} {
-		if err := s.db.update(ctx, r.id, column, value); err != nil {
-			return err
-		}
+	// "lifted" stands for the flag until the follower sees the unflag land.
+	if err := s.db.update(ctx, r.id, "flag_sent", nil); err != nil {
+		return err
 	}
-	s.record(ctx, Decision{Kind: "unflag", DepositID: &id, Address: r.depositor, Amount: r.amount, Outcome: "unflag", Reason: r.flag,
-		Detail: "the review cleared the deposit after its deadline flagged it", TxHash: res.Hash})
+	if err := s.db.update(ctx, r.id, "flag_kind", "lifted"); err != nil {
+		return err
+	}
+	r.flagSent, r.flagKind = nil, "lifted"
+	id, held := r.id, uint32(ReasonHeld)
+	s.record(ctx, Decision{Kind: "unflag", DepositID: &id, Address: r.depositor, Amount: r.amount, Outcome: "unflag", Reason: &held,
+		Detail: "the hold ended: its final check passed", TxHash: res.Hash})
 	return nil
 }
 
+// refundDelay is how long after a flag anyone may refund the deposit, the vault's REFUND_DELAY.
+const refundDelay = 24 * 60 * 60
+
 // attestCandidate is the end of the longest run of pending deposits after the attested ones in
-// which each one passed its own final check lately, or is flagged. A deposit still under review,
-// not yet re-checked, checked too long ago, or refused without its flag landed, ends the run:
-// attest vouches for every unflagged deposit up to the ID, so none may be covered on the strength
-// of an older check.
-func attestCandidate(rows []row, attested, now, window uint64) uint64 {
+// which each one passed its own final check lately or is flagged, with the deposits the run passes
+// only once they are held: those that wait, as holdable reports, for a person or for their own
+// final window. Any other deposit not re-checked, checked too long ago, or refused without its
+// flag landed, ends the run: attest vouches for every unflagged deposit up to the ID, so none may
+// be covered on the strength of an older check.
+func attestCandidate(rows []row, attested, now, window uint64, holdable func(*row) bool) (uint64, []*row) {
 	var best uint64
-	for _, r := range rows {
-		if r.id <= attested {
-			continue
-		}
-		if r.flag != nil || r.flagSent != nil {
+	var holds, waiting []*row
+	for i := range rows {
+		r := &rows[i]
+		if r.id <= attested || r.reason() != nil {
 			continue
 		}
 		if r.needsFlag || r.recheck != "pass" || r.recheckAt == nil || now > *r.recheckAt+window {
+			if !r.needsFlag && holdable(r) {
+				waiting = append(waiting, r)
+				continue
+			}
 			break
 		}
 		best = r.id
+		holds, waiting = append(holds, waiting...), nil
 	}
-	return best
+	return best, holds
 }
 
 func (s *Screener) attest(ctx context.Context, v vaultView, rows []row) error {
@@ -680,9 +738,30 @@ func (s *Screener) attest(ctx context.Context, v vaultView, rows []row) error {
 	if v.inst.Status.Halted(v.now) {
 		return nil
 	}
-	upTo := attestCandidate(rows, v.inst.Status.AttestedUpTo, v.now, uint64(s.cfg.RecheckWindow.Seconds()))
+	window := uint64(s.cfg.RecheckWindow.Seconds())
+	// A deposit is held only when its hold can be lifted, before it is eligible, ahead of the
+	// refund the hold allows a day later.
+	holdable := func(r *row) bool {
+		if r.delay == nil {
+			return false
+		}
+		eligible := vault.PendingDeposit{Amount: r.amountInt(), CreatedAt: r.createdAt, Delay: *r.delay}.EligibleAt(v.inst.Config, v.inst.Limits)
+		return eligible <= v.now+refundDelay && (r.review == "needed" || v.now+window < eligible)
+	}
+	upTo, holds := attestCandidate(rows, v.inst.Status.AttestedUpTo, v.now, window, holdable)
 	if upTo == 0 || upTo >= v.inst.Status.NextDepositID {
 		return nil
+	}
+	for _, r := range holds {
+		detail := "it holds back later deposits while it waits for its own final check"
+		if r.review == "needed" {
+			detail = "it holds back later deposits while it waits for a review"
+		}
+		if err := s.Flag(ctx, r.id, ReasonHeld, "hold", detail); err != nil {
+			return err
+		}
+		held := uint32(ReasonHeld)
+		r.flagSent, r.flagKind = &held, "hold"
 	}
 	if err := s.chainAgrees(ctx, v.inst.Status.AttestedUpTo, upTo, v.now, rows); err != nil {
 		s.alerts.Raise(ctx, alert.Critical, "attest_withheld", "attestation up to %d withheld: %v", upTo, err)

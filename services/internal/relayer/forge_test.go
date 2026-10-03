@@ -93,9 +93,15 @@ func randomField(t *testing.T) fr.Element {
 // address, with a proof the trapdoor key accepts.
 func (h *harness) forged(t *testing.T, recipient string, extAmount, fee int64) Request {
 	t.Helper()
+	return h.forgedUntil(t, recipient, extAmount, fee, 5000)
+}
+
+// forgedUntil is forged with the given deadline.
+func (h *harness) forgedUntil(t *testing.T, recipient string, extAmount, fee int64, deadline uint32) Request {
+	t.Helper()
 	_, roots := fixtureChain(t)
 	e := vault.ExtData{
-		Vault: vaulttest.Vault, NetworkID: h.r.cfg.NetworkID, Deadline: 5000,
+		Vault: vaulttest.Vault, NetworkID: h.r.cfg.NetworkID, Deadline: deadline,
 		ExtAmount: big.NewInt(extAmount), Fee: big.NewInt(fee), Recipient: recipient, Relayer: feeAddress,
 		Ciphertext0: make([]byte, vault.CiphertextLen), Ciphertext1: make([]byte, vault.CiphertextLen),
 	}

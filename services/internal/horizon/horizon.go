@@ -154,28 +154,48 @@ func stroops(s string) *big.Int {
 // maxClaims bounds the claimable balances whose creators one lookup asks for.
 const maxClaims = 50
 
-// Inflows returns what the account received since a time, newest first, and whether its history
-// was read in full: payments, path payments, account creations and merges and contract transfers
-// from its payments, and the claimable balances it claimed, the trades that paid it and its
-// withdrawals from liquidity pools from its effects. A missing account received nothing.
-func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, bool, error) {
+// Gap names what a lookup left unread.
+type Gap uint8
+
+const (
+	// GapVolume is a history longer than a lookup reads: more pages holding value for the account
+	// than MaxPages, more pages in all than twice that, or more claimed balances than are traced.
+	// Anyone can cause it by sending the account many small payments.
+	GapVolume Gap = 1 << iota
+	// GapUnnamed is value from a sender Horizon cannot name.
+	GapUnnamed
+)
+
+// Inflows returns what the account received since a time, newest first, and what it could not
+// read: payments, path payments, account creations and merges and contract transfers from its
+// payments, and the claimable balances it claimed, the trades that paid it and its withdrawals
+// from liquidity pools from its effects. Only value counts: a transfer of nothing is left out,
+// and only pages that hold value for the account count toward MaxPages, so an account's own
+// activity does not cut its history short. A missing account received nothing.
+func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, Gap, error) {
 	var out []Inflow
-	complete := true
+	var gap Gap
+	add := func(in Inflow) {
+		if in.Amount == nil || in.Amount.Sign() != 0 {
+			out = append(out, in)
+		}
+	}
 	next := c.accountURL(account, "payments", fmt.Sprintf("order=desc&limit=%d", pageSize))
-	for page := 0; next != ""; page++ {
-		if page == c.MaxPages {
-			complete = false
+	for valued, read := 0, 0; next != ""; read++ {
+		if valued == c.MaxPages || read == 2*c.MaxPages {
+			gap |= GapVolume
 			break
 		}
 		var p paymentsPage
 		found, err := c.get(ctx, next, &p)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, err
 		}
 		if !found {
-			return nil, true, nil
+			return nil, 0, nil
 		}
 		next = ""
+		before := len(out)
 		for _, r := range p.Embedded.Records {
 			if r.CreatedAt.Before(since) {
 				break
@@ -183,23 +203,26 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 			switch r.Type {
 			case "payment", "path_payment_strict_receive", "path_payment_strict_send":
 				if r.To == account && r.From != account {
-					out = append(out, Inflow{From: r.From, Asset: r.name(), Amount: stroops(r.Amount)})
+					add(Inflow{From: r.From, Asset: r.name(), Amount: stroops(r.Amount)})
 				}
 			case "create_account":
 				if r.Account == account {
-					out = append(out, Inflow{From: r.Funder, Asset: "native", Amount: stroops(r.Starting)})
+					add(Inflow{From: r.Funder, Asset: "native", Amount: stroops(r.Starting)})
 				}
 			case "account_merge":
 				if r.Into == account {
-					out = append(out, Inflow{From: r.Account, Asset: "native"})
+					add(Inflow{From: r.Account, Asset: "native"})
 				}
 			case "invoke_host_function":
 				for _, ch := range r.Changes {
 					if ch.To == account && ch.From != account {
-						out = append(out, Inflow{From: ch.From, Asset: ch.name(), Amount: stroops(ch.Amount)})
+						add(Inflow{From: ch.From, Asset: ch.name(), Amount: stroops(ch.Amount)})
 					}
 				}
 			}
+		}
+		if len(out) > before {
+			valued++
 		}
 		if n := len(p.Embedded.Records); n == pageSize && !p.Embedded.Records[n-1].CreatedAt.Before(since) {
 			next = p.Links.Next.Href
@@ -207,20 +230,21 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 	}
 	claims := 0
 	next = c.accountURL(account, "effects", fmt.Sprintf("order=desc&limit=%d", pageSize))
-	for page := 0; next != ""; page++ {
-		if page == c.MaxPages {
-			complete = false
+	for valued, read := 0, 0; next != ""; read++ {
+		if valued == c.MaxPages || read == 2*c.MaxPages {
+			gap |= GapVolume
 			break
 		}
 		var p inflowEffectsPage
 		found, err := c.get(ctx, next, &p)
 		if err != nil {
-			return nil, false, err
+			return nil, 0, err
 		}
 		if !found {
 			break
 		}
 		next = ""
+		before := len(out)
 		for _, r := range p.Embedded.Records {
 			if r.CreatedAt.Before(since) {
 				break
@@ -229,33 +253,35 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 			case "claimable_balance_claimed":
 				claims++
 				if claims > maxClaims {
-					complete = false
+					gap |= GapVolume
 					continue
 				}
 				from, err := c.creator(ctx, r.BalanceID)
 				if err != nil {
-					return nil, false, err
+					return nil, 0, err
 				}
 				if from == "" {
-					// A sender that cannot be named cannot be screened.
-					complete = false
+					gap |= GapUnnamed
 					continue
 				}
-				out = append(out, Inflow{From: from, Asset: r.Asset, Amount: stroops(r.Amount)})
+				add(Inflow{From: from, Asset: r.Asset, Amount: stroops(r.Amount)})
 			case "trade":
 				bought := assetFields{AssetType: r.BoughtTyp, AssetCode: r.BoughtCod, AssetIssuer: r.BoughtIss}
-				out = append(out, Inflow{From: r.Seller, Asset: bought.name(), Amount: stroops(r.Bought)})
+				add(Inflow{From: r.Seller, Asset: bought.name(), Amount: stroops(r.Bought)})
 			case "liquidity_pool_withdrew":
 				for _, res := range r.Reserves {
-					out = append(out, Inflow{Asset: res.Asset, Amount: stroops(res.Amount)})
+					add(Inflow{Asset: res.Asset, Amount: stroops(res.Amount)})
 				}
 			}
+		}
+		if len(out) > before {
+			valued++
 		}
 		if n := len(p.Embedded.Records); n == pageSize && !p.Embedded.Records[n-1].CreatedAt.Before(since) {
 			next = p.Links.Next.Href
 		}
 	}
-	return out, complete, nil
+	return out, gap, nil
 }
 
 type operationsPage struct {
@@ -284,7 +310,7 @@ func (c Client) creator(ctx context.Context, balanceID string) (string, error) {
 // Funders returns the accounts that sent value to account since a time, newest first, and whether
 // the history was read in full.
 func (c Client) Funders(ctx context.Context, account string, since time.Time) ([]string, bool, error) {
-	inflows, complete, err := c.Inflows(ctx, account, since)
+	inflows, gap, err := c.Inflows(ctx, account, since)
 	if err != nil {
 		return nil, false, err
 	}
@@ -296,18 +322,25 @@ func (c Client) Funders(ctx context.Context, account string, since time.Time) ([
 			out = append(out, in.From)
 		}
 	}
-	return out, complete, nil
+	return out, gap == 0, nil
 }
 
 // Operation is one operation an account took part in, as Horizon reports it. Trustor is set on
-// an issuer's change to the account's trustline flags.
+// an issuer's change to the account's trustline flags, and Changes on a Soroban call that moved
+// assets.
 type Operation struct {
-	ID            string    `json:"id"`
-	PagingToken   string    `json:"paging_token"`
-	Type          string    `json:"type"`
-	SourceAccount string    `json:"source_account"`
-	CreatedAt     time.Time `json:"created_at"`
-	Trustor       string    `json:"trustor"`
+	ID            string          `json:"id"`
+	PagingToken   string          `json:"paging_token"`
+	Type          string          `json:"type"`
+	SourceAccount string          `json:"source_account"`
+	CreatedAt     time.Time       `json:"created_at"`
+	Trustor       string          `json:"trustor"`
+	Changes       []BalanceChange `json:"asset_balance_changes"`
+}
+
+// BalanceChange is a movement of an asset a Soroban call made.
+type BalanceChange struct {
+	From string `json:"from"`
 }
 
 type operationRecordsPage struct {

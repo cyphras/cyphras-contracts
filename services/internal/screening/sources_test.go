@@ -139,15 +139,15 @@ func static(name string, fetched time.Time, entries map[string]Hit) *staticSourc
 // funderMap gives each account its funders, each having sent 100 XLM, enough to matter.
 type funderMap map[string][]string
 
-func (f funderMap) Inflows(_ context.Context, account string, _ time.Time) ([]Inflow, bool, error) {
+func (f funderMap) Inflows(_ context.Context, account string, _ time.Time) ([]Inflow, Gap, error) {
 	if account == "unreachable" {
-		return nil, false, errors.New("down")
+		return nil, 0, errors.New("down")
 	}
 	var out []Inflow
 	for _, from := range f[account] {
 		out = append(out, Inflow{From: from, Asset: "native", Amount: big.NewInt(1_000_000_000)})
 	}
-	return out, true, nil
+	return out, 0, nil
 }
 
 func TestTheCheckerFollowsFunders(t *testing.T) {
@@ -186,12 +186,12 @@ func TestTheCheckerFollowsFunders(t *testing.T) {
 
 // inflowList answers every account with the same inflows.
 type inflowList struct {
-	inflows  []Inflow
-	complete bool
+	inflows []Inflow
+	gap     Gap
 }
 
-func (l inflowList) Inflows(context.Context, string, time.Time) ([]Inflow, bool, error) {
-	return l.inflows, l.complete, nil
+func (l inflowList) Inflows(context.Context, string, time.Time) ([]Inflow, Gap, error) {
+	return l.inflows, l.gap, nil
 }
 
 func TestASelfReportNeverReachesThePayeesOfTheReportedKey(t *testing.T) {
@@ -206,7 +206,7 @@ func TestASelfReportNeverReachesThePayeesOfTheReportedKey(t *testing.T) {
 		"dust":        {{From: attacker, Asset: "native", Amount: big.NewInt(1)}, {From: funder, Asset: "native", Amount: big.NewInt(1_000_000_000)}},
 		"a real gift": {{From: attacker, Asset: "native", Amount: big.NewInt(50_000_000_000)}},
 	} {
-		c := &Checker{Sources: []Source{reports, fraud}, Inflows: inflowList{inflows, true}, MaxFunders: 25, Now: func() time.Time { return now },
+		c := &Checker{Sources: []Source{reports, fraud}, Inflows: inflowList{inflows, 0}, MaxFunders: 25, Now: func() time.Time { return now },
 			Dust: Dust{ShareBps: 100, Floors: map[string]*big.Int{"native": big.NewInt(100_000_000)}}}
 		v, err := c.Check(context.Background(), honest, 1, now.Add(-FunderWindow))
 		if err != nil || !v.Clear() {
@@ -214,7 +214,7 @@ func TestASelfReportNeverReachesThePayeesOfTheReportedKey(t *testing.T) {
 		}
 	}
 	// A victim's report about a funder sends the payee to review, never to a public reason 4.
-	c := &Checker{Sources: []Source{reports, fraud}, Inflows: inflowList{[]Inflow{{From: thief, Asset: "native", Amount: big.NewInt(1_000_000_000)}}, true},
+	c := &Checker{Sources: []Source{reports, fraud}, Inflows: inflowList{[]Inflow{{From: thief, Asset: "native", Amount: big.NewInt(1_000_000_000)}}, 0},
 		MaxFunders: 25, Now: func() time.Time { return now }}
 	if v, _ := c.Check(context.Background(), honest, 1, now.Add(-FunderWindow)); v.Refused || !v.Refer {
 		t.Fatalf("a reported funder: %+v", v)
@@ -258,13 +258,13 @@ func TestAHistoryNotReadInFullNeverPasses(t *testing.T) {
 	}
 	// The listed funder comes last, past the cap, as the oldest of a newest-first history.
 	inflows = append(inflows, Inflow{From: listed, Asset: "native", Amount: big.NewInt(1_000_000_000)})
-	c := &Checker{Sources: []Source{src}, Inflows: inflowList{inflows, true}, MaxFunders: 25, Now: func() time.Time { return now }}
+	c := &Checker{Sources: []Source{src}, Inflows: inflowList{inflows, 0}, MaxFunders: 25, Now: func() time.Time { return now }}
 	v, err := c.Check(context.Background(), clean, 1, now.Add(-FunderWindow))
 	if err != nil || v.Clear() || !v.Incomplete || !strings.Contains(v.Detail, "25 of the 26 funders") {
 		t.Fatalf("over the cap: %+v %v", v, err)
 	}
-	c.Inflows = inflowList{inflows[:3], false}
-	if v, _ := c.Check(context.Background(), clean, 1, now.Add(-FunderWindow)); v.Clear() || !v.Incomplete || !strings.Contains(v.Detail, "read only in part") {
+	c.Inflows = inflowList{inflows[:3], GapVolume}
+	if v, _ := c.Check(context.Background(), clean, 1, now.Add(-FunderWindow)); v.Clear() || !v.Incomplete || !strings.Contains(v.Detail, "longer than a check reads") {
 		t.Fatalf("a partial history: %+v", v)
 	}
 	c.Exempt = map[string]bool{clean: true}
@@ -363,5 +363,81 @@ func TestADirectoryPageWithoutRecordsIsRefused(t *testing.T) {
 	defer srv.Close()
 	if err := NewDirectorySource(srv.URL, time.Hour).Refresh(context.Background()); err == nil {
 		t.Fatal("a page without records was read as an empty directory")
+	}
+}
+
+func TestTheFirstUpdateAfterARestartIsGuarded(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	var entries []string
+	for range 10 {
+		entries = append(entries, `{"address": "`+keypair.MustRandom().Address()+`", "reason": 2, "source": "incident"}`)
+	}
+	canary := `{"address": "` + thief + `", "reason": 2, "source": "incident"}`
+	path := writeList(t, strings.Join(append(slices.Clone(entries), canary), ","))
+	src := NewFileSource("curated_list", path, 30*24*time.Hour)
+	src.Guard(&Guard{MaxShrinkPct: 20, Canaries: []string{thief}})
+	h.s.check.Sources = append(h.s.check.Sources, src)
+	h.s.RefreshSources(ctx)
+	// The service restarts: its list has no copy yet, and its guard no canaries of its own.
+	restarted := NewFileSource("curated_list", path, 30*24*time.Hour)
+	restarted.Guard(&Guard{MaxShrinkPct: 20})
+	check := &Checker{Sources: []Source{h.sources, restarted}, Inflows: h.funders, MaxFunders: 25, Now: func() time.Time { return h.now }}
+	if _, err := New(ctx, h.s.cfg, h.fake, h.s.chain, check, h.s.engine, h.s.asp, h.s.alerts, h.s.log); err != nil {
+		t.Fatal(err)
+	}
+	write := func(list []string) {
+		doc := fmt.Sprintf(`{"version": "8", "updated_at": "2026-10-02T00:00:00Z", "entries": [%s]}`, strings.Join(list, ","))
+		if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A first update that lost a third of the list is refused.
+	write(append(slices.Clone(entries[:7]), canary))
+	if err := restarted.Refresh(ctx); !errors.Is(err, ErrSuspect) || !strings.Contains(err.Error(), "from 11") {
+		t.Fatalf("a shrunk first update: %v", err)
+	}
+	// So is one without the canary the last good copy held.
+	write(entries)
+	if err := restarted.Refresh(ctx); !errors.Is(err, ErrSuspect) || !strings.Contains(err.Error(), "canary") {
+		t.Fatalf("a first update without the canary: %v", err)
+	}
+	write(append(slices.Clone(entries), canary))
+	if err := restarted.Refresh(ctx); err != nil {
+		t.Fatalf("a good first update: %v", err)
+	}
+}
+
+func TestTheSanctionsGuardCountsTheStellarAddresses(t *testing.T) {
+	var listed []string
+	for range 3 {
+		listed = append(listed, keypair.MustRandom().Address())
+	}
+	sdn := func(withStellar bool) string {
+		var rows []string
+		for n := range 20 {
+			remarks := "Digital Currency Address - XBT 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+			if withStellar && n < len(listed) {
+				remarks += "; Digital Currency Address - XLM " + listed[n]
+			}
+			rows = append(rows, fmt.Sprintf(`%d,"ENTITY %d","entity","CYBER2",-0- ,-0- ,-0- ,-0- ,-0- ,-0- ,-0- ,"%s."`, n+1, n, remarks))
+		}
+		return strings.Join(rows, "\n")
+	}
+	body := sdn(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+	defer srv.Close()
+	src := NewOFACSource(srv.URL, time.Hour)
+	src.Guard(&Guard{MaxShrinkPct: 20, Canaries: []string{"Digital Currency Address - XBT"}})
+	if err := src.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Every record is still there, but the Stellar addresses are gone.
+	body = sdn(false)
+	if err := src.Refresh(context.Background()); !errors.Is(err, ErrSuspect) || !strings.Contains(err.Error(), "from 3 to 0") {
+		t.Fatalf("an update without the Stellar addresses: %v", err)
+	}
+	if _, ok := src.Lookup(listed[0]); !ok {
+		t.Fatal("the previous list was dropped")
 	}
 }

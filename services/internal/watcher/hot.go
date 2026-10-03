@@ -14,6 +14,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/strkey"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
+	"github.com/cyphras/cyphras-contracts/services/internal/horizon"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
@@ -24,9 +25,10 @@ import (
 var ownOperations = map[string]bool{"invoke_host_function": true, "extend_footprint_ttl": true, "restore_footprint": true}
 
 // CheckHotAccounts pages when a hot account is missing or below its floor, and when Horizon shows
-// it sourcing anything but its own Soroban calls, or an issuer changing its trustline flags. What
-// others send it means nothing and is ignored, so nobody can flood the pager by paying it. Each
-// account is checked on its own, and a run raises at most one alert per account and condition.
+// it sourcing anything but its own Soroban calls, an issuer changing its trustline flags, or its
+// funds moving, whoever sourced the call. What others send it means nothing and is ignored, so
+// nobody can flood the pager by paying it. Each account is checked on its own, and a page of its
+// history raises at most one alert per account.
 func (w *Watcher) CheckHotAccounts(ctx context.Context) error {
 	var errs []error
 	for _, h := range w.cfg.HotAccounts {
@@ -66,15 +68,25 @@ func (w *Watcher) checkHot(ctx context.Context, h HotAccount) error {
 	return w.operations(ctx, h)
 }
 
-// operations reads the account's new operations from its stored cursor.
+// operations reads the account's new operations from its stored cursor. Each page is judged
+// before the cursor moves past it, so a failed read of a later page loses nothing.
 func (w *Watcher) operations(ctx context.Context, h HotAccount) error {
 	key := "operations:" + h.Address
-	cursor, _, err := w.db.meta(ctx, key)
+	cursor, ok, err := w.db.meta(ctx, key)
 	if err != nil {
 		return err
 	}
-	counts := map[string]int{}
-	var newest string
+	if !ok {
+		// An earlier watcher read the account's effects; an effect's paging token is its
+		// operation's followed by a dash and the effect's index.
+		effects, found, err := w.db.meta(ctx, "effects:"+h.Address)
+		if err != nil {
+			return err
+		}
+		if found {
+			cursor, _, _ = strings.Cut(effects, "-")
+		}
+	}
 	for range 50 {
 		list, err := w.horizon.Operations(ctx, h.Address, cursor)
 		if err != nil {
@@ -84,29 +96,44 @@ func (w *Watcher) operations(ctx context.Context, h HotAccount) error {
 			break
 		}
 		if cursor != "" {
-			for _, op := range list {
-				own := op.SourceAccount == h.Address && !ownOperations[op.Type]
-				flags := (op.Type == "set_trust_line_flags" || op.Type == "allow_trust") && op.Trustor == h.Address
-				if own || flags {
-					counts[op.Type]++
-					newest = op.ID
-				}
-			}
+			w.judgeOperations(ctx, h, list)
 		}
 		cursor = list[len(list)-1].PagingToken
 		if err := w.db.setMeta(ctx, key, cursor); err != nil {
 			return err
 		}
 	}
-	if len(counts) > 0 {
-		var parts []string
-		for _, t := range slices.Sorted(maps.Keys(counts)) {
-			parts = append(parts, fmt.Sprintf("%d %s", counts[t], t))
-		}
-		w.alerts.Raise(ctx, alert.Critical, "hot_account_activity_"+h.Address, "the %s account %s took part in what it never should: %s, the newest operation %s",
-			h.Name, h.Address, strings.Join(parts, ", "), newest)
-	}
 	return nil
+}
+
+// judgeOperations pages on the operations of a hot account it should never take part in.
+func (w *Watcher) judgeOperations(ctx context.Context, h HotAccount, list []horizon.Operation) {
+	counts := map[string]int{}
+	var newest string
+	for _, op := range list {
+		var what string
+		switch {
+		case slices.ContainsFunc(op.Changes, func(c horizon.BalanceChange) bool { return c.From == h.Address }):
+			what = op.Type + " moving its funds"
+		case op.SourceAccount == h.Address && !ownOperations[op.Type]:
+			what = op.Type
+		case (op.Type == "set_trust_line_flags" || op.Type == "allow_trust") && op.Trustor == h.Address:
+			what = op.Type
+		default:
+			continue
+		}
+		counts[what]++
+		newest = op.ID
+	}
+	if len(counts) == 0 {
+		return
+	}
+	var parts []string
+	for _, t := range slices.Sorted(maps.Keys(counts)) {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[t], t))
+	}
+	w.alerts.Raise(ctx, alert.Critical, "hot_account_activity_"+h.Address, "the %s account %s took part in what it never should: %s, the newest operation %s",
+		h.Name, h.Address, strings.Join(parts, ", "), newest)
 }
 
 // ParseHotAccounts reads one "name address floor" line per hot account, the floor in stroops;

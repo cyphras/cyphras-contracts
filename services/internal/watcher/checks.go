@@ -91,6 +91,7 @@ func (w *Watcher) Reconcile(ctx context.Context) error {
 	w.mu.Lock()
 	w.inst = &inst
 	w.latest = max(w.latest, latest)
+	w.closedAt = health.LatestLedgerCloseTime
 	cursor := w.cursor
 	w.reads = append(w.reads, statusRead{inst: inst, from: instEntry.LastModified, to: latest, now: now})
 	if len(w.reads) > 16 {
@@ -519,8 +520,9 @@ func (w *Watcher) CheckFreezes(ctx context.Context) error {
 	return nil
 }
 
-// CheckAdmissions pages when an attested, unflagged deposit is still pending ten minutes after it
-// became eligible.
+// CheckAdmissions pages when an unflagged deposit is still pending ten minutes after it became
+// eligible: an attested one the keeper has not admitted, or one the screening service has not
+// attested, which holds back every deposit behind it.
 func (w *Watcher) CheckAdmissions(ctx context.Context) error {
 	health, err := w.rpc.GetHealth(ctx)
 	if err != nil {
@@ -531,16 +533,17 @@ func (w *Watcher) CheckAdmissions(ctx context.Context) error {
 	inst := w.inst
 	var due []*chainstate.Deposit
 	for _, d := range w.state.Pending {
-		if d.Flag == nil && d.ID <= w.state.AttestedUpTo {
+		if d.Flag == nil {
 			due = append(due, d)
 		}
 	}
+	attested := w.state.AttestedUpTo
 	halted := w.state.HaltedUntil > now
 	w.mu.RUnlock()
 	if inst == nil || halted {
 		return nil
 	}
-	var late []uint64
+	var late, unattested []uint64
 	for _, d := range due {
 		delay, ok, err := w.delayOf(ctx, d.ID)
 		if err != nil {
@@ -550,15 +553,25 @@ func (w *Watcher) CheckAdmissions(ctx context.Context) error {
 			continue
 		}
 		eligible := vault.PendingDeposit{Amount: d.Amount, CreatedAt: d.CreatedAt, Delay: delay}.EligibleAt(inst.Config, inst.Limits)
-		if now >= eligible+600 {
+		switch {
+		case now < eligible+600:
+		case d.ID <= attested:
 			late = append(late, d.ID)
+		default:
+			unattested = append(unattested, d.ID)
 		}
 	}
 	slices.Sort(late)
+	slices.Sort(unattested)
 	if len(late) > 0 {
 		w.alerts.Raise(ctx, alert.Warning, "admission_late", "deposits %v have been eligible for more than 10 minutes", late)
 	} else {
 		w.alerts.Clear(ctx, "admission_late", "every eligible deposit is admitted")
+	}
+	if len(unattested) > 0 {
+		w.alerts.Raise(ctx, alert.Warning, "attestation_late", "deposits %v have been eligible for more than 10 minutes without an attestation", unattested)
+	} else {
+		w.alerts.Clear(ctx, "attestation_late", "every eligible deposit is attested")
 	}
 	return nil
 }

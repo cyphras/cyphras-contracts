@@ -344,3 +344,116 @@ func TestAPaymentToTheAssetsIssuerIsNoMismatch(t *testing.T) {
 		t.Fatalf("pages %v", h.pages.codes())
 	}
 }
+
+func TestAnAttestationIsJudgedForEveryDepositItCovers(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		h := newHarness(t)
+		c := h.chain
+		large := c.Shield(vaulttest.Depositor, 6_000_000_000)
+		small := c.Shield(vaulttest.Depositor, 10_000_000)
+		c.NextLedger(5)
+		h.sync()
+		created := uint64(c.ClosedAt - 5)
+		h.primary.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, large)), vaulttest.Pending(large, vaulttest.Depositor, 6_000_000_000, created, 86400, nil, 0), c.Ledger, nil)
+		h.primary.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, small)), vaulttest.Pending(small, vaulttest.Depositor, 10_000_000, created, 3600, nil, 0), c.Ledger, nil)
+		// Inside the small deposit's final ten minutes, 23 hours before the large one's: the
+		// attestation vouches for the large one too, unless it is held.
+		c.NextLedger(3600 - 5*60)
+		if held {
+			c.Flag(large, 6)
+		}
+		c.Attest(small)
+		c.NextLedger(5)
+		h.sync()
+		if got := h.pages.has("early_attestation_1"); got == held || h.pages.has("early_attestation_2") {
+			t.Fatalf("held %v: pages %v", held, h.pages.codes())
+		}
+	}
+}
+
+func TestAStalledPrimaryStopsTheHeartbeat(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.activity()
+	h.sync()
+	h.second.Fail["getLedgerEntries"] = errors.New("down")
+	h.second.Fail["getHealth"] = errors.New("down")
+	beats := 0
+	h.w.SetHeartbeat(func(context.Context) error { beats++; return nil })
+	if err := h.w.reconcileAndBeat(ctx); err != nil || beats != 1 {
+		t.Fatalf("a fresh primary: %d beats, %v", beats, err)
+	}
+	// The primary stops at its last ledger while time goes on.
+	h.chain.NextLedger(3 * 60)
+	for range 5 {
+		if err := h.w.reconcileAndBeat(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	critical := false
+	for _, a := range h.pages.alerts {
+		critical = critical || (a.Code == "rpc_stale" && a.Severity == alert.Critical)
+	}
+	if beats != 1 || !critical {
+		t.Fatalf("a stalled primary: %d beats, pages %v", beats, h.pages.codes())
+	}
+}
+
+// refusing refuses every alert, as a webhook that is down does.
+type refusing struct{}
+
+func (refusing) Send(context.Context, alert.Alert) error { return errors.New("webhook down") }
+
+func TestAnAlertChannelThatRefusesEverythingStopsTheHeartbeat(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.activity()
+	h.sync()
+	q := &alert.Queue{Name: "operator", Channels: []alert.Channel{refusing{}}, Now: h.w.now}
+	h.w.alerts.Queue = q
+	beats := 0
+	h.w.SetHeartbeat(func(context.Context) error { beats++; return nil })
+	h.w.alerts.Raise(ctx, alert.Critical, "balance_below_tvl", "test")
+	q.Flush(ctx)
+	if err := h.w.reconcileAndBeat(ctx); err != nil || beats != 1 {
+		t.Fatalf("a channel failing for a moment: %d beats, %v", beats, err)
+	}
+	h.chain.NextLedger(11 * 60)
+	h.sync()
+	q.Flush(ctx)
+	if err := h.w.reconcileAndBeat(ctx); err != nil || beats != 1 {
+		t.Fatalf("a channel failing for 11 minutes: %d beats, %v", beats, err)
+	}
+}
+
+func TestADepositNotAttestedPastItsEligibilityPages(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	id := h.chain.Shield(vaulttest.Depositor, 10_000_000)
+	h.chain.NextLedger(5)
+	h.sync()
+	h.primary.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)), vaulttest.Pending(id, vaulttest.Depositor, 10_000_000, uint64(h.chain.ClosedAt-5), 3600, nil, 0), h.chain.Ledger, nil)
+	h.primary.CloseTime = h.chain.ClosedAt + 3600 + 11*60
+	if err := h.w.CheckAdmissions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !h.pages.has("attestation_late") || h.pages.has("admission_late") {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+	// A flagged deposit waits for nothing.
+	h.chain.NextLedger(5)
+	h.chain.Flag(id, 6)
+	h.chain.NextLedger(5)
+	h.sync()
+	h.primary.CloseTime = h.chain.ClosedAt + 3600 + 11*60
+	if err := h.w.CheckAdmissions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolved := false
+	for _, a := range h.pages.alerts {
+		resolved = resolved || a.Code == "attestation_late_resolved"
+	}
+	if !resolved {
+		t.Fatalf("pages %v", h.pages.codes())
+	}
+}

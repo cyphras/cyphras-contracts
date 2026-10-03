@@ -80,17 +80,17 @@ func tokens(line string) []string {
 	return out
 }
 
-// clientKey reads the map that keys clients for the rate limits and returns it as a function.
-func clientKey(t *testing.T) func(string) string {
+// mapKey reads a map the rate limits key clients by and returns it as a function.
+func mapKey(t *testing.T, name string) func(string) string {
 	t.Helper()
 	conf, err := os.ReadFile("nginx/cyphras-services.conf")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, block, ok := strings.Cut(string(conf), "map $remote_addr $cy_client {\n")
+	_, block, ok := strings.Cut(string(conf), "map $remote_addr $"+name+" {\n")
 	block, _, ok2 := strings.Cut(block, "\n}")
 	if !ok || !ok2 {
-		t.Fatal("the client key map is missing")
+		t.Fatalf("the map of $%s is missing", name)
 	}
 	var rules []rule
 	def := ""
@@ -118,8 +118,8 @@ func clientKey(t *testing.T) func(string) string {
 	}
 }
 
-func TestEveryAddressOfASlash64GetsOneRateLimitKey(t *testing.T) {
-	key := clientKey(t)
+func TestEveryAddressOfASlash64AndASlash48GetsOneRateLimitKey(t *testing.T) {
+	client, site := mapKey(t, "cy_client"), mapKey(t, "cy_site")
 	rng := rand.New(rand.NewPCG(1, 2))
 	check := func(groups [8]uint16) {
 		t.Helper()
@@ -128,12 +128,16 @@ func TestEveryAddressOfASlash64GetsOneRateLimitKey(t *testing.T) {
 			p[2*i], p[2*i+1] = byte(g>>8), byte(g)
 		}
 		text := nginxText(p)
-		want := fmt.Sprintf("6:%x:%x:%x:%x", groups[0], groups[1], groups[2], groups[3])
+		want64 := fmt.Sprintf("6:%x:%x:%x:%x", groups[0], groups[1], groups[2], groups[3])
+		want48 := fmt.Sprintf("6:%x:%x:%x", groups[0], groups[1], groups[2])
 		if strings.Contains(text, ".") {
-			want = "$binary_remote_addr"
+			want64, want48 = "$binary_remote_addr", "$binary_remote_addr"
 		}
-		if got := key(text); got != want {
-			t.Fatalf("%s keys as %q, want %q", text, got, want)
+		if got := client(text); got != want64 {
+			t.Fatalf("%s keys its /64 as %q, want %q", text, got, want64)
+		}
+		if got := site(text); got != want48 {
+			t.Fatalf("%s keys its /48 as %q, want %q", text, got, want48)
 		}
 	}
 	// Every placement of zero groups, so every place nginx can put the "::".
@@ -148,7 +152,7 @@ func TestEveryAddressOfASlash64GetsOneRateLimitKey(t *testing.T) {
 			check(groups)
 		}
 	}
-	if got := key("203.0.113.7"); got != "$binary_remote_addr" {
-		t.Fatalf("an IPv4 address keys as %q", got)
+	if client("203.0.113.7") != "$binary_remote_addr" || site("203.0.113.7") != "$binary_remote_addr" {
+		t.Fatal("an IPv4 address is not keyed on itself")
 	}
 }

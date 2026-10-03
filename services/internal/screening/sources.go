@@ -37,7 +37,11 @@ const (
 	ReasonFrozen    = 3
 	ReasonFraud     = 4
 	ReasonReview    = 5
-	ReasonOther     = 99
+	// ReasonHeld holds a deposit that waits for a person or for its own final check. It is not a
+	// refusal: the hold is lifted once the deposit clears, and replaced by the refusal's reason when
+	// it is refused. The keeper refunds a deposit still held a day after the hold.
+	ReasonHeld  = 6
+	ReasonOther = 99
 	// ReasonCourtOrder refuses a deposit a written order from an authority concerns. The keeper
 	// never refunds it; the depositor still can.
 	ReasonCourtOrder = 100
@@ -77,26 +81,32 @@ type Source interface {
 }
 
 // Guard refuses a source update that looks broken: one that shrinks the list by more than
-// MaxShrinkPct percent, or that lacks a canary, an entry every good copy holds. The previous list
-// stays in use, and ages until a good update arrives.
+// MaxShrinkPct percent, or that lacks a canary, an entry every good copy holds. Without canaries
+// of its own, the guard checks those the last good copy held. The previous list stays in use, and
+// ages until a good update arrives.
 type Guard struct {
 	MaxShrinkPct int
 	Canaries     []string
 }
 
-func (g *Guard) check(name string, prev, size int, has func(string) bool) error {
+// check returns the canaries the update holds.
+func (g *Guard) check(name string, prev, size int, known []string, has func(string) bool) ([]string, error) {
 	if g == nil {
-		return nil
+		return nil, nil
 	}
 	if prev > 0 && g.MaxShrinkPct > 0 && size*100 < prev*(100-g.MaxShrinkPct) {
-		return fmt.Errorf("%s: %w: the update shrinks the list from %d to %d entries", name, ErrSuspect, prev, size)
+		return nil, fmt.Errorf("%s: %w: the update shrinks the list from %d to %d entries", name, ErrSuspect, prev, size)
 	}
-	for _, c := range g.Canaries {
+	canaries := g.Canaries
+	if len(canaries) == 0 {
+		canaries = known
+	}
+	for _, c := range canaries {
 		if !has(c) {
-			return fmt.Errorf("%s: %w: the update lacks the canary %q", name, ErrSuspect, c)
+			return nil, fmt.Errorf("%s: %w: the update lacks the canary %q", name, ErrSuspect, c)
 		}
 	}
-	return nil
+	return canaries, nil
 }
 
 // ErrSuspect reports a source update the guard refused.
@@ -112,8 +122,10 @@ type list struct {
 	entries   map[string]Hit
 	version   string
 	fetchedAt time.Time
-	// size is how big the source's last accepted copy was, in the unit its guard counts.
-	size int
+	// size is how big the source's last accepted copy was, in the unit its guard counts, and known
+	// the canaries it held. Both outlive a restart, so the guard checks the first update after one.
+	size  int
+	known []string
 }
 
 // Guard sets the checks every update of the source must pass.
@@ -126,15 +138,31 @@ func (l *list) Guard(g *Guard) {
 // accept checks an update against the guard and the last accepted copy, and keeps it.
 func (l *list) accept(entries map[string]Hit, version string, fetchedAt time.Time, size int, has func(string) bool) error {
 	l.mu.RLock()
-	g, prev := l.guard, l.size
+	g, prev, known := l.guard, l.size, l.known
 	l.mu.RUnlock()
-	if err := g.check(l.name, prev, size, has); err != nil {
+	canaries, err := g.check(l.name, prev, size, known, has)
+	if err != nil {
 		return err
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.entries, l.version, l.fetchedAt, l.size = entries, version, fetchedAt, size
+	l.entries, l.version, l.fetchedAt, l.size, l.known = entries, version, fetchedAt, size, canaries
 	return nil
+}
+
+// lastGood returns the size of the last accepted copy and the canaries it held, for a source with
+// a guard.
+func (l *list) lastGood() (int, []string, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.size, l.known, l.guard != nil
+}
+
+// restore sets what the guard compares the next update with, as it was before a restart.
+func (l *list) restore(size int, canaries []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.size, l.known = size, canaries
 }
 
 func inEntries(entries map[string]Hit) func(string) bool {
@@ -314,8 +342,9 @@ func (s *OFACSource) Refresh(ctx context.Context) error {
 		}
 	}
 	sum := sha256.Sum256(body)
-	// The list holds few Stellar addresses, so its size and canaries are those of the whole list.
-	return s.accept(entries, hex.EncodeToString(sum[:8]), s.now(), records, func(token string) bool { return bytes.Contains(body, []byte(token)) })
+	// The guard counts the Stellar addresses, the part of the list screening uses, while its
+	// canaries are text anywhere in the list, which shows the whole of it came.
+	return s.accept(entries, fmt.Sprintf("%s, %d records", hex.EncodeToString(sum[:8]), records), s.now(), len(entries), func(token string) bool { return bytes.Contains(body, []byte(token)) })
 }
 
 // DirectorySource reads the accounts the stellar.expert directory tags as malicious, and refers

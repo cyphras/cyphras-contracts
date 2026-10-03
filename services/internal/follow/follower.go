@@ -49,6 +49,9 @@ func (f *Follower) Step(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("rpc health: %w", err)
 	}
+	if health.OldestLedger > health.LatestLedger {
+		return false, fmt.Errorf("%w: the RPC keeps ledgers %d to %d", ErrRange, health.OldestLedger, health.LatestLedger)
+	}
 	next := f.Sink.Cursor() + 1
 	if next > health.LatestLedger {
 		return false, nil

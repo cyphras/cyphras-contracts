@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS unshield_refusals (
 	reason integer PRIMARY KEY,
 	refused bigint NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_guards (
+	name text PRIMARY KEY,
+	size integer NOT NULL,
+	canaries text[] NOT NULL
+);
 CREATE TABLE IF NOT EXISTS registers (
 	id bigserial PRIMARY KEY,
 	kind text NOT NULL,
@@ -127,12 +132,32 @@ type row struct {
 	// recheckAt is when the final check ran; a pass vouches for the deposit only for a while.
 	recheckAt *uint64
 	flagSent  *uint32
-	// firstFindings are what the first check found, which a cleared review accepted.
-	firstFindings []string
-	// flagKind is the kind of decision behind this service's flag, such as review_timeout.
+	// findings are what a review is asked to clear: what the first check found, or what a later
+	// check found since.
+	findings []string
+	// flagKind is the kind of decision behind this service's flag, such as hold, or lifted once a
+	// hold is lifted.
 	flagKind string
 	// needsFlag marks a refusal whose flag has not been sent yet.
 	needsFlag bool
+}
+
+// reason is the deposit's flag: the one this service sent last, which counts before the follower
+// sees it land, or else the chain's.
+func (r *row) reason() *uint32 {
+	switch {
+	case r.flagSent != nil:
+		return r.flagSent
+	case r.flagKind == "lifted":
+		return nil
+	}
+	return r.flag
+}
+
+// awaitsReview reports a deposit that waits for a person, held or not.
+func (r *row) awaitsReview() bool {
+	f := r.reason()
+	return r.review == "needed" && (f == nil || *f == ReasonHeld)
 }
 
 func (s store) pending(ctx context.Context) ([]row, error) {
@@ -162,7 +187,7 @@ func (s store) pending(ctx context.Context) ([]row, error) {
 			r.recheckAt = &at
 		}
 		if findings != "" {
-			r.firstFindings = strings.Split(findings, "\n")
+			r.findings = strings.Split(findings, "\n")
 		}
 		r.id, r.createdAt = uint64(id), uint64(created)
 		r.flag, r.refuseReason, r.flagSent = u32p(flag), u32p(refuseReason), u32p(flagSent)
@@ -254,6 +279,40 @@ func (s store) addSelfReport(ctx context.Context, address, date, signature strin
 	tag, err := s.pool.Exec(ctx, `INSERT INTO self_reports (address, report_date, signature, received_day) VALUES ($1, $2, $3, $4)
 		ON CONFLICT (address) DO NOTHING`, address, date, signature, at.UTC().Format(time.DateOnly))
 	return tag.RowsAffected() == 1, err
+}
+
+// guardState is what a source's guard compares the next update with.
+type guardState struct {
+	size     int
+	canaries []string
+}
+
+func (s store) saveGuard(ctx context.Context, name string, g guardState) error {
+	canaries := g.canaries
+	if canaries == nil {
+		canaries = []string{} // a nil slice is NULL, which the column refuses
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO source_guards (name, size, canaries) VALUES ($1, $2, $3)
+		ON CONFLICT (name) DO UPDATE SET size = EXCLUDED.size, canaries = EXCLUDED.canaries`, name, g.size, canaries)
+	return err
+}
+
+func (s store) guards(ctx context.Context) (map[string]guardState, error) {
+	rows, err := s.pool.Query(ctx, `SELECT name, size, canaries FROM source_guards`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]guardState{}
+	for rows.Next() {
+		var name string
+		var g guardState
+		if err := rows.Scan(&name, &g.size, &g.canaries); err != nil {
+			return nil, err
+		}
+		out[name] = g
+	}
+	return out, rows.Err()
 }
 
 func (s store) countUnshieldRefusal(ctx context.Context, reason uint32) error {

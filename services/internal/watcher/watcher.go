@@ -55,6 +55,8 @@ type Config struct {
 	// HealthURLs are health endpoints that must answer 200.
 	HealthURLs  []string
 	HotAccounts []HotAccount
+	// Lumens is the contract of the native asset, whose transfers out of a hot account page.
+	Lumens string
 	// ServiceAccounts are checked against CAP-77 freezes, with the vault, its code and its asset.
 	ServiceAccounts []string
 	// BurstMultiple and BurstFloor bound transact calls within 10 minutes: alert above the
@@ -93,6 +95,8 @@ type Watcher struct {
 	state  *chainstate.State
 	cursor uint32
 	latest uint32
+	// closedAt is when the newest ledger the primary RPC knows closed.
+	closedAt int64
 	// roots holds the tree's recent roots by leaf count, as the vault's root ring does.
 	roots     map[uint64]fr.Element
 	rootOrder []uint64
@@ -204,6 +208,9 @@ func (w *Watcher) Apply(ctx context.Context, b follow.Batch) error {
 	if err := w.checkTransfers(ctx, b, delta); err != nil {
 		return err
 	}
+	if err := w.checkHotTransfers(ctx, b); err != nil {
+		return err
+	}
 	err = w.chain.Commit(ctx, b.From, b.To, next, delta, func(tx pgx.Tx) error {
 		if err := w.recordActivity(ctx, tx, b); err != nil {
 			return err
@@ -212,7 +219,8 @@ func (w *Watcher) Apply(ctx context.Context, b follow.Batch) error {
 		// stays in the database, so neither a failed read nor a restart loses it.
 		for _, n := range delta.Notices {
 			if n.Name == "attested" && n.ClosedAt+secondsPerDay >= b.LatestCloseTime {
-				if err := w.db.addAttestCheck(ctx, tx, n.Body.(vault.Attested).UpTo, n.Ledger, n.ClosedAt); err != nil {
+				a := n.Body.(chainstate.Attestation)
+				if err := w.db.addAttestCheck(ctx, tx, attestCheck{upTo: a.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: a.Covered}); err != nil {
 					return err
 				}
 			}
@@ -345,7 +353,8 @@ func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, late
 			r := n.Body.(vault.ExitRequeued)
 			w.alerts.Raise(ctx, alert.Info, fmt.Sprintf("exit_requeued_%d", r.NewID), "%v of the payout and %v of the fee of stranded exit %d were queued again as exit %d", r.Payout, r.Fee, r.ID, r.NewID)
 		case n.Name == "attested":
-			if err := w.judgeAttestation(ctx, attestCheck{upTo: n.Body.(vault.Attested).UpTo, ledger: n.Ledger, closedAt: n.ClosedAt}); err != nil {
+			a := n.Body.(chainstate.Attestation)
+			if err := w.judgeAttestation(ctx, attestCheck{upTo: a.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: a.Covered}); err != nil {
 				w.log.Warn("attestation check deferred", "ledger", n.Ledger, "error", err.Error())
 			}
 		}
@@ -387,6 +396,8 @@ type attestCheck struct {
 	upTo     uint64
 	ledger   uint32
 	closedAt int64
+	// covered are the deposits the attestation vouches for.
+	covered []uint64
 }
 
 // errNotYet reports a check that cannot run before the vault's instance has been read.
@@ -394,8 +405,9 @@ var errNotYet = errors.New("the vault's instance is not read yet")
 
 // judgeAttestation pages when an attestation covers a deposit more than ten minutes before that
 // deposit can be admitted: the screening service attests only after the final check, which runs
-// in the last ten minutes, so an earlier one can mean a stolen asp key. Once judged, the check is
-// forgotten; one that cannot be judged now stays for RetryAttestations.
+// in the last ten minutes, so an earlier one can mean a stolen asp key. Every deposit it vouches
+// for is judged, not only the last. Once judged, the check is forgotten; one that cannot be judged
+// now stays for RetryAttestations.
 func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 	w.mu.RLock()
 	inst := w.inst
@@ -403,12 +415,15 @@ func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 	if inst == nil {
 		return errNotYet
 	}
-	amount, createdAt, found, err := w.db.deposit(ctx, c.upTo)
-	if err != nil {
-		return err
-	}
-	if found {
-		delay, ok, err := w.delayOf(ctx, c.upTo)
+	for _, id := range c.covered {
+		amount, createdAt, found, err := w.db.deposit(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		delay, ok, err := w.delayOf(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -417,9 +432,9 @@ func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 		}
 		eligible := vault.PendingDeposit{Amount: amount, CreatedAt: createdAt, Delay: delay}.EligibleAt(inst.Config, inst.Limits)
 		if uint64(c.closedAt)+600+attestSlack < eligible {
-			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("early_attestation_%d", c.upTo),
-				"attestation up to deposit %d at ledger %d came %d seconds before its final-check window; the asp key may be stolen",
-				c.upTo, c.ledger, eligible-600-uint64(c.closedAt))
+			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("early_attestation_%d", id),
+				"attestation up to deposit %d at ledger %d covered deposit %d %d seconds before its final-check window; the asp key may be stolen",
+				c.upTo, c.ledger, id, eligible-600-uint64(c.closedAt))
 		}
 	}
 	return w.db.dropAttestCheck(ctx, c.upTo, c.ledger)
@@ -596,6 +611,59 @@ func transferFilters(vaultID string) []protocol.TopicFilter {
 	}
 }
 
+// checkHotTransfers pages on any transfer of lumens out of a hot account in the window, whoever
+// sent the transaction: a hot account only pays its own fees, which the native asset reports as
+// fee events, never as transfers.
+func (w *Watcher) checkHotTransfers(ctx context.Context, b follow.Batch) error {
+	if w.cfg.Lumens == "" {
+		return nil
+	}
+	transfer := xdr.ScSymbol("transfer")
+	name := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &transfer}
+	one := protocol.WildCardExactOne
+	// A request takes at most five topic filters.
+	for group := range slices.Chunk(w.cfg.HotAccounts, 5) {
+		var topics []protocol.TopicFilter
+		sender := map[string]HotAccount{}
+		for _, h := range group {
+			from, err := vault.Address(h.Address)
+			if err != nil {
+				return err
+			}
+			topic, err := xdr.MarshalBase64(from)
+			if err != nil {
+				return err
+			}
+			sender[topic] = h
+			topics = append(topics, protocol.TopicFilter{{ScVal: &name}, {ScVal: &from}, {Wildcard: &one}, {Wildcard: &one}})
+		}
+		src := follow.RPCSource{Client: w.rpc, Contract: w.cfg.Lumens, Topics: topics, PageLimit: 1000}
+		events, err := src.Events(ctx, b.From, b.To)
+		if errors.Is(err, follow.ErrRetention) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("hot account transfers: %w", err)
+		}
+		for _, e := range events {
+			if len(e.Topics) < 2 {
+				continue
+			}
+			h, ok := sender[e.Topics[1]]
+			if !ok {
+				continue
+			}
+			what := "lumens"
+			if t, err := vault.DecodeTransfer(e); err == nil {
+				what = fmt.Sprintf("%v stroops to %s", t.Amount, t.To)
+			}
+			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("hot_account_transfer_%.16s_%d", e.TxHash, e.Index),
+				"the %s account %s sent %s in ledger %d, which only a stolen key does", h.Name, h.Address, what, e.Ledger)
+		}
+	}
+	return nil
+}
+
 func sameAmounts(a, b map[string]*big.Int) bool {
 	if len(a) != len(b) {
 		return false
@@ -621,14 +689,35 @@ func amountsText(m map[string]*big.Int) string {
 
 var _ follow.Sink = (*Watcher)(nil)
 
-// reconcileAndBeat reconciles, and pings the heartbeat when that succeeded with ingest healthy.
+const (
+	// staleAfter is how long ago the primary RPC's newest ledger may have closed: ledgers close
+	// every few seconds, so an older one means the watcher sees nothing new.
+	staleAfter = 2 * time.Minute
+	// stalledAfter is how long an alert channel may refuse every send before the heartbeat stops.
+	stalledAfter = 10 * time.Minute
+)
+
+// reconcileAndBeat reconciles, and pings the heartbeat when that succeeded with ingest healthy,
+// the primary RPC serving new ledgers, and every alert channel taking alerts, so a monitor
+// elsewhere notices a watcher that is blind or cannot be heard.
 func (w *Watcher) reconcileAndBeat(ctx context.Context) error {
 	if err := w.Reconcile(ctx); err != nil {
 		return err
 	}
+	now := w.now()
 	w.mu.RLock()
 	healthy := !w.faulted && w.cursor+60 >= w.latest
+	age := now.Sub(time.Unix(w.closedAt, 0))
 	w.mu.RUnlock()
+	if age > staleAfter {
+		w.alerts.Raise(ctx, alert.Critical, "rpc_stale", "the primary RPC's newest ledger closed %s ago, so the watcher sees nothing newer", age.Round(time.Second))
+		return nil
+	}
+	w.alerts.Clear(ctx, "rpc_stale", "the primary RPC serves new ledgers again")
+	if q := w.alerts.Queue; q != nil && q.Stalled(now, stalledAfter) {
+		w.log.Warn("heartbeat withheld: an alert channel refuses every send")
+		return nil
+	}
 	if w.beat == nil || !healthy {
 		return nil
 	}

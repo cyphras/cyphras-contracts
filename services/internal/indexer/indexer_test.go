@@ -409,6 +409,9 @@ func TestNullifierPagesFollowTheCursor(t *testing.T) {
 
 func TestTheStreamWakesSubscribers(t *testing.T) {
 	h := newHarness(t)
+	h.activity()
+	h.ready()
+	before := h.ix.Health().NullifierCount
 	srv := httptest.NewServer(h.ix.Handler())
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/v1/stream")
@@ -423,7 +426,9 @@ func TestTheStreamWakesSubscribers(t *testing.T) {
 	if line, _ := reader.ReadString('\n'); !strings.HasPrefix(line, "retry:") {
 		t.Fatalf("first line %q", line)
 	}
+	h.chain.NextLedger(5)
 	h.chain.Shield(vaulttest.Depositor, 5)
+	h.chain.NextLedger(5)
 	h.publish()
 	h.drain()
 	for {
@@ -433,7 +438,7 @@ func TestTheStreamWakesSubscribers(t *testing.T) {
 		}
 		if strings.HasPrefix(line, "data: ") {
 			var w Wake
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &w); err != nil || w.NullifierCount != 2 {
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &w); err != nil || w.NullifierCount != before+2 {
 				t.Fatalf("wake %q", line)
 			}
 			return

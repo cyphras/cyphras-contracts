@@ -158,7 +158,7 @@ func (ix *Indexer) Apply(ctx context.Context, b follow.Batch) error {
 		return fmt.Errorf("%w: %w", follow.ErrFault, err)
 	}
 	// The archive must hold what was applied, not an earlier copy of the window that faulted.
-	if err := ix.confirm(ctx, b.Raw, b.From, b.To); err != nil {
+	if err := ix.confirm(ctx, ix.state, b.Raw, b.From, b.To); err != nil {
 		return fmt.Errorf("archive: %w", err)
 	}
 	if err := ix.chain.Commit(ctx, b.From, b.To, next, delta, nil); err != nil {
@@ -439,6 +439,9 @@ func (ix *Indexer) keep(raw []vault.RawEvent, from, to uint32) error {
 	if ix.archive == nil {
 		return nil
 	}
+	if from > to {
+		return fmt.Errorf("%w: ledgers %d to %d", archive.ErrRange, from, to)
+	}
 	ix.archiveMu.Lock()
 	defer ix.archiveMu.Unlock()
 	if to <= ix.archivedTo {
@@ -468,36 +471,74 @@ func (ix *Indexer) keep(raw []vault.RawEvent, from, to uint32) error {
 // maxArchivedDigests bounds the digests kept while ingest is stuck and the archive copies ahead.
 const maxArchivedDigests = 200_000
 
-// confirm archives an applied window again unless the archive already holds the same events for
-// each of its ledgers: as this process archived them, or, for ledgers archived before it started,
-// as the archive reads them back.
-func (ix *Indexer) confirm(ctx context.Context, raw []vault.RawEvent, from, to uint32) error {
+// confirm makes sure the archive holds the events of an applied window: as this process archived
+// them, or, for ledgers archived before it started, as the archive reads them back. A copy that
+// differs is replaced only when it does not apply to the state before the window, as a copy a
+// faulty RPC served does not; a copy that applies too leaves two histories, and the archive keeps
+// its own while the operator is paged.
+func (ix *Indexer) confirm(ctx context.Context, base *chainstate.State, raw []vault.RawEvent, from, to uint32) error {
 	if ix.archive == nil {
 		return nil
+	}
+	if from > to {
+		return fmt.Errorf("%w: ledgers %d to %d", archive.ErrRange, from, to)
 	}
 	ix.archiveMu.Lock()
 	defer ix.archiveMu.Unlock()
 	applied := digests(raw, from, to)
-	same, unknown := true, false
-	for l, d := range applied {
-		kept, ok := ix.archived[l]
-		unknown = unknown || !ok
-		same = same && (!ok || kept == d)
-	}
-	if same && unknown {
-		events, err := archive.Reader{Dir: ix.cfg.ArchiveDir, Vault: ix.cfg.Vault}.Events(ctx, from, to)
-		same = err == nil && maps.Equal(applied, digests(events, from, to))
-	}
-	if !same {
-		if err := ix.archive.Append(raw, from, to); err != nil {
-			return err
+	defer func() {
+		for l := range applied {
+			delete(ix.archived, l)
 		}
-		ix.archivedTo = max(ix.archivedTo, to)
+	}()
+	same := true
+	for l, d := range applied {
+		if kept, ok := ix.archived[l]; !ok || kept != d {
+			same = false
+		}
 	}
-	for l := range applied {
-		delete(ix.archived, l)
+	if same {
+		return nil
 	}
+	kept, err := archive.Reader{Dir: ix.cfg.ArchiveDir, Vault: ix.cfg.Vault}.Events(ctx, from, to)
+	switch {
+	case errors.Is(err, archive.ErrNotCovered):
+	case err != nil:
+		ix.log.Error("archive unreadable", "from", from, "to", to, "error", err.Error())
+		ix.alerts.Raise(ctx, alert.Critical, "archive_unreadable", "the archive of ledgers %d to %d cannot be read: %v", from, to, err)
+	case maps.Equal(applied, digests(kept, from, to)):
+		return nil
+	case applies(base, kept):
+		ix.log.Error("archive disagrees", "from", from, "to", to)
+		ix.alerts.Raise(ctx, alert.Critical, "archive_disagrees", "the archive and ingest hold different events for ledgers %d to %d, and both apply; the archive keeps its copy", from, to)
+		return nil
+	default:
+		ix.log.Warn("archive copy replaced", "from", from, "to", to)
+		ix.alerts.Raise(ctx, alert.Warning, "archive_replaced", "the archive held a copy of ledgers %d to %d that does not apply; it now holds the applied one", from, to)
+	}
+	if err := ix.archive.Append(raw, from, to); err != nil {
+		return err
+	}
+	ix.archivedTo = max(ix.archivedTo, to)
 	return nil
+}
+
+// applies reports whether raw events apply to a state under the vault's rules.
+func applies(base *chainstate.State, raw []vault.RawEvent) bool {
+	events := make([]vault.Event, 0, len(raw))
+	for _, r := range raw {
+		e, err := vault.Decode(r)
+		if err != nil {
+			return false
+		}
+		events = append(events, e)
+	}
+	txs, err := vault.ParseTxs(events)
+	if err != nil {
+		return false
+	}
+	_, err = base.Clone().Apply(txs)
+	return err == nil
 }
 
 // digests gives each ledger of [from, to] a digest of its events in chain order; equal events give
@@ -516,17 +557,15 @@ func digests(raw []vault.RawEvent, from, to uint32) map[uint32][32]byte {
 		b, _ := json.Marshal(e)
 		h.Write(append(b, '\n'))
 	}
-	out := make(map[uint32][32]byte, int(to-from)+1)
-	for l := from; ; l++ {
+	out := map[uint32][32]byte{}
+	for l := uint64(from); l <= uint64(to); l++ {
 		var d [32]byte
-		if h, ok := sums[l]; ok {
+		if h, ok := sums[uint32(l)]; ok {
 			copy(d[:], h.Sum(nil))
 		}
-		out[l] = d
-		if l == to {
-			return out
-		}
+		out[uint32(l)] = d
 	}
+	return out
 }
 
 // ArchiveStep copies the next window of the vault's raw events from RPC into the archive, whether
@@ -536,6 +575,9 @@ func (ix *Indexer) ArchiveStep(ctx context.Context, src follow.Source) (bool, er
 	h, err := ix.rpc.GetHealth(ctx)
 	if err != nil {
 		return false, err
+	}
+	if h.OldestLedger > h.LatestLedger {
+		return false, fmt.Errorf("the RPC reports its oldest ledger %d past its latest %d", h.OldestLedger, h.LatestLedger)
 	}
 	ix.archiveMu.Lock()
 	next := max(ix.archivedTo+1, ix.cfg.DeployLedger)

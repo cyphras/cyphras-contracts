@@ -1,35 +1,81 @@
 package relayer
 
 import (
+	"crypto/sha256"
 	"math"
 	"sync"
 	"time"
+
+	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 )
 
-// cooldowns refuses the nullifiers and destinations of relayed transactions that failed on chain.
-// A transaction that passed simulation and then failed costs the relayer its fee, and the same
-// notes or destination failing again is how that is repeated at will.
+// cooldowns refuses the nullifiers and destinations of relayed transactions that failed on chain
+// because of what the request carried. A transaction that passed simulation and then failed costs
+// the relayer its fee, and the same notes or destination failing again is how that is repeated
+// at will.
 type cooldowns struct {
 	mu    sync.Mutex
 	until map[string]int64
+	// strikes counts a destination's receive failures in a row.
+	strikes map[string]int
 }
 
 func nullifierKey(hex string) string { return "nullifier:" + hex }
 
-func destinationKey(account string) string { return "destination:" + account }
+// destinationKey names a destination by its full address, a muxed one included, so that one
+// failure cannot rest every other user of the same account.
+func destinationKey(address string) string { return "destination:" + address }
+
+// strikeMemory is how long after its rest a destination's failures still count toward the next
+// rest.
+const strikeMemory = 24 * 60 * 60
+
+// destinationRest is how long a destination rests after its n-th receive failure in a row: ten
+// minutes, doubling up to a day.
+func destinationRest(n int) time.Duration {
+	return min(10*time.Minute<<min(max(n, 1)-1, 8), 24*time.Hour)
+}
+
+func (c *cooldowns) init() {
+	if c.until == nil {
+		c.until, c.strikes = map[string]int64{}, map[string]int{}
+	}
+}
 
 func (c *cooldowns) add(keys []string, until int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.until == nil {
-		c.until = map[string]int64{}
-	}
+	c.init()
 	for _, k := range keys {
 		c.until[k] = max(c.until[k], until)
 	}
 }
 
-// cooling reports whether any key is still refused at now, and forgets those that are not.
+// restore puts back a stored cooldown with its strikes.
+func (c *cooldowns) restore(key string, until int64, strikes int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.init()
+	c.until[key], c.strikes[key] = max(c.until[key], until), max(c.strikes[key], strikes)
+}
+
+// strike rests a destination after a receive failure, longer for each failure that follows one
+// within a day, and returns the end of the rest and the strikes counted.
+func (c *cooldowns) strike(key string, now int64) (int64, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.init()
+	n := 1
+	if until, ok := c.until[key]; ok && now < until+strikeMemory {
+		n = c.strikes[key] + 1
+	}
+	c.until[key] = max(c.until[key], now+int64(destinationRest(n).Seconds()))
+	c.strikes[key] = n
+	return c.until[key], n
+}
+
+// cooling reports whether any key is still refused at now. A key is forgotten a day after its
+// rest ended, once its strikes no longer count.
 func (c *cooldowns) cooling(now int64, keys ...string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -40,11 +86,111 @@ func (c *cooldowns) cooling(now int64, keys ...string) bool {
 		case !ok:
 		case until > now:
 			hit = true
-		default:
+		case until+strikeMemory <= now:
 			delete(c.until, k)
+			delete(c.strikes, k)
 		}
 	}
 	return hit
+}
+
+// spentSet holds nullifiers known to be spent: those of this relayer's own successful relays and
+// those the vault's events name, so a proof that was already used is refused before it costs
+// anything. It keeps the newest ones up to its bound; an older spend is still found by the read
+// of the chain that follows.
+type spentSet struct {
+	max int
+
+	mu    sync.Mutex
+	seen  map[fr.Element]bool
+	order []fr.Element
+}
+
+func (s *spentSet) add(nfs ...fr.Element) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seen == nil {
+		s.seen = map[fr.Element]bool{}
+	}
+	for _, nf := range nfs {
+		if s.seen[nf] {
+			continue
+		}
+		s.seen[nf] = true
+		s.order = append(s.order, nf)
+	}
+	if over := len(s.order) - s.max; s.max > 0 && over > 0 {
+		for _, nf := range s.order[:over] {
+			delete(s.seen, nf)
+		}
+		s.order = append([]fr.Element(nil), s.order[over:]...)
+	}
+}
+
+func (s *spentSet) any(nfs [2]fr.Element) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seen[nfs[0]] || s.seen[nfs[1]]
+}
+
+// verdicts remembers for a while how a proof was refused once it had cost the network, so the same
+// proof sent again is answered from memory.
+type verdicts struct {
+	ttl time.Duration
+	max int
+
+	mu    sync.Mutex
+	by    map[[32]byte]verdict
+	order [][32]byte
+}
+
+type verdict struct {
+	f  failure
+	at time.Time
+}
+
+// proofKey identifies a proof by everything it commits to.
+func proofKey(req Request) [32]byte {
+	p := req.Proof
+	h := sha256.New()
+	h.Write(p.A[:])
+	h.Write(p.B[:])
+	h.Write(p.C[:])
+	for _, e := range []fr.Element{p.Root, p.PublicAmount, p.ExtDataHash, p.Nullifiers[0], p.Nullifiers[1], p.Commitments[0], p.Commitments[1]} {
+		b := e.Bytes()
+		h.Write(b[:])
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+func (v *verdicts) remember(key [32]byte, f failure, now time.Time) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.by == nil {
+		v.by = map[[32]byte]verdict{}
+	}
+	if _, ok := v.by[key]; !ok {
+		v.order = append(v.order, key)
+	}
+	v.by[key] = verdict{f: f, at: now}
+	if over := len(v.order) - v.max; v.max > 0 && over > 0 {
+		for _, k := range v.order[:over] {
+			delete(v.by, k)
+		}
+		v.order = append([][32]byte(nil), v.order[over:]...)
+	}
+}
+
+func (v *verdicts) recall(key [32]byte, now time.Time) *failure {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if r, ok := v.by[key]; ok && now.Sub(r.at) < v.ttl {
+		f := r.f
+		return &f
+	}
+	return nil
 }
 
 // breaker stops relaying for a while once too many relayed transactions failed on chain within a

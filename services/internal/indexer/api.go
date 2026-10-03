@@ -166,7 +166,13 @@ func (ix *Indexer) stats(w http.ResponseWriter, r *http.Request) {
 	httpapi.JSON(w, http.StatusOK, st)
 }
 
+// stream pushes a wake for each ledger that changed the vault, only while the data may be served:
+// a stream open when the indexer stops being ready ends at its next wake, and the client's
+// reconnect waits for readiness like any other request.
 func (ix *Indexer) stream(w http.ResponseWriter, r *http.Request) {
+	if _, ok := ix.serving(w); !ok {
+		return
+	}
 	ch, ok := ix.hub.subscribe()
 	if !ok {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
@@ -189,6 +195,9 @@ func (ix *Indexer) stream(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case wake := <-ch:
+			if !ix.Health().Ready {
+				return
+			}
 			data, _ := json.Marshal(wake)
 			if _, err := fmt.Fprintf(w, "event: wake\ndata: %s\n\n", data); err != nil {
 				return

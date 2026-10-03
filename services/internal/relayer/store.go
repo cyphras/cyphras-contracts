@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS relay_cooldowns (
 	key text PRIMARY KEY,
 	until bigint NOT NULL
 );
+ALTER TABLE relay_cooldowns ADD COLUMN IF NOT EXISTS strikes integer NOT NULL DEFAULT 0;
 `
 
 // The outcomes of a relay record.
@@ -142,27 +143,40 @@ func (s store) coolDown(ctx context.Context, keys []string, until int64) error {
 	return s.pool.SendBatch(ctx, batch).Close()
 }
 
-// forgetCooldowns drops the cooldowns that ended by a time.
-func (s store) forgetCooldowns(ctx context.Context, now int64) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM relay_cooldowns WHERE until <= $1`, now)
+// strike stores a destination's rest with the receive failures in a row it counts.
+func (s store) strike(ctx context.Context, key string, until int64, strikes int) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO relay_cooldowns (key, until, strikes) VALUES ($1, $2, $3)
+		ON CONFLICT (key) DO UPDATE SET until = GREATEST(relay_cooldowns.until, EXCLUDED.until), strikes = EXCLUDED.strikes`, key, until, strikes)
 	return err
 }
 
-// cooldowns returns every stored cooldown with its end.
-func (s store) cooldowns(ctx context.Context) (map[string]int64, error) {
-	rows, err := s.pool.Query(ctx, `SELECT key, until FROM relay_cooldowns`)
+// forgetCooldowns drops the cooldowns that ended by a time.
+func (s store) forgetCooldowns(ctx context.Context, before int64) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM relay_cooldowns WHERE until <= $1`, before)
+	return err
+}
+
+// storedCooldown is a cooldown as stored: its end, and for a destination its strikes.
+type storedCooldown struct {
+	until   int64
+	strikes int
+}
+
+// cooldowns returns every stored cooldown.
+func (s store) cooldowns(ctx context.Context) (map[string]storedCooldown, error) {
+	rows, err := s.pool.Query(ctx, `SELECT key, until, strikes FROM relay_cooldowns`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[string]int64{}
+	out := map[string]storedCooldown{}
 	for rows.Next() {
 		var k string
-		var until int64
-		if err := rows.Scan(&k, &until); err != nil {
+		var c storedCooldown
+		if err := rows.Scan(&k, &c.until, &c.strikes); err != nil {
 			return nil, err
 		}
-		out[k] = until
+		out[k] = c
 	}
 	return out, rows.Err()
 }

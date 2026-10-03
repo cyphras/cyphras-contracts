@@ -8,9 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -91,11 +93,54 @@ func (w Webhook) Send(ctx context.Context, a Alert) error {
 		// The URL holds a token, so the error, which repeats it, is not passed on.
 		return fmt.Errorf("alert: %s webhook unreachable", w.Format)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return RetryAfter{Wait: retryAfter(resp)}
+	}
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("alert: %s webhook answered %d", w.Format, resp.StatusCode)
 	}
 	return nil
+}
+
+// RetryAfter is a channel's refusal that says how long to wait before the next send, as a 429
+// answer does.
+type RetryAfter struct {
+	Wait time.Duration
+}
+
+func (r RetryAfter) Error() string {
+	return fmt.Sprintf("alert: rate limited for %s", r.Wait)
+}
+
+// retryAfter reads how long a 429 answer asks to wait: its Retry-After header, in seconds or as a
+// date, or the retry_after member of its body, as Discord sends it at the top and Telegram in
+// parameters. Without either it is 30 seconds, and it is never more than an hour.
+func retryAfter(resp *http.Response) time.Duration {
+	wait := 30 * time.Second
+	if h := resp.Header.Get("Retry-After"); h != "" {
+		if n, err := strconv.ParseFloat(h, 64); err == nil && n >= 0 {
+			wait = time.Duration(n * float64(time.Second))
+		} else if at, err := http.ParseTime(h); err == nil {
+			wait = time.Until(at)
+		}
+	} else {
+		var body struct {
+			RetryAfter *float64 `json:"retry_after"`
+			Parameters struct {
+				RetryAfter *float64 `json:"retry_after"`
+			} `json:"parameters"`
+		}
+		if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body) == nil {
+			switch {
+			case body.RetryAfter != nil:
+				wait = time.Duration(*body.RetryAfter * float64(time.Second))
+			case body.Parameters.RetryAfter != nil:
+				wait = time.Duration(*body.Parameters.RetryAfter * float64(time.Second))
+			}
+		}
+	}
+	return min(max(wait, time.Second), time.Hour)
 }
 
 // ParseWebhooks reads one "format url" pair per line; blank lines and lines starting with # are

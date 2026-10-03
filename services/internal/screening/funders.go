@@ -25,9 +25,9 @@ type cacheKey struct {
 }
 
 type cachedInflows struct {
-	at       time.Time
-	inflows  []Inflow
-	complete bool
+	at      time.Time
+	inflows []Inflow
+	gap     Gap
 }
 
 // maxCached bounds the cache; past it, expired entries are dropped first and then all of them.
@@ -35,18 +35,18 @@ const maxCached = 10_000
 
 // Inflows implements Inflows. Lookups that start within the same hour share an entry, which looks
 // back from the start of that hour.
-func (c *CachedInflows) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, bool, error) {
+func (c *CachedInflows) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, Gap, error) {
 	now := c.Now()
 	key := cacheKey{account, since.Unix() / 3600}
 	c.mu.Lock()
 	if e, ok := c.entries[key]; ok && now.Sub(e.at) < c.TTL {
 		c.mu.Unlock()
-		return e.inflows, e.complete, nil
+		return e.inflows, e.gap, nil
 	}
 	c.mu.Unlock()
-	inflows, complete, err := c.Inner.Inflows(ctx, account, time.Unix(key.hour*3600, 0))
+	inflows, gap, err := c.Inner.Inflows(ctx, account, time.Unix(key.hour*3600, 0))
 	if err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -63,8 +63,8 @@ func (c *CachedInflows) Inflows(ctx context.Context, account string, since time.
 			clear(c.entries)
 		}
 	}
-	c.entries[key] = cachedInflows{at: now, inflows: inflows, complete: complete}
-	return inflows, complete, nil
+	c.entries[key] = cachedInflows{at: now, inflows: inflows, gap: gap}
+	return inflows, gap, nil
 }
 
 // BudgetedInflows spends a fixed budget of lookups, so the screening that requests drive cannot use
@@ -76,9 +76,9 @@ type BudgetedInflows struct {
 }
 
 // Inflows implements Inflows.
-func (b BudgetedInflows) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, bool, error) {
+func (b BudgetedInflows) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, Gap, error) {
 	if !b.Budget.Allow() {
-		return nil, false, ErrUnavailable
+		return nil, 0, ErrUnavailable
 	}
 	return b.Inner.Inflows(ctx, account, since)
 }

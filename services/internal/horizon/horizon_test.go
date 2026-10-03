@@ -103,13 +103,13 @@ func TestInflowsCarryAmountsAndComeFromEffectsToo(t *testing.T) {
 	}))
 	defer srv.Close()
 	h := Client{URL: srv.URL, HTTP: srv.Client(), MaxPages: 3}
-	got, complete, err := h.Inflows(context.Background(), clean, now.Add(-30*24*time.Hour))
+	got, gap, err := h.Inflows(context.Background(), clean, now.Add(-30*24*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The second claimable balance has no creator Horizon knows, so the history is incomplete.
-	if complete {
-		t.Fatal("an unnamed sender left the history complete")
+	if gap != GapUnnamed {
+		t.Fatalf("an unnamed sender left gap %d", gap)
 	}
 	want := []string{
 		funder + " native 125000000", thief + " USDC:" + grandpa + " 30000000", thief + " native <nil>",
@@ -139,7 +139,51 @@ func TestAHistoryLongerThanThePagesReadIsIncomplete(t *testing.T) {
 	}))
 	defer srv.Close()
 	h := Client{URL: srv.URL, HTTP: srv.Client(), MaxPages: 2}
-	if _, complete, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour)); err != nil || complete {
-		t.Fatalf("complete %v, %v", complete, err)
+	if _, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour)); err != nil || gap != GapVolume {
+		t.Fatalf("gap %d, %v", gap, err)
+	}
+}
+
+func TestOnlyPagesOfValueCountTowardThePagesRead(t *testing.T) {
+	now := time.Now().UTC()
+	reads := map[string]int{}
+	// Three pages of the account's own payments, then one of a payment to it; the effects hold
+	// only what payments already show.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reads[r.URL.Path]++
+		n := reads[r.URL.Path]
+		records := make([]map[string]any, pageSize)
+		for i := range records {
+			records[i] = map[string]any{"type": "payment", "created_at": now, "from": clean, "to": thief, "amount": "1", "asset_type": "native"}
+			if strings.HasSuffix(r.URL.Path, "/effects") {
+				records[i] = map[string]any{"type": "account_credited", "created_at": now, "amount": "1"}
+			}
+		}
+		if strings.HasSuffix(r.URL.Path, "/payments") && n == 4 {
+			records = []map[string]any{
+				{"type": "payment", "created_at": now, "from": funder, "to": clean, "amount": "5", "asset_type": "native"},
+				// A transfer of nothing is no value.
+				{"type": "invoke_host_function", "created_at": now, "asset_balance_changes": []map[string]string{{"from": thief, "to": clean, "amount": "0.0000000", "asset_type": "native"}}},
+			}
+		}
+		if strings.HasSuffix(r.URL.Path, "/effects") && n == 2 {
+			records = records[:1]
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"_links":    map[string]any{"next": map[string]string{"href": "http://" + r.Host + r.URL.Path + "?cursor=next"}},
+			"_embedded": map[string]any{"records": records},
+		})
+	}))
+	defer srv.Close()
+	h := Client{URL: srv.URL, HTTP: srv.Client(), MaxPages: 2}
+	got, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour))
+	if err != nil || gap != 0 || len(got) != 1 || got[0].From != funder {
+		t.Fatalf("inflows %+v, gap %d, %v", got, gap, err)
+	}
+	// Pages without value are read on only up to twice the pages of value.
+	reads = map[string]int{}
+	h.MaxPages = 1
+	if _, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour)); err != nil || gap != GapVolume || reads["/accounts/"+clean+"/payments"] != 2 {
+		t.Fatalf("gap %d after %v, %v", gap, reads, err)
 	}
 }

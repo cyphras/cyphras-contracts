@@ -104,6 +104,7 @@ func newHarness(t *testing.T, mutate ...func(*Config)) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	w.now = func() time.Time { return time.Unix(h.chain.ClosedAt, 0) }
 	h.w = w
 	h.f = &follow.Follower{RPC: h.primary, Live: follow.RPCSource{Client: h.primary, Contract: vaulttest.Vault, PageLimit: 50}, Window: 100, Sink: w}
 	return h

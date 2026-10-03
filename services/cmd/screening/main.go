@@ -56,11 +56,22 @@ func main() {
 		}
 		return
 	}
-	release, err := screening.LockWriter(ctx, b.pool, b.asp)
+	lock, err := screening.LockWriter(ctx, b.pool, b.asp)
 	if err != nil {
 		service.Fatal(log, "start", err)
 	}
-	defer release()
+	defer lock.Release()
+	s.UseLock(lock)
+	go lock.Keep(ctx, 10*time.Second)
+	go func() {
+		select {
+		case <-lock.Lost():
+			if ctx.Err() == nil {
+				service.Fatal(log, "writer lock", screening.ErrLockLost)
+			}
+		case <-ctx.Done():
+		}
+	}()
 
 	tokenHash, err := hex.DecodeString(config.Env("SCREEN_TOKEN_SHA256", ""))
 	if err != nil || len(tokenHash) != 32 {
@@ -165,7 +176,7 @@ func checker(sources []screening.Source) (*screening.Checker, error) {
 	if err != nil {
 		return nil, err
 	}
-	maxPages, err := config.Int("FUNDER_MAX_PAGES", 10)
+	maxPages, err := config.Int("FUNDER_MAX_PAGES", 50)
 	if err != nil {
 		return nil, err
 	}
@@ -219,8 +230,8 @@ func list(s, sep string) []string {
 }
 
 // guard is a source's update guard: SOURCE_MAX_SHRINK_PCT, 20 unless set, and the canaries in the
-// variable named, separated by "|".
-func guard(canaries string) (*screening.Guard, error) {
+// variable named, separated by "|", or else the defaults given.
+func guard(canaries, defaults string) (*screening.Guard, error) {
 	shrink, err := config.Int("SOURCE_MAX_SHRINK_PCT", 20)
 	if err != nil {
 		return nil, err
@@ -228,8 +239,12 @@ func guard(canaries string) (*screening.Guard, error) {
 	if shrink < 0 || shrink > 100 {
 		return nil, errors.New("SOURCE_MAX_SHRINK_PCT must be 0 to 100")
 	}
-	return &screening.Guard{MaxShrinkPct: int(shrink), Canaries: list(config.Env(canaries, ""), "|")}, nil
+	return &screening.Guard{MaxShrinkPct: int(shrink), Canaries: list(config.Env(canaries, defaults), "|")}, nil
 }
+
+// ofacCanaries is text every good copy of the SDN list holds: two kinds of digital-currency
+// address it has carried for years, and an entity listed since 2019.
+const ofacCanaries = "Digital Currency Address - XBT|Digital Currency Address - ETH|LAZARUS GROUP"
 
 func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 	frozenAge, err := config.Duration("FROZEN_MAX_AGE", 15*time.Minute)
@@ -242,7 +257,7 @@ func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 		if err != nil {
 			return nil, err
 		}
-		g, err := guard("EXPLOIT_LIST_CANARIES")
+		g, err := guard("EXPLOIT_LIST_CANARIES", "")
 		if err != nil {
 			return nil, err
 		}
@@ -255,7 +270,7 @@ func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 		if err != nil {
 			return nil, err
 		}
-		g, err := guard("OFAC_CANARIES")
+		g, err := guard("OFAC_CANARIES", ofacCanaries)
 		if err != nil {
 			return nil, err
 		}
@@ -268,7 +283,7 @@ func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 		if err != nil {
 			return nil, err
 		}
-		g, err := guard("DIRECTORY_CANARIES")
+		g, err := guard("DIRECTORY_CANARIES", "")
 		if err != nil {
 			return nil, err
 		}
@@ -282,7 +297,7 @@ func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 // writeOrQueue sends an operator's decision as the asp account when no other process does, and
 // otherwise queues it for the running service.
 func writeOrQueue(ctx context.Context, b *built, send func() error, queue func() (int64, error)) error {
-	release, err := screening.LockWriter(ctx, b.pool, b.asp)
+	lock, err := screening.LockWriter(ctx, b.pool, b.asp)
 	switch {
 	case errors.Is(err, screening.ErrWriterRunning):
 		id, err := queue()
@@ -294,7 +309,8 @@ func writeOrQueue(ctx context.Context, b *built, send func() error, queue func()
 	case err != nil:
 		return err
 	}
-	defer release()
+	defer lock.Release()
+	b.screener.UseLock(lock)
 	return send()
 }
 

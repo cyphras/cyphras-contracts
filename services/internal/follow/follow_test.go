@@ -379,3 +379,21 @@ func TestAnUnknownMetaVersionIsAnError(t *testing.T) {
 		t.Fatalf("unknown meta version: %v", err)
 	}
 }
+
+func TestARangeThatEndsBeforeItStartsIsRefused(t *testing.T) {
+	ctx := context.Background()
+	f := rpctest.New(passphrase, 0)
+	if _, err := (RPCSource{Client: f, Contract: vaulttest.Vault}).Events(ctx, 11, 10); !errors.Is(err, ErrRange) {
+		t.Fatalf("rpc: %v", err)
+	}
+	if _, err := (&LedgerArchive{BaseURL: "http://127.0.0.1:1", Passphrase: passphrase, Vault: vaulttest.Vault}).Events(ctx, 11, 10); !errors.Is(err, ErrRange) {
+		t.Fatalf("ledger archive: %v", err)
+	}
+	// An RPC that says it keeps ledgers past its latest one is not followed.
+	f.SetLatest(20)
+	f.Oldest = 25
+	fol := &Follower{RPC: f, Live: RPCSource{Client: f, Contract: vaulttest.Vault}, Window: 5, Sink: &memSink{cursor: 9}}
+	if _, err := fol.Step(ctx); !errors.Is(err, ErrRange) {
+		t.Fatalf("step: %v", err)
+	}
+}

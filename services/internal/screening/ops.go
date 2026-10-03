@@ -19,17 +19,16 @@ type Review struct {
 	CreatedAt uint64
 }
 
-// Reviews lists the deposits a person must review, those a late review got flagged included: a
-// review that clears one of them lifts its flag.
+// Reviews lists the deposits a person must review, the held ones included: a review that clears
+// one of them lifts its hold after its final check.
 func (s *Screener) Reviews(ctx context.Context) ([]Review, error) {
 	rows, err := s.db.pending(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var out []Review
-	for _, r := range rows {
-		flagged := r.flag != nil || r.flagSent != nil
-		if r.review == "needed" && (!flagged || r.flagKind == "review_timeout") {
+	for i := range rows {
+		if r := &rows[i]; r.awaitsReview() {
 			out = append(out, Review{ID: r.id, Depositor: r.depositor, Amount: r.amount, CreatedAt: r.createdAt})
 		}
 	}
