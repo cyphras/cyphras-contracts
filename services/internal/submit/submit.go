@@ -356,8 +356,6 @@ type Prepared struct {
 	Return *xdr.ScVal
 	// SimulatedAt is the ledger the simulation read the chain at.
 	SimulatedAt uint32
-	// ExtraFee is the part of ResourceFee the call's Extra added.
-	ExtraFee int64
 }
 
 func (e *Engine) loadSequence(ctx context.Context, a *Account) error {
@@ -514,7 +512,7 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 		return nil, err
 	}
 	return &Prepared{Account: a, Tx: tx, Seq: a.seq + 1, InclusionFee: inclusion, ResourceFee: resource, MaxTime: maxTime, MaxLedger: maxLedger, Return: ret,
-		SimulatedAt: uint32(sim.LatestLedger), ExtraFee: extra}, nil
+		SimulatedAt: uint32(sim.LatestLedger)}, nil
 }
 
 // Signed is a transaction accepted for inclusion.

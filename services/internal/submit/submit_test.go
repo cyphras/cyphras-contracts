@@ -521,12 +521,12 @@ func TestAnotherPathsEntriesAndResourcesArePaidFor(t *testing.T) {
 	// written, 232 bytes of keys sent, and the rent of 656 new bytes for mainnet's least TTL of
 	// a new persistent entry with its TTL entry, and 512 bytes of events.
 	want := int64(4*2_500 + 1_563 + 700 + (817 - 257) + 92 + 920 + 1_093_334 + 2_500 + 42 + 2_500)
-	if p.ExtraFee != want || res.Instructions != 2_000_000 || res.WriteBytes != 300+656+2*2048 {
-		t.Fatalf("extra fee %d, want %d; instructions %d, write bytes %d", p.ExtraFee, want, res.Instructions, res.WriteBytes)
-	}
 	// The classic entries are padded as written or read: two written, three read.
-	if res.DiskReadBytes != 500+3*2048 || p.ResourceFee != 100_000+perKB(3*2048, 447)+perKB(2*2048, 875)+want {
-		t.Fatalf("read bytes %d, resource fee %d", res.DiskReadBytes, p.ResourceFee)
+	if res.Instructions != 2_000_000 || res.WriteBytes != 300+656+2*2048 || res.DiskReadBytes != 500+3*2048 {
+		t.Fatalf("instructions %d, write bytes %d, read bytes %d", res.Instructions, res.WriteBytes, res.DiskReadBytes)
+	}
+	if got := p.ResourceFee - 100_000 - perKB(3*2048, 447) - perKB(2*2048, 875); got != want {
+		t.Fatalf("the other path adds %d, want %d", got, want)
 	}
 	// The network's limit on written entries stops the additions in their order.
 	limited := rpctest.Mainnet
