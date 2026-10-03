@@ -4,8 +4,12 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { xchacha20poly1305 } from "@noble/ciphers/chacha";
+import { ed25519 } from "@noble/curves/ed25519";
+import { hmac } from "@noble/hashes/hmac";
 import { sha256, sha512 } from "@noble/hashes/sha2";
+import { base64 } from "@scure/base";
 import { mnemonicToSeedSync } from "@scure/bip39";
+import { StrKey } from "@stellar/stellar-base";
 import { encodeAddress } from "../src/address.ts";
 import { L, packPoint, scalarMul } from "../src/babyjub.ts";
 import {
@@ -18,7 +22,8 @@ import {
 } from "../src/bytes.ts";
 import { encryptOutput } from "../src/encryption.ts";
 import { P } from "../src/field.ts";
-import { addressKeyAt, deriveSpendingKeys } from "../src/keys.ts";
+import { addressKeyAt, defaultAddressKey, deriveSpendingKeys } from "../src/keys.ts";
+import { SIGNATURE_MESSAGE, sep53Digest, signatureSeed } from "../src/keysource.ts";
 import { noteCommitment } from "../src/notes.ts";
 
 export const MNEMONIC =
@@ -106,10 +111,62 @@ export function encryptionVectors(): object {
   };
 }
 
+// SLIP-0010 ed25519 derivation along hardened indices, as SEP-0005 uses for Stellar accounts.
+export function slip10Ed25519(seed: Uint8Array, path: readonly number[]): Uint8Array {
+  let node = hmac(sha512, utf8("ed25519 seed"), seed);
+  for (const index of path) {
+    const hardened = new Uint8Array(4);
+    new DataView(hardened.buffer).setUint32(0, (index | 0x80000000) >>> 0);
+    node = hmac(
+      sha512,
+      node.subarray(32),
+      concatBytes(Uint8Array.of(0), node.subarray(0, 32), hardened),
+    );
+  }
+  return node.slice(0, 32);
+}
+
+export const SEP5_ACCOUNT_0 = [44, 148, 0];
+
+export function sigSeedVectors(): object {
+  const secret = slip10Ed25519(mnemonicToSeedSync(MNEMONIC), SEP5_ACCOUNT_0);
+  const account = StrKey.encodeEd25519PublicKey(Buffer.from(ed25519.getPublicKey(secret)));
+  const digest = sep53Digest(SIGNATURE_MESSAGE);
+  const signature = ed25519.sign(digest, secret);
+  const seed = signatureSeed(signature);
+  const address = (network: "mainnet" | "testnet"): string => {
+    const key = defaultAddressKey(deriveSpendingKeys(seed, network, 0));
+    return encodeAddress(network, key.d, key.pkd);
+  };
+  return {
+    description:
+      "Signature seed vectors for key source (b): the message, the SEP-53 digest a Stellar " +
+      "wallet signs, the signature of a test account and the seed it yields.",
+    derivation:
+      'seed = SHA-512("cyphras/v2/sig-seed" || signature), with the 64-byte signature R || S',
+    message: SIGNATURE_MESSAGE,
+    message_length: utf8(SIGNATURE_MESSAGE).length,
+    message_sha256: bytesToHex(sha256(utf8(SIGNATURE_MESSAGE))),
+    sep53_digest: bytesToHex(digest),
+    signer: {
+      mnemonic: MNEMONIC,
+      path: "m/44'/148'/0'",
+      account,
+    },
+    signature: bytesToHex(signature),
+    signature_base64: base64.encode(signature),
+    seed: bytesToHex(seed),
+    default_addresses: { mainnet: address("mainnet"), testnet: address("testnet") },
+  };
+}
+
 const OUT = join(import.meta.dirname, "..", "test", "vectors");
 
 if (process.argv[1] === import.meta.filename) {
-  for (const [name, vectors] of [["encryption.json", encryptionVectors()]] as const) {
+  for (const [name, vectors] of [
+    ["encryption.json", encryptionVectors()],
+    ["sig-seed.json", sigSeedVectors()],
+  ] as const) {
     writeFileSync(join(OUT, name), JSON.stringify(vectors, null, 2) + "\n");
     console.log(`wrote ${join(OUT, name)}`);
   }

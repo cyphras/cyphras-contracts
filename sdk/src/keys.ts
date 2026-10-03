@@ -96,17 +96,29 @@ export function viewingKeysFromPoints(
   return { network, ak, nk, akFold, nkFold, ivk: deriveIvk(akFold, nkFold), ovk, dk };
 }
 
+// okm(label) = HKDF-Expand(HKDF-Extract("cyphras/v2/shielded", seed), network/account/label, 64)
+function keyMaterial(
+  seed: Uint8Array,
+  network: Network,
+  account: number,
+): (label: string) => Uint8Array {
+  if (seed.length !== SEED_LENGTH) fail("invalid_argument", "the seed must be 64 bytes");
+  if (!isNetwork(network)) fail("invalid_argument", "unknown network");
+  checkAccount(account);
+  const prk = extract(sha512, seed, PRK_SALT);
+  return (label) => expand(sha512, prk, utf8(`${network}/${account}/${label}`), 64);
+}
+
+export function deriveStoreKey(seed: Uint8Array, network: Network, account: number): Uint8Array {
+  return keyMaterial(seed, network, account)("store").slice(0, 32);
+}
+
 export function deriveSpendingKeys(
   seed: Uint8Array,
   network: Network,
   account: number,
 ): SpendingKeys {
-  if (seed.length !== SEED_LENGTH) fail("invalid_argument", "the seed must be 64 bytes");
-  if (!isNetwork(network)) fail("invalid_argument", "unknown network");
-  checkAccount(account);
-  const prk = extract(sha512, seed, PRK_SALT);
-  const okm = (label: string): Uint8Array =>
-    expand(sha512, prk, utf8(`${network}/${account}/${label}`), 64);
+  const okm = keyMaterial(seed, network, account);
   const scalar = (label: string): bigint => {
     for (let retry = 0; ; retry++) {
       const s = bytesToBigIntBE(okm(retry === 0 ? label : `${label}/${retry}`)) % L;

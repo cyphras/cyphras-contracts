@@ -1,0 +1,20 @@
+{
+  "description": "Signature seed vectors for key source (b): the message, the SEP-53 digest a Stellar wallet signs, the signature of a test account and the seed it yields.",
+  "derivation": "seed = SHA-512(\"cyphras/v2/sig-seed\" || signature), with the 64-byte signature R || S",
+  "message": "Cyphras private account v2\n\nSigning this message creates the key to a Cyphras private balance.\nAnyone who obtains this signature can spend that balance.\nOnly sign it in an app you trust.",
+  "message_length": 186,
+  "message_sha256": "21aa4daff79f21d43d0e96dfdcc4487df30826ca3d2be1fdcd5e7b3a086f0a54",
+  "sep53_digest": "f0269990ec0dbae68ffc68dcb35717ac749df78a988d0671283f73d38c5ae36f",
+  "signer": {
+    "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    "path": "m/44'/148'/0'",
+    "account": "GB3JDWCQJCWMJ3IILWIGDTQJJC5567PGVEVXSCVPEQOTDN64VJBDQBYX"
+  },
+  "signature": "35ddef49113e208400ef89cec5ad0aa343ed8ca529e9f77b93071138f8a84ec13dd6e5c346d1ff6004dbcb78893b267f79a5b4ddae9beac723abf79aea208c09",
+  "signature_base64": "Nd3vSRE+IIQA74nOxa0Ko0PtjKUp6fd7kwcROPioTsE91uXDRtH/YATby3iJOyZ/eaW03a6b6scjq/ea6iCMCQ==",
+  "seed": "0a7f3dd3206c65397bae64f7b07cd23010f3c37ef9b28e1d30768d8139f1f38f040fc6b752baf10ae1e56ad955388d81adb099d9b5eca42aeffaa6104b24ae48",
+  "default_addresses": {
+    "mainnet": "cy1qfym46f3lvnwmt80k3p23zjtsmjzdha2ga2nt9xvk0t2f72449avrdfsw9etn4w968cz2xg9wxzy3",
+    "testnet": "cyt1qgg9jqelcrhevlxeen278se3s7f4zmh3vwn4afuadr4n8lpwsuf5rlft2m9cus4puu3738csxr7vu"
+  }
+}
