@@ -516,8 +516,15 @@ func (w *Watcher) CheckAdmissions(ctx context.Context) error {
 	return nil
 }
 
-// CheckExitQueue pages when the exit queue grows long, its oldest exit waits too long, or exits
-// are stranded.
+// The ages at which a part-paid head exit and a stranded exit page.
+const (
+	partPaidAge = 2 * secondsPerDay
+	strandedAge = 7 * secondsPerDay
+)
+
+// CheckExitQueue pages when the exit queue grows long or its oldest exit waits too long, when the
+// head exit has been paid in part for more than two days, and when an exit has stayed stranded for
+// more than seven.
 func (w *Watcher) CheckExitQueue(ctx context.Context) error {
 	health, err := w.rpc.GetHealth(ctx)
 	if err != nil {
@@ -527,25 +534,42 @@ func (w *Watcher) CheckExitQueue(ctx context.Context) error {
 	w.mu.RLock()
 	length := w.state.ExitTail - w.state.ExitHead
 	var oldest uint64
+	partPaid := false
 	if head := w.state.Exits[w.state.ExitHead]; head != nil {
 		oldest = head.QueuedAt
+		partPaid = head.Payout.Cmp(head.QueuedPayout) != 0 || head.Fee.Cmp(head.QueuedFee) != 0
 	}
-	stranded := len(w.state.Stranded)
+	var stuck []uint64
+	for id, e := range w.state.Stranded {
+		if now > uint64(e.StrandedAt) && now-uint64(e.StrandedAt) >= strandedAge {
+			stuck = append(stuck, id)
+		}
+	}
 	w.mu.RUnlock()
+	age := uint64(0)
+	if length > 0 && now > oldest {
+		age = now - oldest
+	}
 	if length >= w.cfg.QueueLength {
 		w.alerts.Raise(ctx, alert.Warning, "exit_queue_long", "%d exits wait in the exit queue", length)
 	} else {
 		w.alerts.Clear(ctx, "exit_queue_long", "the exit queue is short again")
 	}
-	if length > 0 && now > oldest && now-oldest >= uint64(w.cfg.QueueAge.Seconds()) {
-		w.alerts.Raise(ctx, alert.Warning, "exit_queue_old", "the oldest queued exit has waited %d hours", (now-oldest)/3600)
+	if age >= uint64(w.cfg.QueueAge.Seconds()) && length > 0 {
+		w.alerts.Raise(ctx, alert.Warning, "exit_queue_old", "the oldest queued exit has waited %d hours", age/3600)
 	} else {
 		w.alerts.Clear(ctx, "exit_queue_old", "no queued exit has waited too long")
 	}
-	if stranded > 0 {
-		w.alerts.Raise(ctx, alert.Warning, "exits_stranded", "%d released exits are stranded until their parties can receive", stranded)
+	if partPaid && age >= partPaidAge {
+		w.alerts.Raise(ctx, alert.Warning, "exit_part_paid_old", "the exit at the head of the queue has been paid only in part for %d hours", age/3600)
 	} else {
-		w.alerts.Clear(ctx, "exits_stranded", "no exit is stranded")
+		w.alerts.Clear(ctx, "exit_part_paid_old", "no exit is paid only in part for long")
+	}
+	slices.Sort(stuck)
+	if len(stuck) > 0 {
+		w.alerts.Raise(ctx, alert.Warning, "exit_stranded_old", "exits %v have been stranded for more than seven days", stuck)
+	} else {
+		w.alerts.Clear(ctx, "exit_stranded_old", "no exit has been stranded for long")
 	}
 	return nil
 }

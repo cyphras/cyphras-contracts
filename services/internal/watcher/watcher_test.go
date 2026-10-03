@@ -353,18 +353,27 @@ func TestTheExitQueueIsWatched(t *testing.T) {
 	c.Admit(1)
 	c.NextLedger(5)
 	first := c.QueueExit(1, -1_000, 0, vaulttest.Depositor)
-	for id := uint64(2); id <= 4; id++ {
+	second := c.QueueExit(2, -1_000, 0, vaulttest.Depositor)
+	for id := uint64(3); id <= 5; id++ {
 		c.QueueExit(id, -1_000, 0, vaulttest.Depositor)
 	}
 	c.NextLedger(5)
 	c.Strand(first, 1_000, 0)
+	c.PayPart(second, 400, 0, 600, 0)
 	c.NextLedger(5)
 	h.sync()
 	h.primary.CloseTime = h.chain.ClosedAt + 49*3600
 	if err := h.w.CheckExitQueue(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"exit_stranded_1", "exit_queue_long", "exit_queue_old", "exits_stranded"} {
+	if h.pages.has("exit_stranded_old") {
+		t.Fatalf("a stranded exit paged before seven days: %v", h.pages.codes())
+	}
+	h.primary.CloseTime = h.chain.ClosedAt + 8*24*3600
+	if err := h.w.CheckExitQueue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"exit_stranded_1", "exit_queue_long", "exit_queue_old", "exit_part_paid_old", "exit_stranded_old"} {
 		if !h.pages.has(want) {
 			t.Fatalf("missing %s in %v", want, h.pages.codes())
 		}
