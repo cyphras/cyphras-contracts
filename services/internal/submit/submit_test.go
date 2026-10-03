@@ -364,10 +364,24 @@ func TestAFailedCallNamesTheErrorClosestToItsCause(t *testing.T) {
 		}})
 		return raw
 	}
+	// The host's own errors, such as an authorization failure, name no contract's code.
+	host := func() string {
+		id := xdr.ContractId{3}
+		code := xdr.ScErrorCodeScecInvalidAction
+		sym := xdr.ScSymbol("error")
+		raw, _ := xdr.MarshalBase64(xdr.DiagnosticEvent{Event: xdr.ContractEvent{
+			ContractId: &id, Type: xdr.ContractEventTypeDiagnostic,
+			Body: xdr.ContractEventBody{V: 0, V0: &xdr.ContractEventV0{Topics: []xdr.ScVal{
+				{Type: xdr.ScValTypeScvSymbol, Sym: &sym},
+				{Type: xdr.ScValTypeScvError, Error: &xdr.ScError{Type: xdr.ScErrorTypeSceAuth, Code: &code}},
+			}, Data: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}},
+		}})
+		return raw
+	}
 	resp := protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{
 		Status: protocol.TransactionStatusFailed, ResultXDR: tr,
 		// The asset contract refused a transfer, and the vault passed its error up unchanged.
-		DiagnosticEventsXDR: []string{errorEvent(1, 13), errorEvent(2, 13)},
+		DiagnosticEventsXDR: []string{host(), errorEvent(1, 13), errorEvent(2, 13)},
 	}}
 	res := (&Engine{}).result(&Signed{Hash: "h"}, resp)
 	if res.Outcome != Failed || res.InvokeCode == nil || *res.InvokeCode != trapped {

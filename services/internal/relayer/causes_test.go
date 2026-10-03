@@ -65,6 +65,25 @@ func TestOnlyFailuresOfTheRelayersOwnMakingPauseIt(t *testing.T) {
 		t.Fatal("a destination that stopped receiving paused relaying")
 	}
 
+	// Any other error of the vault's is the relayer's to answer for, whoever the destination is.
+	h = newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
+	h.setTxStatus(failedWith(vaulttest.Vault, 101))
+	h.fake.SetContractData(mustKey(vault.BalanceKey(vaulttest.Token, vaulttest.Vault)), vaulttest.Balance(big.NewInt(1_000_000_000), true), 10, nil)
+	dest = newDest(h)
+	h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
+	if !h.r.brk.open(h.clock()) || h.r.cool.cooling(h.clock().Unix(), destinationKey(dest)) {
+		t.Fatal("a vault error was taken for the destination")
+	}
+
+	// A call cut short by its resources is the relayer's, whatever error it reached first.
+	h = newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
+	h.setTxStatus(failedAs(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded, vaulttest.Vault, vaultCannotReceive))
+	dest = newDest(h)
+	h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
+	if !h.r.brk.open(h.clock()) || h.r.cool.cooling(h.clock().Unix(), destinationKey(dest)) {
+		t.Fatal("a call out of resources was taken for the destination")
+	}
+
 	// With no error reported, notes found spent on chain tell a lost race.
 	h = newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
 	h.setTxStatus(failedOnChain())
@@ -156,4 +175,26 @@ func mustB64(t *testing.T, v xdr.ScVal) string {
 		t.Fatal(err)
 	}
 	return s
+}
+
+func TestAFaultOfTheRelayersOwnLeavesTheNotesFree(t *testing.T) {
+	h := trapdoorHarness(t)
+	dest := keypair.MustRandom().Address()
+	h.fund(dest)
+	h.setTxStatus(failedAs(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded, vaulttest.Vault, vaultCannotReceive))
+	req := h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
+	h.setTxStatus(success(900_000))
+	if _, f := h.r.Submit(context.Background(), req); f != nil {
+		t.Fatalf("the same notes after a fault of the relayer's own: %v", f)
+	}
+	h.waitIdle()
+}
+
+func TestAnRPCWhoseOldestLedgerIsPastItsLatestIsNotFollowed(t *testing.T) {
+	h := newHarness(t, vault.Status{})
+	h.fake.SetLatest(10)
+	h.fake.Oldest = 20
+	if err := h.r.FollowNullifiers(context.Background()); err == nil {
+		t.Fatal("an inverted range was followed")
+	}
 }

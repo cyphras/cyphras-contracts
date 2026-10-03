@@ -36,11 +36,15 @@ func failedOnChain() protocol.GetTransactionResponse {
 // failedWith is a relay whose contract call trapped with a contract's error, as the diagnostic
 // events report it.
 func failedWith(contract string, code uint32) protocol.GetTransactionResponse {
-	trapped := xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped
+	return failedAs(xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped, contract, code)
+}
+
+// failedAs is a relay whose contract call failed with the given result, naming a contract's error.
+func failedAs(invoke xdr.InvokeHostFunctionResultCode, contract string, code uint32) protocol.GetTransactionResponse {
 	r, _ := xdr.MarshalBase64(xdr.TransactionResult{FeeCharged: 900_100, Result: xdr.TransactionResultResult{
 		Code: xdr.TransactionResultCodeTxFailed,
 		Results: &[]xdr.OperationResult{{Code: xdr.OperationResultCodeOpInner, Tr: &xdr.OperationResultTr{
-			Type: xdr.OperationTypeInvokeHostFunction, InvokeHostFunctionResult: &xdr.InvokeHostFunctionResult{Code: trapped},
+			Type: xdr.OperationTypeInvokeHostFunction, InvokeHostFunctionResult: &xdr.InvokeHostFunctionResult{Code: invoke},
 		}}},
 	}})
 	raw, _ := strkey.Decode(strkey.VersionByteContract, contract)
@@ -347,6 +351,21 @@ func TestRacesNeverPauseRelayingButGuardIt(t *testing.T) {
 		t.Fatalf("relaying stopped: %v", f)
 	}
 	h.waitIdle()
+	// Guarded, it checks again right before sending: notes spent while the call was simulated are
+	// caught before they cost a fee.
+	racer := h.forged(t, dest, -20_000_000, 5_000_000)
+	simulate := h.fake.Simulate
+	h.fake.Simulate = func(req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		for _, nf := range racer.Proof.Nullifiers {
+			h.fake.SetContractData(mustKey(vault.NullifierKey(vaulttest.Vault, nf.Bytes())), xdr.ScVal{Type: xdr.ScValTypeScvVoid}, 1001, nil)
+		}
+		return simulate(req)
+	}
+	sends := h.fake.CallCount("sendTransaction")
+	if _, f := h.r.Submit(ctx, racer); f == nil || f.code != CodeRejected || h.fake.CallCount("sendTransaction") != sends {
+		t.Fatalf("notes spent during the simulation: %v", f)
+	}
+	h.fake.Simulate = simulate
 	// The guarded mode ends on its own.
 	h.mu.Lock()
 	h.now = h.now.Add(61 * time.Minute)

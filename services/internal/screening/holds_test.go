@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
+	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
@@ -134,6 +136,13 @@ func TestAClearedLargeDepositIsHeldUntilItsOwnFinalCheck(t *testing.T) {
 	if got := h.sent(); !equal(got, []string{"flag 1 6", "attest " + itoa(int64(last))}) {
 		t.Fatalf("in the small deposits' final window: %v", got)
 	}
+	// Cleared and held, it still waits for its own final window.
+	h.now = h.now.Add(time.Hour)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+	h.tick()
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("a day before its final window: %v", got)
+	}
 	// The hold is lifted once the large deposit passes its own final check, before it is eligible.
 	h.now = time.Unix(int64(h.deposits[big].createdAt), 0).Add(24*time.Hour - 9*time.Minute)
 	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
@@ -203,3 +212,76 @@ func (f failing) Inflows(_ context.Context, account string, _ time.Time) ([]Infl
 }
 
 var errUnreachable = errors.New("horizon down")
+
+func TestALiftThatWaitedPastItsCheckChecksAgain(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	big := h.shield(clean, 6_000_000_000)
+	h.tick()
+	h.now = time.Unix(int64(h.deposits[big].createdAt), 0).Add(24*time.Hour - 9*time.Minute)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 6"}) {
+		t.Fatalf("at the review deadline: %v", got)
+	}
+	if err := h.s.DecideReview(ctx, big, "reviewer", true); err != nil {
+		t.Fatal(err)
+	}
+	// The unflag cannot go through for a while, longer than a final check vouches for a deposit.
+	simulate := h.fake.Simulate
+	h.fake.Simulate = func(req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		var env xdr.TransactionEnvelope
+		if err := xdr.SafeUnmarshalBase64(req.Transaction, &env); err != nil {
+			return protocol.SimulateTransactionResponse{}, err
+		}
+		if env.V1.Tx.Operations[0].Body.InvokeHostFunctionOp.HostFunction.InvokeContract.FunctionName == "unflag" {
+			return protocol.SimulateTransactionResponse{Error: "the RPC is down"}, nil
+		}
+		return simulate(req)
+	}
+	h.tick()
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("during the outage: %v", got)
+	}
+	h.now = h.now.Add(11 * time.Minute)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "3", h.now)
+	h.fake.Simulate = simulate
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"unflag 1", "attest 1"}) {
+		t.Fatalf("after the outage: %v", got)
+	}
+	rechecks := 0
+	for _, d := range h.decisions() {
+		if d == "recheck pass -" {
+			rechecks++
+		}
+	}
+	if rechecks != 2 {
+		t.Fatalf("lifted on a final check %d minutes old: %v", 11, h.decisions())
+	}
+}
+
+func TestALiftedHoldIsNotLiftedAgainBeforeTheChainShowsIt(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	big := h.shield(clean, 6_000_000_000)
+	h.tick()
+	h.now = time.Unix(int64(h.deposits[big].createdAt), 0).Add(24*time.Hour - 9*time.Minute)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+	h.tick()
+	if err := h.s.DecideReview(ctx, big, "reviewer", true); err != nil {
+		t.Fatal(err)
+	}
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 6", "unflag 1", "attest 1"}) {
+		t.Fatalf("sent %v", got)
+	}
+	// The next round runs before the follower has seen the unflag land.
+	h.setVault(h.attest)
+	if err := h.s.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("a lifted hold was lifted again: %v", got)
+	}
+}

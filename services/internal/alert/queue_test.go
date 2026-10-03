@@ -327,3 +327,45 @@ func TestA429SaysHowLongToWait(t *testing.T) {
 		}
 	}
 }
+
+// counted refuses every alert and counts the tries.
+type counted struct {
+	mu    sync.Mutex
+	tries int
+}
+
+func (c *counted) Send(context.Context, Alert) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tries++
+	return errors.New("webhook down")
+}
+
+func TestADeadChannelRestsAfterAFewTries(t *testing.T) {
+	now := time.Unix(1_728_000_000, 0)
+	dead := &counted{}
+	q := &Queue{Name: "operator", Channels: []Channel{dead}, Now: func() time.Time { return now }}
+	for i := range 10 {
+		q.Put(Alert{Code: fmt.Sprintf("exit_stranded_%d", i), Severity: Warning, Time: now})
+	}
+	for range 5 {
+		q.Flush(context.Background())
+	}
+	if dead.tries != failuresToRest {
+		t.Fatalf("%d tries before the lane rested", dead.tries)
+	}
+}
+
+func TestACriticalGoesBeforeEarlierWarnings(t *testing.T) {
+	now := time.Unix(1_728_000_000, 0)
+	ch := &limited{now: &now, perMinute: 20}
+	q := &Queue{Name: "operator", Channels: []Channel{ch}, Now: func() time.Time { return now }}
+	for i := range 30 {
+		q.Put(Alert{Code: fmt.Sprintf("hot_balance_low_%d", i), Severity: Warning, Time: now})
+	}
+	q.Put(Alert{Code: "balance_below_tvl", Severity: Critical, Time: now})
+	q.Flush(context.Background())
+	if len(ch.sent) == 0 || ch.sent[0].Code != "balance_below_tvl" {
+		t.Fatalf("the Critical waited behind the Warnings: %d sent", len(ch.sent))
+	}
+}
