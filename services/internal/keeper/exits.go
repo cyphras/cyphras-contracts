@@ -124,6 +124,31 @@ func handledAny(ret *xdr.ScVal) bool {
 	return !ok || n > 0
 }
 
+// Exits pays the exit queue. At the first run of each UTC day it claims stranded exits before
+// anything else: a stranded part is paid only whole, so it fits only before releases fill the
+// new window, and an exit whose parties can receive again should not wait behind the queue. Then,
+// on every run, it releases queued exits while the window has room, which during the day happens
+// only after the limits are raised.
+func (k *Keeper) Exits(ctx context.Context) error {
+	now, _, err := k.chainTime(ctx)
+	if err != nil {
+		return err
+	}
+	day := now / secondsPerDay
+	k.mu.RLock()
+	claimed := k.claimedDay
+	k.mu.RUnlock()
+	if day != claimed {
+		if err := k.Claim(ctx); err != nil {
+			return err
+		}
+		k.mu.Lock()
+		k.claimedDay = day
+		k.mu.Unlock()
+	}
+	return k.Release(ctx)
+}
+
 // Claim pays stranded exits whose recipient or relayer can receive again, oldest first, while
 // today's window has room. A claim pays each part that fits on its own; one that would pay
 // nothing fails in simulation and costs nothing.

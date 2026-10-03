@@ -534,3 +534,46 @@ func TestBumpTTLIsSplitToFitATransaction(t *testing.T) {
 		t.Fatalf("bump calls %v", bumps)
 	}
 }
+
+func TestStrandedExitsAreClaimedBeforeTheDaysReleases(t *testing.T) {
+	h := newHarness(t)
+	h.limit = 1000
+	h.chain.Shield(vaulttest.Depositor, 5000)
+	h.chain.Attest(1)
+	h.chain.Admit(1)
+	first := h.chain.QueueExit(1, -400, 0, vaulttest.Depositor)
+	h.chain.NextLedger(5)
+	h.chain.Strand(first, 400, 0)
+	h.chain.NextLedger(5)
+	h.status.ExitHead, h.status.ExitTail = 2, 2
+	h.queueExits(700)
+	h.fake.SetContractData(mustKey(vault.StrandedKey(vaulttest.Vault, 1)), vaulttest.ExitEntry(vaulttest.Depositor, 400, 0, 1), h.chain.Ledger, h.live(500_000))
+	h.partial = true
+	h.sentHook = func(d string) {
+		var n uint64
+		if _, err := fmt.Sscanf(d, "release %d", &n); err == nil {
+			h.release(n)
+		}
+		if d == "claim 1" {
+			h.status.OutflowDay = uint64(h.now.Unix()) / secondsPerDay
+			h.status.Outflow = big.NewInt(400)
+			h.setInstance()
+		}
+	}
+	h.sync()
+	if err := h.k.Exits(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.take(); !equal(got, []string{"claim 1", "release 1"}) {
+		t.Fatalf("first run of the day %v", got)
+	}
+	// Later runs the same day only release.
+	if err := h.k.Exits(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range h.take() {
+		if strings.HasPrefix(c, "claim") {
+			t.Fatalf("claimed again the same day: %s", c)
+		}
+	}
+}

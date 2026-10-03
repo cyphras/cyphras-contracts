@@ -61,6 +61,8 @@ type Keeper struct {
 	state     *chainstate.State
 	cursor    uint32
 	lastCycle time.Time
+	// claimedDay is the UTC day of the last round of claims.
+	claimedDay uint64
 }
 
 // New loads the stored chain state.
@@ -308,8 +310,7 @@ func (k *Keeper) Run(ctx context.Context, f *follow.Follower, poll time.Duration
 		next  func(time.Time, time.Duration) time.Duration
 	}{
 		{"admission", 30 * time.Second, k.Admit, nil},
-		{"release", 30 * time.Second, k.Release, untilRelease},
-		{"claims", 10 * time.Minute, k.Claim, nil},
+		{"exits", 30 * time.Second, k.Exits, untilRelease},
 		{"refunds", 5 * time.Minute, k.Refund, nil},
 		{"ttl", time.Hour, k.TTLCycle, nil},
 		{"balance", 10 * time.Minute, k.CheckBalance, nil},
