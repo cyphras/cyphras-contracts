@@ -1,21 +1,26 @@
-// Bundles the SDK for browsers with esbuild and prints the minified and gzipped sizes, for the
-// core alone and with the snarkjs prover. A Node built-in in the core fails the browser build.
+// Bundles the packages for browsers with esbuild and prints the minified and gzipped sizes: the
+// core, the snarkjs prover alone with the core left out, and both, which is what an app using the
+// default prover ships. A Node built-in in a package fails the browser build.
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { build } from "esbuild";
 
-const SRC = join(import.meta.dirname, "..", "src");
+const ROOT = join(import.meta.dirname, "..");
+const CORE = join(ROOT, "private", "src", "index.ts");
+const PROVER = join(ROOT, "prover-snarkjs", "src", "index.ts");
 const work = mkdtempSync(join(tmpdir(), "cyphras-size-"));
-const withProver = join(work, "with-prover.ts");
+const both = join(work, "with-prover.ts");
 writeFileSync(
-  withProver,
-  `export * from ${JSON.stringify(join(SRC, "index.ts"))};\n` +
-    `export * from ${JSON.stringify(join(SRC, "prover-snarkjs", "index.ts"))};\n`,
+  both,
+  `export * from ${JSON.stringify(CORE)};\nexport * from ${JSON.stringify(PROVER)};\n`,
 );
 
-async function size(entry: string): Promise<{ minified: number; gzipped: number }> {
+async function size(
+  entry: string,
+  external: string[] = [],
+): Promise<{ minified: number; gzipped: number }> {
   const result = await build({
     entryPoints: [entry],
     bundle: true,
@@ -23,6 +28,8 @@ async function size(entry: string): Promise<{ minified: number; gzipped: number 
     format: "esm",
     platform: "browser",
     target: "es2022",
+    conditions: ["cyphras-source"],
+    external,
     write: false,
     logLevel: "error",
   });
@@ -31,10 +38,11 @@ async function size(entry: string): Promise<{ minified: number; gzipped: number 
 }
 
 const kib = (n: number): string => `${(n / 1024).toFixed(1)} KiB`;
-for (const [name, entry] of [
-  ["core", join(SRC, "index.ts")],
-  ["core + snarkjs prover", withProver],
+for (const [name, entry, external] of [
+  ["@cyphras/private", CORE, []],
+  ["@cyphras/private-prover-snarkjs alone", PROVER, ["@cyphras/private"]],
+  ["both", both, []],
 ] as const) {
-  const { minified, gzipped } = await size(entry);
+  const { minified, gzipped } = await size(entry, [...external]);
   console.log(`${name}: ${kib(minified)} minified, ${kib(gzipped)} gzipped`);
 }

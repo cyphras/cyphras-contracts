@@ -5,7 +5,7 @@ import { bytesToBigIntBE, concatBytes, le32, utf8 } from "../src/bytes.ts";
 import type { TxProofJson } from "../src/extdata.ts";
 
 export const SDK_ROOT = join(import.meta.dirname, "..");
-export const REPO_ROOT = join(SDK_ROOT, "..");
+export const REPO_ROOT = join(SDK_ROOT, "..", "..");
 export const CIRCUIT_VECTORS = join(REPO_ROOT, "circuits", "test", "vectors");
 
 export function readJson<T>(path: string): T {

@@ -1,13 +1,14 @@
-// The default prover, kept in its own entry point and the only module that imports snarkjs, so it
-// can move to a separately licensed package without touching the SDK core.
-import { CyphrasError } from "../errors.ts";
+/// <reference path="./snarkjs.d.ts" />
+// The default prover of @cyphras/private, in a package of its own because snarkjs is GPL-3.0: the
+// core depends on no snarkjs code, and an app that wants another prover never ships it.
 import {
   type CircuitArtifacts,
+  CyphrasError,
   type Groth16Proof,
   type Prover,
   type TransactionWitness,
   circuitInputs,
-} from "../prover.ts";
+} from "@cyphras/private";
 
 /** Options of the snarkjs prover. */
 export interface SnarkjsProverOptions {

@@ -7,6 +7,7 @@ const SDK = join(import.meta.dirname, "..");
 export const CIRCOM_CONSTANTS = join(
   SDK,
   "..",
+  "..",
   "circuits",
   "lib",
   "poseidon2",

@@ -18,7 +18,7 @@ import { type TxProof, fromHostProof } from "../../src/extdata.ts";
 import { parseVerifyingKey, verifyGroth16 } from "../../src/groth16.ts";
 import { NETWORK_PASSPHRASES, defaultAddressKey, deriveSpendingKeys } from "../../src/keys.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
-import { snarkjsProver } from "../../src/prover-snarkjs/index.ts";
+import { snarkjsProver } from "@cyphras/private-prover-snarkjs";
 import { type TransactionWitness, publicInputs } from "../../src/prover.ts";
 import { proveTransaction } from "../../src/proving.ts";
 import {
