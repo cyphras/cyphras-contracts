@@ -13,7 +13,7 @@ pub const PUBLIC_INPUTS: usize = 8;
 // SHA-256 of keys/testnet-forgeable/verification_key.json, the dev key from the circuit's
 // `setup:testnet-forgeable` script. Whoever ran that setup can forge proofs for it.
 pub const FORGEABLE_SHA256: &str =
-    "fe2700e0252b9962ae87fdb967124f6af67a039e2868f603dd97d89fbd026137";
+    "526f5befc2ff836621cc6f2f181fa50de3318a6865d6eca2121c678a225e2b9c";
 
 // SHA-256 of keys/mainnet/verification_key.json, set from the multi-party ceremony output. Until
 // then a mainnet build fails.

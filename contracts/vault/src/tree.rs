@@ -7,7 +7,7 @@ use soroban_sdk::{Env, Vec, U256};
 use crate::storage::{self, DataKey, RootRing};
 
 /// The tree depth, which must match the circuit's `Transaction(levels, 2, 2)`.
-pub const DEPTH: u32 = 20;
+pub const DEPTH: u32 = 32;
 pub const ROOT_HISTORY: u32 = 256;
 const CAPACITY: u64 = 1 << DEPTH;
 
