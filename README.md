@@ -7,7 +7,7 @@ Smart contracts and zero-knowledge circuits for Cyphras private payments.
 ```
 circuits/      Circom circuits + Groth16 trusted setup (chain-agnostic)
 contracts/     Soroban contracts (Rust) - Cargo workspace
-  vault/       shielded pool: entry queue, Merkle tree, nullifiers, limits, guardian
+  vault/       shielded pool: entry and exit queues, Merkle tree, nullifiers, limits, guardian
   verifier/    Groth16 verifier with the verifying key compiled in
   poseidon2/   Poseidon2 over BN254 on the CAP-0075 host function
   types/       proof and ExtData types that clients encode
