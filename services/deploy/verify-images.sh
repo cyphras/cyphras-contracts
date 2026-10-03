@@ -42,8 +42,9 @@ if [ "$(git -C "$here" cat-file -t "refs/tags/$RELEASE_TAG")" != tag ]; then
   exit 1
 fi
 git -C "$here" -c gpg.ssh.allowedSignersFile="$signers" verify-tag "refs/tags/$RELEASE_TAG"
-# The signed tag must name itself, so a signed tag object of another release cannot stand in.
-if ! git -C "$here" cat-file tag "refs/tags/$RELEASE_TAG" | grep -qx "tag $RELEASE_TAG"; then
+# The signed tag must name itself in its header, so a signed tag object of another release cannot
+# stand in, even one whose message names this release.
+if [ "$(git -C "$here" for-each-ref --format='%(tag)' "refs/tags/$RELEASE_TAG")" != "$RELEASE_TAG" ]; then
   echo "$RELEASE_TAG is the signed tag of another release" >&2
   exit 1
 fi

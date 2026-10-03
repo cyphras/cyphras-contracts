@@ -35,9 +35,9 @@ jobs:
           git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
           test "$(git cat-file -t "$TAG")" = tag
           git verify-tag "$TAG"
-          # The signed tag must name itself and point at the commit this run builds, so a tag
-          # moved to another signed tag object cannot release an unsigned commit.
-          git cat-file tag "$TAG" | grep -qx "tag $TAG"
+          # The signed tag must name itself in its header and point at the commit this run builds,
+          # so a tag moved to another signed tag object cannot release an unsigned commit.
+          test "$(git for-each-ref --format='%(tag)' "refs/tags/$TAG")" = "$TAG"
           test "$(git rev-parse "$TAG^{commit}")" = "$GITHUB_SHA"
 
   images:

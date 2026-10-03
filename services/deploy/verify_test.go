@@ -40,9 +40,13 @@ func (r *release) key(name string) string {
 	return name + "@example.org " + strings.TrimSpace(string(pub))
 }
 
-// sign makes a tag signed with the named key.
-func (r *release) sign(key, tag, commit string) {
-	r.git("-c", "gpg.format=ssh", "-c", "user.signingkey="+filepath.Join(r.dir, key), "tag", "-s", "-m", tag, tag, commit)
+// sign makes a tag signed with the named key, whose message is its name and the notes given.
+func (r *release) sign(key, tag, commit string, notes ...string) {
+	args := []string{"-c", "gpg.format=ssh", "-c", "user.signingkey=" + filepath.Join(r.dir, key), "tag", "-s", "-m", tag}
+	for _, n := range notes {
+		args = append(args, "-m", n)
+	}
+	r.git(append(args, tag, commit)...)
 }
 
 // verify runs the script for a tag and commit, with the given signers in the repository variable.
@@ -105,6 +109,8 @@ func TestAReleaseTagIsCheckedOnTheHost(t *testing.T) {
 	r.git("commit", "-q", "-m", "release")
 	reviewed := r.git("rev-parse", "HEAD")
 	r.git("branch", "main")
+	r.git("commit", "-q", "--allow-empty", "-m", "later")
+	later := r.git("rev-parse", "HEAD")
 	r.git("checkout", "-q", "-b", "feature")
 	r.git("commit", "-q", "--allow-empty", "-m", "unreviewed")
 	unreviewed := r.git("rev-parse", "HEAD")
@@ -114,6 +120,8 @@ func TestAReleaseTagIsCheckedOnTheHost(t *testing.T) {
 	r.git("tag", "services-v1.0.3", reviewed)
 	r.sign("maintainer", "services-v1.0.4", unreviewed)
 	r.git("update-ref", "refs/tags/services-v1.0.5", r.git("rev-parse", "refs/tags/services-v1.0.0"))
+	r.sign("maintainer", "services-v1.0.6", reviewed, "tag services-v1.0.7")
+	r.git("update-ref", "refs/tags/services-v1.0.7", r.git("rev-parse", "refs/tags/services-v1.0.6"))
 	r.git("push", "-q", "origin", "dev", "main", "--tags")
 
 	if out, ok := r.verify("services-v1.0.0", reviewed, maintainer); !ok {
@@ -127,7 +135,9 @@ func TestAReleaseTagIsCheckedOnTheHost(t *testing.T) {
 		"a lightweight tag":            {"services-v1.0.3", reviewed, maintainer, "not a signed tag"},
 		"a commit on neither branch":   {"services-v1.0.4", unreviewed, maintainer, "neither dev nor main"},
 		"another release's signed tag": {"services-v1.0.5", reviewed, maintainer, "signed tag of another release"},
+		"a tag whose message names it": {"services-v1.0.7", reviewed, maintainer, "signed tag of another release"},
 		"a tag of another commit":      {"services-v1.0.0", unreviewed, maintainer, "does not point at RELEASE_COMMIT"},
+		"a tag of another dev commit":  {"services-v1.0.0", later, maintainer, "does not point at RELEASE_COMMIT"},
 		"a variable that disagrees":    {"services-v1.0.0", reviewed, stranger, "disagree"},
 		"an empty variable":            {"services-v1.0.0", reviewed, "", "disagree"},
 	} {
