@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { CyphrasError } from "../../src/errors.ts";
-import { LEASE_MS, LeaseLock } from "../../src/lock.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
 import { StateStore, emptyState } from "../../src/wallet/state.ts";
 import { testBytes } from "../helpers.ts";
@@ -38,59 +37,5 @@ describe("state compare-and-swap", () => {
     await states.save(state);
     await backend.set(key as string, old);
     await assert.rejects(states.load(), isCode("state_conflict"));
-  });
-});
-
-describe("lease lock", () => {
-  function clock() {
-    let now = 1_000_000;
-    return {
-      now: () => now,
-      sleep: async (ms: number) => {
-        now += ms;
-        await new Promise((resolve) => setImmediate(resolve));
-      },
-    };
-  }
-
-  const tick = () => new Promise((resolve) => setImmediate(resolve));
-
-  it("lets one holder in at a time", async () => {
-    const store = new SealedStore(new MemoryStore(), testBytes("lock/lease", 0, 32));
-    const { now, sleep } = clock();
-    const a = new LeaseLock(store, now, sleep);
-    const b = new LeaseLock(store, now, sleep);
-    const order: string[] = [];
-    let release = (): void => undefined;
-    const gate = new Promise<void>((resolve) => (release = resolve));
-    const first = a.hold(async () => {
-      order.push("a in");
-      await gate;
-      order.push("a out");
-    });
-    await tick();
-    const second = b.hold(async () => {
-      order.push("b in");
-    });
-    for (let i = 0; i < 5; i++) await tick();
-    assert.deepEqual(order, ["a in"]);
-    release();
-    await Promise.all([first, second]);
-    assert.deepEqual(order, ["a in", "a out", "b in"]);
-  });
-
-  it("takes over a lease its holder left to expire, and gives up on one held too long", async () => {
-    const store = new SealedStore(new MemoryStore(), testBytes("lock/lease", 1, 32));
-    const { now, sleep } = clock();
-    const write = (expiresAt: number) =>
-      store.write("lease", new TextEncoder().encode(JSON.stringify({ owner: "gone", expiresAt })));
-    await write(now() + LEASE_MS / 2);
-    const lock = new LeaseLock(store, now, sleep);
-    assert.equal(await lock.hold(async () => "held"), "held");
-    await write(now() + 10 * LEASE_MS);
-    await assert.rejects(
-      lock.hold(async () => "never"),
-      isCode("account_busy"),
-    );
   });
 });

@@ -27,7 +27,7 @@ import type { FetchLike } from "../net/http.ts";
 import type { IndexerClient } from "../net/indexer.ts";
 import { RelayerClient } from "../net/relayer.ts";
 import type { Prover } from "../prover.ts";
-import { type AccountLock, LeaseLock, lockName, webLock } from "../lock.ts";
+import { type AccountLock, lockName, soleInstance, webLock } from "../lock.ts";
 import { type KeyValueStore, SealedStore } from "../storage.ts";
 import {
   DEFAULT_NETWORK_FEE_CAPS,
@@ -107,6 +107,11 @@ export interface ConnectionOptions {
   // first sync then rebuilds notes and history from the chain; local records of submissions and
   // deposits that were only in the lost state are gone.
   readonly resetUnreadableState?: boolean;
+  // The caller's guarantee that no other wallet instance uses this store, needed where the
+  // platform has no Web Locks API. Instances that share a store, such as an extension's popup and
+  // its service worker, rely on Web Locks to run one operation at a time; without it two of them
+  // could both spend a note.
+  readonly singleInstance?: boolean;
   // For tests: the clock in milliseconds and the wait between polls.
   readonly clock?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -362,7 +367,14 @@ export class PrivateWallet {
     const now = options.clock ?? (() => Date.now());
     const sleep =
       options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-    const lock = webLock(lockName(storeKey)) ?? new LeaseLock(store, now, sleep);
+    const lock =
+      webLock(lockName(storeKey)) ??
+      (options.singleInstance === true
+        ? soleInstance
+        : fail(
+            "locks_unavailable",
+            "this platform has no Web Locks API; set singleInstance if only one wallet instance uses this store",
+          ));
     const core: Core = {
       deployment,
       services,

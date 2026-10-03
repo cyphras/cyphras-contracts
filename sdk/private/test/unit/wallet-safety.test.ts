@@ -1042,6 +1042,21 @@ describe("wallet safety: instances sharing a store", () => {
     return { world, store, popup, worker, bob };
   }
 
+  it("refuses to open without Web Locks unless the caller vouches for one instance", async () => {
+    const world = await createWorld();
+    const navigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    Object.defineProperty(globalThis, "navigator", { value: {}, configurable: true });
+    try {
+      await assert.rejects(openWallet(world, 0), isError("locks_unavailable"));
+      const sole = await openWallet(world, 0, new MemoryStore(), undefined, {
+        singleInstance: true,
+      });
+      assert.equal((await sole.sync()).rootVerified, true);
+    } finally {
+      Object.defineProperty(globalThis, "navigator", navigator as PropertyDescriptor);
+    }
+  });
+
   it("keeps the plan one instance saved when another one syncs", async () => {
     const { world, store, popup, worker, bob } = await shared();
     const notBefore = Number(world.vault.timestamp) + 600;

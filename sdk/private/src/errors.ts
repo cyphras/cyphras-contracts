@@ -17,7 +17,7 @@ export type ErrorCode =
   | "signature_seed_changed"
   | "storage_unreadable"
   | "state_conflict"
-  | "account_busy"
+  | "locks_unavailable"
   | "service_unavailable"
   | "service_rejected"
   | "indexer_fault"

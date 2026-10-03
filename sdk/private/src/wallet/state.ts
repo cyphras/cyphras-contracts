@@ -299,8 +299,9 @@ export async function saveState(store: SealedStore, state: WalletState): Promise
   await store.write(STATE_RECORD, new TextEncoder().encode(JSON.stringify(state, replacer)));
 }
 
-// The state of one account in its sealed store, saved with a compare-and-swap on its revision, so
-// one wallet instance never silently overwrites what another one saved.
+// The state of one account in its sealed store. A save first checks that the store still holds the
+// revision this instance read, which catches an instance that saved in between. It does not stop
+// two saves that interleave on an asynchronous store: only the account lock keeps instances apart.
 export class StateStore {
   readonly #store: SealedStore;
   // The highest revision this instance has read or written.
