@@ -338,8 +338,11 @@ export class MockRelayer {
   pace: number | undefined;
   // Test hook: a fee address the quote names instead of the one the health reports.
   quoteFeeAddress: string | undefined;
-  // Test hooks: errors to answer submissions with, in order.
+  // Test hooks: errors to answer submissions with, in order, and how many of the next
+  // transactions sent fail on the host's storage, which the relayer reports as failed with the
+  // code "unavailable" and rests nothing for.
   failures: { error: string; reason?: number }[] = [];
+  conflictNext = 0;
   // The nullifiers of requests held in memory, which a second submission may not claim.
   inFlight = new Set<string>();
   submissions: { proof: TxProofJson; ext: ExtDataJson; notBefore: number | undefined }[] = [];
@@ -430,6 +433,7 @@ export class MockRelayer {
   #txStatus(hash: string): Record<string, unknown> {
     const status = this.status.get(hash);
     if (status === "failed") return { status, code: "rejected" };
+    if (status === "conflict") return { status: "failed", code: "unavailable" };
     const exit = [...this.vault.exits.values(), ...this.vault.settledExits].find(
       (e) => e.txHash === hash,
     );
@@ -504,6 +508,11 @@ export class MockRelayer {
       .update(`relayed/${key}/${this.submissions.length}`)
       .digest("hex");
     const send = (): boolean => {
+      if (this.conflictNext > 0) {
+        this.conflictNext--;
+        this.status.set(hash, "conflict");
+        return true;
+      }
       try {
         this.rpc.run(hash, () => this.vault.transact(proof, ext, this.channel.publicKey()));
         this.status.set(hash, "success");

@@ -5,6 +5,7 @@ import { StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
 import { bytesToHex, utf8 } from "../../src/bytes.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import { P } from "../../src/field.ts";
+import type { IncomingKeys } from "../../src/keys.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
 import type { Leaf } from "../../src/net/indexer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
@@ -14,11 +15,14 @@ import {
   type LeafChunk,
   type OwnedNote,
   type Plan,
+  type UncheckedRange,
   type WalletState,
   emptyState,
 } from "../../src/wallet/state.ts";
 import {
+  type ScanKeys,
   advancePlans,
+  applyDownload,
   checkRoot,
   checkedBetween,
   recheck,
@@ -172,7 +176,7 @@ describe("plan fate", () => {
     advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
     state.nullifierSince = 321;
-    state.unchecked = [{ from: 300, to: 310, leaves: undefined, lost: false }];
+    state.unchecked = [{ from: 300, to: 310, leaves: undefined, status: "open" }];
     advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
     state.unchecked = [];
@@ -310,7 +314,7 @@ describe("plan fate", () => {
     advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "settled");
     state.nullifierSince = 230;
-    state.unchecked = [{ from: 200, to: 229, leaves: undefined, lost: false }];
+    state.unchecked = [{ from: 200, to: 229, leaves: undefined, status: "open" }];
     advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "settled");
     state.unchecked = [];
@@ -363,9 +367,31 @@ describe("unchecked ranges", () => {
     ),
   });
 
-  // An RPC whose getEvents shows the vault adding these leaves, up to the ledger `latest`.
-  function showing(leaves: readonly Leaf[], latest = 70): SorobanRpc {
-    const events = leaves.map((l, i) => ({
+  // A deposit the vault took into its entry queue at a ledger, as getEvents shows it.
+  const depositAt = (ledger: number, id: number) => ({
+    type: "contract",
+    ledger,
+    ledgerClosedAt: "2026-10-04T00:00:00Z",
+    contractId: VAULT,
+    id: `${String(ledger).padStart(12, "0")}-${String(900).padStart(8, "0")}`,
+    txHash: TX,
+    inSuccessfulContractCall: true,
+    topic: [xdr.ScVal.scvSymbol("deposit_pending").toXDR("base64")],
+    value: map([
+      ["id", xdr.ScVal.scvU64(new xdr.Uint64(BigInt(id)))],
+      ["commitment0", nativeToScVal(1n, { type: "u256" })],
+      ["commitment1", nativeToScVal(2n, { type: "u256" })],
+    ]).toXDR("base64"),
+  });
+
+  // An RPC whose getEvents shows the vault adding these leaves, and any other events, up to the
+  // ledger `latest`.
+  function showing(
+    leaves: readonly Leaf[],
+    latest = 70,
+    others: readonly object[] = [],
+  ): SorobanRpc {
+    const added = leaves.map((l, i) => ({
       type: "contract",
       ledger: l.ledger,
       ledgerClosedAt: "2026-10-04T00:00:00Z",
@@ -380,12 +406,24 @@ describe("unchecked ranges", () => {
         ["encrypted_output", xdr.ScVal.scvBytes(Buffer.from(l.ciphertext))],
       ]).toXDR("base64"),
     }));
+    const events = [...added, ...others];
     return new SorobanRpc("http://rpc", async (_input, init) => {
       const { id } = JSON.parse(String(init?.body));
       const result = { events, latestLedger: latest, oldestLedger: 1 };
       return new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
     });
   }
+
+  // An RPC that answers getEvents with a JSON-RPC error: -32600 as one that no longer holds the
+  // ledgers asked for, -32603 as a busy one.
+  function refusing(code: number): SorobanRpc {
+    return new SorobanRpc("http://rpc", async (_input, init) => {
+      const { id } = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message: "no" } }));
+    });
+  }
+  const isFault = (err: unknown): boolean =>
+    err instanceof CyphrasError && err.code === "indexer_fault";
 
   // A wallet that took the leaves at positions 4 to 7 unchecked, in two runs, the first of them
   // added at ledger 60, in a sync whose spends, from ledger 100 on, were checked.
@@ -394,7 +432,7 @@ describe("unchecked ranges", () => {
     state.nullifierSince = 120;
     const chunks = [chunk(taken.slice(0, 2)), chunk(taken.slice(2))];
     state.unchecked = [
-      { from: 100, to: 99, leaves: { first: 4, end: 8, ledger: 60, chunks }, lost: false },
+      { from: 100, to: 99, leaves: { first: 4, end: 8, ledger: 60, chunks }, status: "open" },
     ];
     return state;
   }
@@ -419,6 +457,15 @@ describe("unchecked ranges", () => {
     assert.equal(rest?.leaves?.first, 6);
     assert.equal(rest?.leaves?.ledger, 60);
     assert.equal(rest?.leaves?.chunks.length, 1);
+    // A range whose leaves were added before its spends' ledgers keeps those ledgers whole when RPC
+    // reaches none of them yet.
+    const spends = walletAfter(four);
+    spends.unchecked = [{ ...(spends.unchecked[0] as UncheckedRange), to: 110 }];
+    await recheck(spends, [showing(four.slice(0, 3), 80)], VAULT, 1);
+    assert.deepEqual(
+      spends.unchecked.map((r) => [r.from, r.to]),
+      [[100, 110]],
+    );
   });
 
   it("refuses a leaf whose ledger or transaction the sync took otherwise", async () => {
@@ -437,7 +484,7 @@ describe("unchecked ranges", () => {
   it("takes a range's spends as checked only up to the ledger every RPC provider reaches", async () => {
     const state = emptyState(1);
     state.nullifierSince = 120;
-    state.unchecked = [{ from: 60, to: 100, leaves: undefined, lost: false }];
+    state.unchecked = [{ from: 60, to: 100, leaves: undefined, status: "open" }];
     await recheck(state, [showing([], 90), showing([], 80)], VAULT, 1);
     assert.deepEqual(
       state.unchecked.map((r) => [r.from, r.to]),
@@ -457,6 +504,135 @@ describe("unchecked ranges", () => {
       recheck(walletAfter(forged), [showing(forged), showing(four)], VAULT, 1),
       (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
     );
+  });
+
+  // Keys for downloads with nothing to scan, which never use them.
+  const NO_KEYS: ScanKeys = {
+    network: "testnet",
+    incoming: {} as IncomingKeys,
+    ovk: undefined,
+    nkFold: undefined,
+  };
+
+  it("starts a new range for an unchecked sync that follows one kept as partial", () => {
+    const state = emptyState(1);
+    state.nullifierSince = 121;
+    state.unchecked = [{ from: 100, to: 120, leaves: undefined, status: "partial" }];
+    const tree = CommitmentTree.empty();
+    const data = { since: 121, completeTo: 130, horizon: 130, nullifiers: [], firstIndex: 0 };
+    applyDownload(state, NO_KEYS, { ...data, leaves: [], tree, pages: [] }, false, 1);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.from, r.to, r.status]),
+      [
+        [100, 120, "partial"],
+        [121, 130, "open"],
+      ],
+    );
+  });
+
+  it("takes no checked ledger from staged unchecked leaves that a checked sync with no new leaves applies", () => {
+    const state = emptyState(1);
+    state.tree = treeOf(4).snapshot();
+    state.nullifierSince = 120;
+    // An earlier sync staged the leaves at positions 4 to 7 while RPC could not check them, the
+    // last one labelled with a ledger far past the vault's.
+    const staged = [4, 5, 6, 7].map((i) => leafAt(i, i === 7 ? 9_999 : 60));
+    state.staging = {
+      tree: treeOf(8).snapshot(),
+      lastLeafLedger: 9_999,
+      notes: [],
+      sent: [],
+      paths: [],
+      found: [],
+      unchecked: { first: 4, ledger: 60, chunks: [chunk(staged)] },
+    };
+    const tree = treeOf(8);
+    const data = { since: 120, completeTo: 130, horizon: 130, nullifiers: [], firstIndex: 8 };
+    applyDownload(state, NO_KEYS, { ...data, leaves: [], tree, pages: [] }, true, 1);
+    assert.equal(state.tree.leafCount, 8);
+    assert.equal(state.checkedLeafLedger, 0);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.leaves?.first, r.leaves?.end, r.status]),
+      [[4, 8, "open"]],
+    );
+  });
+
+  it("clears a range only when every RPC provider shows the vault's exits and deposits in it alike", async () => {
+    const spends = (): WalletState => {
+      const state = emptyState(1);
+      state.nullifierSince = 120;
+      state.unchecked = [{ from: 60, to: 100, leaves: undefined, status: "open" }];
+      return state;
+    };
+    await assert.rejects(
+      recheck(spends(), [showing([], 110), showing([], 110, [depositAt(80, 3)])], VAULT, 1),
+      isFault,
+    );
+    const state = spends();
+    const both = showing([], 110, [depositAt(80, 3)]);
+    const events = await recheck(state, [both, both], VAULT, 1);
+    assert.deepEqual(state.unchecked, []);
+    assert.deepEqual(
+      events?.deposits.map((d) => d.id),
+      [3],
+    );
+    assert.equal(events?.from, 60);
+    // The events of a range of leaves alone cover no ledger's exits or deposits.
+    const leavesOnly = await recheck(walletAfter(four), [showing(four), showing(four)], VAULT, 1);
+    assert.ok((leavesOnly?.from as number) > (leavesOnly?.latest as number));
+  });
+
+  it("checks a range against the RPC providers that still hold it when another no longer does", async () => {
+    const hidden = [...four.slice(0, 3), { ...leafAt(7), ciphertext: new Uint8Array(181) }];
+    await assert.rejects(
+      recheck(walletAfter(hidden), [refusing(-32600), showing(four)], VAULT, 1),
+      isFault,
+    );
+    await assert.rejects(
+      recheck(walletAfter(hidden), [showing(four), refusing(-32600)], VAULT, 1),
+      isFault,
+    );
+  });
+
+  it("keeps what the providers that still hold a range show alike as partial, never cleared", async () => {
+    const state = walletAfter(four);
+    state.unchecked.push({ from: 130, to: 140, leaves: undefined, status: "open" });
+    assert.equal(await recheck(state, [refusing(-32600), showing(four)], VAULT, 1), undefined);
+    assert.deepEqual(
+      state.unchecked.map((r) => r.status),
+      ["partial", "open"],
+    );
+    assert.equal(state.checkedLeafLedger, 0);
+    // The next recheck goes on with the next open range.
+    await recheck(state, [showing([], 150), refusing(-32600)], VAULT, 1);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.from, r.to, r.status]),
+      [
+        [100, 70, "partial"],
+        [130, 140, "partial"],
+      ],
+    );
+    assert.equal(checkedBetween(state, 130, 140), false);
+  });
+
+  it("keeps a range as lost only once no RPC provider holds it, and moves nothing while one is busy", async () => {
+    const state = walletAfter(four);
+    await recheck(state, [refusing(-32600), refusing(-32603)], VAULT, 1);
+    await recheck(state, [refusing(-32603), showing(four)], VAULT, 1);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.leaves?.first, r.status]),
+      [[4, "open"]],
+    );
+    const hidden = [...four.slice(0, 3), { ...leafAt(7), ciphertext: new Uint8Array(181) }];
+    await assert.rejects(
+      recheck(walletAfter(hidden), [refusing(-32603), showing(four)], VAULT, 1),
+      isFault,
+    );
+    await recheck(state, [refusing(-32600), refusing(-32600)], VAULT, 1);
+    assert.equal(state.unchecked[0]?.status, "lost");
+    const alone = walletAfter(four);
+    await recheck(alone, [refusing(-32600)], VAULT, 1);
+    assert.equal(alone.unchecked[0]?.status, "lost");
   });
 
   it("refuses leaves RPC shows with a gap after the range's first, in full runs or not", async () => {

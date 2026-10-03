@@ -218,10 +218,12 @@ export interface FoundLeaf {
   readonly txHash: string;
 }
 
-// What syncs took from the indexer while RPC could not confirm it: the spends of the ledgers from
-// `from` to `to`, none when `from` is past `to`, and the leaves at positions from `first` up to
-// `end`, the first of them added at `ledger`, kept as digests of runs of them. `lost` once RPC no
-// longer holds them, so that nothing can check them any more.
+// What syncs took from the indexer while not every RPC provider could confirm it: the spends of
+// the ledgers from `from` to `to`, none when `from` is past `to`, and the leaves at positions from
+// `first` up to `end`, the first of them added at `ledger`, kept as digests of runs of them. "open"
+// while the providers may still confirm it; "partial" once some provider no longer holds it and
+// every other one showed it as the syncs took it, so that it can never be confirmed by every
+// provider; "lost" once none holds it, so that nothing can check it any more.
 export interface UncheckedRange {
   readonly from: number;
   readonly to: number;
@@ -233,7 +235,7 @@ export interface UncheckedRange {
         readonly chunks: readonly LeafChunk[];
       }
     | undefined;
-  readonly lost: boolean;
+  readonly status: "open" | "partial" | "lost";
 }
 
 // A ledger and the Unix second it closed at.
@@ -337,9 +339,12 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   // leaves it staged without them the next sync takes again.
   state.ledgerTimes ??= [];
   state.checkedLeafLedger ??= 0;
-  state.unchecked = state.unchecked.map((r) =>
-    r.leaves !== undefined && r.leaves.chunks === undefined ? { ...r, lost: true } : r,
-  );
+  state.unchecked = state.unchecked.map((stored) => {
+    const { lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };
+    const undigested = range.leaves !== undefined && range.leaves.chunks === undefined;
+    const status = range.status ?? (lost === true ? "lost" : "open");
+    return { ...range, status: undigested ? "lost" : status };
+  });
   if (state.staging?.unchecked !== undefined && state.staging.unchecked.chunks === undefined) {
     state.staging = undefined;
   }

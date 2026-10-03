@@ -18,17 +18,23 @@ describe("stored state", () => {
     );
   });
 
-  it("loads a state from before close times, checked ledgers, digests and counts of providers", async () => {
+  it("loads a state from before close times, checked ledgers, digests, counts of providers and range statuses", async () => {
     const store = new SealedStore(new MemoryStore(), testBytes("state/key", 2, 32));
     const state = emptyState(10);
     state.unchecked = [
-      { from: 20, to: 30, leaves: { first: 0, end: 4, ledger: 15, chunks: [] }, lost: false },
+      { from: 20, to: 30, leaves: { first: 0, end: 4, ledger: 15, chunks: [] }, status: "open" },
+      { from: 31, to: 40, leaves: undefined, status: "open" },
+      { from: 41, to: 50, leaves: undefined, status: "open" },
     ];
     await saveState(store, state);
     const text = new TextDecoder().decode((await store.read("state")) as Uint8Array);
     const older = JSON.parse(text);
     delete older.ledgerTimes;
     delete older.checkedLeafLedger;
+    older.unchecked.forEach((range: Record<string, unknown>, i: number) => {
+      delete range["status"];
+      range["lost"] = i === 1;
+    });
     delete older.unchecked[0].leaves.chunks;
     // Only what the load reads of a staging and of plans.
     older.staging = { unchecked: { first: 4, ledger: 31 } };
@@ -37,9 +43,16 @@ describe("stored state", () => {
     const loaded = await loadState(store);
     assert.deepEqual(loaded?.ledgerTimes, []);
     assert.equal(loaded?.checkedLeafLedger, 0);
-    // Leaves kept without the digests a recheck compares can no longer be checked, and leaves
-    // staged without them are taken again.
-    assert.equal(loaded?.unchecked[0]?.lost, true);
+    // Ranges keep whether they were lost; leaves kept without the digests a recheck compares can
+    // no longer be checked, and leaves staged without them are taken again.
+    assert.deepEqual(
+      loaded?.unchecked.map((r) => r.status),
+      ["lost", "lost", "open"],
+    );
+    assert.equal(
+      loaded?.unchecked.some((r) => "lost" in r),
+      false,
+    );
     assert.equal(loaded?.staging, undefined);
     // A landing kept without the count of providers that confirmed it rests on the first alone.
     assert.deepEqual(

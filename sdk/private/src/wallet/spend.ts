@@ -29,6 +29,7 @@ import {
   spendNote,
   spendableNotes,
   spendingKeys,
+  transactRoom,
 } from "./core.ts";
 import { type Warning, unshieldWarnings } from "./nudges.ts";
 import type { OwnedNote, Plan, PlanState, RootCheck, Route } from "./state.ts";
@@ -617,6 +618,27 @@ export async function followHeld(
   }
 }
 
+// A relayed call that failed on the host's storage, as one the exit queue moved under past the room
+// its footprint was given, rests nothing at the relayer, which reports it as failed with the code
+// "unavailable": the same request goes to it again while the payment's deadline allows, and its
+// new simulation sees where the queue moved.
+export async function resendConflicted(
+  plan: Plan,
+  client: RelayerClient,
+  latest: number,
+): Promise<void> {
+  if (latest >= plan.deadline) return;
+  const result = await client.submit(plan.proof, plan.ext, undefined);
+  if (result.accepted) {
+    plan.txHash = result.hash;
+    plan.heldId = result.heldId;
+    plan.relayerStatus = result.hash === undefined ? "held" : "pending";
+  } else if (!["duplicate", "unavailable", "rate_limited"].includes(result.error)) {
+    plan.relayerStatus = "failed";
+    plan.error = result.error;
+  }
+}
+
 // The user's own account submits the unshield and pays the network fee. The plan stays
 // submitted until a sync shows its nullifiers and commitments in one transaction, as for a relayed
 // one; the RPC's word that the transaction succeeded does not confirm it.
@@ -634,6 +656,7 @@ async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Pro
           new Address(signer.publicKey).toScVal(),
         ],
         transfers: [],
+        extend: transactRoom(core, ext),
       },
       async (hash) => {
         plan.state = "submitted";

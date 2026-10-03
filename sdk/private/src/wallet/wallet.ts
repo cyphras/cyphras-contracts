@@ -36,7 +36,15 @@ import {
   type TransactionSigner,
   invokeVault,
 } from "../vault/invoke.ts";
-import { type ChainReads, type Core, chainReads, invokeContext, newId } from "./core.ts";
+import {
+  type ChainReads,
+  type Core,
+  chainReads,
+  claimRoom,
+  invokeContext,
+  newId,
+  releaseRoom,
+} from "./core.ts";
 import {
   type DepositInfo,
   type ShieldReceipt,
@@ -69,6 +77,7 @@ import {
   cancelHeld,
   checkIssuer,
   followHeld,
+  resendConflicted,
   spend,
   submissionOf,
 } from "./spend.ts";
@@ -80,6 +89,7 @@ import {
   type Plan,
   type RootCheck,
   StateStore,
+  type UncheckedRange,
   type WalletState,
   emptyState,
 } from "./state.ts";
@@ -96,6 +106,7 @@ import {
   recheck,
   recordEvents,
   resetEvidence,
+  sameRecords,
   stageDownload,
 } from "./sync.ts";
 
@@ -160,10 +171,14 @@ export interface SyncSummary {
   // The new data matched the vault's events from every RPC provider other than the one it came
   // from, for the same ledgers.
   readonly crossChecked: boolean;
-  // Ledgers whose spends, and leaves whose contents, came from the indexer alone: later syncs check
-  // them against the vault's events while RPC still holds them.
+  // Ledgers whose spends, and leaves whose contents, not every RPC provider confirmed: later syncs
+  // check them against the vault's events while the providers still hold them.
   readonly uncheckedLedgers: number;
   readonly uncheckedLeaves: number;
+  // Of those leaves, the ones no RPC provider holds any more, so that nothing can check them: an
+  // incoming payment an indexer hid among them stays hidden until a rescan through an indexer the
+  // user trusts.
+  readonly lostLeaves: number;
 }
 
 /** A shielded payment through a relayer. */
@@ -264,6 +279,9 @@ function randomGap(): number {
   const r = new DataView(randomBytes(4).buffer).getUint32(0) / 2 ** 32;
   return SPLIT_GAP_MS.min + Math.floor(r * (SPLIT_GAP_MS.max - SPLIT_GAP_MS.min));
 }
+
+const leavesOf = (range: UncheckedRange): number =>
+  range.leaves === undefined ? 0 : range.leaves.end - range.leaves.first;
 
 // What became of the part an operation awaits. It landed, itself or as a retry by the same notes;
 // it is dead with all its notes free, to go again with them; one of its notes was spent by a
@@ -673,8 +691,9 @@ export class PrivateWallet {
     // The new data counts as the vault's own: cross-checked, or from the only RPC provider.
     let checked: boolean;
     // The vault's own events, from the first RPC provider, for the ledgers of this sync, when it
-    // held them.
+    // held them, and the other providers' for the same ledgers.
     let events: VaultEvents | undefined;
+    let others: VaultEvents[];
     if (source.kind === "indexer") {
       const matches = [];
       for (const rpc of rpcs) matches.push(await crossCheck(rpc, vault, data, limits.eventPages));
@@ -685,13 +704,21 @@ export class PrivateWallet {
       crossChecked = matches.every((m) => m.verified);
       checked = crossChecked;
       events = matches[0]?.events;
+      others = matches.slice(1).flatMap((m) => (m.events === undefined ? [] : [m.events]));
     } else {
       events = await source.events();
-      crossChecked =
-        second !== undefined &&
-        (await crossCheck(second.rpc, vault, data, limits.eventPages)).verified;
+      const match =
+        second === undefined
+          ? undefined
+          : await crossCheck(second.rpc, vault, data, limits.eventPages);
+      crossChecked = match?.verified === true;
       checked = second === undefined || crossChecked;
+      others = match?.events === undefined ? [] : [match.events];
     }
+    // The vault's exits and deposits of this sync's ledgers count only where its data counts as
+    // the vault's own, and every provider shows them alike.
+    const shown = checked ? events : undefined;
+    if (shown !== undefined) sameRecords([shown, ...others], data.since, data.horizon);
     const checks = views.map((v) => (v === undefined ? undefined : checkRoot(data.tree, v.roots)));
     if (checks.some((c) => c?.state === "mismatch")) {
       fail(
@@ -723,15 +750,23 @@ export class PrivateWallet {
     const pace = updatePace(core.state, events?.times ?? []);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
     onReads({ view, stats: await live?.stats().catch(() => undefined), pace });
+    const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
+      xs.filter((x) => x.ledger >= data.since && x.ledger <= data.horizon);
+    // What a recheck cleared is older than this sync's ledgers, and goes first.
     await trackDeposits(core, await live?.deposits().catch(() => undefined), [
-      ...(events?.deposits ?? []),
       ...(rechecked?.deposits ?? []),
+      ...within(shown?.deposits ?? []),
     ]);
     applyExits(
       core.state,
-      events === undefined
-        ? undefined
-        : { from: events.from, to: events.latest, events: events.exits },
+      [
+        ...(rechecked === undefined
+          ? []
+          : [{ from: rechecked.from, to: rechecked.latest, events: rechecked.exits }]),
+        ...(shown === undefined
+          ? []
+          : [{ from: data.since, to: data.horizon, events: within(shown.exits) }]),
+      ],
       await live?.exits().catch(() => undefined),
       view.ledger,
     );
@@ -749,8 +784,9 @@ export class PrivateWallet {
         (n, r) => n + Math.max(0, r.to - r.from + 1),
         0,
       ),
-      uncheckedLeaves: core.state.unchecked.reduce(
-        (n, r) => n + (r.leaves === undefined ? 0 : r.leaves.end - r.leaves.first),
+      uncheckedLeaves: core.state.unchecked.reduce((n, r) => n + leavesOf(r), 0),
+      lostLeaves: core.state.unchecked.reduce(
+        (n, r) => n + (r.status === "lost" ? leavesOf(r) : 0),
         0,
       ),
     };
@@ -765,10 +801,13 @@ export class PrivateWallet {
       const client = this.#relayerClients(route.url)[0] as RelayerClient;
       const { txHash, heldId } = plan;
       if (txHash !== undefined) {
-        plan.relayerStatus = await client.tx(txHash).then(
-          (tx) => tx?.status ?? "unknown",
-          () => "unknown",
-        );
+        const tx = await client.tx(txHash).catch(() => undefined);
+        plan.relayerStatus = tx?.status ?? "unknown";
+        if (tx?.status === "failed" && tx.code === "unavailable") {
+          await resendConflicted(plan, client, latest).catch(() => {
+            plan.relayerStatus = "unknown";
+          });
+        }
       } else if (heldId !== undefined) {
         await followHeld(core, plan, heldId, client, latest, pace).catch(() => {
           plan.relayerStatus = "unknown";
@@ -1196,6 +1235,7 @@ export class PrivateWallet {
         fn: "release",
         args: [xdr.ScVal.scvU32(max)],
         transfers: [],
+        extend: releaseRoom(this.#core, max),
       });
       return { txHash: hash };
     });
@@ -1215,6 +1255,7 @@ export class PrivateWallet {
         fn: "claim",
         args: [xdr.ScVal.scvU64(new xdr.Uint64(BigInt(exitId)))],
         transfers: [],
+        extend: claimRoom(this.#core),
       });
       if (returnValue?.switch().name !== "scvU64") {
         fail("rpc_error", "the claim returned no exit ID");

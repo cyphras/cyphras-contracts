@@ -179,13 +179,14 @@ function applyExitQueue(plans: readonly Plan[], queue: ExitQueue): void {
   }
 }
 
-// Moves confirmed unshields to queued, stranded or settled, from the vault's events that RPC
-// returned in this sync and from the indexer's queue, which counts only when it is complete to no
-// later than `latest`, the ledger the vault was read at. A transfer is settled once it is
-// confirmed: its payment is the note, and a queued fee concerns only the relayer.
+// Moves confirmed unshields to queued, stranded or settled, from the vault's events of the
+// ledgers this sync checked against every RPC provider, in chain order, and from the indexer's
+// queue, which counts only when it is complete to no later than `latest`, the ledger the vault was
+// read at. A transfer is settled once it is confirmed: its payment is the note, and a queued fee
+// concerns only the relayer.
 export function applyExits(
   state: WalletState,
-  exits: ExitEvents | undefined,
+  exits: readonly ExitEvents[],
   queue: ExitQueue | undefined,
   latest: number,
 ): void {
@@ -193,7 +194,7 @@ export function applyExits(
     if (plan.kind === "send" && plan.state === "confirmed") plan.state = "settled";
   }
   const plans = exitPlans(state);
-  if (exits !== undefined) applyExitEvents(plans, exits);
+  for (const events of exits) applyExitEvents(plans, events);
   if (queue !== undefined && queue.completeTo <= latest) applyExitQueue(plans, queue);
 }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Account, MuxedAccount, StrKey } from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
+import type { FetchLike } from "../../src/net/http.ts";
 import { MemoryStore } from "../../src/storage.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
 import { INDEXER, RELAYER, RPC, XLM, createWorld } from "../support/network.ts";
@@ -142,6 +143,50 @@ describe("wallet: deposits", () => {
   });
 });
 
+describe("wallet: deposits seen through two RPC providers", () => {
+  it("moves a deposit along only on what every RPC provider shows of it", async () => {
+    const world = await createWorld();
+    const second = "http://rpc2.test";
+    let busy = false;
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (url.origin === second) {
+        if (busy && body?.method === "getEvents") {
+          const error = { code: -32603, message: "busy" };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+        }
+        return world.fetch(RPC, init);
+      }
+      // The first provider reports every transaction as failed.
+      if (url.origin === RPC && body?.method === "getTransaction") {
+        const result = { status: "FAILED", latestLedger: world.vault.ledger };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+      }
+      return world.fetch(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await assert.rejects(
+      alice.shield({ amount: 10n * XLM, signer: world.signer("alice depositor") }),
+      isError("transaction_failed"),
+    );
+    // The deposit's event cannot be checked against the second provider, which reports the
+    // transaction as a success.
+    busy = true;
+    assert.equal((await alice.sync()).crossChecked, false);
+    let [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "submitting");
+    busy = false;
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+  });
+});
+
 describe("wallet: screening", () => {
   it("presents a deposit held for review, which may still be admitted, apart from refusals", async () => {
     const world = await createWorld();
@@ -182,6 +227,25 @@ describe("wallet: screening", () => {
     assert.equal(deposits.get(refused.depositId)?.refundKind, "refused_by_reviewer");
     assert.equal(deposits.get(ordered.depositId)?.state, "cancelled");
     assert.equal(deposits.get(ordered.depositId)?.refundKind, "cancelled");
+  });
+
+  it("presents every refusal code of the policy as a refusal, and a code it does not know as unknown", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("alice depositor");
+    const codes = [1, 2, 3, 4, 99, 7, 101];
+    const ids: number[] = [];
+    for (const [i, code] of codes.entries()) {
+      const { depositId } = await alice.shield({ amount: 10n * XLM, signer: depositor });
+      world.rpc.run(String(i).padStart(64, "f"), () => world.vault.flag(depositId, code));
+      ids.push(depositId);
+    }
+    await alice.sync();
+    const kinds = new Map((await alice.deposits()).map((d) => [d.id, d.flag?.kind]));
+    assert.deepEqual(
+      ids.map((id) => kinds.get(id)),
+      ["refused", "refused", "refused", "refused", "refused", "unknown", "unknown"],
+    );
   });
 });
 
