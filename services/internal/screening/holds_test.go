@@ -383,6 +383,19 @@ func TestAnOperatorLiftsAHoldOnlyAsItsFinalCheckWould(t *testing.T) {
 		t.Fatalf("sent %v", got)
 	}
 	h.tick()
+	// Held for a review, it is the review's to decide, even in its final window.
+	final := time.Unix(int64(h.deposits[big].createdAt), 0).Add(24*time.Hour - 9*time.Minute)
+	for _, at := range []time.Time{h.now, final} {
+		h.now = at
+		h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+		if err := h.s.Unflag(ctx, big, "operator", "meant another deposit"); err == nil || !strings.Contains(err.Error(), "review decides") {
+			t.Fatalf("an unflag of a hold waiting for its review: %v", err)
+		}
+	}
+	h.now = time.Unix(int64(h.deposits[big].createdAt), 0).Add(time.Hour)
+	if err := h.s.DecideReview(ctx, big, "reviewer", true); err != nil {
+		t.Fatal(err)
+	}
 	// A day before its final window, the hold stays whatever the checks say.
 	if err := h.s.Unflag(ctx, big, "reviewer", "looked fine"); err == nil || !strings.Contains(err.Error(), "final window") {
 		t.Fatalf("an early unflag: %v", err)
@@ -411,6 +424,59 @@ func TestAnOperatorLiftsAHoldOnlyAsItsFinalCheckWould(t *testing.T) {
 	}
 	rows, err := h.s.db.pending(ctx)
 	if err != nil || rows[0].recheck != "pass" || rows[0].recheckAt == nil || *rows[0].recheckAt != uint64(lifted.Unix()) {
+		t.Fatalf("rows %+v %v", rows, err)
+	}
+}
+
+func TestACorrectionInsideTheAttestedRangeWaitsForTheFinalWindow(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	dirty := h.shield(thief, 6_000_000_000)
+	h.tick()
+	h.land()
+	h.shield(keypair.MustRandom().Address(), 10_000_000)
+	h.tick()
+	h.now = h.now.Add(55 * time.Minute)
+	h.tick()
+	// The attestation of the later deposit passes over the flagged one.
+	if got := h.sent(); !equal(got, []string{"flag 1 2", "attest 2"}) {
+		t.Fatalf("sent %v", got)
+	}
+	// A deposit no attestation has passed yet is corrected at once: its own attestation comes in
+	// its final window.
+	later := h.shield(thief, 6_000_000_000)
+	h.tick()
+	h.setVault(h.attest)
+	h.sync()
+	h.sources.set(map[string]Hit{}, "2", h.now)
+	if err := h.s.Unflag(ctx, later, "reviewer", "false positive"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.sent(); !equal(got, []string{"flag 3 2", "unflag 3"}) {
+		t.Fatalf("sent %v", got)
+	}
+	// The flag was a mistake: the list drops the account. Unflagged now, the deposit would come
+	// under the attestation a day before its final check, as only a stolen key would put it.
+	h.now = h.now.Add(2 * time.Hour)
+	h.setVault(h.attest)
+	h.sources.set(map[string]Hit{}, "3", h.now)
+	if err := h.s.Unflag(ctx, dirty, "reviewer", "false positive"); err == nil || !strings.Contains(err.Error(), "final window") {
+		t.Fatalf("an early correction: %v", err)
+	}
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("sent %v", got)
+	}
+	// In its final window the correction is its final check.
+	h.now = time.Unix(int64(h.deposits[dirty].createdAt), 0).Add(24*time.Hour - 9*time.Minute)
+	h.sources.set(map[string]Hit{}, "4", h.now)
+	if err := h.s.Unflag(ctx, dirty, "reviewer", "false positive"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.sent(); !equal(got, []string{"unflag 1"}) {
+		t.Fatalf("sent %v", got)
+	}
+	rows, err := h.s.db.pending(ctx)
+	if err != nil || rows[0].recheck != "pass" || rows[0].recheckAt == nil || *rows[0].recheckAt != uint64(h.now.Unix()) {
 		t.Fatalf("rows %+v %v", rows, err)
 	}
 }

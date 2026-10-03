@@ -130,11 +130,13 @@ func (s *Screener) runOps(ctx context.Context) error {
 	return nil
 }
 
-// Unflag corrects a mistaken flag while the deposit is pending. A deposit inside the attested
-// range is admitted as soon as the flag is gone, so the automated checks run again first, and the
-// unflag is refused unless they pass. A hold is lifted only as its own final check would lift it:
-// in the deposit's final window, on a check that finds nothing at all, which then counts as that
-// final check.
+// Unflag corrects a mistaken flag while the deposit is pending, after the automated checks run
+// again; it is refused when they refuse the deposit. A deposit inside the attested range is
+// admitted as soon as the flag is gone, so its unflag is its final check: it waits for the
+// deposit's final window, and the checks must find nothing at all. Earlier, the attestation would
+// cover the deposit before its final window, which only a stolen asp key does, and which the
+// watcher pages for. A hold is lifted the same way wherever the deposit stands, and only once any
+// review it waits for has cleared it.
 func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string) error {
 	r, err := s.pendingRow(ctx, id)
 	if err != nil {
@@ -149,13 +151,17 @@ func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string)
 	}
 	now := s.now()
 	held := *r.flag == ReasonHeld
-	if held {
+	if held && r.review == "needed" {
+		return fmt.Errorf("screening: deposit %d is held for a review; the review decides it first", id)
+	}
+	final := held || id <= inst.Status.AttestedUpTo
+	if final {
 		if r.delay == nil {
 			return fmt.Errorf("screening: deposit %d has no delay read yet", id)
 		}
 		eligible := vault.PendingDeposit{Amount: r.amountInt(), CreatedAt: r.createdAt, Delay: *r.delay}.EligibleAt(inst.Config, inst.Limits)
 		if uint64(now.Add(s.cfg.RecheckWindow).Unix()) < eligible {
-			return fmt.Errorf("screening: deposit %d is held until its final window, which opens %s before it is eligible", id, s.cfg.RecheckWindow)
+			return fmt.Errorf("screening: deposit %d keeps its flag until its final window, which opens %s before it is eligible", id, s.cfg.RecheckWindow)
 		}
 	}
 	since := time.Unix(int64(r.createdAt), 0).Add(-FunderWindow)
@@ -166,7 +172,7 @@ func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string)
 	if verdict.Refused {
 		return fmt.Errorf("screening: the checks refuse deposit %d now: %s", id, verdict.Detail)
 	}
-	if held && !verdict.Clear() {
+	if final && !verdict.Clear() {
 		return fmt.Errorf("screening: the checks do not clear deposit %d now: %s", id, verdict.Detail)
 	}
 	res, err := s.send(ctx, "unflag", vault.U64(id))
@@ -174,9 +180,12 @@ func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string)
 		return err
 	}
 	reset := map[string]any{"first_check": "pass", "review": "cleared", "recheck": nil, "recheck_at": nil, "flag_sent": nil, "refuse_reason": nil, "flag_kind": nil}
-	if held {
-		reset["recheck"], reset["recheck_at"], reset["flag_kind"] = "pass", now.Unix(), "lifted"
+	if final {
+		reset["recheck"], reset["recheck_at"] = "pass", now.Unix()
 		s.record(ctx, Decision{Kind: "recheck", DepositID: &id, Address: r.depositor, Amount: r.amount, Outcome: "pass", Detail: verdict.Detail, Sources: verdict.Sources})
+	}
+	if held {
+		reset["flag_kind"] = "lifted"
 	}
 	for column, value := range reset {
 		if err := s.db.update(ctx, id, column, value); err != nil {
