@@ -70,7 +70,7 @@ func (ix *Indexer) leaves(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	leaves, err := ix.db.leaves(r.Context(), page)
+	leaves, err := ix.db.leaves(r.Context(), page, h.IngestedLedger)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return
@@ -96,7 +96,7 @@ func (ix *Indexer) nullifiers(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	list, next, err := ix.db.nullifiers(r.Context(), uint32(since), cursor)
+	list, next, err := ix.db.nullifiers(r.Context(), uint32(since), h.IngestedLedger, cursor)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return
@@ -123,7 +123,7 @@ func (ix *Indexer) deposits(w http.ResponseWriter, r *http.Request) {
 		delays[id] = d
 	}
 	ix.mu.RUnlock()
-	rows, err := ix.db.pending(r.Context())
+	rows, err := ix.db.pending(r.Context(), h.IngestedLedger)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return
@@ -146,7 +146,7 @@ func (ix *Indexer) deposits(w http.ResponseWriter, r *http.Request) {
 		}
 		pending = append(pending, p)
 	}
-	resolved, err := ix.db.resolved(r.Context(), ix.now().Add(-resolvedWindow).Unix())
+	resolved, err := ix.db.resolved(r.Context(), ix.now().Add(-resolvedWindow).Unix(), h.IngestedLedger)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return
@@ -161,7 +161,7 @@ func (ix *Indexer) stats(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	st, err := ix.db.stats(r.Context())
+	st, err := ix.db.stats(r.Context(), h.IngestedLedger)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return

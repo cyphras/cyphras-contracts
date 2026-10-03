@@ -347,17 +347,21 @@ func TestNullifierPagesFollowTheCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	db := store{h.store.Pool}
-	first, next, err := db.nullifiers(ctx, 0, 0)
+	first, next, err := db.nullifiers(ctx, 0, 1000, 0)
 	if err != nil || len(first) != MaxNullifiers || next != "4096" {
 		t.Fatalf("first page %d %q %v", len(first), next, err)
 	}
-	second, next, err := db.nullifiers(ctx, 0, 4096)
+	second, next, err := db.nullifiers(ctx, 0, 1000, 4096)
 	if err != nil || len(second) != 5000-MaxNullifiers || next != "" {
 		t.Fatalf("second page %d %q %v", len(second), next, err)
 	}
-	recent, _, _ := db.nullifiers(ctx, 149, 0)
+	recent, _, _ := db.nullifiers(ctx, 149, 1000, 0)
 	if len(recent) != 100 {
 		t.Fatalf("since ledger 149: %d", len(recent))
+	}
+	cut, _, _ := db.nullifiers(ctx, 149, 148, 0)
+	if len(cut) != 0 {
+		t.Fatalf("up to ledger 148 from 149: %d", len(cut))
 	}
 }
 
@@ -395,18 +399,18 @@ func TestTheStreamWakesSubscribers(t *testing.T) {
 	}
 }
 
-func TestReleaseTimesFollowTheDailyWindow(t *testing.T) {
+func TestPaymentTimesFollowTheDailyWindow(t *testing.T) {
 	const day = 20_000 * secondsPerDay
 	n := func(v int64) *big.Int { return big.NewInt(v) }
-	got := releaseSchedule([]*big.Int{n(300), n(500), n(1000), n(1)}, day+100, 0, n(600), n(1000))
-	// 300 fits today's 400 left; 500 waits for tomorrow, 1000 for the day after, and 1 fits after it
-	// only the day after that.
-	want := []uint64{day + 100, day + secondsPerDay, day + 2*secondsPerDay, day + 3*secondsPerDay}
+	got := paidBy([]*big.Int{n(300), n(500), n(1000), n(1)}, day+100, 0, n(600), n(1000))
+	// 300 fits today's 400 left; the next 500 completes tomorrow, and the 1000 after it, with the 1
+	// behind, the day after, each day's window used in full.
+	want := []uint64{day + 100, day + secondsPerDay, day + 2*secondsPerDay, day + 2*secondsPerDay}
 	if !slices.Equal(got, want) {
 		t.Fatalf("schedule %v, want %v", got, want)
 	}
 	// A halt that ends tomorrow starts the schedule there, with tomorrow's whole window.
-	got = releaseSchedule([]*big.Int{n(900)}, day+100, day+secondsPerDay+50, n(600), n(1000))
+	got = paidBy([]*big.Int{n(900)}, day+100, day+secondsPerDay+50, n(600), n(1000))
 	if got[0] != day+secondsPerDay+50 {
 		t.Fatalf("after a halt %v", got)
 	}
@@ -444,14 +448,54 @@ func TestTheExitQueueIsServedWithReleaseTimes(t *testing.T) {
 		t.Fatalf("exits %v", body)
 	}
 	q := queued[0].(map[string]any)
-	if q["id"].(float64) != 3 || q["position"].(float64) != 0 || q["payout"] != "500000000" || q["earliest_release"].(float64) != float64(c.ClosedAt) {
+	if q["id"].(float64) != 3 || q["position"].(float64) != 0 || q["payout"] != "500000000" || q["earliest_paid_at"].(float64) != float64(c.ClosedAt) {
 		t.Fatalf("queued exit %v", q)
 	}
 	s := stranded[0].(map[string]any)
-	if s["id"].(float64) != 1 || s["payout"] != "2000000000" || s["fee"] != "0" || s["recipient"] != vaulttest.Depositor {
+	if s["id"].(float64) != 1 || s["payout"] != "2000000000" || s["fee"] != "0" || s["recipient"] != vaulttest.Depositor || s["stranded_tx"] == "" || s["stranded_tx"] == s["tx_hash"] {
 		t.Fatalf("stranded exit %v", s)
+	}
+	resolved := body["resolved"].([]any)
+	if len(resolved) != 1 || resolved[0].(map[string]any)["id"].(float64) != 2 || resolved[0].(map[string]any)["outcome"] != "released" || resolved[0].(map[string]any)["settled_tx"] == "" {
+		t.Fatalf("resolved exits %v", resolved)
 	}
 	if body["queued_total"] != "2500000000" || body["window"].(map[string]any)["used"] != "1000001000" {
 		t.Fatalf("totals %v", body)
+	}
+}
+
+func TestPagesStopAtTheLedgerTheyReport(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.publish()
+	h.drain()
+	h.ix.Probe(context.Background())
+	_, body := h.get("/v1/nullifiers?since_ledger=0")
+	before := len(body["nullifiers"].([]any))
+	completeTo := body["complete_to"].(float64)
+	// A window lands in the database while the indexer has not moved its cursor yet.
+	next := h.ix.state.Clone()
+	d, err := next.Apply([]vault.Tx{{Ledger: h.chain.Ledger + 1, ClosedAt: h.chain.ClosedAt + 5, Hash: "late", Calls: []any{
+		vault.Shield{
+			Nullifiers: [2]vault.NewNullifier{{Nullifier: fr.SetUint64(77)}, {Nullifier: fr.SetUint64(78)}},
+			Deposit: vault.DepositPending{ID: next.NextDepositID, Depositor: vaulttest.Depositor, Amount: big.NewInt(5),
+				Commitment0: fr.SetUint64(91), Commitment1: fr.SetUint64(92), CreatedAt: uint64(h.chain.ClosedAt + 5)},
+		},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.Commit(context.Background(), h.chain.Ledger+1, h.chain.Ledger+1, next, d, nil); err != nil {
+		t.Fatal(err)
+	}
+	_, body = h.get("/v1/nullifiers?since_ledger=0")
+	if len(body["nullifiers"].([]any)) != before || body["complete_to"].(float64) != completeTo {
+		t.Fatalf("a page reached past its complete_to: %v", body)
+	}
+	_, body = h.get("/v1/deposits")
+	for _, p := range body["pending"].([]any) {
+		if p.(map[string]any)["id"].(float64) == float64(next.NextDepositID-1) {
+			t.Fatalf("a deposit past complete_to was served: %v", body)
+		}
 	}
 }

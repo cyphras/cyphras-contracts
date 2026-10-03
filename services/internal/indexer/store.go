@@ -58,9 +58,12 @@ type Leaf struct {
 	TxHash     string `json:"tx_hash"`
 }
 
-func (s store) leaves(ctx context.Context, page uint64) ([]Leaf, error) {
+// Every query is cut at upTo, the ledger the response reports as complete. A window committed
+// after the response read it may already be in the database, and must not show.
+
+func (s store) leaves(ctx context.Context, page uint64, upTo uint32) ([]Leaf, error) {
 	rows, err := s.pool.Query(ctx, `SELECT leaf_index, commitment, ciphertext, ledger, tx_hash FROM leaves
-		WHERE leaf_index >= $1 AND leaf_index < $2 ORDER BY leaf_index`, int64(page*PageSize), int64((page+1)*PageSize))
+		WHERE leaf_index >= $1 AND leaf_index < $2 AND ledger <= $3 ORDER BY leaf_index`, int64(page*PageSize), int64((page+1)*PageSize), int64(upTo))
 	if err != nil {
 		return nil, err
 	}
@@ -87,11 +90,11 @@ type Nullifier struct {
 	TxHash    string `json:"tx_hash"`
 }
 
-// nullifiers returns up to MaxNullifiers nullifiers spent at or after the ledger, from the
+// nullifiers returns up to MaxNullifiers nullifiers spent from the ledger since to upTo, from the
 // cursor on, and the cursor of the next page, empty when this is the last.
-func (s store) nullifiers(ctx context.Context, sinceLedger uint32, cursor uint64) ([]Nullifier, string, error) {
+func (s store) nullifiers(ctx context.Context, sinceLedger, upTo uint32, cursor uint64) ([]Nullifier, string, error) {
 	rows, err := s.pool.Query(ctx, `SELECT seq, nullifier, ledger, tx_hash FROM nullifiers
-		WHERE ledger >= $1 AND seq >= $2 ORDER BY seq LIMIT $3`, int64(sinceLedger), int64(cursor), MaxNullifiers+1)
+		WHERE ledger >= $1 AND ledger <= $2 AND seq >= $3 ORDER BY seq LIMIT $4`, int64(sinceLedger), int64(upTo), int64(cursor), MaxNullifiers+1)
 	if err != nil {
 		return nil, "", err
 	}
@@ -147,9 +150,9 @@ type depositRow struct {
 	flaggedAt         *int64
 }
 
-func (s store) pending(ctx context.Context) ([]depositRow, error) {
+func (s store) pending(ctx context.Context, upTo uint32) ([]depositRow, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, depositor, amount::text, created_at, flag_reason, flagged_at
-		FROM deposits WHERE outcome IS NULL ORDER BY id`)
+		FROM deposits WHERE created_ledger <= $1 AND (resolved_ledger IS NULL OR resolved_ledger > $1) ORDER BY id`, int64(upTo))
 	if err != nil {
 		return nil, err
 	}
@@ -165,9 +168,9 @@ func (s store) pending(ctx context.Context) ([]depositRow, error) {
 	return out, rows.Err()
 }
 
-func (s store) resolved(ctx context.Context, since int64) ([]ResolvedDeposit, error) {
+func (s store) resolved(ctx context.Context, since int64, upTo uint32) ([]ResolvedDeposit, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, depositor, amount::text, created_at, outcome, outcome_reason, resolved_at, leaf_index0, leaf_index1
-		FROM deposits WHERE outcome IS NOT NULL AND resolved_at >= $1 ORDER BY id`, since)
+		FROM deposits WHERE outcome IS NOT NULL AND resolved_at >= $1 AND resolved_ledger <= $2 ORDER BY id`, since, int64(upTo))
 	if err != nil {
 		return nil, err
 	}
@@ -199,15 +202,57 @@ type Stats struct {
 	PendingDeposits    uint64 `json:"pending_deposits"`
 }
 
-func (s store) stats(ctx context.Context) (Stats, error) {
+func (s store) stats(ctx context.Context, upTo uint32) (Stats, error) {
 	var admitted, distinct, pending int64
 	err := s.pool.QueryRow(ctx, `SELECT
-		count(*) FILTER (WHERE outcome = 'admitted'),
-		count(DISTINCT depositor) FILTER (WHERE outcome = 'admitted'),
-		count(*) FILTER (WHERE outcome IS NULL)
-		FROM deposits`).Scan(&admitted, &distinct, &pending)
+		count(*) FILTER (WHERE outcome = 'admitted' AND resolved_ledger <= $1),
+		count(DISTINCT depositor) FILTER (WHERE outcome = 'admitted' AND resolved_ledger <= $1),
+		count(*) FILTER (WHERE resolved_ledger IS NULL OR resolved_ledger > $1)
+		FROM deposits WHERE created_ledger <= $1`, int64(upTo)).Scan(&admitted, &distinct, &pending)
 	if err != nil {
 		return Stats{}, err
 	}
 	return Stats{AdmittedDeposits: uint64(admitted), DistinctDepositors: uint64(distinct), PendingDeposits: uint64(pending)}, nil
+}
+
+// ResolvedExit is an exit paid in full in the last week: by release, its last step, or by claim.
+type ResolvedExit struct {
+	ID            uint64 `json:"id"`
+	Payout        string `json:"payout"`
+	Fee           string `json:"fee"`
+	Recipient     string `json:"recipient"`
+	Relayer       string `json:"relayer"`
+	QueuedAt      uint64 `json:"queued_at"`
+	TxHash        string `json:"tx_hash"`
+	Outcome       string `json:"outcome"`
+	SettledLedger uint32 `json:"settled_ledger"`
+	SettledAt     uint64 `json:"settled_at"`
+	SettledTx     string `json:"settled_tx"`
+}
+
+// resolvedExits lists the exits paid in full since a time, up to a ledger. Payout and fee are
+// what the exit owed when it was queued.
+func (s store) resolvedExits(ctx context.Context, since int64, upTo uint32) ([]ResolvedExit, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, payout::text, fee::text, recipient, relayer, queued_at, tx_hash,
+		CASE WHEN claimed_ledger IS NULL THEN 'released' ELSE 'claimed' END,
+		coalesce(claimed_ledger, released_ledger), coalesce(claimed_at, released_at), coalesce(claimed_tx, released_tx)
+		FROM exits
+		WHERE (unpaid_payout IS NULL AND released_ledger <= $2 AND released_at >= $1)
+		   OR (claimed_ledger <= $2 AND claimed_at >= $1)
+		ORDER BY id`, since, int64(upTo))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ResolvedExit{}
+	for rows.Next() {
+		var e ResolvedExit
+		var id, queuedAt, ledger, at int64
+		if err := rows.Scan(&id, &e.Payout, &e.Fee, &e.Recipient, &e.Relayer, &queuedAt, &e.TxHash, &e.Outcome, &ledger, &at, &e.SettledTx); err != nil {
+			return nil, err
+		}
+		e.ID, e.QueuedAt, e.SettledLedger, e.SettledAt = uint64(id), uint64(queuedAt), uint32(ledger), uint64(at)
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
