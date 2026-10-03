@@ -2,7 +2,7 @@ import { CyphrasError, fail } from "../errors.ts";
 import type { IndexerClient, Leaf, SpentNullifier } from "../net/indexer.ts";
 import type { SorobanRpc } from "../net/rpc.ts";
 import { type CommitmentTree, PAGE_SIZE } from "../merkle.ts";
-import { decodeVaultEvent } from "../vault/events.ts";
+import { type VaultEvent, decodeVaultEvent } from "../vault/events.ts";
 
 export interface LeafBatch {
   // The leaves after the tree's last one, in index order.
@@ -64,6 +64,21 @@ export class IndexerSource implements ChainSource {
 
 const EVENT_PAGE = 1000;
 
+// A vault event that moves an exit along, with the transaction that emitted it.
+export type ExitEvent = Extract<
+  VaultEvent,
+  { kind: "exit_queued" | "exit_stranded" | "settled" }
+> & {
+  readonly txHash: string;
+};
+
+export interface VaultEvents {
+  readonly leaves: Leaf[];
+  readonly nullifiers: SpentNullifier[];
+  readonly exits: ExitEvent[];
+  readonly latest: number;
+}
+
 // The fallback when no indexer is available: the vault's own events from RPC, which keeps them
 // for about a week. A wallet further behind than that cannot sync this way.
 export class RpcEventSource implements ChainSource {
@@ -71,7 +86,7 @@ export class RpcEventSource implements ChainSource {
   readonly #rpc: SorobanRpc;
   readonly #vault: string;
   readonly #startLedger: number;
-  #loaded: Promise<{ leaves: Leaf[]; nullifiers: SpentNullifier[]; latest: number }> | undefined;
+  #loaded: Promise<VaultEvents> | undefined;
 
   constructor(rpc: SorobanRpc, vault: string, startLedger: number) {
     this.#rpc = rpc;
@@ -79,9 +94,10 @@ export class RpcEventSource implements ChainSource {
     this.#startLedger = startLedger;
   }
 
-  async #load(): Promise<{ leaves: Leaf[]; nullifiers: SpentNullifier[]; latest: number }> {
+  async #load(): Promise<VaultEvents> {
     const leaves: Leaf[] = [];
     const nullifiers: SpentNullifier[] = [];
+    const exits: ExitEvent[] = [];
     let cursor: string | undefined;
     let latest = this.#startLedger;
     for (;;) {
@@ -119,16 +135,22 @@ export class RpcEventSource implements ChainSource {
             ledger: event.ledger,
             txHash: event.txHash,
           });
+        } else if (
+          decoded.kind === "exit_queued" ||
+          decoded.kind === "exit_stranded" ||
+          decoded.kind === "settled"
+        ) {
+          exits.push({ ...decoded, txHash: event.txHash });
         }
       }
       if (page.events.length < EVENT_PAGE || page.cursor === undefined) break;
       cursor = page.cursor;
     }
     leaves.sort((a, b) => a.index - b.index);
-    return { leaves, nullifiers, latest };
+    return { leaves, nullifiers, exits, latest };
   }
 
-  events(): Promise<{ leaves: Leaf[]; nullifiers: SpentNullifier[]; latest: number }> {
+  events(): Promise<VaultEvents> {
     this.#loaded ??= this.#load();
     return this.#loaded;
   }

@@ -47,7 +47,7 @@ import {
 import { type ExitPosition, applyExits, exitPosition } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
 import { type Verification, createServices, verify } from "./services.ts";
-import { type ChainSource, IndexerSource, RpcEventSource } from "./sources.ts";
+import { type ExitEvent, IndexerSource, RpcEventSource } from "./sources.ts";
 import { type ConfirmSpend, type Submission, spend, submissionOf } from "./spend.ts";
 import { type Operation, type Plan, emptyState, loadState, saveState } from "./state.ts";
 import { type ScanKeys, advancePlans, checkRoot, crossCheck, isActive, syncChain } from "./sync.ts";
@@ -382,7 +382,7 @@ export class PrivateWallet {
     return this.#core.services.indexers.find((i) => i.url === ready?.url);
   }
 
-  #rpcSource(): ChainSource {
+  #rpcSource(): RpcEventSource {
     const { state, deployment, services } = this.#core;
     const from = Math.min(state.nullifierSince, state.lastLeafLedger || state.nullifierSince);
     return new RpcEventSource(
@@ -404,7 +404,7 @@ export class PrivateWallet {
       });
     }
     const indexer = this.#indexer();
-    let source: ChainSource =
+    let source: IndexerSource | RpcEventSource =
       indexer === undefined ? this.#rpcSource() : new IndexerSource(indexer);
     let update;
     try {
@@ -423,14 +423,19 @@ export class PrivateWallet {
       update = await syncChain(core.state, core.scan, source, core.save);
     }
     let crossChecked = false;
+    let exitEvents: readonly ExitEvent[];
     if (source.kind === "indexer") {
       try {
-        crossChecked = await crossCheck(core.services.rpc, core.deployment.vault, update);
+        const check = await crossCheck(core.services.rpc, core.deployment.vault, update);
+        crossChecked = check.verified;
+        exitEvents = check.exits;
       } catch (err) {
         core.state.treeFault = true;
         await core.save();
         throw err;
       }
+    } else {
+      exitEvents = (await source.events()).exits;
     }
     // F-27: the root history is read on every sync, so reading it does not signal a spend.
     const history = await core.services.vault.rootHistory();
@@ -442,7 +447,7 @@ export class PrivateWallet {
     await core.services.vault.instance();
     const live = source.kind === "indexer" ? indexer : undefined;
     await trackDeposits(core, await live?.deposits().catch(() => undefined));
-    applyExits(core.state, await live?.exits().catch(() => undefined));
+    applyExits(core.state, exitEvents, await live?.exits().catch(() => undefined));
     if (live !== undefined) await this.#pollRelayers();
     await core.save();
     if (core.state.treeFault) {
@@ -761,8 +766,7 @@ export class PrivateWallet {
     if (plan?.exitId === undefined || plan.state !== "queued") return undefined;
     const queue = await this.#indexer()?.exits();
     if (queue === undefined) return undefined;
-    const instance = await this.#core.services.vault.instance();
-    return exitPosition(queue, plan.exitId, instance, Math.floor(this.#core.now() / 1000));
+    return exitPosition(queue, plan.exitId, Math.floor(this.#core.now() / 1000));
   }
 
   /** Pays queued exits in FIFO order, up to `max`; anyone may call it once the window has room. */

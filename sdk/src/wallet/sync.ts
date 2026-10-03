@@ -8,7 +8,7 @@ import type { Leaf, SpentNullifier } from "../net/indexer.ts";
 import type { SorobanRpc } from "../net/rpc.ts";
 import { nullifier } from "../notes.ts";
 import type { RootHistory } from "../vault/state.ts";
-import { type ChainSource, RpcEventSource } from "./sources.ts";
+import { type ChainSource, type ExitEvent, RpcEventSource } from "./sources.ts";
 import {
   ACTIVE_STATES,
   type OwnedNote,
@@ -223,23 +223,30 @@ export function advancePlans(
 // RPC keeps events for about a week; a cross-check looks at most a day back.
 const CROSS_CHECK_LEDGERS = 17_280;
 
+export interface CrossCheck {
+  // RPC covered the range and agreed with the indexer.
+  readonly verified: boolean;
+  // The exit events RPC returned for the range and after it.
+  readonly exits: readonly ExitEvent[];
+}
+
 // Compares what the indexer served in this sync with the vault's events from RPC for the same
-// ledgers. Returns false when RPC cannot cover the range, and raises indexer_fault on a
-// difference: either the indexer or the RPC is wrong, and neither is trusted until it is resolved.
+// ledgers. Unverified when RPC cannot cover the range; a difference raises indexer_fault, since
+// either the indexer or the RPC is wrong, and neither is trusted until it is resolved.
 export async function crossCheck(
   rpc: SorobanRpc,
   vault: string,
   update: ChainUpdate,
-): Promise<boolean> {
+): Promise<CrossCheck> {
   // The served data covers nullifiers from sinceLedger and every leaf after firstIndex; leaves
   // after the last scanned one lie at or after sinceLedger.
   const from = Math.max(update.sinceLedger, update.completeToLedger - CROSS_CHECK_LEDGERS);
-  if (from > update.completeToLedger) return true;
+  if (from > update.completeToLedger) return { verified: true, exits: [] };
   let events;
   try {
     events = await new RpcEventSource(rpc, vault, from).events();
   } catch (err) {
-    if (err instanceof CyphrasError) return false;
+    if (err instanceof CyphrasError) return { verified: false, exits: [] };
     throw err;
   }
   const within = (ledger: number): boolean => ledger >= from && ledger <= update.completeToLedger;
@@ -258,5 +265,5 @@ export async function crossCheck(
   if (!same(served, onChain) || !same(servedNfs, chainNfs)) {
     fail("indexer_fault", "the indexer's leaves or nullifiers differ from the vault's events");
   }
-  return true;
+  return { verified: true, exits: events.exits };
 }

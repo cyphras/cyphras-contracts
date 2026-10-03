@@ -66,31 +66,32 @@ export interface DepositQueue {
   readonly resolved: readonly ResolvedDeposit[];
 }
 
-export interface ExitEntry {
+export interface QueuedExit {
   readonly id: number;
   readonly payout: bigint;
   readonly fee: bigint;
-  readonly recipient: string;
   // The transact that queued the exit.
   readonly txHash: string;
-  readonly ledger: number;
+  // Unix seconds: the earliest time a release can pay it, if every exit ahead is released as
+  // soon as it fits.
+  readonly earliestRelease: number;
 }
 
-export interface ResolvedExit {
+// A released exit with parts the asset contract refused: what is still owed, which claim pays.
+export interface StrandedExit {
   readonly id: number;
-  readonly outcome: "paid" | "stranded" | "claimed";
-  readonly txHash: string;
+  readonly payout: bigint;
+  readonly recipient: string;
 }
 
-// The vault's FIFO exit queue. services.md does not define this endpoint yet; these are the
-// fields the SDK needs to place a queued payout and estimate when it is paid.
+// The vault's exit queue as the indexer serves it: every queued exit from the head, in order,
+// and every stranded one.
 export interface ExitQueue {
   readonly head: number;
   readonly tail: number;
-  readonly queued: readonly ExitEntry[];
-  readonly stranded: readonly ExitEntry[];
-  readonly resolved: readonly ResolvedExit[];
-  readonly completeToLedger: number;
+  readonly queued: readonly QueuedExit[];
+  readonly stranded: readonly StrandedExit[];
+  readonly completeTo: number;
 }
 
 export interface PoolStats {
@@ -231,39 +232,29 @@ export class IndexerClient {
 
   async exits(): Promise<ExitQueue> {
     const f = await this.#get("/v1/exits");
-    const entry = (list: string) =>
-      f.array(list).map((raw, i): ExitEntry => {
-        const e: Fields = f.item(raw, i, list);
-        return {
-          id: e.integer("id"),
-          payout: e.amount("payout"),
-          fee: e.amount("fee"),
-          recipient: e.string("recipient"),
-          txHash: e.hash("tx_hash"),
-          ledger: e.integer("ledger", 1),
-        };
-      });
-    const queued = entry("queued");
-    let previous = -1;
-    for (const e of queued) {
-      if (e.id <= previous) f.fault("queued exits are not in ascending order");
-      previous = e.id;
-    }
-    return {
-      head: f.integer("head"),
-      tail: f.integer("tail"),
-      queued,
-      stranded: entry("stranded"),
-      resolved: f.array("resolved").map((raw, i): ResolvedExit => {
-        const e: Fields = f.item(raw, i, "resolved");
-        const outcome = e.string("outcome");
-        if (outcome !== "paid" && outcome !== "stranded" && outcome !== "claimed") {
-          e.fault("unknown exit outcome");
-        }
-        return { id: e.integer("id"), outcome, txHash: e.hash("tx_hash") };
-      }),
-      completeToLedger: f.integer("complete_to_ledger"),
-    };
+    const head = f.integer("head", 1);
+    const tail = f.integer("tail", head);
+    const queued = f.array("queued").map((raw, i): QueuedExit => {
+      const e: Fields = f.item(raw, i, "queued");
+      if (e.integer("id") !== head + i || e.integer("position") !== i) {
+        e.fault("the queued exits are not the queue from its head, in order");
+      }
+      return {
+        id: head + i,
+        payout: e.amount("payout"),
+        fee: e.amount("fee"),
+        txHash: e.hash("tx_hash"),
+        earliestRelease: e.integer("earliest_release"),
+      };
+    });
+    if (queued.length !== tail - head) f.fault("the queue does not hold every exit to its tail");
+    const stranded = f.array("stranded").map((raw, i): StrandedExit => {
+      const e: Fields = f.item(raw, i, "stranded");
+      const id = e.integer("id", 1);
+      if (id >= head) e.fault("a stranded exit lies at or after the head");
+      return { id, payout: e.amount("payout"), recipient: e.string("recipient") };
+    });
+    return { head, tail, queued, stranded, completeTo: f.integer("complete_to") };
   }
 
   async stats(): Promise<PoolStats> {

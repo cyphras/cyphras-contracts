@@ -88,6 +88,7 @@ export interface Exit {
   fee: bigint;
   recipient: string;
   relayer: string;
+  queuedAt: bigint;
   txHash: string;
   ledger: number;
 }
@@ -174,7 +175,6 @@ export class MockVault {
   readonly dayTotals = new Map<string, bigint>();
   readonly exits = new Map<number, Exit>();
   readonly stranded = new Map<number, Exit>();
-  readonly resolvedExits: { id: number; outcome: string; txHash: string }[] = [];
   readonly events: EmittedEvent[] = [];
   readonly transfers: Transfer[] = [];
   // Accounts that cannot receive a payout, to strand exits in tests.
@@ -373,6 +373,7 @@ export class MockVault {
         fee: ext.fee,
         recipient: ext.recipient,
         relayer: ext.relayer,
+        queuedAt: this.timestamp,
         txHash: this.txHash,
         ledger: this.ledger,
       });
@@ -431,11 +432,9 @@ export class MockVault {
       this.#pay(exit.relayer, exit.fee);
       if (unpaid === 0n) {
         this.#pay(exit.recipient, exit.payout);
-        this.resolvedExits.push({ id: exit.id, outcome: "paid", txHash: exit.txHash });
         this.#settled(-exit.payout, exit.fee, exit.recipient, exit.relayer, exit.id);
       } else {
         this.stranded.set(exit.id, { ...exit, fee: 0n });
-        this.resolvedExits.push({ id: exit.id, outcome: "stranded", txHash: exit.txHash });
         this.#emit("exit_stranded", [
           ["id", u64(exit.id)],
           ["payout", i128(unpaid)],
@@ -465,8 +464,6 @@ export class MockVault {
     this.outflow = today;
     this.#settled(-exit.payout, exit.fee, exit.recipient, exit.relayer, id);
     this.#pay(exit.recipient, exit.payout);
-    const entry = this.resolvedExits.find((e) => e.id === id);
-    if (entry !== undefined) entry.outcome = "claimed";
   }
 
   attest(upTo: number): void {

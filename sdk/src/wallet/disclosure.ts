@@ -141,15 +141,7 @@ export async function verifyDisclosure(
       const tx = await rpc.getTransaction(p.txHash);
       confirmedByRpc = tx.events.some((e) => {
         if (e.contractId !== vault) return false;
-        const decoded = decodeVaultEvent({
-          id: "",
-          ledger: 1,
-          txHash: p.txHash,
-          contractId: vault,
-          topic: e.topic,
-          value: e.value,
-          successful: true,
-        });
+        const decoded = decodeVaultEvent(e);
         return (
           decoded.kind === "new_commitment" &&
           decoded.index === p.leafIndex &&

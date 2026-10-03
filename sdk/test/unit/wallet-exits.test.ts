@@ -99,7 +99,10 @@ describe("the exit queue", () => {
     const position = await alice.exitPosition(sub.planId);
     assert.equal(position?.ahead, 0);
     assert.equal(position?.dueNow, false);
-    assert.equal(position?.estimatedAt, Number((world.vault.timestamp / 86_400n + 1n) * 86_400n));
+    assert.equal(
+      position?.earliestRelease,
+      Number((world.vault.timestamp / 86_400n + 1n) * 86_400n),
+    );
     assert.equal(
       world.vault.transfers.some((t) => t.to === destination),
       false,
@@ -170,6 +173,118 @@ describe("the exit queue", () => {
     assert.equal(p2?.ahead, 1);
     assert.equal(p2?.aheadAmount, 26n * XLM);
     // 26 fits tomorrow's window of 30; the next 21 waits a further day
-    assert.equal(p2?.estimatedAt, (p1?.estimatedAt as number) + 86_400);
+    assert.equal(p2?.earliestRelease, (p1?.earliestRelease as number) + 86_400);
+  });
+});
+
+describe("the exit queue: sources", () => {
+  // Today's window is full, so the next exit queues.
+  function fillWindow(world: Awaited<ReturnType<typeof createWorld>>): void {
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+  }
+
+  it("follows a payout through the vault's RPC events when the indexer is down", async () => {
+    const { world, alice } = await funded();
+    fillWindow(world);
+    const destination = world.signer("closed account").publicKey;
+    const sub = await alice.unshield({
+      to: destination,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    assert.ok("planId" in sub);
+    world.indexer.down = true;
+    assert.equal((await alice.sync()).source, "rpc");
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.exitId, 1);
+    // the position comes from the indexer alone
+    await assert.rejects(alice.exitPosition(sub.planId), isError("service_unavailable"));
+    world.vault.unpayable.add(destination);
+    world.advance(86_400);
+    await alice.releaseExits(world.signer("anyone"));
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "stranded");
+    world.vault.unpayable.delete(destination);
+    await alice.claimExit(1, world.signer("anyone"));
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "claimed");
+  });
+
+  it("recognizes a payout stranded between syncs from the indexer's queue alone", async () => {
+    const { world, alice } = await funded();
+    fillWindow(world);
+    const destination = world.signer("closed account").publicKey;
+    const sub = await alice.unshield({
+      to: destination,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    assert.ok("planId" in sub);
+    world.vault.unpayable.add(destination);
+    world.advance(86_400);
+    await alice.releaseExits(world.signer("anyone"));
+    // RPC no longer covers the ledgers of the unshield, so no event names its exit
+    world.rpc.oldestLedger = world.vault.ledger;
+    const summary = await alice.sync();
+    assert.equal(summary.crossChecked, false);
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "stranded");
+    assert.equal(plan?.exitId, 1);
+    world.vault.unpayable.delete(destination);
+    await alice.claimExit(1, world.signer("anyone"));
+    world.rpc.oldestLedger = world.vault.ledger + 1;
+    assert.equal((await alice.sync()).crossChecked, false);
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "claimed");
+  });
+
+  it("takes the exit ID of a self-relayed unshield from its own transaction", async () => {
+    const { world, alice } = await funded();
+    fillWindow(world);
+    const destination = world.signer("merchant").publicKey;
+    const result = await alice.unshield({
+      to: destination,
+      amount: 25n * XLM,
+      selfRelay: world.signer("my account"),
+      confirm: confirmAll,
+    });
+    assert.ok("planId" in result && result.state === "queued");
+    assert.equal((await alice.plans())[0]?.exitId, 1);
+    world.advance(86_400);
+    await alice.releaseExits(world.signer("anyone"));
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+    assert.deepEqual(
+      world.vault.transfers.filter((t) => t.to === destination).map((t) => t.amount),
+      [25n * XLM],
+    );
+  });
+
+  it("counts a split part that waits in the queue as sent", async () => {
+    const { world, alice } = await funded();
+    await alice.unshield({
+      to: world.signer("dest").publicKey,
+      amount: 90n * XLM,
+      maxFee: 2n * XLM,
+      split: true,
+      confirm: confirmAll,
+    });
+    let [view] = await alice.continueOperations();
+    assert.equal(view?.plans.length, 1);
+    world.advance(6 * 3_600 + 1);
+    fillWindow(world);
+    [view] = await alice.continueOperations();
+    assert.equal(view?.plans.length, 2);
+    await alice.sync();
+    const second = (await alice.plans()).find((p) => p.amount === 42n * XLM);
+    assert.equal(second?.state, "queued");
+    [view] = await alice.continueOperations();
+    assert.equal(view?.state, "done");
+    assert.equal(view?.sent, 90n * XLM);
   });
 });

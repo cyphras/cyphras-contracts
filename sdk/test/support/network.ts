@@ -22,7 +22,7 @@ import type { FetchLike } from "../../src/net/http.ts";
 import type { TransactionSigner } from "../../src/vault/invoke.ts";
 import { MockRpc, RpcFailure, keypairFor } from "./rpc.ts";
 import { trapdoorPins } from "./trapdoor.ts";
-import { type Limits, MockVault } from "./vault.ts";
+import { type Exit, type Limits, MockVault } from "./vault.ts";
 
 export const RPC = "http://rpc.test";
 export const INDEXER = "http://indexer.test";
@@ -39,6 +39,30 @@ export const DEFAULT_LIMITS: Limits = {
   maxFee: 5n * XLM,
   largeDepositThreshold: 500n * XLM,
 };
+
+// When a release can first pay each queued exit, as the indexer computes it: in queue order, each
+// as soon as it fits what is left of a day's window, and nothing during a halt.
+function releaseSchedule(
+  outflows: readonly bigint[],
+  now: number,
+  haltedUntil: number,
+  usedToday: bigint,
+  maxDaily: bigint,
+): number[] {
+  const start = Math.max(now, haltedUntil);
+  let day = Math.floor(start / 86_400);
+  let used = day === Math.floor(now / 86_400) ? usedToday : 0n;
+  let at = start;
+  return outflows.map((outflow) => {
+    if (used + outflow > maxDaily) {
+      day++;
+      at = day * 86_400;
+      used = 0n;
+    }
+    used += outflow;
+    return at;
+  });
+}
 
 // Field elements as the indexer serves them: 32 bytes of hex with no prefix.
 const fieldHex = (x: bigint): string => bytesToHex(bigIntToBytesBE(x, 32));
@@ -222,32 +246,41 @@ export class MockIndexer {
           pending_deposits: v.pending.size,
         });
       case "/v1/exits": {
-        const entry = (e: {
-          id: number;
-          payout: bigint;
-          fee: bigint;
-          recipient: string;
-          txHash: string;
-          ledger: number;
-        }) => ({
+        const now = Number(v.timestamp);
+        const today = Math.floor(now / 86_400);
+        const used = v.outflowDay === BigInt(today) ? v.outflow : 0n;
+        const queued = [...v.exits.values()].sort((a, b) => a.id - b.id);
+        const releases = releaseSchedule(
+          queued.map((e) => e.payout + e.fee),
+          now,
+          Number(v.haltedUntil),
+          used,
+          v.limits.maxDailyOutflow,
+        );
+        const parts = (e: Exit) => ({
           id: e.id,
           payout: e.payout.toString(),
           fee: e.fee.toString(),
           recipient: e.recipient,
-          tx_hash: e.txHash,
-          ledger: e.ledger,
+          relayer: e.relayer,
+          queued_at: Number(e.queuedAt),
         });
         return json(200, {
           head: v.exitHead,
           tail: v.exitTail,
-          queued: [...v.exits.values()].sort((a, b) => a.id - b.id).map(entry),
-          stranded: [...v.stranded.values()].map(entry),
-          resolved: v.resolvedExits.map((r) => ({
-            id: r.id,
-            outcome: r.outcome,
-            tx_hash: r.txHash,
+          queued_total: v.queuedTotal.toString(),
+          max_daily_outflow: v.limits.maxDailyOutflow.toString(),
+          window: { day: today, used: used.toString(), resets_at: (today + 1) * 86_400 },
+          halted_until: Number(v.haltedUntil),
+          queued: queued.map((e, i) => ({
+            ...parts(e),
+            position: e.id - v.exitHead,
+            queued_ledger: e.ledger,
+            tx_hash: e.txHash,
+            earliest_release: releases[i],
           })),
-          complete_to_ledger: v.ledger,
+          stranded: [...v.stranded.values()].sort((a, b) => a.id - b.id).map(parts),
+          complete_to: v.ledger,
         });
       }
       default:

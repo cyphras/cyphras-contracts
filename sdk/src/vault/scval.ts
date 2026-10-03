@@ -80,6 +80,13 @@ export class Struct {
     return v.u32();
   }
 
+  optionU64(name: string): bigint | undefined {
+    const v = this.get(name);
+    if (v.switch().name === "scvVoid") return undefined;
+    if (v.switch().name !== "scvU64") this.#fault(`${name} is not an Option<u64>`);
+    return scValToBigInt(v);
+  }
+
   vecU256(name: string): bigint[] {
     const v = this.get(name);
     if (v.switch().name !== "scvVec") this.#fault(`${name} is not a vector`);
