@@ -4,19 +4,29 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 # Runs the free gitleaks CLI directly. The gitleaks-action wrapper requires a paid license for
 # organization repos; the binary itself is MIT-licensed and free.
 jobs:
   gitleaks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Full history so a secret committed in an earlier commit is still caught.
           fetch-depth: 0
+          persist-credentials: false
       - name: Run gitleaks
         run: |
           version=8.18.4
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
-            | tar -xz -C "$RUNNER_TEMP" gitleaks
-          "$RUNNER_TEMP/gitleaks" detect --source . --redact --verbose
+          # From gitleaks_${version}_checksums.txt on the release; bump both together.
+          sha256=ba6dbb656933921c775ee5a2d1c13a91046e7952e9d919f9bac4cec61d628e7d
+          tarball="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -sSfL -o "$tarball" "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz"
+          echo "${sha256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" -C "$RUNNER_TEMP" gitleaks
+          # Only the history behind this checkout: every other branch is scanned by its own run,
+          # so one branch's finding cannot fail the rest.
+          "$RUNNER_TEMP/gitleaks" detect --source . --log-opts=HEAD --redact --verbose
