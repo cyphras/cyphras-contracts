@@ -49,9 +49,9 @@ import {
 import { type ExitPosition, applyExits, exitPosition } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
 import { type Verification, createServices, verify } from "./services.ts";
-import { type ExitEvent, IndexerSource, RpcEventSource } from "./sources.ts";
+import { type DepositEvent, type ExitEvent, IndexerSource, RpcEventSource } from "./sources.ts";
 import { type ConfirmSpend, type Submission, spend, submissionOf } from "./spend.ts";
-import { type Operation, type Plan, StateStore, emptyState } from "./state.ts";
+import { type Operation, type Plan, StateStore, type WalletState, emptyState } from "./state.ts";
 import {
   type ScanKeys,
   advancePlans,
@@ -75,6 +75,10 @@ export interface ConnectionOptions {
   // Service URLs other than the pinned ones; each must report the pinned vault and network.
   readonly indexers?: readonly string[];
   readonly relayers?: readonly string[];
+  // Starts from a fresh state when the stored one cannot be read, instead of refusing to open. The
+  // first sync then rebuilds notes and history from the chain; local records of submissions and
+  // deposits that were only in the lost state are gone.
+  readonly resetUnreadableState?: boolean;
   // For tests: the clock in milliseconds and the wait between polls.
   readonly clock?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
@@ -298,7 +302,20 @@ export class PrivateWallet {
     );
     const store = new SealedStore(options.storage, storeKey);
     const states = new StateStore(store);
-    const state = (await states.load()) ?? emptyState(deployment.deployLedger);
+    let state: WalletState;
+    try {
+      state = (await states.load()) ?? emptyState(deployment.deployLedger);
+    } catch (err) {
+      if (
+        !(err instanceof CyphrasError) ||
+        err.code !== "storage_unreadable" ||
+        options.resetUnreadableState !== true
+      ) {
+        throw err;
+      }
+      await states.discard();
+      state = emptyState(deployment.deployLedger);
+    }
     const now = options.clock ?? (() => Date.now());
     const sleep =
       options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -488,13 +505,16 @@ export class PrivateWallet {
     }
     const { view, data } = download;
     let crossChecked = false;
-    let exitEvents: readonly ExitEvent[];
+    let events: {
+      readonly exits: readonly ExitEvent[];
+      readonly deposits: readonly DepositEvent[];
+    };
     if (source.kind === "indexer") {
       const check = await crossCheck(core.services.rpc, core.deployment.vault, data);
       crossChecked = check.verified;
-      exitEvents = check.exits;
+      events = check;
     } else {
-      exitEvents = (await source.events()).exits;
+      events = await source.events();
     }
     const check = checkRoot(data.tree, view.roots);
     if (check.state === "mismatch") {
@@ -504,10 +524,10 @@ export class PrivateWallet {
       );
     }
     let newNotes = 0;
+    // A plan or a deposit moves only on data the cross-check confirmed, or that RPC itself served.
+    const checked = check.state === "verified" && (source.kind === "rpc" || crossChecked);
     if (check.state === "verified") {
-      // Only leaves under a root the vault confirms count: notes at them, and spends of notes. A
-      // plan moves only on data the cross-check confirmed too, or that RPC itself served.
-      const checked = source.kind === "rpc" || crossChecked;
+      // Only leaves under a root the vault confirms count: notes at them, and spends of notes.
       newNotes = applyDownload(core.state, core.scan, data, checked);
       core.state.rootCheck = check;
       if (checked) advancePlans(core.state, data.horizon, view);
@@ -515,8 +535,13 @@ export class PrivateWallet {
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
     const live = source.kind === "indexer" ? indexer : undefined;
-    await trackDeposits(core, await live?.deposits().catch(() => undefined));
-    applyExits(core.state, exitEvents, await live?.exits().catch(() => undefined));
+    await trackDeposits(
+      core,
+      await live?.deposits().catch(() => undefined),
+      events.deposits,
+      checked ? data.horizon : undefined,
+    );
+    applyExits(core.state, events.exits, await live?.exits().catch(() => undefined));
     if (live !== undefined) await this.#pollRelayers(core);
     return {
       leafCount: core.state.tree.leafCount,

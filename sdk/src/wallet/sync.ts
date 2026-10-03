@@ -8,7 +8,7 @@ import type { Leaf, SpentNullifier } from "../net/indexer.ts";
 import type { SorobanRpc } from "../net/rpc.ts";
 import { nullifier } from "../notes.ts";
 import type { ChainView, RootHistory, VaultReader } from "../vault/state.ts";
-import { type ChainSource, type ExitEvent, RpcEventSource } from "./sources.ts";
+import { type ChainSource, type DepositEvent, type ExitEvent, RpcEventSource } from "./sources.ts";
 import {
   ACTIVE_STATES,
   type Evidence,
@@ -90,8 +90,9 @@ export async function downloadChain(
 export interface CrossCheck {
   // RPC covered the range and agreed with the indexer.
   readonly verified: boolean;
-  // The exit events RPC returned for the range and after it.
+  // The exit and deposit events RPC returned for the range and after it.
   readonly exits: readonly ExitEvent[];
+  readonly deposits: readonly DepositEvent[];
 }
 
 const leafKey = (l: Leaf): string =>
@@ -112,7 +113,7 @@ export async function crossCheck(
   try {
     events = await new RpcEventSource(rpc, vault, data.since).events();
   } catch (err) {
-    if (err instanceof CyphrasError) return { verified: false, exits: [] };
+    if (err instanceof CyphrasError) return { verified: false, exits: [], deposits: [] };
     throw err;
   }
   if (data.completeTo > Math.max(events.latest, data.horizon)) {
@@ -134,7 +135,7 @@ export async function crossCheck(
   const served = new Set(data.nullifiers.map(nfKey));
   const chainNfs = new Set(events.nullifiers.filter(within).map(nfKey));
   if (served.size !== chainNfs.size || [...served].some((k) => !chainNfs.has(k))) differ();
-  return { verified: true, exits: events.exits };
+  return { verified: true, exits: events.exits, deposits: events.deposits };
 }
 
 // F-27: the local root must be one of the vault's last 256 roots, read from the ledger.

@@ -72,10 +72,16 @@ export type ExitEvent = Extract<
   readonly txHash: string;
 };
 
+// A deposit the vault took into its entry queue, with the transaction that made it.
+export type DepositEvent = Extract<VaultEvent, { kind: "deposit_pending" }> & {
+  readonly txHash: string;
+};
+
 export interface VaultEvents {
   readonly leaves: Leaf[];
   readonly nullifiers: SpentNullifier[];
   readonly exits: ExitEvent[];
+  readonly deposits: DepositEvent[];
   readonly latest: number;
 }
 
@@ -98,6 +104,7 @@ export class RpcEventSource implements ChainSource {
     const leaves: Leaf[] = [];
     const nullifiers: SpentNullifier[] = [];
     const exits: ExitEvent[] = [];
+    const deposits: DepositEvent[] = [];
     let cursor: string | undefined;
     let latest = this.#startLedger;
     for (;;) {
@@ -142,13 +149,15 @@ export class RpcEventSource implements ChainSource {
           decoded.kind === "settled"
         ) {
           exits.push({ ...decoded, txHash: event.txHash });
+        } else if (decoded.kind === "deposit_pending") {
+          deposits.push({ ...decoded, txHash: event.txHash });
         }
       }
       if (page.events.length < EVENT_PAGE || page.cursor === undefined) break;
       cursor = page.cursor;
     }
     leaves.sort((a, b) => a.index - b.index);
-    return { leaves, nullifiers, exits, latest };
+    return { leaves, nullifiers, exits, deposits, latest };
   }
 
   events(): Promise<VaultEvents> {

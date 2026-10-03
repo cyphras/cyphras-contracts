@@ -8,10 +8,12 @@ import { CyphrasError } from "../../src/errors.ts";
 import { noteCommitment, randomFieldElement, randomScalar } from "../../src/notes.ts";
 import type { FetchLike } from "../../src/net/http.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
+import { keySource } from "../../src/keysource.ts";
 import { type Plan, type WalletState, loadState, saveState } from "../../src/wallet/state.ts";
-import { XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
+import { PrivateWallet } from "../../src/wallet/wallet.ts";
+import { RPC, XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
 import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
-import { TrapdoorProver } from "../support/trapdoor.ts";
+import { TrapdoorProver, trapdoorArtifacts } from "../support/trapdoor.ts";
 import { MNEMONIC } from "../helpers.ts";
 
 // A commitment as the indexer serves it, with its lowest bit flipped.
@@ -673,6 +675,63 @@ describe("wallet safety: instances sharing a store", () => {
     );
     await bob.sync();
     assert.equal((await bob.balance()).spendable, 90n * XLM);
+  });
+});
+
+describe("wallet safety: a damaged store", () => {
+  it("starts afresh from an unreadable store only when asked, and rebuilds from the chain", async () => {
+    const { world } = await funded();
+    const backend = new MemoryStore();
+    const alice = await openWallet(world, 0, backend);
+    await alice.sync();
+    for (const key of backend.keys()) await backend.set(key, randomBytes(64));
+    await assert.rejects(openWallet(world, 0, backend), isError("storage_unreadable"));
+    const fresh = await PrivateWallet.open({
+      deployment: world.deployment,
+      allowUnpinnedDeployment: true,
+      keys: keySource.mnemonic(MNEMONIC, { account: 0 }),
+      prover: new TrapdoorProver(),
+      artifacts: trapdoorArtifacts,
+      storage: backend,
+      rpcUrl: RPC,
+      fetch: world.fetch,
+      clock: world.clock,
+      sleep: async () => {},
+      resetUnreadableState: true,
+    });
+    assert.equal((await fresh.balance()).spendable, 0n);
+    await fresh.sync();
+    assert.equal((await fresh.balance()).spendable, 100n * XLM);
+  });
+
+  it("finds a deposit whose submission was cut off by its commitments, and fails one that never landed", async () => {
+    const world = await createWorld();
+    const backend = new MemoryStore();
+    const alice = await openWallet(world, 0, backend);
+    const receipt = await alice.shield({ amount: 40n * XLM, signer: world.signer("depositor") });
+    // As if the wallet had stopped before it learned the transaction of the first deposit, and the
+    // second never reached the network.
+    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const state = (await loadState(sealed)) as WalletState;
+    const landed = state.deposits[0] as WalletState["deposits"][0];
+    Object.assign(landed, { id: undefined, txHash: undefined, state: "submitting" });
+    state.deposits.push({
+      ...landed,
+      commitments: [randomFieldElement(), randomFieldElement()],
+    });
+    await saveState(sealed, state);
+    const reopened = await openWallet(world, 0, backend);
+    await reopened.sync();
+    let deposits = await reopened.deposits();
+    assert.equal(deposits[0]?.state, "pending");
+    assert.equal(deposits[0]?.id, receipt.depositId);
+    assert.equal(deposits[0]?.txHash, receipt.txHash);
+    assert.equal(deposits[1]?.state, "submitting");
+    world.advance(121 * 5);
+    await reopened.sync();
+    deposits = await reopened.deposits();
+    assert.equal(deposits[1]?.state, "failed");
+    assert.equal((await reopened.balance()).pendingDeposits, 40n * XLM);
   });
 });
 

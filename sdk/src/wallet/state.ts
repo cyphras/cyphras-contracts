@@ -128,6 +128,9 @@ export interface Deposit {
   readonly amount: bigint;
   readonly commitments: readonly [bigint, bigint];
   readonly createdAt: number;
+  // The ledger the deposit was built at, and the last one at which it can land.
+  readonly builtAt: number;
+  readonly deadline: number;
   txHash: string | undefined;
   state: DepositState;
   attested: boolean | undefined;
@@ -264,6 +267,12 @@ export class StateStore {
     }
     this.#seen = state.revision;
     return state;
+  }
+
+  // Drops a stored state that cannot be read, so that a fresh one can be saved in its place.
+  async discard(): Promise<void> {
+    await this.#store.remove(STATE_RECORD);
+    this.#seen = 0;
   }
 
   // Saves `state` as the next revision if the store still holds the revision it was read at.

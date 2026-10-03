@@ -10,6 +10,7 @@ import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
 import type { VaultInstance } from "../vault/state.ts";
 import { type Core, spendingKeys } from "./core.ts";
 import { DEADLINE_LEDGERS } from "./spend.ts";
+import type { DepositEvent } from "./sources.ts";
 import type { Deposit, WalletState } from "./state.ts";
 
 /** A deposit made by this wallet, as it moves through the vault's entry queue. */
@@ -115,6 +116,7 @@ export async function shield(
   await checkDepositLimits(core, instance, signer.publicKey, amount);
 
   const latest = await core.services.rpc.getLatestLedger();
+  const deadline = latest + DEADLINE_LEDGERS;
   const built = buildTransaction({
     keys,
     self: core.self,
@@ -128,7 +130,7 @@ export async function shield(
     ext: {
       vault: core.deployment.vault,
       networkId: hexToBytes(core.services.networkId),
-      deadline: latest + DEADLINE_LEDGERS,
+      deadline,
       extAmount: amount,
       fee: 0n,
       recipient: signer.publicKey,
@@ -142,6 +144,8 @@ export async function shield(
     amount,
     commitments: built.commitments,
     createdAt: core.now(),
+    builtAt: latest,
+    deadline,
     txHash: undefined,
     state: "submitting",
     attested: undefined,
@@ -247,17 +251,43 @@ export async function refundDeposit(
   return result.hash;
 }
 
-// Follows this wallet's deposits through the entry queue. A deposit's notes are spendable only
-// once admitted, which is when their leaves appear.
-export async function trackDeposits(core: Core, queue: DepositQueue | undefined): Promise<void> {
+// Follows this wallet's deposits through the entry queue. A deposit still being submitted is found
+// by its commitments in the vault's deposit_pending events, even when this wallet never learned its
+// transaction; one that cannot land any more, with every ledger up to its deadline checked, failed.
+// A deposit's notes are spendable only once admitted, which is when their leaves appear.
+export async function trackDeposits(
+  core: Core,
+  queue: DepositQueue | undefined,
+  events: readonly DepositEvent[],
+  checkedTo: number | undefined,
+): Promise<void> {
   const state: WalletState = core.state;
   for (const deposit of state.deposits) {
-    if (deposit.state === "submitting" && deposit.txHash !== undefined) {
-      const status = await core.services.rpc.getTransaction(deposit.txHash);
-      if (status.status === "SUCCESS" && status.returnValue?.switch().name === "scvU64") {
-        deposit.id = Number(scValToBigInt(status.returnValue));
+    if (deposit.state === "submitting") {
+      const pending = events.find(
+        (e) =>
+          e.commitments[0] === deposit.commitments[0] &&
+          e.commitments[1] === deposit.commitments[1],
+      );
+      if (pending !== undefined) {
+        deposit.id = pending.id;
+        deposit.txHash = pending.txHash;
         deposit.state = "pending";
-      } else if (status.status === "FAILED") {
+      } else if (deposit.txHash !== undefined) {
+        const status = await core.services.rpc.getTransaction(deposit.txHash);
+        if (status.status === "SUCCESS" && status.returnValue?.switch().name === "scvU64") {
+          deposit.id = Number(scValToBigInt(status.returnValue));
+          deposit.state = "pending";
+        } else if (status.status === "FAILED") {
+          deposit.state = "failed";
+        }
+      }
+      if (
+        deposit.state === "submitting" &&
+        checkedTo !== undefined &&
+        state.checkedFrom <= deposit.builtAt &&
+        checkedTo >= deposit.deadline
+      ) {
         deposit.state = "failed";
       }
     }

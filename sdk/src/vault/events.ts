@@ -13,6 +13,11 @@ export type VaultEvent =
     }
   | { readonly kind: "new_nullifier"; readonly nullifier: bigint }
   | {
+      readonly kind: "deposit_pending";
+      readonly id: number;
+      readonly commitments: readonly [bigint, bigint];
+    }
+  | {
       readonly kind: "exit_queued";
       readonly id: number;
       readonly payout: bigint;
@@ -54,6 +59,14 @@ export function decodeVaultEvent(event: Pick<ContractEvent, "topic" | "value">):
     }
     case "new_nullifier":
       return { kind: topic, nullifier: new Struct(event.value, topic).u256("nullifier") };
+    case "deposit_pending": {
+      const data = new Struct(event.value, topic);
+      return {
+        kind: topic,
+        id: Number(data.u64("id")),
+        commitments: [data.u256("commitment0"), data.u256("commitment1")],
+      };
+    }
     case "exit_queued": {
       const data = new Struct(event.value, topic);
       return {
