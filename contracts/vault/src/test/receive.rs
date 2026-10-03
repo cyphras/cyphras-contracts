@@ -3,7 +3,8 @@
 
 use soroban_sdk::{
     testutils::{Address as _, MuxedAddress as _},
-    Address, MuxedAddress,
+    xdr::{self, ScAddress},
+    Address, MuxedAddress, TryFromVal,
 };
 
 use super::{
@@ -167,4 +168,22 @@ fn a_relayer_that_cannot_receive_is_refused_only_when_it_has_a_fee_to_take() {
     assert_eq!(exit(s, 10 * XLM, 0, user.clone().into(), &relayer), Ok(()));
     assert_eq!(s.balance(&user), 10 * XLM);
     assert_eq!(used(s), 10 * XLM);
+}
+
+#[test]
+fn only_an_account_or_a_contract_can_be_named_as_a_party() {
+    // The host builds an address object only for an account or a contract, so a call naming a
+    // liquidity pool or a claimable balance fails before the vault runs, and the check of
+    // whether a party can receive never meets one.
+    let s = funded();
+    let pool = ScAddress::LiquidityPool(xdr::PoolId(xdr::Hash([7; 32])));
+    let balance = ScAddress::ClaimableBalance(xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
+        xdr::Hash([9; 32]),
+    ));
+    for address in [pool, balance] {
+        assert!(
+            Address::try_from_val(&s.env, &address).is_err(),
+            "{address:?}"
+        );
+    }
 }
