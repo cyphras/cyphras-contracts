@@ -1103,16 +1103,21 @@ func (r *Relayer) finish(res submit.Result, sent Record) {
 		r.log.Info("confirmed", "tx", res.Hash, "ledger", res.Ledger, "network_fee", res.FeeCharged)
 	case submit.Failed:
 		rec.Outcome = outcomeFailed
-		r.setStatus(res.Hash, txStatus{Status: "failed", Code: CodeRejected})
 		r.results.add(false)
 		c := r.classify(res, sent)
+		code := CodeRejected
+		if c == causeConflict {
+			// The request rests nowhere and may be sent again.
+			code = CodeUnavailable
+		}
+		r.setStatus(res.Hash, txStatus{Status: "failed", Code: code})
 		r.log.Warn("failed on chain", "tx", res.Hash, "result", res.Code, "cause", c.String(), "network_fee", res.FeeCharged)
 		r.coolDown(sent, c)
 		if c == causeUnclear {
 			r.alerts.Raise(r.ctx, alert.Warning, "rpc_no_diagnostics", "the RPC returned no diagnostic events for failed transaction %s, so its cause cannot be told; it counts as a race and rests its notes and destination. Use an RPC that returns diagnostic events.", res.Hash)
 		}
 		switch c {
-		case causeSpent, causeReceive, causeRace, causeUnclear:
+		case causeSpent, causeReceive, causeRace, causeUnclear, causeConflict:
 			if c == causeSpent {
 				r.known.add(sentNullifiers(sent)...)
 			}
@@ -1164,10 +1169,15 @@ const (
 	causeRace
 	// causeUnclear is a failure the RPC returned no diagnostic events for, which cannot be told.
 	causeUnclear
+	// causeConflict is a call that failed on the host's storage: the exit queue, or another entry
+	// it touched, moved under it past the room its footprint was given. Sent again after a new
+	// simulation, the same request can succeed.
+	causeConflict
 )
 
 func (c cause) String() string {
-	return [...]string{"relayer", "vault", "notes spent first", "destination stopped receiving", "the chain moved under the call", "no diagnostics"}[c]
+	return [...]string{"relayer", "vault", "notes spent first", "destination stopped receiving", "the chain moved under the call", "no diagnostics",
+		"the exit queue moved under the call"}[c]
 }
 
 // The vault's error codes a client can bring about after its request was checked. Codes below
@@ -1199,6 +1209,8 @@ func (r *Relayer) classify(res submit.Result, sent Record) cause {
 	}
 	e := res.ContractError
 	switch {
+	case e == nil && res.Conflict:
+		return causeConflict
 	case e == nil:
 		if nfs := sentNullifiers(sent); len(nfs) == 2 {
 			if spent, err := r.spent(ctx, [2]fr.Element{nfs[0], nfs[1]}); err == nil && spent {
@@ -1298,13 +1310,17 @@ func (r *Relayer) vaultCanPay(ctx context.Context) (bool, error) {
 // coolDown rests what a failed relay carried, in memory and in the database, so a restart does
 // not forget it: the request itself and, unless the relayer was at fault or the chain moved under
 // the call, its notes, for a day; and after a receive failure, or one that cannot be told, the
-// destination, for longer each time it fails again.
+// destination, for longer each time it fails again. A conflict on the exit queue rests nothing.
 func (r *Relayer) coolDown(rec Record, c cause) {
+	if c == causeConflict {
+		return
+	}
 	now := r.now()
 	until := now.Add(r.cfg.Cooldown).Unix()
 	var keys []string
-	// The exact request is never sent again, whatever the cause: a failure the relayer itself
-	// pays for must not be repeatable at will.
+	// The exact request is never sent again, whatever else the cause: a failure the relayer
+	// itself pays for must not be repeatable at will. A conflict needs another exit or call to
+	// land first in the same ledger, which costs whoever sends it.
 	if rec.Request != "" {
 		keys = append(keys, rec.Request)
 	}

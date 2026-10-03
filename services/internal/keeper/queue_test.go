@@ -12,6 +12,27 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 )
 
+// conflictOnChain is a call that failed on the host's storage: the exit queue moved under it past
+// the room its footprint was given.
+func conflictOnChain() protocol.GetTransactionResponse {
+	r, _ := xdr.MarshalBase64(xdr.TransactionResult{Result: xdr.TransactionResultResult{
+		Code: xdr.TransactionResultCodeTxFailed,
+		Results: &[]xdr.OperationResult{{Code: xdr.OperationResultCodeOpInner, Tr: &xdr.OperationResultTr{
+			Type: xdr.OperationTypeInvokeHostFunction, InvokeHostFunctionResult: &xdr.InvokeHostFunctionResult{Code: xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped},
+		}}},
+	}})
+	code := xdr.ScErrorCodeScecExceededLimit
+	sym := xdr.ScSymbol("error")
+	event, _ := xdr.MarshalBase64(xdr.DiagnosticEvent{Event: xdr.ContractEvent{Type: xdr.ContractEventTypeDiagnostic,
+		Body: xdr.ContractEventBody{V: 0, V0: &xdr.ContractEventV0{Topics: []xdr.ScVal{
+			{Type: xdr.ScValTypeScvSymbol, Sym: &sym},
+			{Type: xdr.ScValTypeScvError, Error: &xdr.ScError{Type: xdr.ScErrorTypeSceStorage, Code: &code}},
+		}, Data: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}}}})
+	return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{
+		Status: protocol.TransactionStatusFailed, ResultXDR: r, DiagnosticEventsXDR: []string{event},
+	}}
+}
+
 func written(fp xdr.LedgerFootprint) map[string]bool {
 	out := map[string]bool{}
 	for _, k := range fp.ReadWrite {
@@ -39,11 +60,20 @@ func TestAClaimHasRoomForExitsQueuedAheadOfIt(t *testing.T) {
 		resp.TransactionDataXDR, _ = xdr.MarshalBase64(data)
 		return resp, err
 	}
+	conflicts := 1
+	h.conflict = func(d string) bool {
+		if d != "claim 1" || conflicts == 0 {
+			return false
+		}
+		conflicts--
+		return true
+	}
 	if err := h.k.Claims(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.take(); !equal(got, []string{"claim 1"}) {
-		t.Fatalf("sent %v", got)
+	// A conflict is simulated and sent again, and pages nothing.
+	if got := h.take(); !equal(got, []string{"claim 1", "claim 1"}) || h.has("call_failed") || h.has("claim_failed") {
+		t.Fatalf("sent %v, pages %+v", got, h.pages)
 	}
 	for _, fp := range h.footprints {
 		keys := written(fp)

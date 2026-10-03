@@ -1,16 +1,72 @@
 package relayer
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 )
+
+// failedConflict is a relay that failed on the host's storage, as one does that writes an exit the
+// queue's tail moved past its footprint: the diagnostics name no contract's error.
+func failedConflict() protocol.GetTransactionResponse {
+	r, _ := xdr.MarshalBase64(xdr.TransactionResult{FeeCharged: 900_100, Result: xdr.TransactionResultResult{
+		Code: xdr.TransactionResultCodeTxFailed,
+		Results: &[]xdr.OperationResult{{Code: xdr.OperationResultCodeOpInner, Tr: &xdr.OperationResultTr{
+			Type: xdr.OperationTypeInvokeHostFunction, InvokeHostFunctionResult: &xdr.InvokeHostFunctionResult{Code: xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped},
+		}}},
+	}})
+	raw, _ := strkey.Decode(strkey.VersionByteContract, vaulttest.Vault)
+	id := xdr.ContractId(raw)
+	code := xdr.ScErrorCodeScecExceededLimit
+	sym := xdr.ScSymbol("error")
+	event, _ := xdr.MarshalBase64(xdr.DiagnosticEvent{Event: xdr.ContractEvent{ContractId: &id, Type: xdr.ContractEventTypeDiagnostic,
+		Body: xdr.ContractEventBody{V: 0, V0: &xdr.ContractEventV0{Topics: []xdr.ScVal{
+			{Type: xdr.ScValTypeScvSymbol, Sym: &sym},
+			{Type: xdr.ScValTypeScvError, Error: &xdr.ScError{Type: xdr.ScErrorTypeSceStorage, Code: &code}},
+		}, Data: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}}}})
+	return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{
+		Status: protocol.TransactionStatusFailed, ResultXDR: r, Ledger: 1001, DiagnosticEventsXDR: []string{event},
+	}}
+}
+
+func TestAConflictOnTheExitQueueRestsNothingAndNeverPauses(t *testing.T) {
+	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
+	h.setTxStatus(failedConflict())
+	var last Request
+	var dest, hash string
+	for range 3 {
+		dest = keypair.MustRandom().Address()
+		h.fund(dest)
+		last = h.forged(t, dest, -20_000_000, 5_000_000)
+		a, f := h.r.Submit(context.Background(), last)
+		if f != nil {
+			t.Fatalf("not sent: %v", f)
+		}
+		hash = a.Hash
+		h.waitIdle()
+	}
+	now := h.clock().Unix()
+	if h.r.brk.open(h.clock()) || h.r.cool.cooling(now, nullifierKey(last.Proof.Nullifiers[0].Hex()), requestKey(last), destinationKey(dest)) {
+		t.Fatal("conflicts paused relaying or rested what the honest request carried")
+	}
+	if _, st := h.get("/v1/tx/" + hash); st["status"] != "failed" || st["code"] != CodeUnavailable {
+		t.Fatalf("status %v", st)
+	}
+	// The request is taken again, simulated anew.
+	h.setTxStatus(success(900_000))
+	if _, f := h.r.Submit(context.Background(), last); f != nil {
+		t.Fatalf("the same request after a conflict: %v", f)
+	}
+	h.waitIdle()
+}
 
 // queuedAt makes the harness's simulations queue the exit at the tail, as the vault does while
 // the queue holds exits or the day's window is full; a tail of 0 pays at once.

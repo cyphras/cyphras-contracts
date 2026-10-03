@@ -561,3 +561,51 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// storageFailure is a call that failed on the host's storage, as one that wrote an entry outside
+// its footprint does.
+func storageFailure() protocol.GetTransactionResponse {
+	tr, _ := xdr.MarshalBase64(xdr.TransactionResult{FeeCharged: 100, Result: xdr.TransactionResultResult{
+		Code: xdr.TransactionResultCodeTxFailed,
+		Results: &[]xdr.OperationResult{{Code: xdr.OperationResultCodeOpInner, Tr: &xdr.OperationResultTr{
+			Type: xdr.OperationTypeInvokeHostFunction, InvokeHostFunctionResult: &xdr.InvokeHostFunctionResult{Code: xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped},
+		}}},
+	}})
+	id := xdr.ContractId{1}
+	code := xdr.ScErrorCodeScecExceededLimit
+	sym := xdr.ScSymbol("error")
+	event, _ := xdr.MarshalBase64(xdr.DiagnosticEvent{Event: xdr.ContractEvent{ContractId: &id, Type: xdr.ContractEventTypeDiagnostic,
+		Body: xdr.ContractEventBody{V: 0, V0: &xdr.ContractEventV0{Topics: []xdr.ScVal{
+			{Type: xdr.ScValTypeScvSymbol, Sym: &sym},
+			{Type: xdr.ScValTypeScvError, Error: &xdr.ScError{Type: xdr.ScErrorTypeSceStorage, Code: &code}},
+		}, Data: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}}}})
+	return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{
+		Status: protocol.TransactionStatusFailed, ResultXDR: tr, Ledger: 1001, DiagnosticEventsXDR: []string{event},
+	}}
+}
+
+func TestACallTheChainMovedUnderIsSimulatedAgain(t *testing.T) {
+	h := newHarness(t)
+	h.sendStatuses("PENDING")
+	failures := 1
+	h.fake.Get = func(protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
+		if failures > 0 {
+			failures--
+			return storageFailure(), nil
+		}
+		return success(1_000, 900, 0), nil
+	}
+	if res := (&Engine{}).result(&Signed{Hash: "h"}, storageFailure()); !res.Conflict || res.ContractError != nil {
+		t.Fatalf("a storage failure read as %+v", res)
+	}
+	h.engine.Poll = time.Millisecond
+	res, err := h.engine.Do(context.Background(), h.account, func() (txnbuild.Operation, error) { return invoke(), nil }, 3)
+	if err != nil || res.Outcome != Success || len(h.sends) != 2 {
+		t.Fatalf("after a conflict: %+v %v, %d sent", res, err, len(h.sends))
+	}
+	// A conflict every time is reported as one.
+	failures = 10
+	if _, err := h.engine.Do(context.Background(), h.account, func() (txnbuild.Operation, error) { return invoke(), nil }, 2); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conflicts every time: %v", err)
+	}
+}

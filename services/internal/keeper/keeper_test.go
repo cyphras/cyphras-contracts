@@ -41,8 +41,10 @@ type harness struct {
 	simFail func(string) bool
 	// sentHook sees each sent transaction, so a test can play its effect on the chain.
 	sentHook func(string)
-	// chainFail makes the sent transactions it matches fail on chain.
+	// chainFail makes the sent transactions it matches fail on chain, and conflict fail on the
+	// host's storage, as a call does that the exit queue moved under.
 	chainFail func(string) bool
+	conflict  func(string) bool
 	// footprints holds the footprint of each sent transaction.
 	footprints []xdr.LedgerFootprint
 	last       string
@@ -184,7 +186,11 @@ func newHarness(t *testing.T) *harness {
 	h.fake.Get = func(protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
 		h.mu.Lock()
 		failed := h.chainFail != nil && h.chainFail(h.last)
+		conflict := h.conflict != nil && h.conflict(h.last)
 		h.mu.Unlock()
+		if conflict {
+			return conflictOnChain(), nil
+		}
 		if failed {
 			r, _ := xdr.MarshalBase64(xdr.TransactionResult{Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxFailed, Results: &[]xdr.OperationResult{}}})
 			return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusFailed, ResultXDR: r}}, nil

@@ -651,6 +651,10 @@ type Result struct {
 	// Diagnosed is set when the RPC returned diagnostic events for the transaction; one that does
 	// not keeps the cause of a failure from being told.
 	Diagnosed bool
+	// Conflict is set when the call failed on the host's storage, as when it touched an entry its
+	// footprint does not hold: the chain moved under it between its simulation and its ledger,
+	// and a new simulation sees where it moved.
+	Conflict bool
 }
 
 // ContractError is an error a contract raised: the contract and its code.
@@ -758,9 +762,26 @@ func (e *Engine) result(s *Signed, resp protocol.GetTransactionResponse) Result 
 	}
 	if r.Outcome == Failed {
 		r.ContractError = contractError(diagnostics)
+		r.Conflict = storageError(diagnostics)
 	}
 	r.Diagnosed = len(diagnostics) > 0
 	return r
+}
+
+// storageError reports whether diagnostic events name an error of the host's storage.
+func storageError(events []xdr.DiagnosticEvent) bool {
+	for _, d := range events {
+		body, ok := d.Event.Body.GetV0()
+		if !ok {
+			continue
+		}
+		for _, t := range body.Topics {
+			if e, ok := t.GetError(); ok && e.Type == xdr.ScErrorTypeSceStorage {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // contractError finds the first contract error in diagnostic events: the one closest to the cause,
@@ -800,7 +821,11 @@ func (e *Engine) DoWorth(ctx context.Context, a *Account, build func() (txnbuild
 	return e.DoExtended(ctx, a, build, attempts, worth, nil)
 }
 
-// DoExtended is DoWorth for a call that may need extend beyond its simulation.
+// ErrConflict reports calls that kept failing on the host's storage as the chain moved under them.
+var ErrConflict = errors.New("submit: the chain kept moving under the call")
+
+// DoExtended is DoWorth for a call that may need extend beyond its simulation. A call that fails
+// for a conflict is simulated and sent again, as one that expired is.
 func (e *Engine) DoExtended(ctx context.Context, a *Account, build func() (txnbuild.Operation, error), attempts int, worth func(*xdr.ScVal) bool, extend Extend) (Result, error) {
 	a.Lock()
 	defer a.Unlock()
@@ -827,10 +852,14 @@ func (e *Engine) DoExtended(ctx context.Context, a *Account, build func() (txnbu
 			if err != nil {
 				return Result{}, err
 			}
-			if res.Outcome != Expired {
+			switch {
+			case res.Outcome == Failed && res.Conflict:
+				last = fmt.Errorf("%w: %s", ErrConflict, res.Hash)
+			case res.Outcome != Expired:
 				return res, nil
+			default:
+				last = ErrExpired
 			}
-			last = ErrExpired
 		}
 		if err := wait(ctx, backoff); err != nil {
 			return Result{}, err
