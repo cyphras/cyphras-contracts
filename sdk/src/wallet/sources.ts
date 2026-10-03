@@ -15,6 +15,22 @@ export interface NullifierSet {
   readonly completeToLedger: number;
 }
 
+/**
+ * How much one sync downloads at most, in pages: of 1,024 leaves, of the indexer's nullifiers and
+ * of RPC's events. A sync that stops at a cap keeps what it could check and continues next time.
+ */
+export interface SyncLimits {
+  readonly leafPages: number;
+  readonly nullifierPages: number;
+  readonly eventPages: number;
+}
+
+export const DEFAULT_SYNC_LIMITS: SyncLimits = {
+  leafPages: 64,
+  nullifierPages: 64,
+  eventPages: 100,
+};
+
 // Where a sync reads the vault's leaves and spent nullifiers from. Both kinds download whole
 // pages or ranges, so no request names a note.
 export interface ChainSource {
@@ -26,9 +42,11 @@ export interface ChainSource {
 export class IndexerSource implements ChainSource {
   readonly kind = "indexer";
   readonly #indexer: IndexerClient;
+  readonly #maxPages: number;
 
-  constructor(indexer: IndexerClient) {
+  constructor(indexer: IndexerClient, maxPages: number) {
     this.#indexer = indexer;
+    this.#maxPages = maxPages;
   }
 
   // Asks for the page of the next leaf, from its start, so the request shows only how far the
@@ -49,11 +67,16 @@ export class IndexerSource implements ChainSource {
     const nullifiers: SpentNullifier[] = [];
     let cursor: string | undefined;
     let completeToLedger = sinceLedger - 1;
-    for (;;) {
+    for (let pages = 1; ; pages++) {
       const page = await this.#indexer.nullifiers(sinceLedger, cursor);
       nullifiers.push(...page.nullifiers);
       completeToLedger = page.completeToLedger;
       if (page.cursor === undefined) break;
+      if (pages === this.#maxPages) {
+        // In chain order, every ledger before the last one listed is complete.
+        completeToLedger = (nullifiers[nullifiers.length - 1]?.ledger ?? sinceLedger) - 1;
+        break;
+      }
       cursor = page.cursor;
     }
     // A nullifier ingested after the indexer read its complete-to ledger may already be listed;
@@ -70,11 +93,13 @@ export type ExitEvent = Extract<
   { kind: "exit_queued" | "exit_paid" | "exit_stranded" | "settled" }
 > & {
   readonly txHash: string;
+  readonly ledger: number;
 };
 
 // A deposit the vault took into its entry queue, with the transaction that made it.
 export type DepositEvent = Extract<VaultEvent, { kind: "deposit_pending" }> & {
   readonly txHash: string;
+  readonly ledger: number;
 };
 
 export interface VaultEvents {
@@ -82,7 +107,9 @@ export interface VaultEvents {
   readonly nullifiers: SpentNullifier[];
   readonly exits: ExitEvent[];
   readonly deposits: DepositEvent[];
+  // The events are complete up to `latest`; `head` is the latest ledger RPC knows of.
   readonly latest: number;
+  readonly head: number;
 }
 
 // The fallback when no indexer is available: the vault's own events from RPC, which keeps them
@@ -92,12 +119,14 @@ export class RpcEventSource implements ChainSource {
   readonly #rpc: SorobanRpc;
   readonly #vault: string;
   readonly #startLedger: number;
+  readonly #maxPages: number;
   #loaded: Promise<VaultEvents> | undefined;
 
-  constructor(rpc: SorobanRpc, vault: string, startLedger: number) {
+  constructor(rpc: SorobanRpc, vault: string, startLedger: number, maxPages: number) {
     this.#rpc = rpc;
     this.#vault = vault;
     this.#startLedger = startLedger;
+    this.#maxPages = maxPages;
   }
 
   async #load(): Promise<VaultEvents> {
@@ -107,7 +136,8 @@ export class RpcEventSource implements ChainSource {
     const deposits: DepositEvent[] = [];
     let cursor: string | undefined;
     let latest = this.#startLedger;
-    for (;;) {
+    let head = this.#startLedger;
+    for (let pages = 1; ; pages++) {
       let page;
       try {
         page = await this.#rpc.getEvents({
@@ -125,6 +155,7 @@ export class RpcEventSource implements ChainSource {
         fail("history_unavailable", "RPC no longer holds the vault events this wallet needs");
       }
       latest = page.latestLedger;
+      head = page.latestLedger;
       for (const event of page.events) {
         if (!event.successful || event.contractId !== this.#vault) continue;
         const decoded = decodeVaultEvent(event);
@@ -148,16 +179,29 @@ export class RpcEventSource implements ChainSource {
           decoded.kind === "exit_stranded" ||
           decoded.kind === "settled"
         ) {
-          exits.push({ ...decoded, txHash: event.txHash });
+          exits.push({ ...decoded, txHash: event.txHash, ledger: event.ledger });
         } else if (decoded.kind === "deposit_pending") {
-          deposits.push({ ...decoded, txHash: event.txHash });
+          deposits.push({ ...decoded, txHash: event.txHash, ledger: event.ledger });
         }
       }
       if (page.events.length < EVENT_PAGE || page.cursor === undefined) break;
+      if (pages === this.#maxPages) {
+        // Every ledger before the last one listed is complete.
+        latest = (page.events[page.events.length - 1]?.ledger ?? this.#startLedger) - 1;
+        break;
+      }
       cursor = page.cursor;
     }
-    leaves.sort((a, b) => a.index - b.index);
-    return { leaves, nullifiers, exits, deposits, latest };
+    const upTo = <T extends { readonly ledger: number }>(xs: T[]): T[] =>
+      xs.filter((x) => x.ledger <= latest);
+    return {
+      leaves: upTo(leaves).sort((a, b) => a.index - b.index),
+      nullifiers: upTo(nullifiers),
+      exits: upTo(exits),
+      deposits: upTo(deposits),
+      latest,
+      head,
+    };
   }
 
   events(): Promise<VaultEvents> {

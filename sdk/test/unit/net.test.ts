@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { CyphrasError } from "../../src/errors.ts";
 import { P } from "../../src/field.ts";
-import { Fields, type FetchLike } from "../../src/net/http.ts";
+import { Fields, type FetchLike, MAX_REPLY_BYTES } from "../../src/net/http.ts";
 import { IndexerClient } from "../../src/net/indexer.ts";
 import { RelayerClient } from "../../src/net/relayer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
@@ -141,12 +141,44 @@ describe("indexer client", () => {
       "http://i",
       reply(200, { nullifiers: [n(9, "01"), n(12, "02")], next_cursor: null, complete_to: 10 }),
     );
-    const set = await new IndexerSource(indexer).nullifiers(5);
+    const set = await new IndexerSource(indexer, 64).nullifiers(5);
     assert.deepEqual(
       set.nullifiers.map((x) => x.ledger),
       [9],
     );
     assert.equal(set.completeToLedger, 10);
+  });
+
+  it("stops at its page cap with the nullifiers complete up to the last ledger before it", async () => {
+    const n = (ledger: number, byte: string) => ({
+      nullifier: byte.repeat(32),
+      ledger,
+      tx_hash: "bb".repeat(32),
+    });
+    const pages: Record<string, unknown>[] = [
+      { nullifiers: [n(9, "01"), n(10, "02")], next_cursor: "2", complete_to: 20 },
+      { nullifiers: [n(10, "03"), n(12, "04")], next_cursor: "4", complete_to: 20 },
+      { nullifiers: [n(15, "05")], next_cursor: null, complete_to: 20 },
+    ];
+    let served = 0;
+    const indexer = new IndexerClient("http://i", async () => {
+      return new Response(JSON.stringify(pages[served++]), { status: 200 });
+    });
+    const set = await new IndexerSource(indexer, 2).nullifiers(5);
+    assert.equal(served, 2);
+    assert.equal(set.completeToLedger, 11);
+    assert.deepEqual(
+      set.nullifiers.map((x) => x.ledger),
+      [9, 10, 10],
+    );
+  });
+
+  it("refuses a reply larger than any a service sends", async () => {
+    const huge = new IndexerClient(
+      "http://i",
+      reply(200, { page: 0, leaves: [], padding: "x".repeat(MAX_REPLY_BYTES) }),
+    );
+    await assert.rejects(huge.leaves(0), isCode("service_unavailable"));
   });
 
   it("reads the entry queue with null for absent values", async () => {

@@ -158,6 +158,18 @@ export interface Operation {
   state: "active" | "done";
 }
 
+// Leaves taken past the confirmed tree, and what this wallet found in them, held until the vault's
+// root history confirms them: a sync that stops at its page cap far behind the vault leaves its
+// progress here. Nothing in it counts in the balance or the history.
+export interface Staging {
+  readonly tree: TreeSnapshot;
+  readonly lastLeafLedger: number;
+  readonly notes: OwnedNote[];
+  readonly sent: SentNote[];
+  // Paths of confirmed notes whose page the staged leaves completed.
+  readonly paths: { readonly pos: number; readonly pagePath: bigint[] }[];
+}
+
 export interface RootCheck {
   readonly state: "verified" | "behind" | "mismatch";
   readonly ledger: number;
@@ -171,6 +183,7 @@ export interface WalletState {
   revision: number;
   tree: TreeSnapshot;
   lastLeafLedger: number;
+  staging: Staging | undefined;
   nullifierSince: number;
   // Every spend from this ledger up to nullifierSince was confirmed by the cross-check.
   checkedFrom: number;
@@ -189,6 +202,7 @@ export function emptyState(deployLedger: number): WalletState {
     revision: 0,
     tree: { leafCount: 0, upper: [], partial: [] },
     lastLeafLedger: 0,
+    staging: undefined,
     nullifierSince: deployLedger,
     checkedFrom: deployLedger,
     nullifierBuffer: [],

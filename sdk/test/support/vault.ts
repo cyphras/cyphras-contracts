@@ -15,7 +15,8 @@ import {
 } from "../../src/extdata.ts";
 import { P } from "../../src/field.ts";
 import { parseVerifyingKey, verifyGroth16 } from "../../src/groth16.ts";
-import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
+import { EMPTY_ROOT, LEVELS, ZEROS } from "../../src/merkle.ts";
+import { compress } from "../../src/poseidon2.ts";
 import { TRAPDOOR_VK } from "./trapdoor.ts";
 
 // The vault's error codes by name, read from the contract source the SDK's table is generated from.
@@ -150,6 +151,36 @@ export function baseAccount(address: string): string {
     : address;
 }
 
+// The vault's tree as the contract keeps it: the frontier of the last insertion, so that each new
+// root costs one hash per level.
+class Frontier {
+  leafCount = 0;
+  readonly #filled: bigint[] = [];
+  #root = EMPTY_ROOT;
+
+  append(leaves: readonly bigint[]): void {
+    for (const leaf of leaves) {
+      let node = leaf;
+      let index = this.leafCount;
+      for (let level = 0; level < LEVELS; level++) {
+        if (index % 2 === 0) {
+          this.#filled[level] = node;
+          node = compress(node, ZEROS[level] as bigint);
+        } else {
+          node = compress(this.#filled[level] as bigint, node);
+        }
+        index = Math.floor(index / 2);
+      }
+      this.#root = node;
+      this.leafCount++;
+    }
+  }
+
+  root(): bigint {
+    return this.#root;
+  }
+}
+
 export class MockVault {
   readonly address: string;
   readonly token: string;
@@ -172,7 +203,7 @@ export class MockVault {
   exitTail = 1;
   queuedTotal = 0n;
 
-  readonly tree = CommitmentTree.empty();
+  readonly tree = new Frontier();
   readonly leaves: {
     index: number;
     cm: bigint;

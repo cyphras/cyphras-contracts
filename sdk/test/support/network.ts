@@ -136,6 +136,8 @@ export class MockIndexer {
   // Test hooks: change what the indexer serves.
   tamperLeaf: ((index: number, cm: string) => string) | undefined;
   hideNullifiers = false;
+  // Serves only the leaves below this index, as an indexer that lags the vault.
+  leafLimit: number | undefined;
   // The ledger the nullifiers reply claims to be complete to, when it lags the listed ones.
   completeTo: number | undefined;
   down = false;
@@ -171,7 +173,8 @@ export class MockIndexer {
         });
       case "/v1/leaves": {
         const page = Number(url.searchParams.get("page"));
-        const leaves = v.leaves.slice(page * 1024, page * 1024 + 1024).map((l) => {
+        const end = Math.min(page * 1024 + 1024, this.leafLimit ?? Number.POSITIVE_INFINITY);
+        const leaves = v.leaves.slice(page * 1024, end).map((l) => {
           const cm = fieldHex(l.cm);
           return {
             index: l.index,

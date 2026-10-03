@@ -16,6 +16,7 @@ import {
   type Plan,
   type PlanState,
   type RootCheck,
+  type Staging,
   type WalletState,
 } from "./state.ts";
 
@@ -45,24 +46,31 @@ export interface Download {
 }
 
 // Downloads the nullifiers spent since the last sync, then reads the vault, then the leaves after
-// the local tree's last one up to the vault's NextLeaf. A leaf past NextLeaf cannot be checked
-// against the vault yet, so the next sync takes it. Nullifiers count only up to the ledger the
-// vault was read at, so every transaction whose nullifiers are kept has its leaves below NextLeaf.
+// the local tree's last one, staged or confirmed, up to the vault's NextLeaf. A leaf past NextLeaf
+// cannot be checked against the vault yet, so the next sync takes it. Nullifiers count only up to
+// the ledger the vault was read at, so every transaction whose nullifiers are kept has its leaves
+// below NextLeaf; and when the page cap stops the leaves short, only up to the ledger before the
+// last leaf taken.
 export async function downloadChain(
   state: WalletState,
   source: ChainSource,
   vault: VaultReader,
+  maxPages: number,
 ): Promise<{ readonly view: ChainView; readonly data: Download }> {
   const since = state.nullifierSince;
   const served = await source.nullifiers(since);
   const view = await vault.view();
-  const horizon = Math.min(served.completeToLedger, view.ledger);
-  const tree = CommitmentTree.fromSnapshot(state.tree);
+  const tree = CommitmentTree.fromSnapshot(state.staging?.tree ?? state.tree);
   const firstIndex = tree.leafCount;
   const nextLeaf = view.roots.nextLeaf;
   const leaves: Leaf[] = [];
   const pages: { page: number; leaves: readonly bigint[] }[] = [];
-  while (tree.leafCount < nextLeaf) {
+  let capped = false;
+  for (let fetched = 0; tree.leafCount < nextLeaf; fetched++) {
+    if (fetched === maxPages) {
+      capped = true;
+      break;
+    }
     const batch = await source.nextLeaves(tree);
     const accepted = batch.leaves.slice(0, nextLeaf - tree.leafCount);
     if ((tree.leafCount + accepted.length) % 2 !== 0) {
@@ -72,6 +80,9 @@ export async function downloadChain(
     leaves.push(...accepted);
     if (batch.done || accepted.length < batch.leaves.length) break;
   }
+  let horizon = Math.min(served.completeToLedger, view.ledger);
+  const last = leaves[leaves.length - 1];
+  if (capped && last !== undefined) horizon = Math.min(horizon, last.ledger - 1);
   return {
     view,
     data: {
@@ -108,16 +119,21 @@ export async function crossCheck(
   rpc: SorobanRpc,
   vault: string,
   data: Download,
+  maxPages: number,
 ): Promise<CrossCheck> {
   let events;
   try {
-    events = await new RpcEventSource(rpc, vault, data.since).events();
+    events = await new RpcEventSource(rpc, vault, data.since, maxPages).events();
   } catch (err) {
     if (err instanceof CyphrasError) return { verified: false, exits: [], deposits: [] };
     throw err;
   }
-  if (data.completeTo > Math.max(events.latest, data.horizon)) {
+  if (data.completeTo > Math.max(events.head, data.horizon)) {
     fail("indexer_fault", "the indexer claims to be complete past the chain's latest ledger");
+  }
+  // RPC stopped short of the horizon, at its page cap or behind the indexer: nothing is proven.
+  if (events.latest < data.horizon) {
+    return { verified: false, exits: events.exits, deposits: events.deposits };
   }
   const differ = (): never =>
     fail("indexer_fault", "the indexer's leaves or nullifiers differ from the vault's events");
@@ -226,30 +242,81 @@ function recordEvidence(
   }
 }
 
-// Applies a download whose tree the vault's root history has confirmed: scans the new leaves,
-// keeps the paths of owned notes in completed pages and marks spent notes. The evidence of plans
-// is recorded only from data the cross-check confirmed, since it decides whether a payment failed.
-// Returns how many notes it found.
+// The notes and outgoing outputs this wallet finds in new leaves, with the paths of notes in the
+// pages those leaves completed.
+function scanDownload(
+  state: WalletState,
+  keys: ScanKeys,
+  data: Download,
+): { readonly staging: Staging; readonly newNotes: number } {
+  const staged = state.staging;
+  const found: WalletState = {
+    ...state,
+    notes: [...(staged?.notes ?? [])],
+    sent: [...(staged?.sent ?? [])],
+  };
+  const cache = new AddressCache(keys.incoming);
+  let newNotes = 0;
+  for (const leaf of data.leaves) {
+    if (state.notes.some((n) => n.pos === leaf.index)) continue;
+    if (scanLeaf(found, leaf, keys, cache)) newNotes++;
+  }
+  const paths = [...(staged?.paths ?? [])];
+  for (const page of data.pages) {
+    const start = page.page * PAGE_SIZE;
+    const inPage = (pos: number): boolean => pos >= start && pos < start + PAGE_SIZE;
+    for (const note of found.notes) {
+      if (note.pagePath === undefined && inPage(note.pos)) {
+        note.pagePath = pagePath(page.leaves, note.pos - start);
+      }
+    }
+    for (const note of state.notes) {
+      if (note.pagePath === undefined && inPage(note.pos)) {
+        paths.push({ pos: note.pos, pagePath: pagePath(page.leaves, note.pos - start) });
+      }
+    }
+  }
+  return {
+    staging: {
+      tree: data.tree.snapshot(),
+      lastLeafLedger:
+        data.leaves[data.leaves.length - 1]?.ledger ??
+        staged?.lastLeafLedger ??
+        state.lastLeafLedger,
+      notes: found.notes,
+      sent: found.sent,
+      paths,
+    },
+    newNotes,
+  };
+}
+
+// Holds a download whose tree the vault's root history cannot confirm yet, because it stopped at
+// its page cap far behind the vault. None of it counts; the next sync continues from it.
+export function stageDownload(state: WalletState, keys: ScanKeys, data: Download): void {
+  if (data.leaves.length > 0) state.staging = scanDownload(state, keys, data).staging;
+}
+
+// Applies a download whose tree the vault's root history has confirmed, with anything staged
+// before it: the notes found count from now, spent notes are marked, and the evidence of plans is
+// recorded, only from data the cross-check confirmed, since it decides whether a payment failed.
+// Returns how many notes this sync found.
 export function applyDownload(
   state: WalletState,
   keys: ScanKeys,
   data: Download,
   checked: boolean,
 ): number {
-  const cache = new AddressCache(keys.incoming);
-  let newNotes = 0;
-  for (const leaf of data.leaves) if (scanLeaf(state, leaf, keys, cache)) newNotes++;
-  for (const page of data.pages) {
-    const start = page.page * PAGE_SIZE;
-    for (const note of state.notes) {
-      if (note.pagePath === undefined && note.pos >= start && note.pos < start + PAGE_SIZE) {
-        note.pagePath = pagePath(page.leaves, note.pos - start);
-      }
-    }
+  const { staging, newNotes } = scanDownload(state, keys, data);
+  for (const { pos, pagePath: path } of staging.paths) {
+    const note = state.notes.find((n) => n.pos === pos);
+    if (note !== undefined) note.pagePath = path;
   }
-  state.tree = data.tree.snapshot();
-  const last = data.leaves[data.leaves.length - 1];
-  if (last !== undefined) state.lastLeafLedger = last.ledger;
+  state.notes.push(...staging.notes);
+  state.sent.push(...staging.sent);
+  state.tree = staging.tree;
+  state.lastLeafLedger = staging.lastLeafLedger;
+  state.staging = undefined;
 
   const buffer = [
     ...state.nullifierBuffer,

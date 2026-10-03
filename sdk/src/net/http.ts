@@ -6,14 +6,43 @@ import { hexToBytes } from "../bytes.ts";
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+// Several times the largest reply a service sends: a page of 1,024 leaves or 4,096 nullifiers,
+// or 1,000 contract events.
+export const MAX_REPLY_BYTES = 4 * 1024 * 1024;
 
 export interface JsonResponse {
   readonly status: number;
   readonly body: unknown;
 }
 
-// One JSON request. No cookies, credentials or referrer go out, and the reply is read as JSON or
-// refused. A transport failure raises service_unavailable naming only the service.
+// Reads a reply body no larger than `limit`, and stops reading as soon as it is larger.
+async function readBody(response: Response, limit: number): Promise<string | undefined> {
+  const reader = response.body?.getReader();
+  if (reader === undefined) return undefined;
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > limit) {
+      await reader.cancel();
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const all = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    all.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return new TextDecoder().decode(all);
+}
+
+// One JSON request. No cookies, credentials or referrer go out, the reply is read as JSON or
+// refused, and the request is abandoned past its timeout or once its reply grows too large. A
+// transport failure raises service_unavailable naming only the service.
 export async function requestJson(
   fetchFn: FetchLike,
   service: string,
@@ -36,9 +65,18 @@ export async function requestJson(
   } catch {
     return fail("service_unavailable", `the ${service} could not be reached`, { service });
   }
+  let text: string | undefined;
+  try {
+    text = await readBody(response, MAX_REPLY_BYTES);
+  } catch {
+    return fail("service_unavailable", `the ${service} could not be reached`, { service });
+  }
+  if (text === undefined && response.body !== null) {
+    fail("service_unavailable", `the ${service} sent a reply that is too large`, { service });
+  }
   let body: unknown;
   try {
-    body = await response.json();
+    body = text === undefined ? undefined : JSON.parse(text);
   } catch {
     body = undefined;
   }

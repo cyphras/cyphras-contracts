@@ -54,7 +54,14 @@ import {
 import { type ExitPosition, applyExits, exitPosition } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
 import { type Verification, createServices, verify } from "./services.ts";
-import { type DepositEvent, type ExitEvent, IndexerSource, RpcEventSource } from "./sources.ts";
+import {
+  DEFAULT_SYNC_LIMITS,
+  type DepositEvent,
+  type ExitEvent,
+  IndexerSource,
+  RpcEventSource,
+  type SyncLimits,
+} from "./sources.ts";
 import { type ConfirmSpend, type Submission, spend, submissionOf } from "./spend.ts";
 import { type Operation, type Plan, StateStore, type WalletState, emptyState } from "./state.ts";
 import {
@@ -66,6 +73,7 @@ import {
   downloadChain,
   isActive,
   resetUnlanded,
+  stageDownload,
 } from "./sync.ts";
 
 /** Options shared by full and view-only wallets. */
@@ -83,6 +91,8 @@ export interface ConnectionOptions {
   // The most a transaction the SDK builds may pay the network; defaults to 0.01 XLM for inclusion
   // and 1 XLM for resources.
   readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
+  // How much one sync downloads at most; the defaults suit an extension's service worker.
+  readonly syncLimits?: Partial<SyncLimits>;
   // Starts from a fresh state when the stored one cannot be read, instead of refusing to open. The
   // first sync then rebuilds notes and history from the chain; local records of submissions and
   // deposits that were only in the lost state are gone.
@@ -107,6 +117,8 @@ export interface ViewOnlyOptions extends ConnectionOptions {
 /** What a sync found. */
 export interface SyncSummary {
   readonly leafCount: number;
+  // Leaves taken past leafCount that the vault has yet to confirm; the next sync continues.
+  readonly staged: number;
   readonly newNotes: number;
   readonly source: "indexer" | "rpc";
   readonly rootVerified: boolean;
@@ -217,6 +229,7 @@ export class PrivateWallet {
   readonly #fetch: FetchLike;
   readonly #states: StateStore;
   readonly #lock: AccountLock;
+  readonly #limits: SyncLimits;
   #verification: Verification;
   #queue: Promise<unknown> = Promise.resolve();
   // The last sync found data that contradicts the chain; nothing of it was kept.
@@ -227,12 +240,14 @@ export class PrivateWallet {
     fetchFn: FetchLike,
     states: StateStore,
     lock: AccountLock,
+    limits: SyncLimits,
     verification: Verification,
   ) {
     this.#core = core;
     this.#fetch = fetchFn;
     this.#states = states;
     this.#lock = lock;
+    this.#limits = limits;
     this.#verification = verification;
   }
 
@@ -344,7 +359,8 @@ export class PrivateWallet {
       sleep,
     };
     const { verification } = await verify(services);
-    return new PrivateWallet(core, fetchFn, states, lock, verification);
+    const limits = { ...DEFAULT_SYNC_LIMITS, ...options.syncLimits };
+    return new PrivateWallet(core, fetchFn, states, lock, limits, verification);
   }
 
   /**
@@ -454,11 +470,13 @@ export class PrivateWallet {
 
   #rpcSource(core: Core): RpcEventSource {
     const { state, deployment, services } = core;
-    const from = Math.min(state.nullifierSince, state.lastLeafLedger || state.nullifierSince);
+    const lastLeaf = state.staging?.lastLeafLedger ?? state.lastLeafLedger;
+    const from = Math.min(state.nullifierSince, lastLeaf || state.nullifierSince);
     return new RpcEventSource(
       services.rpc,
       deployment.vault,
       Math.max(deployment.deployLedger, from),
+      this.#limits.eventPages,
     );
   }
 
@@ -487,6 +505,12 @@ export class PrivateWallet {
       this.#fault =
         err instanceof CyphrasError &&
         (err.code === "indexer_fault" || err.code === "tree_unverified");
+      // Staged leaves were never confirmed and may be what contradicts the vault; the next sync
+      // takes them again from the confirmed tree.
+      if (this.#fault && core.state.staging !== undefined) {
+        core.state.staging = undefined;
+        await core.save();
+      }
       throw err;
     }
     this.#fault = false;
@@ -497,11 +521,14 @@ export class PrivateWallet {
 
   async #syncInto(core: Core, onReads: (reads: ChainReads) => void): Promise<SyncSummary> {
     const indexer = this.#indexer();
+    const limits = this.#limits;
     let source: IndexerSource | RpcEventSource =
-      indexer === undefined ? this.#rpcSource(core) : new IndexerSource(indexer);
+      indexer === undefined
+        ? this.#rpcSource(core)
+        : new IndexerSource(indexer, limits.nullifierPages);
     let download;
     try {
-      download = await downloadChain(core.state, source, core.services.vault);
+      download = await downloadChain(core.state, source, core.services.vault, limits.leafPages);
     } catch (err) {
       // An indexer that becomes unreachable is passed over for the vault's RPC events; one that
       // served inconsistent data is a fault the caller must see.
@@ -513,7 +540,7 @@ export class PrivateWallet {
         throw err;
       }
       source = this.#rpcSource(core);
-      download = await downloadChain(core.state, source, core.services.vault);
+      download = await downloadChain(core.state, source, core.services.vault, limits.leafPages);
     }
     const { view, data } = download;
     let crossChecked = false;
@@ -522,7 +549,12 @@ export class PrivateWallet {
       readonly deposits: readonly DepositEvent[];
     };
     if (source.kind === "indexer") {
-      const check = await crossCheck(core.services.rpc, core.deployment.vault, data);
+      const check = await crossCheck(
+        core.services.rpc,
+        core.deployment.vault,
+        data,
+        limits.eventPages,
+      );
       crossChecked = check.verified;
       events = check;
     } else {
@@ -544,6 +576,7 @@ export class PrivateWallet {
       core.state.rootCheck = check;
       if (checked) advancePlans(core.state, data.horizon, view);
     } else {
+      stageDownload(core.state, core.scan, data);
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
     const live = source.kind === "indexer" ? indexer : undefined;
@@ -559,6 +592,9 @@ export class PrivateWallet {
     if (live !== undefined) await this.#pollRelayers(core);
     return {
       leafCount: core.state.tree.leafCount,
+      staged:
+        (core.state.staging?.tree.leafCount ?? core.state.tree.leafCount) -
+        core.state.tree.leafCount,
       newNotes,
       source: source.kind,
       rootVerified: core.state.rootCheck.state === "verified",

@@ -416,6 +416,73 @@ describe("wallet safety: availability", () => {
   });
 });
 
+describe("wallet safety: bounded syncs", () => {
+  it("holds leaves taken past its page cap aside until the vault confirms them", async () => {
+    const { world } = await funded();
+    // Enough leaves that one page leaves the tree too far behind for the vault's root history.
+    world.fill(800);
+    const capped = await openWallet(world, 0, new MemoryStore(), undefined, {
+      syncLimits: { leafPages: 1 },
+    });
+    let summary = await capped.sync();
+    assert.equal(summary.leafCount, 0);
+    assert.equal(summary.staged, 1024);
+    assert.equal(summary.rootVerified, false);
+    assert.equal((await capped.balance()).spendable, 0n);
+    summary = await capped.sync();
+    assert.equal(summary.staged, 0);
+    assert.equal(summary.leafCount, world.vault.leaves.length);
+    assert.equal(summary.rootVerified, true);
+    assert.equal((await capped.balance()).spendable, 100n * XLM);
+  });
+
+  it("drops staged leaves that the vault contradicts", async () => {
+    const { world } = await funded();
+    world.fill(800);
+    const lying = rewritingFetch(world, {
+      "/v1/leaves": (body) => ({
+        ...body,
+        leaves: (body["leaves"] as { index: number; commitment: string }[]).map((l) =>
+          l.index === 5 ? { ...l, commitment: flipLowBit(l.commitment) } : l,
+        ),
+      }),
+    });
+    const store = new MemoryStore();
+    const capped = await openWallet({ ...world, fetch: lying }, 0, store, undefined, {
+      syncLimits: { leafPages: 1 },
+    });
+    // RPC no longer holds the events of these leaves, so only the root check can catch the lie.
+    world.rpc.oldestLedger = world.vault.ledger + 1;
+    assert.equal((await capped.sync()).staged, 1024);
+    await assert.rejects(capped.sync(), isError("tree_unverified"));
+    assert.equal(capped.treeStatus().fault, true);
+    world.rpc.oldestLedger = 1;
+    const honest = await openWallet(world, 0, store);
+    const summary = await honest.sync();
+    assert.equal(summary.rootVerified, true);
+    assert.equal((await honest.balance()).spendable, 100n * XLM);
+  });
+
+  it("keeps a spend whose note an indexer that lags on leaves serves later", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    await bob.sync();
+    // bob spends the note he received
+    await bob.send({ to: alice.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM });
+    const before = world.vault.leaves.findIndex((l) => l.txHash === world.vault.leaves[2]?.txHash);
+    // A fresh copy of bob's wallet, served every nullifier but not the leaves of the note yet,
+    // with RPC unable to cross-check.
+    world.indexer.leafLimit = before;
+    world.rpc.oldestLedger = world.vault.ledger + 1;
+    const restored = await openWallet(world, 1);
+    await restored.sync();
+    world.indexer.leafLimit = undefined;
+    await restored.sync();
+    assert.equal((await restored.balance()).spendable, 10n * XLM - 5n * XLM - 1n * XLM);
+  });
+});
+
 describe("wallet safety: the submission state machine", () => {
   it("keeps a refused proof's notes until its deadline, then frees them", async () => {
     const { world, alice } = await funded();

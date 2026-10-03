@@ -3,7 +3,7 @@ import { CyphrasError } from "../../src/errors.ts";
 import { deriveStoreKey } from "../../src/keys.ts";
 import { keySource } from "../../src/keysource.ts";
 import { type KeyValueStore, MemoryStore } from "../../src/storage.ts";
-import { PrivateWallet } from "../../src/wallet/wallet.ts";
+import { type OpenOptions, PrivateWallet } from "../../src/wallet/wallet.ts";
 import { MNEMONIC } from "../helpers.ts";
 import { RPC, type World } from "./network.ts";
 import { TrapdoorProver, trapdoorArtifacts } from "./trapdoor.ts";
@@ -13,6 +13,7 @@ export async function openWallet(
   account: number,
   storage: KeyValueStore = new MemoryStore(),
   prover = new TrapdoorProver(),
+  options: Partial<OpenOptions> = {},
 ): Promise<PrivateWallet> {
   return PrivateWallet.open({
     deployment: world.deployment,
@@ -25,6 +26,7 @@ export async function openWallet(
     fetch: world.fetch,
     clock: world.clock,
     sleep: async () => {},
+    ...options,
   });
 }
 
