@@ -431,6 +431,35 @@ describe("wallet: spends", () => {
   });
 });
 
+describe("wallet: a pool of an issued asset", () => {
+  it("unshields only to an existing account whose authorized trustline has room", async () => {
+    const issuer = keypairFor("issuer").publicKey();
+    const world = await createWorld({ asset: `USDC:${issuer}` });
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const unshield = (to: string) =>
+      alice.unshield({ to, amount: 5n * XLM, maxFee: 2n * XLM, confirm: confirmAll });
+    // No payment of an issued asset creates an account, however large.
+    await assert.rejects(
+      unshield(keypairFor("nobody yet").publicKey()),
+      isError("destination_invalid"),
+    );
+    const holder = world.signer("holder").publicKey;
+    await assert.rejects(unshield(holder), isError("destination_invalid"));
+    world.rpc.trustlines.set(holder, { authorized: false, limit: 1_000n * XLM, balance: 0n });
+    await assert.rejects(unshield(holder), isError("destination_invalid"));
+    world.rpc.trustlines.set(holder, { authorized: true, limit: 10n * XLM, balance: 6n * XLM });
+    await assert.rejects(unshield(holder), isError("destination_invalid"));
+    world.rpc.trustlines.set(holder, { authorized: true, limit: 10n * XLM, balance: 5n * XLM });
+    assert.ok("planId" in (await unshield(holder)));
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+  });
+});
+
 describe("wallet: keys and state", () => {
   it("restores the balance and the history from the mnemonic alone", async () => {
     const { world, alice } = await funded();

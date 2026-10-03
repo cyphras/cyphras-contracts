@@ -329,6 +329,7 @@ export class MockRelayer {
   readonly channel: Keypair;
   fee = 1n * XLM;
   tier = 100_000n;
+  asset = "native";
   ready = true;
   // Test hook: a fee address the quote names instead of the one the health reports.
   quoteFeeAddress: string | undefined;
@@ -372,7 +373,7 @@ export class MockRelayer {
       if (this.fee > v.limits.maxFee) return json(503, { error: "unavailable" });
       return json(200, {
         fee: this.fee.toString(),
-        asset: "native",
+        asset: this.asset,
         tier: this.tier.toString(),
         margin_bps: 500,
         valid_until: Number(v.timestamp) + 300,
@@ -503,15 +504,22 @@ export interface World {
   fill(pairs: number): void;
 }
 
-export async function createWorld(options: { limits?: Partial<Limits> } = {}): Promise<World> {
+// The pool asset is native unless `asset` names an issued one as CODE:ISSUER.
+export async function createWorld(
+  options: { limits?: Partial<Limits>; asset?: string } = {},
+): Promise<World> {
   const networkId = createHash("sha256").update(PASSPHRASE).digest();
   const vaultAddress = StrKey.encodeContract(createHash("sha256").update("test vault").digest());
-  const token = Asset.native().contractId(PASSPHRASE);
+  const assetName = options.asset ?? "native";
+  const [code, issuer] = assetName.split(":") as [string, string | undefined];
+  const token = (issuer === undefined ? Asset.native() : new Asset(code, issuer)).contractId(
+    PASSPHRASE,
+  );
   const vault = new MockVault({
     address: vaultAddress,
     token,
     networkId: new Uint8Array(networkId),
-    domain: computeDomain("testnet", "native"),
+    domain: computeDomain("testnet", assetName),
     wasmHash: createHash("sha256").update("test vault wasm").digest("hex"),
     limits: { ...DEFAULT_LIMITS, ...options.limits },
   });
@@ -519,13 +527,15 @@ export async function createWorld(options: { limits?: Partial<Limits> } = {}): P
   const feeAddress = keypairFor("relayer fee").publicKey();
   const indexer = new MockIndexer(vault, networkId.toString("hex"));
   const relayer = new MockRelayer(rpc, networkId.toString("hex"), feeAddress);
+  relayer.asset = assetName;
+  vault.native = issuer === undefined;
   const requests: string[] = [];
   const deployment: Deployment = {
     id: "testnet/test",
     network: "testnet",
     networkPassphrase: PASSPHRASE,
     vault: vaultAddress,
-    asset: { contract: token, name: "native" },
+    asset: { contract: token, name: assetName },
     domain: vault.domain,
     deployLedger: 10,
     vaultWasmHash: vault.wasmHash,

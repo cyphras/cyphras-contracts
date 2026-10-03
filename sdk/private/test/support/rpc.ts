@@ -89,6 +89,8 @@ export class MockRpc {
   readonly vault: MockVault;
   readonly passphrase: string;
   readonly accounts = new Map<string, Account>();
+  // Trustlines of an issued pool asset, by account.
+  readonly trustlines = new Map<string, { authorized: boolean; limit: bigint; balance: bigint }>();
   readonly contracts = new Set<string>();
   readonly records = new Map<string, TxRecord>();
   oldestLedger = 1;
@@ -277,6 +279,21 @@ export class MockRpc {
           thresholds: Buffer.from([1, 0, 0, 0]),
           signers: [],
           ext: new xdr.AccountEntryExt(0),
+        }),
+      );
+    }
+    if (key.switch().name === "trustline") {
+      const id = StrKey.encodeEd25519PublicKey(key.trustLine().accountId().ed25519());
+      const line = this.trustlines.get(id);
+      if (line === undefined) return undefined;
+      return xdr.LedgerEntryData.trustline(
+        new xdr.TrustLineEntry({
+          accountId: key.trustLine().accountId(),
+          asset: key.trustLine().asset(),
+          balance: xdr.Int64.fromString(line.balance.toString()),
+          limit: xdr.Int64.fromString(line.limit.toString()),
+          flags: line.authorized ? 1 : 0,
+          ext: new xdr.TrustLineEntryExt(0),
         }),
       );
     }

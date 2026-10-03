@@ -256,6 +256,8 @@ export class MockVault {
   readonly transfers: Transfer[] = [];
   // Accounts that cannot receive a payout, to strand exits in tests.
   readonly unpayable = new Set<string>();
+  // Only a payment of the native asset creates a missing account.
+  native = true;
   // The network's accounts, which the world connects to its RPC. A contract always exists.
   accountExists: (account: string) => boolean = () => true;
   createAccount: (account: string) => void = () => {};
@@ -386,7 +388,8 @@ export class MockVault {
     const account = baseAccount(to);
     if (this.unpayable.has(account)) return false;
     return (
-      this.accountExists(account) || (!StrKey.isValidContract(to) && amount >= NEW_ACCOUNT_MIN)
+      this.accountExists(account) ||
+      (this.native && !StrKey.isValidContract(to) && amount >= NEW_ACCOUNT_MIN)
     );
   }
 
@@ -555,7 +558,9 @@ export class MockVault {
       // No first part below its minimum balance goes to an account the payout creates; the exit
       // waits for the next window.
       const missing = !this.accountExists(baseAccount(exit.recipient));
-      if (missing && payout < NEW_ACCOUNT_MIN && exit.payout >= NEW_ACCOUNT_MIN) break;
+      if (this.native && missing && payout < NEW_ACCOUNT_MIN && exit.payout >= NEW_ACCOUNT_MIN) {
+        break;
+      }
       count++;
       const fee = exit.fee < room - payout ? exit.fee : room - payout;
       const payoutPaid = this.#tryPay(exit.recipient, payout);
