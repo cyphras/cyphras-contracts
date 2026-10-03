@@ -154,7 +154,7 @@ func newHarness(t *testing.T, status vault.Status) *harness {
 	t.Cleanup(pool.Close)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, Validity: time.Minute, Poll: time.Millisecond, Now: func() time.Time { return h.now }}
+	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, Validity: time.Minute, Poll: time.Millisecond, Now: h.clock}
 	r, err := New(ctx, Config{
 		Vault: vaulttest.Vault, NetworkID: rpc.NetworkID(passphrase), Asset: "native", FeeAddress: feeAddress,
 		Pricing: Pricing{Native: true, MarginBps: 500, Tier: big.NewInt(100_000)}, LedgerSeconds: 5, MaxHeld: 10,
@@ -162,12 +162,19 @@ func newHarness(t *testing.T, status vault.Status) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.now = func() time.Time { return h.now }
+	r.now = h.clock
 	h.r = r
 	if err := r.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	return h
+}
+
+// clock is the harness's time, which held requests read from their own goroutines.
+func (h *harness) clock() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.now
 }
 
 func mustKey[T any](k T, err error) T {
@@ -446,7 +453,9 @@ func TestADelayedRequestIsHeldThenSent(t *testing.T) {
 	if code, _ := h.get("/v1/held/" + strings.Repeat("0", 63) + "1"); code != http.StatusNotFound {
 		t.Fatalf("an unknown nullifier answered %d", code)
 	}
+	h.mu.Lock()
 	h.now = h.now.Add(2 * time.Second)
+	h.mu.Unlock()
 	for range 1000 {
 		h.mu.Lock()
 		sent := h.sent
