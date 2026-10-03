@@ -99,7 +99,7 @@ function lyingEvents(world: World): {
         ...events.map((e, i) => ({
           type: "contract",
           ledger,
-          ledgerClosedAt: "2026-10-03T00:00:00Z",
+          ledgerClosedAt: new Date(world.rpc.closeTime(ledger) * 1000).toISOString(),
           contractId: world.vault.address,
           id: `${String(ledger).padStart(12, "0")}-${String(900 + i).padStart(8, "0")}`,
           pagingToken: "fake",

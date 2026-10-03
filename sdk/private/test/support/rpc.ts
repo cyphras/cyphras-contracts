@@ -94,6 +94,8 @@ export class MockRpc {
   readonly contracts = new Set<string>();
   readonly records = new Map<string, TxRecord>();
   oldestLedger = 1;
+  // The pace at which the ledgers it reports closed, from a fixed moment at ledger 0.
+  secondsPerLedger = 5;
   calls: string[] = [];
   // The fee of every transaction sent, in stroops.
   sentFees: bigint[] = [];
@@ -104,6 +106,11 @@ export class MockRpc {
   constructor(vault: MockVault, passphrase: string) {
     this.vault = vault;
     this.passphrase = passphrase;
+  }
+
+  // Unix seconds at which a ledger closed, as RPC reports it.
+  closeTime(ledger: number): number {
+    return 1_700_000_000 + this.secondsPerLedger * ledger;
   }
 
   // An account the native asset contract created with a payment, whose key no test holds.
@@ -519,7 +526,7 @@ export class MockRpc {
       events: selected.map(({ e, id }) => ({
         type: "contract",
         ledger: e.ledger,
-        ledgerClosedAt: "2026-10-03T00:00:00Z",
+        ledgerClosedAt: new Date(this.closeTime(e.ledger) * 1000).toISOString(),
         contractId: this.vault.address,
         id,
         pagingToken: id,
@@ -531,6 +538,8 @@ export class MockRpc {
       cursor: selected[selected.length - 1]?.id ?? after ?? "",
       latestLedger: this.vault.ledger,
       oldestLedger: this.oldestLedger,
+      latestLedgerCloseTime: String(this.closeTime(this.vault.ledger)),
+      oldestLedgerCloseTime: String(this.closeTime(this.oldestLedger)),
     };
   }
 }

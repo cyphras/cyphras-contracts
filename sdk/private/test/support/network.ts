@@ -466,6 +466,14 @@ export class MockRelayer {
       return json(409, { error: "duplicate" });
     }
     const notBefore = body["not_before"] as number | undefined;
+    const now = Number(this.vault.timestamp);
+    // A held request must still be valid at the end of the window after not_before, whose ledger
+    // the pace of recent ledgers predicts, and 20 ledgers past it.
+    if (notBefore !== undefined && notBefore > now) {
+      const end =
+        this.vault.ledger + Math.ceil((notBefore + 600 - now) / this.rpc.secondsPerLedger);
+      if (ext.deadline < end + 20) return json(422, { error: "rejected" });
+    }
     this.submissions.push({
       proof: body["proof"] as TxProofJson,
       ext: body["ext"] as ExtDataJson,

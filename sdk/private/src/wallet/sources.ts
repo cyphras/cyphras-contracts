@@ -3,6 +3,7 @@ import type { IndexerClient, Leaf, SpentNullifier } from "../net/indexer.ts";
 import type { SorobanRpc } from "../net/rpc.ts";
 import { type CommitmentTree, PAGE_SIZE } from "../merkle.ts";
 import { type VaultEvent, decodeVaultEvent } from "../vault/events.ts";
+import type { LedgerTime } from "./state.ts";
 
 export interface LeafBatch {
   // The leaves after the tree's last one, in index order.
@@ -120,6 +121,9 @@ export interface VaultEvents {
   readonly from: number;
   readonly latest: number;
   readonly head: number;
+  // Close times RPC reported: of the oldest ledger it holds, of the first event's ledger and of
+  // the head.
+  readonly times: readonly LedgerTime[];
 }
 
 // The fallback when no indexer is available: the vault's own events from RPC, which keeps them
@@ -144,9 +148,14 @@ export class RpcEventSource implements ChainSource {
     const nullifiers: SpentNullifier[] = [];
     const exits: ExitEvent[] = [];
     const deposits: DepositEvent[] = [];
+    const times: LedgerTime[] = [];
+    const time = (ledger: number, at: number | undefined): void => {
+      if (at !== undefined) times.push({ ledger, at });
+    };
     let cursor: string | undefined;
     let latest = this.#startLedger;
     let head = this.#startLedger;
+    let headTime: number | undefined;
     for (let pages = 1; ; pages++) {
       let page;
       try {
@@ -165,8 +174,14 @@ export class RpcEventSource implements ChainSource {
       if (cursor === undefined && page.oldestLedger > this.#startLedger) {
         fail("history_unavailable", "RPC no longer holds the vault events this wallet needs");
       }
+      if (cursor === undefined) {
+        time(page.oldestLedger, page.oldestCloseTime);
+        const first = page.events[0];
+        if (first !== undefined) time(first.ledger, first.closedAt);
+      }
       latest = page.latestLedger;
       head = page.latestLedger;
+      headTime = page.latestCloseTime;
       for (const event of page.events) {
         if (!event.successful || event.contractId !== this.#vault) continue;
         const decoded = decodeVaultEvent(event);
@@ -204,6 +219,7 @@ export class RpcEventSource implements ChainSource {
       }
       cursor = page.cursor;
     }
+    time(head, headTime);
     const upTo = <T extends { readonly ledger: number }>(xs: T[]): T[] =>
       xs.filter((x) => x.ledger <= latest);
     return {
@@ -214,6 +230,7 @@ export class RpcEventSource implements ChainSource {
       from: this.#startLedger,
       latest,
       head,
+      times,
     };
   }
 

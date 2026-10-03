@@ -62,12 +62,12 @@ export interface Submission {
 
 // Clients set the deadline about ten minutes of ledgers ahead and prove again after it passes.
 export const DEADLINE_LEDGERS = 120;
-const LEDGER_SECONDS = 5;
 const MAX_NOT_BEFORE_SECONDS = 24 * 3600;
 const FEE_RETRIES = 2;
 // The relayer runs a delayed request at a random moment in the 10 minutes after not_before, and
-// takes one only while its deadline lies this many ledgers past that window.
-const JITTER_LEDGERS = 120;
+// takes one only while its deadline lies this many ledgers past the end of that window, which it
+// predicts from the pace of recent ledgers.
+const JITTER_SECONDS = 600;
 const RELAYER_DEADLINE_MARGIN = 20;
 
 const randomBelow = (n: number): number =>
@@ -439,11 +439,13 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       }
 
       const latest = reads.view.ledger;
+      // A held request must still be valid at the end of the relayer's window after not_before.
       const delay =
         intent.notBefore === undefined
           ? 0
-          : Math.ceil((intent.notBefore - Math.floor(core.now() / 1000)) / LEDGER_SECONDS) +
-            JITTER_LEDGERS;
+          : Math.ceil(
+              (intent.notBefore + JITTER_SECONDS - Math.floor(core.now() / 1000)) / reads.pace,
+            );
       const terms: ExtTerms = {
         vault: core.deployment.vault,
         networkId: hexToBytes(core.services.networkId),
@@ -531,14 +533,15 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
 // A request the relayer holds until its not_before lives in the relayer's memory only. Once sent,
 // it has a hash, which the plan takes; the chain's evidence still decides whether it landed. A
 // relayer that restarted no longer knows the request, so the same proof goes to it again while
-// its deadline, past `latest`, allows; one that failed before it was sent, or was cancelled, is
-// followed no further.
+// its deadline, past `latest` at `pace` seconds per ledger, allows; one that failed before it was
+// sent, or was cancelled, is followed no further.
 export async function followHeld(
   core: Core,
   plan: Plan,
   heldId: string,
   client: RelayerClient,
   latest: number,
+  pace: number,
 ): Promise<void> {
   const held = await client.held(heldId);
   if (held !== undefined) {
@@ -556,10 +559,9 @@ export async function followHeld(
   if (notBefore !== undefined && notBefore <= now) {
     // A new moment, at random within the relayer's window, keeps the inclusion time from following
     // this request as it kept it from following the first; the deadline must still cover it.
-    const room =
-      (plan.deadline - latest - JITTER_LEDGERS - RELAYER_DEADLINE_MARGIN) * LEDGER_SECONDS;
+    const room = (plan.deadline - latest - RELAYER_DEADLINE_MARGIN) * pace - JITTER_SECONDS;
     if (room <= 0) return;
-    notBefore = now + 1 + randomBelow(Math.min(room, JITTER_LEDGERS * LEDGER_SECONDS));
+    notBefore = now + 1 + randomBelow(Math.min(room, JITTER_SECONDS));
   }
   const result = await client.submit(plan.proof, plan.ext, notBefore);
   if (result.accepted) {

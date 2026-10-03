@@ -219,6 +219,12 @@ export interface UncheckedRange {
   readonly lost: boolean;
 }
 
+// A ledger and the Unix second it closed at.
+export interface LedgerTime {
+  readonly ledger: number;
+  readonly at: number;
+}
+
 export interface RootCheck {
   readonly state: "verified" | "behind" | "mismatch";
   readonly ledger: number;
@@ -244,6 +250,8 @@ export interface WalletState {
   deposits: Deposit[];
   operations: Operation[];
   rootCheck: RootCheck | undefined;
+  // Close times of the last hour that RPC reported, from which the pace of ledgers is taken.
+  ledgerTimes: LedgerTime[];
 }
 
 export function emptyState(deployLedger: number): WalletState {
@@ -262,6 +270,7 @@ export function emptyState(deployLedger: number): WalletState {
     deposits: [],
     operations: [],
     rootCheck: undefined,
+    ledgerTimes: [],
   };
 }
 
@@ -303,6 +312,8 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   if (bytes === undefined) return undefined;
   const state = JSON.parse(new TextDecoder().decode(bytes), reviver) as WalletState;
   if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
+  // A state need not hold close times yet; its next sync records them.
+  state.ledgerTimes ??= [];
   return state;
 }
 

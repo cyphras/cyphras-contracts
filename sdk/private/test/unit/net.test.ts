@@ -606,6 +606,26 @@ describe("RPC client", () => {
     );
   });
 
+  it("reads the close times of the events' ledgers and of the range RPC holds", async () => {
+    const rpc = new SorobanRpc(
+      "http://rpc",
+      reply(200, {
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          events: [],
+          latestLedger: 2_000,
+          oldestLedger: 1_000,
+          latestLedgerCloseTime: "1700005000",
+          oldestLedgerCloseTime: "1700000000",
+        },
+      }),
+    );
+    const page = await rpc.getEvents({ contractId: "C", startLedger: 1_500 });
+    assert.equal(page.latestCloseTime, 1_700_005_000);
+    assert.equal(page.oldestCloseTime, 1_700_000_000);
+  });
+
   it("reads the vault error of a failed simulation", async () => {
     const rpc = new SorobanRpc(
       "http://rpc",

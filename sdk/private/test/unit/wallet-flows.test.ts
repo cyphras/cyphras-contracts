@@ -4,7 +4,7 @@ import { Account, MuxedAccount, StrKey } from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
 import { MemoryStore } from "../../src/storage.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
-import { INDEXER, RPC, XLM, createWorld } from "../support/network.ts";
+import { INDEXER, RELAYER, RPC, XLM, createWorld } from "../support/network.ts";
 import { keypairFor } from "../support/rpc.ts";
 import { confirmAll, isError, openWallet } from "../support/wallets.ts";
 
@@ -282,6 +282,24 @@ describe("wallet: spends", () => {
     );
   });
 
+  it("covers a long hold at the pace at which ledgers close", async () => {
+    const world = await createWorld();
+    // Ledgers close every four seconds, so the relayer predicts more of them for the hold.
+    world.rpc.secondsPerLedger = 4;
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 3_600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    const [submission] = world.relayer.submissions;
+    // an hour and the relayer's 10-minute window in four-second ledgers, and the usual 120
+    assert.ok((submission?.ext.deadline as number) >= world.vault.ledger + 1_050 + 120);
+    assert.equal((await alice.plans())[0]?.state, "submitted");
+  });
+
   it("follows a held payment by its ID, sends it again to a relayer that restarted, and takes its hash", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
@@ -337,9 +355,11 @@ describe("wallet: spends", () => {
     world.indexer.leafLimit = world.vault.leaves.length;
     world.indexer.completeTo = deadline - 1;
     world.fill(1);
+    const submits = () => world.requests.filter((r) => r === `${RELAYER}/v1/submit`).length;
+    const before = submits();
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "submitted");
-    assert.equal(world.relayer.submissions.length, 1);
+    assert.equal(submits(), before);
   });
 
   it("asks the relayer about a held payment while the indexer is down", async () => {

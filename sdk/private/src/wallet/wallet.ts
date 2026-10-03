@@ -53,6 +53,7 @@ import {
 } from "./disclosure.ts";
 import { type ExitPosition, applyExits, exitPosition, payoutLeft } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
+import { updatePace } from "./pace.ts";
 import { type Verification, createServices, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
@@ -712,8 +713,9 @@ export class PrivateWallet {
       advancePlans(core.state, views);
     }
     const live = source.kind === "indexer" ? indexer : undefined;
+    const pace = updatePace(core.state, events?.times ?? []);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
-    onReads({ view, stats: await live?.stats().catch(() => undefined) });
+    onReads({ view, stats: await live?.stats().catch(() => undefined), pace });
     await trackDeposits(core, await live?.deposits().catch(() => undefined), [
       ...(events?.deposits ?? []),
       ...(rechecked?.deposits ?? []),
@@ -726,7 +728,7 @@ export class PrivateWallet {
       await live?.exits().catch(() => undefined),
       view.ledger,
     );
-    await this.#pollRelayers(core, view.ledger);
+    await this.#pollRelayers(core, view.ledger, pace);
     return {
       leafCount: core.state.tree.leafCount,
       staged:
@@ -749,7 +751,7 @@ export class PrivateWallet {
 
   // Asks only the relayer that took each pending plan about it: by its transaction's hash, or by
   // the ID of a request the relayer holds until its not_before.
-  async #pollRelayers(core: Core, latest: number): Promise<void> {
+  async #pollRelayers(core: Core, latest: number, pace: number): Promise<void> {
     for (const plan of core.state.plans) {
       const route = plan.route;
       if (plan.state !== "submitted" || route.kind !== "relayer") continue;
@@ -761,7 +763,7 @@ export class PrivateWallet {
           () => "unknown",
         );
       } else if (heldId !== undefined) {
-        await followHeld(core, plan, heldId, client, latest).catch(() => {
+        await followHeld(core, plan, heldId, client, latest, pace).catch(() => {
           plan.relayerStatus = "unknown";
         });
       }
