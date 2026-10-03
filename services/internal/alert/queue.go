@@ -64,6 +64,9 @@ type lane struct {
 	rest     time.Time
 	digestAt time.Time
 	tried    time.Time
+	// refusing is set once the channel refused an alert, and cleared only once it takes one: a
+	// test it takes clears the failing, not this.
+	refusing bool
 }
 
 // Named is a channel that names itself the same way across restarts, as its configuration does.
@@ -313,20 +316,19 @@ func (q *Queue) flushLane(ctx context.Context, ch int) time.Duration {
 	return max(q.restLeft(l, now), 50*time.Millisecond)
 }
 
-// test sends a lane's channel a test when the channel counts as failing and the lane has sent it
-// nothing for TestEvery. A channel that refused one copy, and would take the next, then stops
-// counting as failing although no other alert comes; one that keeps refusing keeps failing, and
-// stalls the heartbeat.
+// test sends a lane's channel a test when the channel counts as failing or refusing and the lane
+// has sent it nothing for TestEvery. A channel that refused one copy, and would take the next,
+// then stops counting as failing although no other alert comes, so the heartbeat goes on; one that
+// keeps refusing keeps failing, and stalls the heartbeat. Only an alert it takes, not a test, shows
+// it takes alerts again, so a refusing channel is tested until then.
 func (q *Queue) test(ctx context.Context, l *lane, ch int, now time.Time) {
 	q.mu.Lock()
-	due := q.TestEvery > 0 && !l.failing.IsZero() && !now.Before(l.rest) && now.Sub(l.tried) >= q.TestEvery
-	since := l.failing
+	due := q.TestEvery > 0 && (!l.failing.IsZero() || l.refusing) && !now.Before(l.rest) && now.Sub(l.tried) >= q.TestEvery
 	q.mu.Unlock()
 	if !due {
 		return
 	}
-	a := Alert{Service: q.Service, Severity: Info, Code: "channel_test",
-		Message: fmt.Sprintf("a test of this channel, which has refused alerts since %s", since.UTC().Format(time.RFC3339)), Time: now.UTC()}
+	a := Alert{Service: q.Service, Severity: Info, Code: "channel_test", Message: "a test of this channel, which refused an alert", Time: now.UTC()}
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
 	err := q.Channels[ch].Send(sendCtx, a)
 	cancel()
@@ -353,7 +355,7 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 			q.done(ctx, d)
 		}
 		q.mu.Lock()
-		l.failures, l.failing = 0, time.Time{}
+		l.failures, l.failing, l.refusing = 0, time.Time{}, false
 		q.mu.Unlock()
 		return true
 	}
@@ -372,6 +374,7 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 		if l.failing.IsZero() {
 			l.failing = now
 		}
+		l.refusing = true
 		q.mu.Unlock()
 		return true
 	}

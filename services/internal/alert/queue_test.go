@@ -564,7 +564,7 @@ func (h *hook) got(s string) int {
 	return n
 }
 
-func TestARefusedCriticalGoesToTheOtherChannelsAndATestClearsTheRefusal(t *testing.T) {
+func TestARefusedCriticalGoesToTheOtherChannelsAndTestsGoOnUntilAnAlertIsTaken(t *testing.T) {
 	ctx := context.Background()
 	telegram, discord := &hook{status: http.StatusBadRequest, refusals: 1}, &hook{}
 	st, sd := httptest.NewServer(telegram), httptest.NewServer(discord)
@@ -585,19 +585,29 @@ func TestARefusedCriticalGoesToTheOtherChannelsAndATestClearsTheRefusal(t *testi
 	if telegram.got("channel_test") != 0 {
 		t.Fatal("tested right after the refusal")
 	}
-	// Nothing else comes: a test of the refusing channel, which takes it, clears its refusal.
+	// Nothing else comes: a test the refusing channel takes clears its failing, so the heartbeat
+	// goes on, but not its refusal, so it is tested again until it takes an alert.
 	for range 20 {
 		now = now.Add(time.Minute)
 		q.Flush(ctx)
 	}
-	if telegram.got("channel_test") != 1 || q.Stalled(now, 10*time.Minute) {
+	if telegram.got("channel_test") != 4 || q.Stalled(now, 10*time.Minute) || !q.lane(0).refusing {
 		t.Fatalf("%d tests, stalled %v", telegram.got("channel_test"), q.Stalled(now, 10*time.Minute))
+	}
+	q.Put(Alert{Service: "watcher", Severity: Warning, Code: "hot_balance_low", Time: now})
+	q.Flush(ctx)
+	for range 20 {
+		now = now.Add(time.Minute)
+		q.Flush(ctx)
+	}
+	if telegram.got("hot_balance_low") != 1 || telegram.got("channel_test") != 4 || q.lane(0).refusing {
+		t.Fatalf("after an alert it took: %d tests", telegram.got("channel_test"))
 	}
 	// A channel that keeps refusing, as a deleted webhook does, stays stalled though tested.
 	telegram.mu.Lock()
 	telegram.status, telegram.refusals = http.StatusNotFound, -1
 	telegram.mu.Unlock()
-	q.Put(Alert{Service: "watcher", Severity: Warning, Code: "hot_balance_low", Time: now})
+	q.Put(Alert{Service: "watcher", Severity: Warning, Code: "hot_balance_low_again", Time: now})
 	for range 20 {
 		q.Flush(ctx)
 		now = now.Add(time.Minute)
