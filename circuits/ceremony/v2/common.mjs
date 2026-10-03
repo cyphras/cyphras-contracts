@@ -98,7 +98,14 @@ export function checkName(name) {
   }
 }
 
-export const show = (name) => (name === undefined ? "(no name)" : JSON.stringify(name));
+// A name read from a zkey may hold anything. Escaping all but printable ASCII keeps it from moving
+// the cursor, hiding text or reversing it on the terminal.
+export const show = (name) =>
+  name === undefined
+    ? "(no name)"
+    : `"${name.replace(/[^\x20-\x7e]|["\\]/g, (c) =>
+        c === '"' || c === "\\" ? `\\${c}` : `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+      )}"`;
 
 function cursor(buf, what) {
   let at = 0;
