@@ -90,11 +90,20 @@ const EVENT_PAGE = 1000;
 // A vault event that moves an exit along, with the transaction that emitted it.
 export type ExitEvent = Extract<
   VaultEvent,
-  { kind: "exit_queued" | "exit_paid" | "exit_stranded" | "settled" }
+  { kind: "exit_queued" | "exit_paid" | "exit_stranded" | "exit_requeued" | "settled" }
 > & {
+  // RPC's ID of the event, which orders events across ledgers and within one.
+  readonly eventId: string;
   readonly txHash: string;
   readonly ledger: number;
 };
+
+// The vault's exit events of every ledger from `from` to `to`.
+export interface ExitEvents {
+  readonly from: number;
+  readonly to: number;
+  readonly events: readonly ExitEvent[];
+}
 
 // A deposit the vault took into its entry queue, with the transaction that made it.
 export type DepositEvent = Extract<VaultEvent, { kind: "deposit_pending" }> & {
@@ -107,7 +116,8 @@ export interface VaultEvents {
   readonly nullifiers: SpentNullifier[];
   readonly exits: ExitEvent[];
   readonly deposits: DepositEvent[];
-  // The events are complete up to `latest`; `head` is the latest ledger RPC knows of.
+  // The events are complete from `from` up to `latest`; `head` is the latest ledger RPC knows of.
+  readonly from: number;
   readonly latest: number;
   readonly head: number;
 }
@@ -177,9 +187,10 @@ export class RpcEventSource implements ChainSource {
           decoded.kind === "exit_queued" ||
           decoded.kind === "exit_paid" ||
           decoded.kind === "exit_stranded" ||
+          decoded.kind === "exit_requeued" ||
           decoded.kind === "settled"
         ) {
-          exits.push({ ...decoded, txHash: event.txHash, ledger: event.ledger });
+          exits.push({ ...decoded, eventId: event.id, txHash: event.txHash, ledger: event.ledger });
         } else if (decoded.kind === "deposit_pending") {
           deposits.push({ ...decoded, txHash: event.txHash, ledger: event.ledger });
         }
@@ -199,6 +210,7 @@ export class RpcEventSource implements ChainSource {
       nullifiers: upTo(nullifiers),
       exits: upTo(exits),
       deposits: upTo(deposits),
+      from: this.#startLedger,
       latest,
       head,
     };

@@ -258,8 +258,10 @@ export class MockIndexer {
           state,
           payout: e.queuedPayout.toString(),
           fee: e.queuedFee.toString(),
-          payout_paid: (e.queuedPayout - e.payout).toString(),
-          fee_paid: (e.queuedFee - e.fee).toString(),
+          payout_paid: (e.queuedPayout - e.movedPayout - e.payout).toString(),
+          fee_paid: (e.queuedFee - e.movedFee - e.fee).toString(),
+          payout_requeued: e.movedPayout.toString(),
+          fee_requeued: e.movedFee.toString(),
           payout_left: e.payout.toString(),
           fee_left: e.fee.toString(),
           recipient: e.recipient,
@@ -267,6 +269,8 @@ export class MockIndexer {
           queued_at: Number(e.queuedAt),
           queued_ledger: e.ledger,
           tx_hash: e.txHash,
+          ...(e.requeuedFrom === undefined ? {} : { requeued_from: e.requeuedFrom }),
+          ...(e.requeuedTo.length === 0 ? {} : { requeued_to: e.requeuedTo }),
         });
         return json(200, {
           head: v.exitHead,
@@ -284,10 +288,11 @@ export class MockIndexer {
               position: e.id - v.exitHead,
               paid_by: paid[i],
             })),
-            ...[...v.stranded.values()]
-              .sort((a, b) => a.id - b.id)
-              .map((e) => entry(e, "stranded")),
-            ...v.settledExits.map((e) => entry(e, "settled")),
+            ...[
+              ...[...v.stranded.values()].map((e) => entry(e, "stranded")),
+              ...v.requeuedExits.map((e) => entry(e, "requeued")),
+              ...v.settledExits.map((e) => entry(e, "settled")),
+            ].sort((a, b) => a.id - b.id),
           ],
           complete_to: v.ledger,
         });

@@ -65,6 +65,8 @@ export const ERROR = {
   ExceedsDailyOutflow: code("ExceedsDailyOutflow"),
   NotStranded: code("NotStranded"),
   NothingClaimable: code("NothingClaimable"),
+  CannotReceive: code("CannotReceive"),
+  VaultCannotPay: code("VaultCannotPay"),
 };
 
 export class VaultError extends Error {
@@ -101,18 +103,23 @@ export interface Pending {
 }
 
 // An exit the vault owes: payout and fee are what is still owed, queuedPayout and queuedFee what
-// transact queued.
+// was queued, and movedPayout and movedFee what claims moved back into the queue as the exits
+// requeuedTo. requeuedFrom is the stranded exit a claim queued this one from.
 export interface Exit {
   id: number;
   payout: bigint;
   fee: bigint;
   queuedPayout: bigint;
   queuedFee: bigint;
+  movedPayout: bigint;
+  movedFee: bigint;
   recipient: string;
   relayer: string;
   queuedAt: bigint;
   txHash: string;
   ledger: number;
+  requeuedFrom: number | undefined;
+  requeuedTo: number[];
 }
 
 export interface EmittedEvent {
@@ -228,12 +235,16 @@ export class MockVault {
   readonly dayTotals = new Map<string, bigint>();
   readonly exits = new Map<number, Exit>();
   readonly stranded = new Map<number, Exit>();
-  // Exits paid in full, by release or claim, for the indexer's view of the queue.
+  // Exits paid in full by release, and stranded ones whose claims moved all they owed, for the
+  // indexer's view of the queue.
   readonly settledExits: Exit[] = [];
+  readonly requeuedExits: Exit[] = [];
   readonly events: EmittedEvent[] = [];
   readonly transfers: Transfer[] = [];
   // Accounts that cannot receive a payout, to strand exits in tests.
   readonly unpayable = new Set<string>();
+  // The issuer keeps the vault itself from paying out.
+  vaultCannotPay = false;
 
   // A simulation runs every check and stops before the first effect.
   dryRun = false;
@@ -409,6 +420,13 @@ export class MockVault {
     if (outflow > this.tvl - this.pendingTotal - this.queuedTotal) {
       refuse(ERROR.ExceedsAdmittedValue);
     }
+    // A party paid by the exit must be able to receive now, whether it is paid at once or queued.
+    if (
+      (payout > 0n && this.unpayable.has(baseAccount(ext.recipient))) ||
+      (ext.fee > 0n && this.unpayable.has(ext.relayer))
+    ) {
+      refuse(ERROR.CannotReceive);
+    }
     this.#shape(proof, ext);
     if (proof.root === 0n || !this.roots.includes(proof.root)) refuse(ERROR.UnknownRoot);
     this.#spend(proof, ext);
@@ -428,11 +446,15 @@ export class MockVault {
         fee: ext.fee,
         queuedPayout: payout,
         queuedFee: ext.fee,
+        movedPayout: 0n,
+        movedFee: 0n,
         recipient: ext.recipient,
         relayer: ext.relayer,
         queuedAt: this.timestamp,
         txHash: this.txHash,
         ledger: this.ledger,
+        requeuedFrom: undefined,
+        requeuedTo: [],
       });
       this.#emit("exit_queued", [
         ["id", u64(id)],
@@ -479,9 +501,12 @@ export class MockVault {
   // contract refuses is set aside as stranded with everything it still owes.
   release(max: number): number {
     if (this.#halted()) refuse(ERROR.Halted);
-    if (this.dryRun) return 0;
     const day = this.timestamp / DAY;
     let today = this.outflowDay === day ? this.outflow : 0n;
+    // A vault that cannot pay stops with the queue as it is, and fails if it would pay nothing.
+    const due = this.exitHead < this.exitTail && today < this.limits.maxDailyOutflow;
+    if (due && this.vaultCannotPay) refuse(ERROR.VaultCannotPay);
+    if (this.dryRun) return 0;
     let count = 0;
     while (count < max && this.exitHead < this.exitTail) {
       const room = this.limits.maxDailyOutflow - today;
@@ -534,37 +559,54 @@ export class MockVault {
     ]);
   }
 
-  // Pays each part of a stranded exit whole when it fits today's window and the asset contract
-  // takes it; a call that pays nothing fails.
-  claim(id: number): void {
+  // Moves the parts of a stranded exit whose party can receive now to the tail of the queue as a
+  // new exit and returns its ID. The value stays owed, so queuedTotal and tvl do not change.
+  claim(id: number): bigint {
     if (this.#halted()) refuse(ERROR.Halted);
     const exit = this.stranded.get(id) ?? refuse(ERROR.NotStranded);
-    const day = this.timestamp / DAY;
-    let today = this.outflowDay === day ? this.outflow : 0n;
-    const fits = (part: bigint): boolean => today + part <= this.limits.maxDailyOutflow;
-    const payable = (to: string, part: bigint): bigint =>
-      part > 0n && fits(part) && !this.unpayable.has(baseAccount(to)) ? part : 0n;
-    const payoutPaid = payable(exit.recipient, exit.payout);
-    today += payoutPaid;
-    const feePaid = payable(exit.relayer, exit.fee);
-    today += feePaid;
-    if (payoutPaid + feePaid === 0n) refuse(ERROR.NothingClaimable);
-    if (this.dryRun) return;
-    this.#pay(exit.recipient, payoutPaid);
-    this.#pay(exit.relayer, feePaid);
-    this.tvl -= payoutPaid + feePaid;
-    this.queuedTotal -= payoutPaid + feePaid;
-    this.outflowDay = day;
-    this.outflow = today;
-    const left = { ...exit, payout: exit.payout - payoutPaid, fee: exit.fee - feePaid };
+    const movable = (to: string, part: bigint): bigint =>
+      part > 0n && !this.unpayable.has(baseAccount(to)) ? part : 0n;
+    const payout = movable(exit.recipient, exit.payout);
+    const fee = movable(exit.relayer, exit.fee);
+    if (payout === 0n && fee === 0n) refuse(ERROR.NothingClaimable);
+    if (this.dryRun) return BigInt(this.exitTail);
+    const newId = this.exitTail++;
+    const left = {
+      ...exit,
+      payout: exit.payout - payout,
+      fee: exit.fee - fee,
+      movedPayout: exit.movedPayout + payout,
+      movedFee: exit.movedFee + fee,
+      requeuedTo: [...exit.requeuedTo, newId],
+    };
     if (left.payout === 0n && left.fee === 0n) {
       this.stranded.delete(id);
-      this.settledExits.push(left);
-      this.#settled(-payoutPaid, feePaid, exit.recipient, exit.relayer, id);
+      this.requeuedExits.push(left);
     } else {
       this.stranded.set(id, left);
-      this.#exitPaid(id, payoutPaid, feePaid, left);
     }
+    this.exits.set(newId, {
+      ...exit,
+      id: newId,
+      payout,
+      fee,
+      queuedPayout: payout,
+      queuedFee: fee,
+      movedPayout: 0n,
+      movedFee: 0n,
+      queuedAt: this.timestamp,
+      txHash: this.txHash,
+      ledger: this.ledger,
+      requeuedFrom: id,
+      requeuedTo: [],
+    });
+    this.#emit("exit_requeued", [
+      ["id", u64(id)],
+      ["new_id", u64(newId)],
+      ["payout", i128(payout)],
+      ["fee", i128(fee)],
+    ]);
+    return BigInt(newId);
   }
 
   // Other users' activity: pairs of random commitments, each pair its own insertion.

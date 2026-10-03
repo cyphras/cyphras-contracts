@@ -23,7 +23,7 @@ export type VaultEvent =
       readonly payout: bigint;
       readonly fee: bigint;
     }
-  // A part payment of a queued or stranded exit, and what it still owes.
+  // A part payment by release of the exit at the head of the queue, and what it still owes.
   | {
       readonly kind: "exit_paid";
       readonly id: number;
@@ -37,7 +37,15 @@ export type VaultEvent =
       readonly payoutLeft: bigint;
       readonly feeLeft: bigint;
     }
-  // exitId is set when release or claim completes an exit, and absent when transact paid at once.
+  // Parts of the stranded exit `id` moved back into the queue, at its tail, as the exit `newId`.
+  | {
+      readonly kind: "exit_requeued";
+      readonly id: number;
+      readonly newId: number;
+      readonly payout: bigint;
+      readonly fee: bigint;
+    }
+  // exitId is set when release completes an exit, and absent when transact paid at once.
   | { readonly kind: "settled"; readonly exitId: number | undefined }
   | { readonly kind: "other"; readonly topic: string };
 
@@ -92,6 +100,16 @@ export function decodeVaultEvent(event: Pick<ContractEvent, "topic" | "value">):
         id: Number(data.u64("id")),
         payoutLeft: data.i128("payout"),
         feeLeft: data.i128("fee"),
+      };
+    }
+    case "exit_requeued": {
+      const data = new Struct(event.value, topic);
+      return {
+        kind: topic,
+        id: Number(data.u64("id")),
+        newId: Number(data.u64("new_id")),
+        payout: data.i128("payout"),
+        fee: data.i128("fee"),
       };
     }
     case "settled": {

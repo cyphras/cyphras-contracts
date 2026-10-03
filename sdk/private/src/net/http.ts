@@ -173,6 +173,15 @@ export class Fields {
     return v;
   }
 
+  integers(key: string, min = 0): readonly number[] {
+    return this.array(key).map((v) => {
+      if (typeof v !== "number" || !Number.isSafeInteger(v) || v < min) {
+        this.fault(`${key} holds a value that is not an integer of at least ${min}`);
+      }
+      return v;
+    });
+  }
+
   object(key: string): Fields {
     return Fields.of(this.#value[key], this.#code, `${this.#what}.${key}`);
   }

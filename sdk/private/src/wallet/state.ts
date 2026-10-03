@@ -55,7 +55,6 @@ export type PlanState =
   | "queued"
   | "settled"
   | "stranded"
-  | "claimed"
   | "superseded"
   | "dead";
 
@@ -74,11 +73,24 @@ export type Route =
   | { readonly kind: "relayer"; readonly url: string }
   | { readonly kind: "self"; readonly account: string };
 
-// The exit of an unshield in the vault's exit queue, and what it still owes.
-export interface PlanExit {
+// One exit that still owes part of an unshield's payout or fee: the exit transact queued, or one a
+// claim requeued a stranded part as.
+export interface ExitPart {
   readonly id: number;
   payoutLeft: bigint;
   feeLeft: bigint;
+  stranded: boolean;
+}
+
+// The exit of an unshield in the vault's exit queue: the ID transact gave it, the exits that still
+// owe part of it, and how far it follows the chain. Every vault event of a ledger before `ledger`
+// is applied, and of `ledger` itself those up to `event`, or all of them when it is undefined, so
+// no event is applied twice and no account older than what it shows is taken.
+export interface PlanExit {
+  readonly id: number;
+  parts: ExitPart[];
+  ledger: number;
+  event: string | undefined;
 }
 
 // A spend, saved before anything is submitted (sdk.md, Submission state machine).

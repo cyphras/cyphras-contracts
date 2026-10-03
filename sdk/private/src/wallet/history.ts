@@ -1,4 +1,5 @@
 import { confirmedInputs, lockedPositions, spendableNotes } from "./core.ts";
+import { payoutLeft } from "./exits.ts";
 import type { WalletState } from "./state.ts";
 
 /** Spendable value, value in pending deposits, value locked in unconfirmed submissions. */
@@ -23,7 +24,7 @@ export function balanceOf(state: WalletState, spendsVisible: boolean): Balance {
     locked: state.notes.filter((n) => locked.has(n.pos)).reduce((s, n) => s + n.value, 0n),
     awaitingPayout: state.plans
       .filter((p) => p.state === "queued" || p.state === "stranded")
-      .reduce((s, p) => s + (p.exit?.payoutLeft ?? p.amount), 0n),
+      .reduce((s, p) => s + (p.exit === undefined ? p.amount : payoutLeft(p.exit)), 0n),
     spendsUnknown: !spendsVisible,
   };
 }

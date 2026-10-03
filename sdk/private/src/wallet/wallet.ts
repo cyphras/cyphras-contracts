@@ -1,6 +1,6 @@
 import { expand, extract } from "@noble/hashes/hkdf";
 import { sha512 } from "@noble/hashes/sha2";
-import { xdr } from "@stellar/stellar-base";
+import { scValToBigInt, xdr } from "@stellar/stellar-base";
 import {
   decodeViewingKey,
   encodeAddress,
@@ -51,19 +51,26 @@ import {
   disclose,
   verifyDisclosure,
 } from "./disclosure.ts";
-import { type ExitPosition, applyExits, exitPosition } from "./exits.ts";
+import { type ExitPosition, applyExits, exitPosition, payoutLeft } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
 import { type Verification, createServices, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
   type DepositEvent,
-  type ExitEvent,
+  type ExitEvents,
   IndexerSource,
   RpcEventSource,
   type SyncLimits,
 } from "./sources.ts";
 import { type ConfirmSpend, type Submission, spend, submissionOf } from "./spend.ts";
-import { type Operation, type Plan, StateStore, type WalletState, emptyState } from "./state.ts";
+import {
+  type ExitPart,
+  type Operation,
+  type Plan,
+  StateStore,
+  type WalletState,
+  emptyState,
+} from "./state.ts";
 import {
   type ScanKeys,
   advancePlans,
@@ -177,9 +184,11 @@ export interface PlanView extends Submission {
   readonly amount: bigint;
   readonly to: string;
   readonly createdAt: number;
-  // The exit of an unshield that waits in the vault's exit queue, and what it still owes.
+  // The exit of an unshield that waits in the vault's exit queue: the ID transact gave it, what
+  // it still owes the recipient, and the exits that owe it, a stranded one until claimed.
   readonly exitId: number | undefined;
   readonly payoutLeft: bigint | undefined;
+  readonly exitParts: readonly ExitPart[];
   readonly operationId: string | undefined;
   readonly relayerStatus: string | undefined;
   // The payment may still land, or failed by the wallet's last reading of the chain only: paying
@@ -194,7 +203,7 @@ const VIEWING_KEY_WARNING =
 // Parts of a split unshield follow the previous part's landing by one to six hours, at random.
 const SPLIT_GAP_MS = { min: 3_600_000, max: 21_600_000 };
 
-const LANDED: readonly Plan["state"][] = ["confirmed", "queued", "settled", "stranded", "claimed"];
+const LANDED: readonly Plan["state"][] = ["confirmed", "queued", "settled", "stranded"];
 
 function randomGap(): number {
   const r = new DataView(randomBytes(4).buffer).getUint32(0) / 2 ** 32;
@@ -549,7 +558,7 @@ export class PrivateWallet {
     const { view, data } = download;
     let crossChecked = false;
     let events: {
-      readonly exits: readonly ExitEvent[];
+      readonly exits: ExitEvents | undefined;
       readonly deposits: readonly DepositEvent[];
     };
     if (source.kind === "indexer") {
@@ -562,7 +571,11 @@ export class PrivateWallet {
       crossChecked = check.verified;
       events = check;
     } else {
-      events = await source.events();
+      const all = await source.events();
+      events = {
+        exits: { from: all.from, to: all.latest, events: all.exits },
+        deposits: all.deposits,
+      };
     }
     const check = checkRoot(data.tree, view.roots);
     if (check.state === "mismatch") {
@@ -592,7 +605,7 @@ export class PrivateWallet {
       events.deposits,
       checked ? data.horizon : undefined,
     );
-    applyExits(core.state, events.exits, await live?.exits().catch(() => undefined));
+    applyExits(core.state, events.exits, await live?.exits().catch(() => undefined), view.ledger);
     if (live !== undefined) await this.#pollRelayers(core);
     return {
       leafCount: core.state.tree.leafCount,
@@ -653,7 +666,8 @@ export class PrivateWallet {
       to: p.to,
       createdAt: p.createdAt,
       exitId: p.exit?.id,
-      payoutLeft: p.exit?.payoutLeft,
+      payoutLeft: p.exit === undefined ? undefined : payoutLeft(p.exit),
+      exitParts: (p.exit?.parts ?? []).map((part) => ({ ...part })),
       operationId: p.operationId,
       relayerStatus: p.relayerStatus,
       mustRetry: isActive(p) || p.state === "dead",
@@ -906,10 +920,11 @@ export class PrivateWallet {
   /** Where a queued payout of this wallet stands in the vault's exit queue, and when it is due. */
   async exitPosition(planId: string): Promise<ExitPosition | undefined> {
     const plan = this.#core.state.plans.find((p) => p.id === planId);
-    if (plan?.exit === undefined || plan.state !== "queued") return undefined;
+    const queued = plan?.exit?.parts.find((p) => !p.stranded && p.payoutLeft > 0n);
+    if (queued === undefined) return undefined;
     const queue = await this.#indexer()?.exits();
     if (queue === undefined) return undefined;
-    return exitPosition(queue, plan.exit.id);
+    return exitPosition(queue, queued.id);
   }
 
   /**
@@ -929,18 +944,24 @@ export class PrivateWallet {
   }
 
   /**
-   * Pays the parts of a stranded exit that its recipient and relayer can now receive, each part
-   * whole within today's outflow window; anyone may submit it.
+   * Moves the parts of a stranded exit whose recipient or relayer can receive again back to the
+   * tail of the exit queue, as the exit it returns; release then pays it. Anyone may submit it.
    */
-  claimExit(exitId: number, signer: TransactionSigner): Promise<{ readonly txHash: string }> {
+  claimExit(
+    exitId: number,
+    signer: TransactionSigner,
+  ): Promise<{ readonly txHash: string; readonly requeuedAs: number }> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      const { hash } = await invokeVault(invokeContext(this.#core), signer, {
+      const { hash, returnValue } = await invokeVault(invokeContext(this.#core), signer, {
         fn: "claim",
         args: [xdr.ScVal.scvU64(new xdr.Uint64(BigInt(exitId)))],
         transfers: [],
       });
-      return { txHash: hash };
+      if (returnValue?.switch().name !== "scvU64") {
+        fail("rpc_error", "the claim returned no exit ID");
+      }
+      return { txHash: hash, requeuedAs: Number(scValToBigInt(returnValue)) };
     });
   }
 

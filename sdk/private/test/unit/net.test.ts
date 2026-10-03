@@ -269,6 +269,37 @@ describe("indexer exit queue", () => {
       await assert.rejects(queue(exits), isCode("indexer_fault"));
     }
   });
+
+  it("reads a requeued exit and the links between it and the exits claims queued from it", async () => {
+    const q = await queue([
+      exit(3, "queued", 0),
+      { ...exit(4, "queued", 1), requeued_from: 1 },
+      { ...exit(1, "requeued"), requeued_to: [4] },
+    ]);
+    assert.deepEqual(
+      q.exits.map((e) => [e.id, e.state, e.requeuedFrom, e.requeuedTo]),
+      [
+        [3, "queued", undefined, []],
+        [4, "queued", 1, []],
+        [1, "requeued", undefined, [4]],
+      ],
+    );
+  });
+
+  it("refuses a requeue link to an exit queued no later than the one it came from", async () => {
+    for (const link of [
+      { requeued_from: 4 },
+      { requeued_from: 5 },
+      { requeued_to: [2] },
+      { requeued_to: [1] },
+      { requeued_to: ["4"] },
+    ]) {
+      await assert.rejects(
+        queue([exit(3, "queued", 0), { ...exit(4, "queued", 1), ...link }]),
+        isCode("indexer_fault"),
+      );
+    }
+  });
 });
 
 describe("relayer client", () => {

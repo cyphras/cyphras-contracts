@@ -50,4 +50,6 @@ pub enum Error {
     ExceedsDailyOutflow = 141,
     NotStranded = 142,
     NothingClaimable = 143,
+    CannotReceive = 144,
+    VaultCannotPay = 145,
 }

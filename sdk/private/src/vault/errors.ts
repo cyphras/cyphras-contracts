@@ -45,6 +45,8 @@ const VAULT_ERRORS: Readonly<Record<number, string>> = {
   141: "ExceedsDailyOutflow",
   142: "NotStranded",
   143: "NothingClaimable",
+  144: "CannotReceive",
+  145: "VaultCannotPay",
 };
 
 export function vaultErrorName(code: number): string | undefined {

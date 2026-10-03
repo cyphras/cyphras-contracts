@@ -8,7 +8,7 @@ import type { Leaf, SpentNullifier } from "../net/indexer.ts";
 import type { SorobanRpc } from "../net/rpc.ts";
 import { nullifier } from "../notes.ts";
 import type { ChainView, RootHistory, VaultReader } from "../vault/state.ts";
-import { type ChainSource, type DepositEvent, type ExitEvent, RpcEventSource } from "./sources.ts";
+import { type ChainSource, type DepositEvent, type ExitEvents, RpcEventSource } from "./sources.ts";
 import {
   ACTIVE_STATES,
   type Evidence,
@@ -101,8 +101,8 @@ export async function downloadChain(
 export interface CrossCheck {
   // RPC covered the range and agreed with the indexer.
   readonly verified: boolean;
-  // The exit and deposit events RPC returned for the range and after it.
-  readonly exits: readonly ExitEvent[];
+  // The exit and deposit events RPC returned for the range and after it, if it held them.
+  readonly exits: ExitEvents | undefined;
   readonly deposits: readonly DepositEvent[];
 }
 
@@ -125,15 +125,16 @@ export async function crossCheck(
   try {
     events = await new RpcEventSource(rpc, vault, data.since, maxPages).events();
   } catch (err) {
-    if (err instanceof CyphrasError) return { verified: false, exits: [], deposits: [] };
+    if (err instanceof CyphrasError) return { verified: false, exits: undefined, deposits: [] };
     throw err;
   }
   if (data.completeTo > Math.max(events.head, data.horizon)) {
     fail("indexer_fault", "the indexer claims to be complete past the chain's latest ledger");
   }
   // RPC stopped short of the horizon, at its page cap or behind the indexer: nothing is proven.
+  const exits = { from: events.from, to: events.latest, events: events.exits };
   if (events.latest < data.horizon) {
-    return { verified: false, exits: events.exits, deposits: events.deposits };
+    return { verified: false, exits, deposits: events.deposits };
   }
   const differ = (): never =>
     fail("indexer_fault", "the indexer's leaves or nullifiers differ from the vault's events");
@@ -151,7 +152,7 @@ export async function crossCheck(
   const served = new Set(data.nullifiers.map(nfKey));
   const chainNfs = new Set(events.nullifiers.filter(within).map(nfKey));
   if (served.size !== chainNfs.size || [...served].some((k) => !chainNfs.has(k))) differ();
-  return { verified: true, exits: events.exits, deposits: events.deposits };
+  return { verified: true, exits, deposits: events.deposits };
 }
 
 // F-27: the local root must be one of the vault's last 256 roots, read from the ledger.

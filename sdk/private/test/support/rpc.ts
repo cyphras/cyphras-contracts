@@ -182,8 +182,9 @@ export class MockRpc {
       case "release":
         return xdr.ScVal.scvU32(v.release((args[0] as xdr.ScVal).u32()));
       case "claim":
-        v.claim(Number(scValToBigInt(args[0] as xdr.ScVal)));
-        return xdr.ScVal.scvVoid();
+        return xdr.ScVal.scvU64(
+          new xdr.Uint64(v.claim(Number(scValToBigInt(args[0] as xdr.ScVal)))),
+        );
       default:
         throw new Error(`unknown function ${fn}`);
     }

@@ -66,9 +66,11 @@ export interface DepositQueue {
   readonly resolved: readonly ResolvedDeposit[];
 }
 
-export type ExitState = "queued" | "paid_in_part" | "stranded" | "settled";
+// A requeued exit is a stranded one whose claims moved all it still owed back into the queue.
+export type ExitState = "queued" | "paid_in_part" | "stranded" | "requeued" | "settled";
 
-// One exit as the indexer serves it: payoutLeft and feeLeft are what the vault still owes.
+// One exit as the indexer serves it: payoutLeft and feeLeft are what the vault still owes under
+// its ID.
 export interface ExitEntry {
   readonly id: number;
   readonly state: ExitState;
@@ -78,12 +80,15 @@ export interface ExitEntry {
   readonly paidBy: number | undefined;
   readonly payoutLeft: bigint;
   readonly feeLeft: bigint;
-  // The transact that queued the exit.
+  // The transaction that queued the exit: a transact, or the claim that requeued it.
   readonly txHash: string;
+  // The stranded exit a claim queued this one from, and the exits claims queued from this one.
+  readonly requeuedFrom: number | undefined;
+  readonly requeuedTo: readonly number[];
 }
 
 // The vault's exit queue as the indexer serves it: every queued exit from the head in order,
-// every stranded one, and those paid in full lately.
+// every stranded one, and those paid in full or requeued lately.
 export interface ExitQueue {
   readonly head: number;
   readonly tail: number;
@@ -91,7 +96,13 @@ export interface ExitQueue {
   readonly completeTo: number;
 }
 
-const EXIT_STATES: readonly ExitState[] = ["queued", "paid_in_part", "stranded", "settled"];
+const EXIT_STATES: readonly ExitState[] = [
+  "queued",
+  "paid_in_part",
+  "stranded",
+  "requeued",
+  "settled",
+];
 
 export interface PoolStats {
   readonly leafCount: number;
@@ -243,6 +254,12 @@ export class IndexerClient {
       if (inQueue ? id !== head + (position as number) : id >= head) {
         e.fault("an exit lies on the wrong side of the queue's head");
       }
+      // A claim queues at the tail, after every exit it could come from.
+      const requeuedFrom = e.has("requeued_from") ? e.integer("requeued_from", 1) : undefined;
+      const requeuedTo = e.has("requeued_to") ? e.integers("requeued_to", 1) : [];
+      if ((requeuedFrom ?? 0) >= id || requeuedTo.some((to) => to <= id)) {
+        e.fault("an exit is requeued from a later exit");
+      }
       return {
         id,
         state,
@@ -251,6 +268,8 @@ export class IndexerClient {
         payoutLeft: e.amount("payout_left"),
         feeLeft: e.amount("fee_left"),
         txHash: e.hash("tx_hash"),
+        requeuedFrom,
+        requeuedTo,
       };
     });
     const positions = exits
