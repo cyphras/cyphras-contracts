@@ -386,6 +386,26 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 2);
   });
 
+  it("gives a forgotten held payment whose moment has passed a new one at random", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    world.relayer.restart();
+    world.advance(700);
+    await alice.sync();
+    const now = Number(world.vault.timestamp);
+    const again = world.relayer.submissions[1]?.notBefore as number;
+    // within the relayer's window, so that the deadline still covers it and the relayer's jitter
+    assert.ok(again > now && again <= now + 401, `not_before ${again - now} s ahead`);
+    assert.equal((await alice.plans())[0]?.relayerStatus, "held");
+    // With no time left for a hold before the deadline, the payment waits for its fate instead.
+    world.relayer.restart();
+    world.advance(600);
+    await alice.sync();
+    assert.equal(world.relayer.submissions.length, 2);
+  });
+
   it("stops following a held payment that was cancelled, and never sends it again", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);

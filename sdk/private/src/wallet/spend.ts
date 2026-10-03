@@ -1,6 +1,6 @@
 import { Address } from "@stellar/stellar-base";
 import { decodeAddress, encodeAddress } from "../address.ts";
-import { hexToBytes } from "../bytes.ts";
+import { hexToBytes, randomBytes } from "../bytes.ts";
 import { CyphrasError, fail } from "../errors.ts";
 import {
   type ExtData,
@@ -65,8 +65,13 @@ export const DEADLINE_LEDGERS = 120;
 const LEDGER_SECONDS = 5;
 const MAX_NOT_BEFORE_SECONDS = 24 * 3600;
 const FEE_RETRIES = 2;
-// The relayer runs a delayed request at a random moment in the 10 minutes after not_before.
+// The relayer runs a delayed request at a random moment in the 10 minutes after not_before, and
+// takes one only while its deadline lies this many ledgers past that window.
 const JITTER_LEDGERS = 120;
+const RELAYER_DEADLINE_MARGIN = 20;
+
+const randomBelow = (n: number): number =>
+  Math.floor((new DataView(randomBytes(4).buffer).getUint32(0) / 2 ** 32) * n);
 
 export interface SpendIntent {
   readonly kind: "send" | "unshield";
@@ -500,8 +505,15 @@ export async function followHeld(
   }
   if (latest >= plan.deadline) return;
   const now = Math.floor(core.now() / 1000);
-  const notBefore =
-    plan.notBefore !== undefined && plan.notBefore > now ? plan.notBefore : undefined;
+  let notBefore = plan.notBefore;
+  if (notBefore !== undefined && notBefore <= now) {
+    // A new moment, at random within the relayer's window, keeps the inclusion time from following
+    // this request as it kept it from following the first; the deadline must still cover it.
+    const room =
+      (plan.deadline - latest - JITTER_LEDGERS - RELAYER_DEADLINE_MARGIN) * LEDGER_SECONDS;
+    if (room <= 0) return;
+    notBefore = now + 1 + randomBelow(Math.min(room, JITTER_LEDGERS * LEDGER_SECONDS));
+  }
   const result = await client.submit(plan.proof, plan.ext, notBefore);
   if (result.accepted) {
     plan.txHash = result.hash;
