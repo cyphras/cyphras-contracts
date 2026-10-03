@@ -6,6 +6,21 @@ on:
   pull_request:
 
 jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+          components: rustfmt
+      - run: cargo fmt --check
+      - run: cargo build --target wasm32v1-none --release
+      - run: cargo test
+
   circuits:
     runs-on: ubuntu-latest
     defaults:

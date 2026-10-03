@@ -1,0 +1,16 @@
+[package]
+name = "poseidon2"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["hazmat-crypto"] }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["hazmat-crypto", "testutils"] }
+serde_json = "1"

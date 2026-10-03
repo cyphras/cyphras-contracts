@@ -1,0 +1,27 @@
+[package]
+name = "vault"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[features]
+# Builds the vault with the ceremony verifying key instead of the testnet-forgeable dev key.
+mainnet = ["verifier/mainnet"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+types = { path = "../types" }
+poseidon2 = { path = "../poseidon2" }
+verifier = { path = "../verifier" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+serde_json = "1"
+sha2 = "0.10"

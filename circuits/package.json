@@ -13,6 +13,7 @@
     "ptau": "node scripts/ptau.mjs",
     "setup:testnet-forgeable": "bash scripts/setup-testnet-forgeable.sh",
     "vectors": "node scripts/gen-vectors.mjs",
+    "fixtures:contracts": "node scripts/contract-fixtures.mjs",
     "test": "mocha \"test/**/*.test.mjs\"",
     "format": "prettier --write \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\"",
     "format:check": "prettier --check \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\""
@@ -21,7 +22,9 @@
     "circomlib": "2.0.5"
   },
   "devDependencies": {
+    "@noble/hashes": "^1.8.0",
     "@scure/base": "^2.0.0",
+    "@stellar/stellar-base": "^15.0.0",
     "circomlibjs": "0.1.7",
     "ffjavascript": "^0.3.0",
     "mocha": "^10.7.3",

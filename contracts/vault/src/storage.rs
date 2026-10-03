@@ -1,0 +1,272 @@
+use soroban_sdk::{
+    contracttype, Address, Bytes, Env, IntoVal, MuxedAddress, TryFromVal, Val, Vec, U256,
+};
+
+// Ledgers per day at the nominal five-second close time.
+const DAY_IN_LEDGERS: u32 = 17_280;
+
+// A write keeps the entry alive for at least this long, so live state survives a stalled keeper.
+// Extending only a little past the threshold keeps the rent a user transaction pays small.
+const TTL_THRESHOLD: u32 = 30 * DAY_IN_LEDGERS;
+const TTL_EXTEND_TO: u32 = TTL_THRESHOLD + DAY_IN_LEDGERS / 24;
+
+// A day total must outlive its UTC day, or the per-depositor cap would reset early. This many
+// ledgers last a day even at one ledger a second, five times the nominal rate.
+const DAY_TOTAL_TTL: u32 = 86_400;
+
+/// Every storage key of the vault. Clients read state with `getLedgerEntries` on these keys.
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Config,
+    Limits,
+    QueuedLimits,
+    Status,
+    Roots,
+    Frontier,
+    NextLeaf,
+    Nullifier(U256),
+    Pending(u64),
+    Exit(u64),
+    Stranded(u64),
+    DepositorDay(Address, u64),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub token: Address,
+    pub domain: U256,
+    pub guardian: Address,
+    pub asp: Address,
+    pub delay_small: u64,
+    pub delay_large: u64,
+}
+
+/// Amounts in the asset's smallest unit.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Limits {
+    pub min_deposit: i128,
+    pub max_deposit: i128,
+    pub max_daily_per_depositor: i128,
+    pub tvl_cap: i128,
+    pub max_daily_outflow: i128,
+    pub max_fee: i128,
+    pub large_deposit_threshold: i128,
+}
+
+/// A loosening of the limits that applies once `ready_at` has passed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedLimits {
+    pub limits: Limits,
+    pub ready_at: u64,
+}
+
+/// `tvl` is all value the vault holds for users: `pending_total` of it is in pending deposits,
+/// `queued_total` is owed to queued and stranded exits, and the rest belongs to unspent notes.
+/// `exit_head` is the ID of the oldest exit still queued and `exit_tail` the ID the next queued
+/// exit takes, so the queue is empty when they are equal. `outflow` is the total paid out on day
+/// `outflow_day`; a later day starts from zero.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Status {
+    pub deposits_paused: bool,
+    pub transfers_paused: bool,
+    pub halted_until: u64,
+    pub next_halt_at: u64,
+    pub next_deposit_id: u64,
+    pub attested_up_to: u64,
+    pub tvl: i128,
+    pub pending_total: i128,
+    pub queued_total: i128,
+    pub exit_head: u64,
+    pub exit_tail: u64,
+    pub outflow_day: u64,
+    pub outflow: i128,
+}
+
+impl Status {
+    pub fn halted(&self, now: u64) -> bool {
+        now < self.halted_until
+    }
+}
+
+/// A deposit waiting in the entry queue. `delay` is the wait its amount called for when it was
+/// made. `flag` is the reason code of the ASP's refusal and `flagged_at` the time the deposit was
+/// first flagged, 0 while it is not.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingDeposit {
+    pub depositor: Address,
+    pub amount: i128,
+    pub commitment0: U256,
+    pub commitment1: U256,
+    pub encrypted_output0: Bytes,
+    pub encrypted_output1: Bytes,
+    pub created_at: u64,
+    pub delay: u64,
+    pub flag: Option<u32>,
+    pub flagged_at: u64,
+}
+
+/// An exit owed by the vault: what is still owed to `recipient` and `relayer`, and the time
+/// `transact` or `claim` queued it. A queued exit holds what is left after any part payment; a
+/// stranded one holds the parts not yet moved back into the queue.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Exit {
+    pub recipient: MuxedAddress,
+    pub payout: i128,
+    pub relayer: Address,
+    pub fee: i128,
+    pub queued_at: u64,
+}
+
+/// The last 256 roots, one per inserted leaf pair. `newest` indexes the current root; slots not
+/// yet written hold 0, which is never accepted as a root.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RootRing {
+    pub roots: Vec<U256>,
+    pub newest: u32,
+}
+
+fn instance<V: TryFromVal<Env, Val>>(env: &Env, key: &DataKey) -> V {
+    env.storage().instance().get(key).unwrap()
+}
+
+fn set_instance<V: IntoVal<Env, Val>>(env: &Env, key: &DataKey, value: &V) {
+    let storage = env.storage().instance();
+    storage.set(key, value);
+    storage.extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+pub fn get<V: TryFromVal<Env, Val>>(env: &Env, key: &DataKey) -> Option<V> {
+    env.storage().persistent().get(key)
+}
+
+pub fn set<V: IntoVal<Env, Val>>(env: &Env, key: &DataKey, value: &V) {
+    let storage = env.storage().persistent();
+    storage.set(key, value);
+    storage.extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
+pub fn config(env: &Env) -> Config {
+    instance(env, &DataKey::Config)
+}
+
+pub fn set_config(env: &Env, config: &Config) {
+    set_instance(env, &DataKey::Config, config);
+}
+
+pub fn limits(env: &Env) -> Limits {
+    instance(env, &DataKey::Limits)
+}
+
+pub fn set_limits(env: &Env, limits: &Limits) {
+    set_instance(env, &DataKey::Limits, limits);
+}
+
+pub fn queued_limits(env: &Env) -> Option<QueuedLimits> {
+    env.storage().instance().get(&DataKey::QueuedLimits)
+}
+
+pub fn set_queued_limits(env: &Env, queued: &QueuedLimits) {
+    set_instance(env, &DataKey::QueuedLimits, queued);
+}
+
+pub fn remove_queued_limits(env: &Env) {
+    env.storage().instance().remove(&DataKey::QueuedLimits);
+}
+
+pub fn status(env: &Env) -> Status {
+    instance(env, &DataKey::Status)
+}
+
+pub fn set_status(env: &Env, status: &Status) {
+    set_instance(env, &DataKey::Status, status);
+}
+
+pub fn is_spent(env: &Env, nullifier: &U256) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::Nullifier(nullifier.clone()))
+}
+
+pub fn spend(env: &Env, nullifier: &U256) {
+    set(env, &DataKey::Nullifier(nullifier.clone()), &());
+}
+
+pub fn pending(env: &Env, id: u64) -> Option<PendingDeposit> {
+    get(env, &DataKey::Pending(id))
+}
+
+pub fn set_pending(env: &Env, id: u64, deposit: &PendingDeposit) {
+    set(env, &DataKey::Pending(id), deposit);
+}
+
+pub fn remove_pending(env: &Env, id: u64) {
+    env.storage().persistent().remove(&DataKey::Pending(id));
+}
+
+pub fn exit(env: &Env, id: u64) -> Option<Exit> {
+    get(env, &DataKey::Exit(id))
+}
+
+pub fn set_exit(env: &Env, id: u64, exit: &Exit) {
+    set(env, &DataKey::Exit(id), exit);
+}
+
+pub fn remove_exit(env: &Env, id: u64) {
+    env.storage().persistent().remove(&DataKey::Exit(id));
+}
+
+pub fn stranded(env: &Env, id: u64) -> Option<Exit> {
+    get(env, &DataKey::Stranded(id))
+}
+
+pub fn set_stranded(env: &Env, id: u64, exit: &Exit) {
+    set(env, &DataKey::Stranded(id), exit);
+}
+
+pub fn remove_stranded(env: &Env, id: u64) {
+    env.storage().persistent().remove(&DataKey::Stranded(id));
+}
+
+pub fn day_total(env: &Env, depositor: &Address, day: u64) -> i128 {
+    env.storage()
+        .temporary()
+        .get(&DataKey::DepositorDay(depositor.clone(), day))
+        .unwrap_or(0)
+}
+
+pub fn set_day_total(env: &Env, depositor: &Address, day: u64, total: i128) {
+    let key = DataKey::DepositorDay(depositor.clone(), day);
+    let storage = env.storage().temporary();
+    storage.set(&key, &total);
+    let ttl = DAY_TOTAL_TTL.min(env.storage().max_ttl());
+    storage.extend_ttl(&key, ttl, ttl);
+}
+
+/// Extends the instance and the tree entries to the network's maximum TTL, and every listed
+/// pending deposit and queued or stranded exit that still exists.
+pub fn bump(env: &Env, pending_ids: &Vec<u64>, exit_ids: &Vec<u64>) {
+    let max = env.storage().max_ttl();
+    env.storage().instance().extend_ttl(max, max);
+    let storage = env.storage().persistent();
+    for key in [DataKey::Roots, DataKey::Frontier, DataKey::NextLeaf] {
+        storage.extend_ttl(&key, max, max);
+    }
+    let listed = pending_ids.iter().map(DataKey::Pending).chain(
+        exit_ids
+            .iter()
+            .flat_map(|id| [DataKey::Exit(id), DataKey::Stranded(id)]),
+    );
+    for key in listed {
+        if storage.has(&key) {
+            storage.extend_ttl(&key, max, max);
+        }
+    }
+}
