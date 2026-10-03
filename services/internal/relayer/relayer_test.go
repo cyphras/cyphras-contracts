@@ -350,7 +350,7 @@ func TestSubmissionsAreCheckedBeforeAnySimulation(t *testing.T) {
 	if h.fake.CallCount("simulateTransaction") != 0 {
 		t.Fatal("a refused request was simulated")
 	}
-	h.simErr = "HostError: Error(Contract, #23)"
+	h.simErr = "HostError: Error(WasmVm, InvalidAction)"
 	if code, out := h.post(fixture(t, "transfer")); code != http.StatusUnprocessableEntity || out["error"] != CodeRejected || strings.Contains(out["error"].(string), "Host") {
 		t.Fatalf("failed simulation: %d %v", code, out)
 	}
@@ -439,6 +439,13 @@ func TestADelayedRequestIsHeldThenSent(t *testing.T) {
 	if code, out := h.post(fixture(t, "transfer")); code != http.StatusConflict {
 		t.Fatalf("its notes stay in flight: %d %v", code, out)
 	}
+	nf := body["proof"].(map[string]any)["input_nullifiers"].([]any)[0].(string)
+	if _, st := h.get("/v1/held/" + nf); st["status"] != "held" || st["hash"] != nil {
+		t.Fatalf("held status %v", st)
+	}
+	if code, _ := h.get("/v1/held/" + strings.Repeat("0", 63) + "1"); code != http.StatusNotFound {
+		t.Fatalf("an unknown nullifier answered %d", code)
+	}
 	h.now = h.now.Add(2 * time.Second)
 	for range 1000 {
 		h.mu.Lock()
@@ -446,6 +453,9 @@ func TestADelayedRequestIsHeldThenSent(t *testing.T) {
 		h.mu.Unlock()
 		if sent == 1 {
 			h.waitIdle()
+			if _, st := h.get("/v1/held/" + nf); st["status"] != "success" || st["hash"] == nil {
+				t.Fatalf("status once sent %v", st)
+			}
 			return
 		}
 		time.Sleep(5 * time.Millisecond)

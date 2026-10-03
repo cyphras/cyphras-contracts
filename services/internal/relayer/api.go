@@ -91,6 +91,33 @@ func (r *Relayer) Handler() http.Handler {
 		}
 		httpapi.JSON(w, http.StatusOK, s)
 	})
+	mux.HandleFunc("GET /v1/held/{nullifier}", func(w http.ResponseWriter, req *http.Request) {
+		if !statusLimit.Allow() {
+			httpapi.Fail(w, http.StatusTooManyRequests, CodeRateLimited)
+			return
+		}
+		nf, err := field(req.PathValue("nullifier"))
+		if err != nil {
+			httpapi.Fail(w, http.StatusBadRequest, CodeBadRequest)
+			return
+		}
+		s, hash, ok := r.HeldStatus(req.Context(), nf)
+		if !ok {
+			httpapi.Fail(w, http.StatusNotFound, "not_found")
+			return
+		}
+		body := map[string]any{"status": s.Status}
+		if hash != "" {
+			body["hash"] = hash
+		}
+		if s.Code != "" {
+			body["code"] = s.Code
+		}
+		if s.ExitID != nil {
+			body["exit_id"] = *s.ExitID
+		}
+		httpapi.JSON(w, http.StatusOK, body)
+	})
 	return httpapi.Public(mux)
 }
 

@@ -81,6 +81,10 @@ type Relayer struct {
 	statuses map[string]txStatus
 	order    []string
 	held     int
+	// heldBy follows each held request by its first input nullifier, which the client knows, since
+	// a held request has no transaction hash until it is sent.
+	heldBy    map[fr.Element]heldRequest
+	heldOrder []fr.Element
 
 	chainMu     sync.RWMutex
 	inst        *vault.Instance
@@ -113,7 +117,7 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		cfg: cfg, rpc: client, engine: engine, channels: newChannelPool(channels), costs: NewCosts(bootstrapCost, samples),
 		screen: screen, db: db, alerts: alerts, log: log, now: time.Now, ctx: ctx,
 		submitLimit: httpapi.NewLimiter(120, 20), simulateLimit: httpapi.NewLimiter(60, 10),
-		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{},
+		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[fr.Element]heldRequest{},
 	}, nil
 }
 
@@ -287,7 +291,8 @@ func (r *Relayer) screenDestination(ctx context.Context, e vault.ExtData) *failu
 }
 
 // Accepted is the answer to an accepted submission: the hash, or for a delayed request nothing,
-// because the transaction is built only when it is sent.
+// because the transaction is built only when it is sent; GET /v1/held/{nullifier} follows it by
+// its first input nullifier.
 type Accepted struct {
 	Hash string `json:"hash,omitempty"`
 	Held bool   `json:"held,omitempty"`
@@ -316,6 +321,47 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	return Accepted{Hash: hash}, nil
 }
 
+// heldRequest is a held request's progress: held until sent, then the hash of its transaction,
+// or the code it failed with before it was sent.
+type heldRequest struct {
+	hash string
+	code string
+}
+
+func (r *Relayer) setHeld(nf fr.Element, h heldRequest) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.heldBy[nf]; !ok {
+		r.heldOrder = append(r.heldOrder, nf)
+		if len(r.heldOrder) > maxStatuses {
+			delete(r.heldBy, r.heldOrder[0])
+			r.heldOrder = r.heldOrder[1:]
+		}
+	}
+	r.heldBy[nf] = h
+}
+
+// HeldStatus reports a held request by its first input nullifier: held, or once sent, the status
+// of its transaction with the hash.
+func (r *Relayer) HeldStatus(ctx context.Context, nf fr.Element) (txStatus, string, bool) {
+	r.mu.Lock()
+	h, ok := r.heldBy[nf]
+	r.mu.Unlock()
+	switch {
+	case !ok:
+		return txStatus{}, "", false
+	case h.code != "":
+		return txStatus{Status: "failed", Code: h.code}, "", true
+	case h.hash == "":
+		return txStatus{Status: "held"}, "", true
+	}
+	s, found := r.Status(ctx, h.hash)
+	if !found {
+		s = txStatus{Status: "pending"}
+	}
+	return s, h.hash, true
+}
+
 func (r *Relayer) hold(req Request) (Accepted, *failure) {
 	r.mu.Lock()
 	if r.held >= r.cfg.MaxHeld {
@@ -325,6 +371,8 @@ func (r *Relayer) hold(req Request) (Accepted, *failure) {
 	}
 	r.held++
 	r.mu.Unlock()
+	nf := req.Proof.Nullifiers[0]
+	r.setHeld(nf, heldRequest{})
 	// A random moment in the window keeps the inclusion time from following the request time.
 	at := time.Unix(*req.NotBefore, 0)
 	if r.cfg.Jitter > 0 {
@@ -342,13 +390,18 @@ func (r *Relayer) hold(req Request) (Accepted, *failure) {
 		}
 		if f := r.screenDestination(r.ctx, req.Ext); f != nil {
 			r.unclaim(req.Proof.Nullifiers)
+			r.setHeld(nf, heldRequest{code: f.code})
 			r.log.Info("held request dropped at screening", "code", f.code)
 			return
 		}
-		if _, f := r.send(r.ctx, req); f != nil {
+		hash, f := r.send(r.ctx, req)
+		if f != nil {
 			r.unclaim(req.Proof.Nullifiers)
+			r.setHeld(nf, heldRequest{code: f.code})
 			r.log.Info("held request not sent", "code", f.code)
+			return
 		}
+		r.setHeld(nf, heldRequest{hash: hash})
 	})
 	return Accepted{Held: true}, nil
 }
