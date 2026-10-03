@@ -4,7 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -153,5 +158,165 @@ func TestARepeatWithinTheCooldownIsStillLogged(t *testing.T) {
 	a.Raise(context.Background(), Warning, "balance_low", "holds %d", 4)
 	if !strings.Contains(logs.String(), "alert repeated") || !strings.Contains(logs.String(), "holds 4") {
 		t.Fatalf("logs %q", logs.String())
+	}
+}
+
+func outboxStore(t *testing.T) *Store {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, testdb.URL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	store := &Store{Pool: pool}
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func TestADeadChannelNeverHoldsUpALiveOne(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_728_000_000, 0)
+	live, dead := &flaky{}, &flaky{fails: 1 << 30}
+	q := &Queue{Name: "operator", Channels: []Channel{live, dead}, Store: outboxStore(t), Now: func() time.Time { return now }}
+	for i := range 1300 {
+		q.Put(Alert{Code: fmt.Sprintf("exit_stranded_%d", i), Severity: Warning, Time: now})
+	}
+	for range 20 {
+		q.Flush(ctx)
+	}
+	if live.count() != 1300 {
+		t.Fatalf("the live channel got %d of 1300", live.count())
+	}
+	// The dead channel's backlog comes due again, and a Critical arrives.
+	now = now.Add(11 * time.Minute)
+	q.Put(Alert{Code: "balance_below_tvl", Severity: Critical, Time: now})
+	q.Flush(ctx)
+	if live.count() != 1301 || live.sent[1300].Code != "balance_below_tvl" {
+		t.Fatalf("the Critical waited behind a dead channel: %d sent", live.count())
+	}
+	// The dead lane tried a few copies and rests, rather than trying all of them each pass.
+	if dead.count() != 0 || !q.Stalled(now, 10*time.Minute) {
+		t.Fatal("a channel refusing everything for 11 minutes is not stalled")
+	}
+}
+
+// limited takes at most perMinute sends per minute of the fake clock and answers the rest with a
+// plain error, as a webhook behind a rate limit without Retry-After does.
+type limited struct {
+	mu        sync.Mutex
+	now       *time.Time
+	perMinute int
+	window    time.Time
+	used      int
+	sent      []Alert
+}
+
+func (l *limited) Send(_ context.Context, a Alert) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.now.Sub(l.window) >= time.Minute {
+		l.window, l.used = *l.now, 0
+	}
+	if l.used >= l.perMinute {
+		return errors.New("alert: telegram webhook answered 429")
+	}
+	l.used++
+	l.sent = append(l.sent, a)
+	return nil
+}
+
+func TestACriticalGoesFirstAndInfoIsDigested(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_728_000_000, 0)
+	ch := &limited{now: &now, perMinute: 20}
+	q := &Queue{Name: "operator", Channels: []Channel{ch}, Store: outboxStore(t), Now: func() time.Time { return now }}
+	// A burst of Info alerts, such as flags an attacker provokes.
+	for i := range 200 {
+		q.Put(Alert{Code: fmt.Sprintf("deposit_flagged_%d", i), Severity: Info, Time: now})
+	}
+	q.Flush(ctx)
+	now = now.Add(time.Second)
+	q.Put(Alert{Code: "balance_below_tvl", Severity: Critical, Time: now})
+	q.Flush(ctx)
+	ch.mu.Lock()
+	sent := slices.Clone(ch.sent)
+	ch.mu.Unlock()
+	if len(sent) != 2 || sent[0].Code != "digest" || !strings.Contains(sent[0].Message, "100 notices") || sent[1].Severity != Critical {
+		t.Fatalf("sent %+v", sent)
+	}
+	// The rest of the burst goes out as the next digest, not before it is due.
+	q.Flush(ctx)
+	now = now.Add(5 * time.Minute)
+	q.Flush(ctx)
+	if len(ch.sent) != 3 || !strings.Contains(ch.sent[2].Message, "100 notices") {
+		t.Fatalf("sent %d", len(ch.sent))
+	}
+	if n, _ := q.Waiting(ctx); n != 0 {
+		t.Fatalf("%d copies wait", n)
+	}
+}
+
+func TestARateLimitedChannelRestsAsLongAsItAsks(t *testing.T) {
+	ctx := context.Background()
+	var mu sync.Mutex
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		requests++
+		if requests == 1 {
+			w.Header().Set("Retry-After", "120")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}
+	}))
+	defer srv.Close()
+	now := time.Unix(1_728_000_000, 0)
+	q := &Queue{Name: "operator", Channels: []Channel{Webhook{Format: "json", URL: srv.URL, HTTP: srv.Client()}}, Now: func() time.Time { return now }}
+	q.Put(Alert{Code: "invariant", Severity: Critical, Time: now})
+	if wait := q.flushLane(ctx, 0); wait != 120*time.Second {
+		t.Fatalf("rests %v", wait)
+	}
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return requests
+	}
+	now = now.Add(time.Minute)
+	q.Flush(ctx)
+	if count() != 1 {
+		t.Fatalf("%d requests while resting", count())
+	}
+	now = now.Add(61 * time.Second)
+	q.Flush(ctx)
+	if n, _ := q.Waiting(ctx); count() != 2 || n != 0 {
+		t.Fatalf("%d requests, %d waiting", count(), n)
+	}
+}
+
+func TestA429SaysHowLongToWait(t *testing.T) {
+	answer := func(header, body string) *http.Response {
+		r := &http.Response{StatusCode: http.StatusTooManyRequests, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
+		if header != "" {
+			r.Header.Set("Retry-After", header)
+		}
+		return r
+	}
+	for name, c := range map[string]struct {
+		resp *http.Response
+		want time.Duration
+	}{
+		"seconds":  {answer("7", ""), 7 * time.Second},
+		"discord":  {answer("", `{"retry_after": 2.5}`), 2500 * time.Millisecond},
+		"telegram": {answer("", `{"ok": false, "parameters": {"retry_after": 9}}`), 9 * time.Second},
+		"nothing":  {answer("", "busy"), 30 * time.Second},
+		"too long": {answer("86400", ""), time.Hour},
+		"zero":     {answer("0", ""), time.Second},
+	} {
+		if got := retryAfter(c.resp); got != c.want {
+			t.Fatalf("%s: %v, want %v", name, got, c.want)
+		}
 	}
 }
