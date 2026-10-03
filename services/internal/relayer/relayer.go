@@ -436,14 +436,6 @@ func (f *failure) Error() string { return f.code }
 
 func fail(status int, code string) *failure { return &failure{status: status, code: code} }
 
-// belowNewAccount reports a payout of the native asset to an account below what creates one.
-// Such a payout fails on chain when its destination merges away in the same ledger, at the
-// relayer's cost; from there up the vault creates the account again instead.
-func (r *Relayer) belowNewAccount(e vault.ExtData) bool {
-	return r.cfg.Asset == "native" && e.ExtAmount.Sign() < 0 && (e.Recipient[0] == 'G' || e.Recipient[0] == 'M') &&
-		new(big.Int).Neg(e.ExtAmount).Cmp(big.NewInt(vault.MinNewAccountPayout)) < 0
-}
-
 // check compares a parsed request with the relayer and the vault.
 func (r *Relayer) check(req Request) *failure {
 	e := req.Ext
@@ -459,9 +451,6 @@ func (r *Relayer) check(req Request) *failure {
 	inst, latest, _ := r.view()
 	if inst == nil {
 		return fail(http.StatusServiceUnavailable, CodeUnavailable)
-	}
-	if r.belowNewAccount(e) {
-		return fail(http.StatusUnprocessableEntity, CodeRejected)
 	}
 	if e.Fee.Cmp(inst.Limits.MaxFee) > 0 {
 		return fail(http.StatusBadRequest, CodeFeeAboveCap)

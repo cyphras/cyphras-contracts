@@ -2,10 +2,8 @@ package relayer
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
-	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,7 +18,6 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
-	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 )
 
 // fixtureDeadline is the ExtData deadline every fixture proof is bound to.
@@ -261,36 +258,6 @@ func TestRepeatedFailuresPauseRelayingAndRaiseTheFee(t *testing.T) {
 	}
 	h.setTxStatus(success(900_000))
 	h.waitIdle()
-}
-
-func TestANativePayoutBelowOneXLMIsNotRelayedToAnAccount(t *testing.T) {
-	h := newHarness(t, vault.Status{})
-	body := fixture(t, "unshield_muxed")
-	body["ext"].(map[string]any)["ext_amount"] = "-9999999"
-	var sb SubmitBody
-	raw, _ := json.Marshal(body)
-	if err := json.Unmarshal(raw, &sb); err != nil {
-		t.Fatal(err)
-	}
-	req, err := sb.Parse()
-	if err != nil {
-		t.Fatal(err)
-	}
-	f := h.r.check(req)
-	if f == nil || f.code != CodeRejected {
-		t.Fatalf("a payout below 1 XLM: %v", f)
-	}
-	// The same request a stroop above passes this check and fails only where its proof no longer
-	// matches its ExtData, which comes later.
-	req.Ext.ExtAmount = big.NewInt(-vault.MinNewAccountPayout)
-	if f := h.r.belowNewAccount(req.Ext); f {
-		t.Fatal("1 XLM counted as too small")
-	}
-	req.Ext.Recipient = vaulttest.Vault
-	req.Ext.ExtAmount = big.NewInt(-1)
-	if h.r.belowNewAccount(req.Ext) {
-		t.Fatal("a contract destination counted")
-	}
 }
 
 func TestCostlyStepsAreBudgetedOnlyAfterTheFreeChecks(t *testing.T) {
