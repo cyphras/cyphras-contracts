@@ -1818,6 +1818,22 @@ describe("exits that other exits race in the same ledger", () => {
     assert.equal(world.relayer.submissions.length, 3);
   });
 
+  it("sends a relayed payment no further when its relayer reports any other failure", async () => {
+    const { world, alice } = await funded();
+    world.relayer.failNext = 1;
+    await alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    await alice.sync();
+    await alice.sync();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    assert.equal(world.relayer.submissions.length, 1);
+  });
+
   it("gives a transact that pays only a fee its room, and one that pays nothing none, from the tail it queued at", async () => {
     const vault = StrKey.encodeContract(Buffer.alloc(32, 9));
     const token = StrKey.encodeContract(Buffer.alloc(32, 7));
