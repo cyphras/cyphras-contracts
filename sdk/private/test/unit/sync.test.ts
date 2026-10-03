@@ -217,6 +217,19 @@ describe("plan fate", () => {
     assert.equal(plan.txHash, "aa".repeat(32));
   });
 
+  it("takes the transaction that added both of a plan's commitments over one that copied one", () => {
+    const { state, plan } = walletWith(44);
+    // The recipient of the first output knows its opening, and so can add its commitment again.
+    plan.evidence = [
+      evidence({ txHash: "aa".repeat(32), ledger: 205, outputs: [40, undefined] }),
+      evidence({ txHash: "bb".repeat(32), ledger: 206, outputs: [42, 43] }),
+    ];
+    advancePlans(state, [viewAt(250, 44)]);
+    assert.equal(plan.state, "confirmed");
+    assert.equal(plan.txHash, "bb".repeat(32));
+    assert.equal(plan.ledger, 206);
+  });
+
   it("takes where a plan landed from leaves only, never from the vault's events", () => {
     const { state, plan } = walletWith(40);
     const tx = "cc".repeat(32);
