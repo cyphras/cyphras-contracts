@@ -17,6 +17,7 @@ import {
   parseTime,
   quiet,
   readZkey,
+  refuseExisting,
   run,
   sameContributor,
   show,
@@ -40,13 +41,16 @@ Usage:
   node coordinator.mjs init [--r1cs <file>] [--ptau <file>]
       Check the frozen r1cs and the Hermez ptau, run snarkjs powersoftau verify (about 20
       minutes), create transaction_0000.zkey with snarkjs groth16 setup and verify it.
-  node coordinator.mjs receive <zkey> "<name>" <contribution hash>
+  node coordinator.mjs receive <zkey> "<name>" <contribution hash> [--resolve "<name>"]
       Run it only after checking that the signed attestation was posted from the
-      contributor's own account and states this name and contribution hash. It refuses a
-      hash already in the chain or attested under another name, and a contributor already in
-      the chain. It then accepts the zkey only if it extends the last accepted one by exactly
-      one contribution with this name and hash and snarkjs zkey verify passes, and files it as
-      the next transaction_NNNN.zkey. Every call is logged in the record.
+      contributor's own account and states this name and contribution hash. It accepts the
+      zkey only if it extends the last accepted one by exactly one contribution with this
+      name and hash and snarkjs zkey verify passes, and files it as the next
+      transaction_NNNN.zkey. A contributor already in the chain is refused. A hash already in
+      the chain under another name is refused, naming both claimants: check both signed
+      attestations in the thread, then run receive again with --resolve and the rightful
+      name. If that is the new claimant, its file replaces the last accepted zkey, which is
+      kept as <file>.superseded. Every call is logged in the record.
   node coordinator.mjs round <time>
       Print the first drand quicknet round produced at or after <time> (ISO 8601 with a zone,
       such as 2026-10-20T12:00:00Z) and the text to announce, at least 24 hours before the
@@ -72,7 +76,12 @@ run(USAGE, async (argv) => {
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
-    options: { dir: { type: "string" }, r1cs: { type: "string" }, ptau: { type: "string" } },
+    options: {
+      dir: { type: "string" },
+      r1cs: { type: "string" },
+      ptau: { type: "string" },
+      resolve: { type: "string" },
+    },
   });
   const [command, ...args] = positionals;
   if (!Object.hasOwn(ARITY, command) || args.length !== ARITY[command]) {
@@ -80,6 +89,9 @@ run(USAGE, async (argv) => {
   }
   if (command !== "init" && (values.r1cs || values.ptau)) {
     throw new Error("only init takes --r1cs and --ptau");
+  }
+  if (command !== "receive" && values.resolve !== undefined) {
+    throw new Error("only receive takes --resolve");
   }
   const dir = resolve(values.dir ?? join(CIRCUITS, "build", "ceremony-v2"));
   if (command === "init") {
@@ -89,7 +101,7 @@ run(USAGE, async (argv) => {
       resolve(values.ptau ?? join(CIRCUITS, "build", "ptau", PTAU_NAME)),
     );
   } else if (command === "receive") {
-    await receive(dir, ...args);
+    await receive(dir, ...args, values.resolve);
   } else if (command === "round") {
     roundAt(args[0]);
   } else if (command === "announce") {
@@ -115,13 +127,12 @@ function save(dir, state) {
 
 // The recorded inputs are read and re-hashed before every step, so nothing an earlier step
 // verified can change unseen.
-function inputs(dir, state) {
+function inputs(dir, state, last = state.zkeys.at(-1)) {
   const read = (path, sha256) => {
     const data = readFileSync(path);
     expectHash(data, "sha256", sha256, `${path} changed since it was recorded`);
     return data;
   };
-  const last = state.zkeys.at(-1);
   return {
     r1cs: read(state.r1cs.path, state.r1cs.sha256),
     ptau: read(state.ptau.path, state.ptau.sha256),
@@ -175,38 +186,60 @@ async function init(dir, r1csPath, ptauPath) {
   state.circuitHash = Buffer.from(csHash).toString("hex");
   state.zkeys = [{ file, sha256: digest(zkey), at: new Date().toISOString() }];
   state.attestations = [];
+  state.superseded = [];
   state.announcements = [];
   save(dir, state);
   report(dir, state);
 }
 
-// A name is not covered by the contribution hash, so anyone holding a contributor's file could
-// rename the contribution and claim it. Once a file has shown a hash under one name, that hash
-// is refused under any other, and one person cannot contribute twice.
-function checkAttestation(state, name, hash) {
+// A name is not covered by the contribution hash, so anyone holding a contributor's file can
+// rename the contribution and claim it. Only files that fully verify enter the chain, and a hash
+// in the chain that a second name claims waits for the coordinator to decide, from the two signed
+// attestations in the thread, whose it is. Returns the chain position the file would fill.
+function slotFor(state, name, hash, rightful) {
+  const next = state.zkeys.length;
+  const held = state.zkeys.findIndex((z) => z.contributionHash === hash);
+  const holder = state.zkeys[held]?.contributor;
+  let slot = next;
+  if (held === -1) {
+    if (rightful !== undefined) throw new Error(`no one else claims contribution hash ${hash}`);
+  } else if (holder === name) {
+    throw new Error(`contribution hash ${hash} is already in the chain as #${held}`);
+  } else if (rightful === undefined) {
+    throw new Error(
+      `contribution hash ${hash} is #${held} in the chain, filed for ${show(holder)}, and ` +
+        `${show(name)} claims it too; check both signed attestations in the thread, then run ` +
+        "receive again with --resolve and the rightful name",
+    );
+  } else if (rightful === holder) {
+    throw new Error(`resolved for ${show(holder)}, who keeps #${held}; ${show(name)} is refused`);
+  } else if (rightful !== name) {
+    throw new Error(`--resolve must name ${show(holder)} or ${show(name)}`);
+  } else if (held !== next - 1) {
+    throw new Error(
+      `#${held} already has contributions built on it; the chain must restart from ` +
+        `${state.zkeys[held - 1].file}`,
+    );
+  } else {
+    slot = held;
+  }
   state.zkeys.forEach((z, i) => {
-    if (z.contributionHash === hash) {
-      throw new Error(`contribution hash ${hash} is already in the chain as #${i}`);
-    }
-    if (i > 0 && sameContributor(z.contributor, name)) {
+    if (i > 0 && i !== slot && sameContributor(z.contributor, name)) {
       throw new Error(`${show(name)} is the contributor of #${i}, ${show(z.contributor)}`);
     }
   });
-  const earlier = state.attestations.find((a) => a.matched && a.hash === hash && a.name !== name);
-  if (earlier) {
-    throw new Error(`contribution hash ${hash} was already shown under ${show(earlier.name)}`);
-  }
+  return slot;
 }
 
-async function receive(dir, incoming, name, attested) {
+async function receive(dir, incoming, name, attested, rightful) {
   checkName(name);
   const claimed = parseHex(attested, 64, "the attested contribution hash");
   const state = load(dir);
   if (state.final) throw new Error("the ceremony is finalized");
   const entry = { at: new Date().toISOString(), name, hash: claimed, file: basename(incoming) };
   try {
-    checkAttestation(state, name, claimed);
-    const { r1cs, ptau, last, lastFile } = inputs(dir, state);
+    const slot = slotFor(state, name, claimed, rightful);
+    const { r1cs, ptau, last, lastFile } = inputs(dir, state, state.zkeys[slot - 1]);
     const data = readFileSync(incoming);
     const c = newContribution(readZkey(last, lastFile), readZkey(data, incoming));
     if (c.type !== 0) throw new Error("the new contribution is a beacon");
@@ -216,20 +249,30 @@ async function receive(dir, incoming, name, attested) {
     if (c.hash !== claimed) {
       throw new Error(`the contribution hash is ${c.hash}, not the attested ${claimed}`);
     }
-    entry.matched = true;
     console.log(`${basename(incoming)} extends ${lastFile} by one contribution,`);
     console.log(`named ${show(name)}, with the attested hash ${c.hash}.`);
     await zkeyVerify(r1cs, ptau, data, basename(incoming));
-    const file = zkeyFile(state.zkeys.length);
-    writeNew(join(dir, file), data);
-    state.zkeys.push({
-      file,
-      contributor: name,
-      contributionHash: c.hash,
-      sha256: digest(data),
-      at: new Date().toISOString(),
-    });
-    entry.result = `accepted as #${state.zkeys.length - 1}`;
+    const file = zkeyFile(slot);
+    const now = new Date().toISOString();
+    entry.result = `accepted as #${slot}`;
+    if (slot < state.zkeys.length) {
+      const old = state.zkeys[slot];
+      const kept = `${file}.superseded`;
+      refuseExisting(join(dir, kept));
+      renameSync(join(dir, file), join(dir, kept));
+      try {
+        writeNew(join(dir, file), data);
+      } catch (e) {
+        renameSync(join(dir, kept), join(dir, file));
+        throw e;
+      }
+      state.superseded.push({ ...old, file: kept, supersededAt: now, supersededBy: name });
+      entry.result += `, superseding ${show(old.contributor)}`;
+    } else {
+      writeNew(join(dir, file), data);
+    }
+    const sha256 = digest(data);
+    state.zkeys[slot] = { file, contributor: name, contributionHash: c.hash, sha256, at: now };
   } catch (e) {
     entry.result = `refused: ${e.message}`;
     throw e;
@@ -361,9 +404,9 @@ async function beacon(dir, roundArg) {
 
 // The record to copy into the transcript. Every file hash is recomputed, not read back.
 function report(dir, state) {
-  const files = [...state.zkeys, state.final, state.verificationKey].filter(Boolean);
+  const files = [...state.zkeys, ...state.superseded, state.final, state.verificationKey];
   const paths = [
-    ...files.map((f) => [join(dir, f.file), f.sha256]),
+    ...files.filter(Boolean).map((f) => [join(dir, f.file), f.sha256]),
     [state.r1cs.path, state.r1cs.sha256],
     [state.ptau.path, state.ptau.sha256],
   ];
@@ -381,6 +424,12 @@ function report(dir, state) {
     if (i > 0) out.push(`  contribution hash ${z.contributionHash}`);
     out.push(`  sha256 ${z.sha256}`, `  ${i === 0 ? "created" : "accepted"} at ${z.at}`);
   });
+  if (state.superseded.length > 0) out.push("", "Superseded by --resolve:");
+  for (const z of state.superseded) {
+    out.push(`  ${z.file}, ${show(z.contributor)}, accepted at ${z.at}`);
+    out.push(`    contribution hash ${z.contributionHash}`, `    sha256 ${z.sha256}`);
+    out.push(`    superseded at ${z.supersededAt} by ${show(z.supersededBy)}`);
+  }
   if (state.attestations.length > 0) out.push("", "Attestations given to receive:");
   for (const a of state.attestations) {
     out.push(`  ${a.at} ${show(a.name)}, ${a.file}`, `    hash ${a.hash}`, `    ${a.result}`);

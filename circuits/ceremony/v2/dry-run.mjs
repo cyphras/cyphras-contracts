@@ -291,6 +291,12 @@ async function dryRun(root, r1cs, ptau) {
     coord(coordinator, "receive", out1, "Someone Else", h1),
     "is named",
   );
+  refuse(
+    "receive: --resolve without a conflict",
+    KIT,
+    [...coord(coordinator, "receive", out1, name1, h1), "--resolve", name1],
+    "no one else claims contribution hash",
+  );
   pass("coordinator receive #1", KIT, coord(coordinator, "receive", out1, name1, h1));
 
   const out2 = join(two, "transaction_0002.zkey");
@@ -366,28 +372,65 @@ async function dryRun(root, r1cs, ptau) {
   args3.splice(2, 0, out3, name3);
   const h3 = attested(pass("contributor 3: verify the input, contribute", three, args3));
   const data3 = readFileSync(out3);
-  const corrupt = tamper(out3, join(three, "corrupt.zkey"), flip(sectionOffset(data3, 9) + 1000));
   const thief = "Thieves 3 (github: thieves-3)";
   const stolen = tamper(out3, join(mallory, "stolen.zkey"), rename(2, thief));
+  const broken = tamper(stolen, join(mallory, "broken.zkey"), flip(sectionOffset(data3, 9) + 1000));
+  // A copy of the ceremony in which the thief's copy of #3 arrives before its owner's file.
+  const theft = join(root, "coordinator-theft");
+  cpSync(coordinator, theft, { recursive: true });
   refuse(
-    "receive: #3 with a corrupted H section",
+    "receive: a thief's corrupted copy of #3 before its owner's file",
     KIT,
-    coord(coordinator, "receive", corrupt, name3, h3),
+    coord(coordinator, "receive", broken, thief, h3),
     "snarkjs zkey verify rejects",
   );
-  refuse(
-    "receive: #3 renamed by a thief after its owner's file arrived",
-    KIT,
-    coord(coordinator, "receive", stolen, thief, h3),
-    `was already shown under "${name3}"`,
-  );
-  pass("coordinator receive #3", KIT, coord(coordinator, "receive", out3, name3, h3));
+  pass("coordinator receive #3 after the thief's corrupted copy", KIT, [
+    ...coord(coordinator, "receive", out3, name3, h3),
+  ]);
+  const conflict = (holder, claimant) =>
+    `is #3 in the chain, filed for "${holder}", and "${claimant}" claims it too`;
   refuse(
     "receive: the thief's copy after #3 is accepted",
     KIT,
     coord(coordinator, "receive", stolen, thief, h3),
+    conflict(name3, thief),
+  );
+  refuse(
+    "receive: the thief's copy, resolved for the holder of #3",
+    KIT,
+    [...coord(coordinator, "receive", stolen, thief, h3), "--resolve", name3],
+    `resolved for "${name3}", who keeps #3`,
+  );
+  refuse(
+    "receive: --resolve naming neither claimant",
+    KIT,
+    [...coord(coordinator, "receive", stolen, thief, h3), "--resolve", "Someone Else"],
+    "--resolve must name",
+  );
+  refuse(
+    "receive: #3 again",
+    KIT,
+    coord(coordinator, "receive", out3, name3, h3),
     "is already in the chain as #3",
   );
+  pass("theft copy: the thief's copy of #3 arrives first", KIT, [
+    ...coord(theft, "receive", stolen, thief, h3),
+  ]);
+  refuse(
+    "theft copy: the owner's file while the thief holds #3",
+    KIT,
+    coord(theft, "receive", out3, name3, h3),
+    conflict(thief, name3),
+  );
+  pass("theft copy: --resolve gives #3 to its owner", KIT, [
+    ...coord(theft, "receive", out3, name3, h3),
+    "--resolve",
+    name3,
+  ]);
+  const resolved = record(theft);
+  if (resolved.zkeys[3].contributor !== name3 || resolved.superseded[0].contributor !== thief) {
+    throw new Error("--resolve did not give #3 to its owner and keep the thief's file aside");
+  }
 
   // A real ceremony announces the round at least a day ahead; here drand produces it in seconds.
   const lastAccepted = new Date(record(coordinator).zkeys.at(-1).at);
