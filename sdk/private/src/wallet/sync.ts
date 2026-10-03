@@ -155,7 +155,7 @@ export async function crossCheck(
   return { verified: true, exits, deposits: events.deposits };
 }
 
-// F-27: the local root must be one of the vault's last 256 roots, read from the ledger.
+// The local root must be one of the vault's last 256 roots, read from the ledger.
 export function checkRoot(tree: CommitmentTree, history: RootHistory): RootCheck {
   const root = tree.root();
   const known = history.roots.filter((r) => r !== 0n);

@@ -10,7 +10,7 @@ import { type VaultInstance, VaultReader } from "../vault/state.ts";
 
 export type ServiceState = "ok" | "mismatch" | "unavailable";
 
-/** What the open-time checks of the pinned deployment found (sdk.md, Pinned configuration). */
+/** What the open-time checks of the pinned deployment found. */
 export interface Verification {
   readonly state: "verified" | "mismatch" | "unverified";
   readonly rpc: ServiceState;

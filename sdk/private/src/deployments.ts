@@ -12,7 +12,7 @@ export interface RelayerEndpoint {
 
 /**
  * Everything an SDK release pins for one vault, taken from deployments/<network>.json by the
- * release script (sdk.md, Pinned configuration).
+ * release script.
  */
 export interface Deployment {
   readonly id: string;

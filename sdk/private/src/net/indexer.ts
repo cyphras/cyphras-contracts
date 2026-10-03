@@ -4,7 +4,7 @@ import { isAccountId, isContractId } from "../extdata.ts";
 import { PAGE_SIZE } from "../merkle.ts";
 import { type FetchLike, Fields, joinUrl, requestJson } from "./http.ts";
 
-// The indexer API of services.md, with the field names the services serve: binary values are
+// The indexer's API, with the field names the services serve: binary values are
 // lowercase hex, field elements may carry a 0x prefix, amounts are decimal strings and absent
 // values are null.
 

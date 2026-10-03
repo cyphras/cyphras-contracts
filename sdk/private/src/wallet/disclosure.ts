@@ -13,7 +13,7 @@ import { decodeVaultEvent } from "../vault/events.ts";
 import type { WalletState } from "./state.ts";
 
 /**
- * A payment disclosure (encryption.md): it proves one note to a third party without a viewing
+ * A payment disclosure: it proves one note to a third party without a viewing
  * key. `esk` is present when the discloser built the output, which only its sender could have.
  */
 export interface PaymentDisclosure {

@@ -66,7 +66,7 @@ describe("signature seed vectors", () => {
     assert.deepEqual(VECTORS, JSON.parse(JSON.stringify(sigSeedVectors())));
   });
 
-  it("pins the message of sdk.md", () => {
+  it("pins the message the signature key source signs", () => {
     assert.equal(VECTORS.message, SIGNATURE_MESSAGE);
     assert.equal(utf8(SIGNATURE_MESSAGE).length, 186);
     assert.equal(

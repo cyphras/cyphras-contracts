@@ -42,7 +42,7 @@ const MESSAGES: Readonly<Record<WarningCode, string>> = {
 
 export const warning = (code: WarningCode): Warning => ({ code, message: MESSAGES[code] });
 
-// sdk.md leaves these thresholds open; these are the SDK's defaults.
+// The SDK's defaults for when an unshield warns.
 const NUDGE_THRESHOLDS = {
   recentShieldMs: 24 * 3_600_000,
   matchingWindowMs: 30 * 24 * 3_600_000,
@@ -71,7 +71,8 @@ const baseAccount = (address: string): string =>
     ? MuxedAccount.fromAddress(address, "0").baseAccount().accountId()
     : address;
 
-// The unshield nudges of sdk.md (F-26, F-28).
+// The warnings an unshield shows for review: what could link it to the wallet or its deposits,
+// a small anonymity set, and a payout that will wait in the exit queue.
 export function unshieldWarnings(c: UnshieldContext): Warning[] {
   const codes: WarningCode[] = [];
   const shields = c.deposits.filter((d) => d.state !== "failed");

@@ -3,7 +3,7 @@ import { type ExtDataJson, type TxProofJson, isAccountId, isContractId } from ".
 import { type FetchLike, Fields, joinUrl, requestJson } from "./http.ts";
 import { type ServiceIdentity, readIdentity } from "./indexer.ts";
 
-// The relayer API of services.md, read with the same JSON conventions as the indexer's.
+// The relayer's API, read with the same JSON conventions as the indexer's.
 
 export interface RelayerHealth extends ServiceIdentity {
   readonly feeAddress: string;

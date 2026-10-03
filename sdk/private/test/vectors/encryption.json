@@ -1,5 +1,5 @@
 {
-  "description": "Output ciphertext vectors for encryption.md, with every intermediate value.",
+  "description": "Output ciphertext vectors of the note encryption, with every intermediate value.",
   "format": "Field elements and scalars are 0x-prefixed 32-byte big-endian hex. Byte strings are unprefixed hex. Points are packed with packPoint.",
   "derivation": "rcm_i = SHA-512(\"cyphras/v2/vectors/enc-rcm/\" || i) mod p and esk_i = SHA-512(\"cyphras/v2/vectors/esk/\" || i) mod (L - 1) + 1, for these vectors only",
   "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",

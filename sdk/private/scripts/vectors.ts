@@ -74,7 +74,7 @@ export function encryptionVectors(): object {
     const cOut = xchacha20poly1305(ock, zeroNonce).encrypt(outPlaintext);
     const ciphertext = concatBytes(epk, Uint8Array.of(tag), cEnc, cOut);
     if (bytesToHex(encryptOutput(note, sender.ovk, esk)) !== bytesToHex(ciphertext)) {
-      throw new Error("encryptOutput disagrees with the formulas of encryption.md");
+      throw new Error("encryptOutput disagrees with the formulas computed here step by step");
     }
     return {
       recipient_account: recipient,
@@ -98,7 +98,7 @@ export function encryptionVectors(): object {
     };
   });
   return {
-    description: "Output ciphertext vectors for encryption.md, with every intermediate value.",
+    description: "Output ciphertext vectors of the note encryption, with every intermediate value.",
     format: FORMAT,
     derivation:
       'rcm_i = SHA-512("cyphras/v2/vectors/enc-rcm/" || i) mod p and ' +

@@ -99,7 +99,7 @@ function checkQuote(core: Core, quote: Quote, feeAddress: string, cap: bigint): 
   }
   if (quote.feeAddress !== feeAddress) bad("names another fee address");
   if (quote.asset !== deployment.asset.name) bad("is in another asset");
-  // F-17: a fee off the pinned tier could fingerprint the moment of the quote.
+  // A fee off the pinned tier could fingerprint the moment of the quote.
   if (quote.tier !== deployment.feeTier || quote.fee % deployment.feeTier !== 0n)
     bad("is off the fee tier");
   if (quote.marginBps < 0 || quote.marginBps > 1_000) bad("takes a margin above 10 percent");
@@ -145,7 +145,7 @@ async function chooseRelay(
   return fail("service_unavailable", "no relayer is available", { service: "relayer" });
 }
 
-// F-26: the destination must be able to receive before anything is proved.
+// The destination must be able to receive before anything is proved.
 async function checkDestination(
   core: Core,
   to: string,
@@ -269,7 +269,7 @@ const view = (plan: Plan): Submission => ({
 });
 
 // One spend from the review to the submission, with a write-ahead plan saved before anything
-// leaves the device (F-25) and the confirmed fee inside the proof (F-11).
+// leaves the device and the confirmed fee inside the proof.
 export async function spend(core: Core, intent: SpendIntent): Promise<Submission> {
   const keys = spendingKeys(core);
   if (core.prover === undefined || core.artifacts === undefined) {
@@ -376,7 +376,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       deadline: latest + delay + DEADLINE_LEDGERS,
       extAmount: intent.kind === "send" ? 0n : -intent.amount,
       fee,
-      // F-08: a transfer names no party to the payment, only the relayer.
+      // A transfer names no party to the payment, only the relayer.
       recipient: intent.kind === "send" ? relayerAddress : intent.to,
       relayer: relayerAddress,
     };
@@ -448,7 +448,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
   }
 }
 
-// F-35: the user's own account submits the unshield and pays the network fee. The plan stays
+// The user's own account submits the unshield and pays the network fee. The plan stays
 // submitted until a sync shows its nullifiers and commitments in one transaction, as for a relayed
 // one; the RPC's word that the transaction succeeded does not confirm it.
 async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Promise<Submission> {

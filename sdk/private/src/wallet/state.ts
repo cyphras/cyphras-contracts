@@ -93,7 +93,7 @@ export interface PlanExit {
   event: string | undefined;
 }
 
-// A spend, saved before anything is submitted (sdk.md, Submission state machine).
+// A spend, saved before anything is submitted.
 export interface Plan {
   readonly id: string;
   readonly kind: "send" | "unshield";

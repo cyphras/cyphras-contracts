@@ -57,7 +57,7 @@ export interface KeySourceContext {
   readonly storage: KeyValueStore;
 }
 
-/** One of the three ways to obtain the seed of a private account (sdk.md, Key sources). */
+/** One of the three ways to obtain the seed of a private account. */
 export interface KeySource {
   readonly mode: "mnemonic" | "signature" | "random";
   resolve(context: KeySourceContext): Promise<SeedMaterial>;
@@ -192,7 +192,7 @@ function signatureSource(signer: MessageSigner): KeySource {
   };
 }
 
-/** The key sources of sdk.md: (a) mnemonic, (b) signature and (c) random. */
+/** The key sources: (a) mnemonic, (b) signature and (c) random. */
 export const keySource = {
   /**
    * Mode (a): the BIP39 seed of the wallet's mnemonic and passphrase, at the SEP-0005 index of
