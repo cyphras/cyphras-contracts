@@ -16,6 +16,8 @@ export type ErrorCode =
   | "signature_not_deterministic"
   | "signature_seed_changed"
   | "storage_unreadable"
+  | "state_conflict"
+  | "account_busy"
   | "service_unavailable"
   | "service_rejected"
   | "indexer_fault"

@@ -630,6 +630,52 @@ describe("wallet safety: when a payment is dead", () => {
   });
 });
 
+describe("wallet safety: instances sharing a store", () => {
+  async function shared() {
+    const world = await createWorld();
+    const store = new MemoryStore();
+    // An extension's popup and its service worker, each with its own wallet over one store.
+    const popup = await openWallet(world, 0, store);
+    await popup.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await popup.sync();
+    const worker = await openWallet(world, 0, store);
+    const bob = await openWallet(world, 1);
+    return { world, store, popup, worker, bob };
+  }
+
+  it("keeps the plan one instance saved when another one syncs", async () => {
+    const { world, store, popup, worker, bob } = await shared();
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await popup.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
+    await worker.sync();
+    assert.equal((await worker.plans()).length, 1);
+    const reopened = await openWallet(world, 0, store);
+    const plans = await reopened.plans();
+    assert.equal(plans.length, 1);
+    assert.equal((await reopened.balance()).locked, 100n * XLM);
+  });
+
+  it("runs one operation at a time across them and never spends a note twice", async () => {
+    const { world, popup, worker, bob } = await shared();
+    await Promise.all([
+      popup.send({ to: bob.generateAddress(), amount: 60n * XLM, maxFee: 2n * XLM }),
+      worker.send({ to: bob.generateAddress(), amount: 30n * XLM, maxFee: 2n * XLM }),
+    ]);
+    const spent = world.relayer.submissions.flatMap((s) => s.proof.input_nullifiers);
+    assert.equal(spent.length, 4);
+    assert.equal(new Set(spent).size, 4);
+    await popup.sync();
+    assert.deepEqual(
+      (await popup.plans()).map((p) => p.state),
+      ["settled", "settled"],
+    );
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 90n * XLM);
+  });
+});
+
 describe("wallet safety: secrets", () => {
   it("keeps keys out of errors and of the store", async () => {
     const world = await createWorld();

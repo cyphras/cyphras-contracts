@@ -27,6 +27,7 @@ import type { FetchLike } from "../net/http.ts";
 import type { IndexerClient } from "../net/indexer.ts";
 import { RelayerClient } from "../net/relayer.ts";
 import type { Prover } from "../prover.ts";
+import { type AccountLock, LeaseLock, lockName, webLock } from "../lock.ts";
 import { type KeyValueStore, SealedStore } from "../storage.ts";
 import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
 import { type Core, newId } from "./core.ts";
@@ -50,7 +51,7 @@ import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history
 import { type Verification, createServices, verify } from "./services.ts";
 import { type ExitEvent, IndexerSource, RpcEventSource } from "./sources.ts";
 import { type ConfirmSpend, type Submission, spend, submissionOf } from "./spend.ts";
-import { type Operation, type Plan, emptyState, loadState, saveState } from "./state.ts";
+import { type Operation, type Plan, StateStore, emptyState } from "./state.ts";
 import {
   type ScanKeys,
   advancePlans,
@@ -202,14 +203,24 @@ const defaultFetch: FetchLike = (input, init) => globalThis.fetch(input, init);
 export class PrivateWallet {
   readonly #core: Core;
   readonly #fetch: FetchLike;
+  readonly #states: StateStore;
+  readonly #lock: AccountLock;
   #verification: Verification;
   #queue: Promise<unknown> = Promise.resolve();
   // The last sync found data that contradicts the chain; nothing of it was kept.
   #fault = false;
 
-  private constructor(core: Core, fetchFn: FetchLike, verification: Verification) {
+  private constructor(
+    core: Core,
+    fetchFn: FetchLike,
+    states: StateStore,
+    lock: AccountLock,
+    verification: Verification,
+  ) {
     this.#core = core;
     this.#fetch = fetchFn;
+    this.#states = states;
+    this.#lock = lock;
     this.#verification = verification;
   }
 
@@ -286,7 +297,12 @@ export class PrivateWallet {
       options.relayers,
     );
     const store = new SealedStore(options.storage, storeKey);
-    const state = (await loadState(store)) ?? emptyState(deployment.deployLedger);
+    const states = new StateStore(store);
+    const state = (await states.load()) ?? emptyState(deployment.deployLedger);
+    const now = options.clock ?? (() => Date.now());
+    const sleep =
+      options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const lock = webLock(lockName(storeKey)) ?? new LeaseLock(store, now, sleep);
     const core: Core = {
       deployment,
       services,
@@ -296,12 +312,12 @@ export class PrivateWallet {
       prover,
       artifacts,
       state,
-      save: () => saveState(store, state),
-      now: options.clock ?? (() => Date.now()),
-      sleep: options.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+      save: () => states.save(state),
+      now,
+      sleep,
     };
     const { verification } = await verify(services);
-    return new PrivateWallet(core, fetchFn, verification);
+    return new PrivateWallet(core, fetchFn, states, lock, verification);
   }
 
   /**
@@ -333,8 +349,18 @@ export class PrivateWallet {
     return verifyDisclosure(doc, deployment.network, deployment.vault, indexer, services.rpc);
   }
 
+  // Runs one operation at a time: in this instance through its queue, and across the instances
+  // that share the store through the account lock. Each starts from the latest saved state.
   #run<T>(task: () => Promise<T>): Promise<T> {
-    const next = this.#queue.then(task, task);
+    const locked = (): Promise<T> =>
+      this.#lock.hold(async () => {
+        const latest = await this.#states.load();
+        if (latest !== undefined && latest.revision !== this.#core.state.revision) {
+          Object.assign(this.#core.state, latest);
+        }
+        return task();
+      });
+    const next = this.#queue.then(locked, locked);
     this.#queue = next.catch(() => undefined);
     return next;
   }
@@ -416,9 +442,10 @@ export class PrivateWallet {
     const core = this.#core;
     const draft = structuredClone(core.state);
     if (full) {
-      const { plans, deposits, operations } = draft;
+      const { revision, plans, deposits, operations } = draft;
       resetUnlanded(plans);
       Object.assign(draft, emptyState(core.deployment.deployLedger), {
+        revision,
         plans,
         deposits,
         operations,

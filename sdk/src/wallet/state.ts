@@ -164,6 +164,8 @@ export interface RootCheck {
 
 export interface WalletState {
   readonly version: 2;
+  // One more at every save, so an instance can tell that another one saved since it read.
+  revision: number;
   tree: TreeSnapshot;
   lastLeafLedger: number;
   nullifierSince: number;
@@ -181,6 +183,7 @@ export interface WalletState {
 export function emptyState(deployLedger: number): WalletState {
   return {
     version: 2,
+    revision: 0,
     tree: { leafCount: 0, upper: [], partial: [] },
     lastLeafLedger: 0,
     nullifierSince: deployLedger,
@@ -236,4 +239,43 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
 
 export async function saveState(store: SealedStore, state: WalletState): Promise<void> {
   await store.write(STATE_RECORD, new TextEncoder().encode(JSON.stringify(state, replacer)));
+}
+
+// The state of one account in its sealed store, saved with a compare-and-swap on its revision, so
+// one wallet instance never silently overwrites what another one saved.
+export class StateStore {
+  readonly #store: SealedStore;
+  // The highest revision this instance has read or written.
+  #seen = 0;
+
+  constructor(store: SealedStore) {
+    this.#store = store;
+  }
+
+  // The stored state, refused when it is older than one this instance already saw: the store was
+  // rolled back.
+  async load(): Promise<WalletState | undefined> {
+    const state = await loadState(this.#store);
+    if (state === undefined) return undefined;
+    if (state.revision < this.#seen) {
+      fail("state_conflict", "the stored state is older than one this wallet saw", {
+        conflict: "older",
+      });
+    }
+    this.#seen = state.revision;
+    return state;
+  }
+
+  // Saves `state` as the next revision if the store still holds the revision it was read at.
+  async save(state: WalletState): Promise<void> {
+    const stored = (await loadState(this.#store))?.revision ?? 0;
+    if (stored !== state.revision) {
+      fail("state_conflict", "another instance of this wallet saved since this one read", {
+        conflict: stored > state.revision ? "newer" : "older",
+      });
+    }
+    await saveState(this.#store, { ...state, revision: state.revision + 1 });
+    state.revision += 1;
+    this.#seen = state.revision;
+  }
 }
