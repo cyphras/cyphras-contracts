@@ -139,6 +139,7 @@ impl Model {
                 let id = self.status.next_deposit_id;
                 self.status.next_deposit_id += 1;
                 self.status.tvl += amount;
+                self.status.pending_total += amount;
                 self.day_totals.insert((*depositor, day), total);
                 let deposit = Deposit {
                     depositor: *depositor,
@@ -170,11 +171,11 @@ impl Model {
                 if today > self.limits.max_daily_outflow {
                     return Err(Error::OutflowLimit);
                 }
+                if outflow > self.status.tvl - self.status.pending_total {
+                    return Err(Error::ExceedsAdmittedValue);
+                }
                 if *reuse {
                     return Err(Error::NullifierSpent);
-                }
-                if self.status.tvl < outflow {
-                    return Err(Error::Overflow);
                 }
                 self.notes -= outflow;
                 self.status.tvl -= outflow;
@@ -224,6 +225,7 @@ impl Model {
                     .collect();
                 for id in &admitted {
                     self.notes += self.pending[id].amount;
+                    self.status.pending_total -= self.pending[id].amount;
                     self.next_leaf += 2;
                     self.resolve(*id);
                 }
@@ -238,6 +240,7 @@ impl Model {
                     }
                 }
                 self.status.tvl -= deposit.amount;
+                self.status.pending_total -= deposit.amount;
                 self.resolve(*id);
                 Ok(Done::Unit)
             }
@@ -516,6 +519,7 @@ impl Run {
 
         // 1. The token balance covers the TVL, which is pending deposits plus unspent notes.
         let pending: i128 = m.pending.values().map(|d| d.amount).sum();
+        assert_eq!(status.pending_total, pending);
         assert_eq!(status.tvl, pending + m.notes);
         assert!(s.balance(&s.vault.address) >= status.tvl);
         // 2. The next leaf index only grows, by two per inserted pair.

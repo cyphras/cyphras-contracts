@@ -169,6 +169,7 @@ fn the_constructor_stores_the_configuration_and_an_empty_tree() {
             next_deposit_id: 1,
             attested_up_to: 0,
             tvl: 0,
+            pending_total: 0,
             outflow_day: 0,
             outflow: 0,
         }

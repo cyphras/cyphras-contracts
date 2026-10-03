@@ -59,7 +59,8 @@ pub struct QueuedLimits {
     pub ready_at: u64,
 }
 
-/// `outflow` is the total paid out on day `outflow_day`; a later day starts from zero.
+/// `tvl` is all value the vault holds for users and `pending_total` the part of it in pending
+/// deposits. `outflow` is the total paid out on day `outflow_day`; a later day starts from zero.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Status {
@@ -70,6 +71,7 @@ pub struct Status {
     pub next_deposit_id: u64,
     pub attested_up_to: u64,
     pub tvl: i128,
+    pub pending_total: i128,
     pub outflow_day: u64,
     pub outflow: i128,
 }

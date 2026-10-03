@@ -89,6 +89,7 @@ impl Vault {
                 next_deposit_id: 1,
                 attested_up_to: 0,
                 tvl: 0,
+                pending_total: 0,
                 outflow_day: 0,
                 outflow: 0,
             },
@@ -159,6 +160,10 @@ impl Vault {
         let id = status.next_deposit_id;
         status.next_deposit_id = id.checked_add(1).ok_or(Error::Overflow)?;
         status.tvl = tvl;
+        status.pending_total = status
+            .pending_total
+            .checked_add(amount)
+            .ok_or(Error::Overflow)?;
         let commitment0 = proof.output_commitments.get_unchecked(0);
         let commitment1 = proof.output_commitments.get_unchecked(1);
         storage::set_pending(
@@ -229,16 +234,7 @@ impl Vault {
         let payout = ext.ext_amount.checked_neg().ok_or(Error::Overflow)?;
         let outflow = payout.checked_add(ext.fee).ok_or(Error::Overflow)?;
         let day = now / DAY;
-        let outflow_today = if status.outflow_day == day {
-            status.outflow
-        } else {
-            0
-        }
-        .checked_add(outflow)
-        .ok_or(Error::Overflow)?;
-        if outflow_today > limits.max_daily_outflow {
-            return Err(Error::OutflowLimit);
-        }
+        let outflow_today = check_outflow(&status, &limits, day, outflow)?;
 
         proof::check_shape(&env, &proof, &ext)?;
         let tree = tree::Tree::load(&env);
@@ -261,12 +257,7 @@ impl Vault {
             ext.encrypted_output1,
         );
         appender.save();
-        // More can only leave than entered if a proof was forged.
-        status.tvl = status
-            .tvl
-            .checked_sub(outflow)
-            .filter(|tvl| *tvl >= 0)
-            .ok_or(Error::Overflow)?;
+        status.tvl = status.tvl.checked_sub(outflow).ok_or(Error::Overflow)?;
         status.outflow_day = day;
         status.outflow = outflow_today;
         storage::set_status(&env, &status);
@@ -339,7 +330,7 @@ impl Vault {
     /// attested, and past its delay. Others are skipped. IDs must be strictly ascending. Returns
     /// the admitted IDs.
     pub fn admit(env: Env, ids: Vec<u64>) -> Result<Vec<u64>, Error> {
-        let status = storage::status(&env);
+        let mut status = storage::status(&env);
         let now = env.ledger().timestamp();
         if status.halted(now) {
             return Err(Error::Halted);
@@ -387,10 +378,15 @@ impl Vault {
             }
             .publish(&env);
             storage::remove_pending(&env, id);
+            status.pending_total = status
+                .pending_total
+                .checked_sub(deposit.amount)
+                .ok_or(Error::Overflow)?;
             admitted.push_back(id);
         }
         if let Some(appender) = appender {
             appender.save();
+            storage::set_status(&env, &status);
         }
         Ok(admitted)
     }
@@ -400,8 +396,7 @@ impl Vault {
     pub fn cancel(env: Env, id: u64) -> Result<(), Error> {
         let deposit = storage::pending(&env, id).ok_or(Error::UnknownDeposit)?;
         deposit.depositor.require_auth();
-        release(&env, id, deposit, 0);
-        Ok(())
+        release(&env, id, deposit, 0)
     }
 
     /// Anyone returns a deposit flagged at least a day ago to its depositor. Works while halted.
@@ -411,8 +406,7 @@ impl Vault {
         if env.ledger().timestamp() < deposit.flagged_at.saturating_add(REFUND_DELAY) {
             return Err(Error::RefundTooEarly);
         }
-        release(&env, id, deposit, reason);
-        Ok(())
+        release(&env, id, deposit, reason)
     }
 
     /// The guardian stops or resumes deposits and transfers. Unshields, cancellations and refunds
@@ -617,6 +611,29 @@ fn delay(config: &Config, limits: &Limits, amount: i128) -> u64 {
     }
 }
 
+/// Today's outflow after paying out `outflow`, if the daily window and the vault's value allow
+/// it. Pending deposits stay claimable by their depositors, so only admitted value can leave.
+fn check_outflow(status: &Status, limits: &Limits, day: u64, outflow: i128) -> Result<i128, Error> {
+    let today = if status.outflow_day == day {
+        status.outflow
+    } else {
+        0
+    }
+    .checked_add(outflow)
+    .ok_or(Error::Overflow)?;
+    if today > limits.max_daily_outflow {
+        return Err(Error::OutflowLimit);
+    }
+    let admitted = status
+        .tvl
+        .checked_sub(status.pending_total)
+        .ok_or(Error::Overflow)?;
+    if outflow > admitted {
+        return Err(Error::ExceedsAdmittedValue);
+    }
+    Ok(today)
+}
+
 fn check_limits(limits: &Limits) -> Result<(), Error> {
     let amounts = [
         limits.max_deposit,
@@ -674,10 +691,17 @@ fn insert_pair(
 }
 
 /// Returns a pending deposit to the depositor recorded at `shield`, never anywhere else.
-fn release(env: &Env, id: u64, deposit: PendingDeposit, reason: u32) {
+fn release(env: &Env, id: u64, deposit: PendingDeposit, reason: u32) -> Result<(), Error> {
     storage::remove_pending(env, id);
     let mut status = storage::status(env);
-    status.tvl -= deposit.amount;
+    status.tvl = status
+        .tvl
+        .checked_sub(deposit.amount)
+        .ok_or(Error::Overflow)?;
+    status.pending_total = status
+        .pending_total
+        .checked_sub(deposit.amount)
+        .ok_or(Error::Overflow)?;
     storage::set_status(env, &status);
     events::DepositRefunded { id, reason }.publish(env);
     TokenClient::new(env, &storage::config(env).token).transfer(
@@ -685,4 +709,5 @@ fn release(env: &Env, id: u64, deposit: PendingDeposit, reason: u32) {
         &deposit.depositor,
         &deposit.amount,
     );
+    Ok(())
 }

@@ -115,9 +115,9 @@ fn each_call_writes_only_the_entries_it_changes() {
     s.shield(&depositor, XLM).unwrap();
     s.vault.attest(&4);
     s.advance(DELAY_SMALL);
-    // The deposit and three tree entries.
+    // The instance, the deposit and three tree entries.
     s.vault.admit(&Vec::from_slice(&s.env, &[2]));
-    assert_eq!(writes(), 4);
+    assert_eq!(writes(), 5);
     // The instance, the deposit and two balances.
     s.vault.cancel(&3);
     assert_eq!(writes(), 5);

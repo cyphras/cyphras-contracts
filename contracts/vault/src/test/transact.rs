@@ -238,10 +238,37 @@ fn more_than_the_vault_holds_can_never_leave() {
     s.fund_pool("funder", 100 * XLM);
     let relayer = s.account("relayer", 0);
     let ext = s.ext(-100 * XLM, 1, &relayer, &relayer);
-    assert_eq!(s.transact(&relayer, &ext), Err(Error::Overflow));
+    assert_eq!(s.transact(&relayer, &ext), Err(Error::ExceedsAdmittedValue));
     let ext = s.ext(-100 * XLM, 0, &relayer, &relayer);
     assert_eq!(s.transact(&relayer, &ext), Ok(()));
     assert_eq!(s.vault.status().tvl, 0);
+}
+
+#[test]
+fn a_forged_spend_cannot_take_pending_deposits() {
+    // The trapdoor key stands in for a broken proof system: it forges any spend.
+    let s = Setup::new();
+    s.fund_pool("admitted", 100 * XLM);
+    let depositor = s.account("pending depositor", 1_000 * XLM);
+    let id = s.shield(&depositor, 100 * XLM).unwrap();
+    let forger = s.account("forger", 0);
+    let status = s.vault.status();
+    assert_eq!((status.tvl, status.pending_total), (200 * XLM, 100 * XLM));
+
+    // Only 100 XLM was ever admitted, so no more than that can leave.
+    let ext = s.ext(-100 * XLM - 1, 0, &forger, &forger);
+    assert_eq!(s.transact(&forger, &ext), Err(Error::ExceedsAdmittedValue));
+    let ext = s.ext(-100 * XLM, 0, &forger, &forger);
+    assert_eq!(s.transact(&forger, &ext), Ok(()));
+    let ext = s.ext(-1, 0, &forger, &forger);
+    assert_eq!(s.transact(&forger, &ext), Err(Error::ExceedsAdmittedValue));
+
+    // The pending deposit is untouched and its depositor takes it back.
+    s.vault.cancel(&id);
+    assert_eq!(s.balance(&depositor), 1_000 * XLM);
+    assert_eq!(s.balance(&s.vault.address), 0);
+    let status = s.vault.status();
+    assert_eq!((status.tvl, status.pending_total), (0, 0));
 }
 
 #[test]
