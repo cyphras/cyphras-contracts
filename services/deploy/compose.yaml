@@ -13,8 +13,11 @@
 # public port on loopback only, for nginx, and reaches only its own database. Settings that are
 # not secret are in env/<service>.env; secrets are files in secrets/<network>/<asset>/, each mode
 # 0400 and owned by the uid of the one service that mounts it (10001 to 10005 below, 999 for the
-# databases). Testnet and mainnet run as separate projects and share nothing. Logs rotate by size;
-# the host's log shipping, if any, keeps 7 days, and 30 for the watcher.
+# databases). Testnet and mainnet run as separate projects and share nothing.
+#
+# Docker rotates each container's log by size, keeping at most 7 files of 20 MB, so the days the
+# host holds depend on how much a service logs. The retention policy, 7 days and 30 for the
+# watcher, is kept by the host's log shipping, which must also delete what is older on the host.
 
 x-service: &service
   read_only: true
@@ -71,17 +74,22 @@ services:
       ALERT_WEBHOOKS_FILE: /run/secrets/relayer_alert_webhooks
       CHANNEL_KEYS_FILE: /run/secrets/relayer_channel_keys
       SCREEN_TOKEN_FILE: /run/secrets/relayer_screen_token
-      SCREENING_URL: http://screening:8091/internal/v1/screen
+      SCREENING_URL: http://screening-internal:8091/internal/v1/screen
       LISTEN_ADDR: 0.0.0.0:8081
       VERIFICATION_KEY_FILE: /etc/cyphras/verification_key.json
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
       # The key the vault's verifier is built with, from the same checkout, for checking proofs
-      # before relaying them.
-      - ../../contracts/verifier/keys/${VERIFYING_KEY:?set VERIFYING_KEY to the verifier's key directory}/verification_key.json:/etc/cyphras/verification_key.json:ro
+      # before relaying them; VERIFICATION_KEY_SHA256 in env/relayer.env pins it. A key directory
+      # that does not exist stops compose instead of mounting an empty directory.
+      - type: bind
+        source: ../../contracts/verifier/keys/${VERIFYING_KEY:?set VERIFYING_KEY to the verifier's key directory}/verification_key.json
+        target: /etc/cyphras/verification_key.json
+        read_only: true
+        bind: {create_host_path: false}
     secrets: [relayer_database_url, relayer_alert_webhooks, relayer_channel_keys, relayer_screen_token]
     ports: ["127.0.0.1:${RELAYER_PORT:?}:8081"]
-    networks: [egress, relayer_db, services]
+    networks: [egress, relayer_db, services, screen]
     depends_on: [relayer_db, screening]
 
   keeper:
@@ -115,14 +123,19 @@ services:
       ALERT_WEBHOOKS_FILE: /run/secrets/screening_alert_webhooks
       ASP_KEY_FILE: /run/secrets/screening_asp_key
       LISTEN_ADDR: 0.0.0.0:8090
-      # The internal endpoint is reachable from the relayer only, never through nginx.
-      INTERNAL_ADDR: 0.0.0.0:8091
+      # The internal endpoint listens only on the address the name has on the screen network,
+      # which no service but the relayer joins, and is never reachable through nginx.
+      INTERNAL_ADDR: screening-internal:8091
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
       - ./lists:/etc/cyphras/lists:ro
     secrets: [screening_database_url, screening_alert_webhooks, screening_asp_key]
     ports: ["127.0.0.1:${SCREENING_PORT:?}:8090"]
-    networks: [egress, screening_db, services]
+    networks:
+      egress: {}
+      screening_db: {}
+      services: {}
+      screen: {aliases: [screening-internal]}
     depends_on: [screening_db]
 
   watcher:
@@ -135,13 +148,14 @@ services:
       DATABASE_URL_FILE: /run/secrets/watcher_database_url
       ALERT_WEBHOOKS_FILE: /run/secrets/watcher_alert_webhooks
       PUBLIC_WEBHOOKS_FILE: /run/secrets/watcher_public_webhooks
+      HEARTBEAT_URL_FILE: /run/secrets/watcher_heartbeat_url
       INDEXER_URL: http://indexer:8080
       HEALTH_URLS: http://indexer:8080/v1/health,http://relayer:8081/v1/health,http://screening:8090/v1/health
       HOT_ACCOUNTS_FILE: /etc/cyphras/hot-accounts
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
       - ./hot-accounts/${NETWORK}-${ASSET}:/etc/cyphras/hot-accounts:ro
-    secrets: [watcher_database_url, watcher_alert_webhooks, watcher_public_webhooks]
+    secrets: [watcher_database_url, watcher_alert_webhooks, watcher_public_webhooks, watcher_heartbeat_url]
     networks: [egress, watcher_db, services]
     depends_on: [watcher_db]
 
@@ -183,6 +197,7 @@ services:
 networks:
   egress: {}
   services: {internal: true}
+  screen: {internal: true}
   indexer_db: {internal: true}
   relayer_db: {internal: true}
   keeper_db: {internal: true}
@@ -209,4 +224,5 @@ secrets:
   watcher_database_url: {file: "./secrets/${NETWORK}/${ASSET}/watcher_database_url"}
   watcher_alert_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/watcher_alert_webhooks"}
   watcher_public_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/watcher_public_webhooks"}
+  watcher_heartbeat_url: {file: "./secrets/${NETWORK}/${ASSET}/watcher_heartbeat_url"}
   watcher_db_password: {file: "./secrets/${NETWORK}/${ASSET}/watcher_db_password"}

@@ -6,9 +6,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
+	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc/rpctest"
@@ -108,5 +110,26 @@ func TestAHotSignerIsNeitherTheMasterNorAtTheHighThreshold(t *testing.T) {
 	set(2, 10, 1)
 	if err := CheckHotSigner(ctx, f, account.Address(), hot); err == nil {
 		t.Fatal("a signer below the medium threshold accepted")
+	}
+}
+
+func TestTheVerifyingKeyMustMatchItsPinAndTheTestnetKeyNeverServesMainnet(t *testing.T) {
+	raw, err := os.ReadFile("../../../contracts/verifier/keys/testnet-forgeable/verification_key.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckVerifyingKey(raw, forgeableTestnetSHA256, network.TestNetworkPassphrase); err != nil {
+		t.Fatalf("the testnet key on testnet: %v", err)
+	}
+	if err := CheckVerifyingKey(raw, strings.ToUpper(forgeableTestnetSHA256), network.TestNetworkPassphrase); err != nil {
+		t.Fatalf("an upper-case pin: %v", err)
+	}
+	if err := CheckVerifyingKey(raw, forgeableTestnetSHA256, network.PublicNetworkPassphrase); err == nil {
+		t.Fatal("the testnet key accepted on mainnet")
+	}
+	for _, pin := range []string{"", strings.Repeat("0", 64)} {
+		if err := CheckVerifyingKey(raw, pin, network.TestNetworkPassphrase); err == nil {
+			t.Fatalf("a key accepted under the pin %q", pin)
+		}
 	}
 }

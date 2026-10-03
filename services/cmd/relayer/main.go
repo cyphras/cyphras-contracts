@@ -128,6 +128,13 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	if err != nil {
 		return nil, err
 	}
+	pin, err := config.Required("VERIFICATION_KEY_SHA256")
+	if err != nil {
+		return nil, err
+	}
+	if err := service.CheckVerifyingKey(rawKey, pin, base.Deployment.NetworkPassphrase); err != nil {
+		return nil, err
+	}
 	key, err := groth16.ParseKey(rawKey)
 	if err != nil {
 		return nil, err
