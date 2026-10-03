@@ -1,0 +1,80 @@
+// The default prover, kept in its own entry point and the only module that imports snarkjs, so it
+// can move to a separately licensed package without touching the SDK core.
+import { CyphrasError } from "../errors.ts";
+import {
+  type CircuitArtifacts,
+  type Groth16Proof,
+  type Prover,
+  type TransactionWitness,
+  circuitInputs,
+} from "../prover.ts";
+
+/** Options of the snarkjs prover. */
+export interface SnarkjsProverOptions {
+  /**
+   * Proves on the calling thread. Chrome MV3 extension pages need it: their content security
+   * policy blocks the blob: workers snarkjs starts otherwise.
+   */
+  readonly singleThread?: boolean;
+}
+
+/** A Prover backed by snarkjs, with a way to stop the worker threads it starts. */
+export interface SnarkjsProver extends Prover {
+  close(): Promise<void>;
+}
+
+function decimal(value: unknown): bigint {
+  if (typeof value !== "string" || !/^[0-9]+$/.test(value)) {
+    throw new TypeError("snarkjs returned a malformed proof");
+  }
+  return BigInt(value);
+}
+
+function affine(point: readonly unknown[] | undefined): readonly [bigint, bigint] {
+  if (point === undefined || point.length !== 3 || point[2] !== "1") {
+    throw new TypeError("snarkjs returned a proof point that is not affine");
+  }
+  return [decimal(point[0]), decimal(point[1])];
+}
+
+/** The default prover: snarkjs Groth16 over the pinned witness generator and proving key. */
+export function snarkjsProver(options: SnarkjsProverOptions = {}): SnarkjsProver {
+  return {
+    async prove(witness: TransactionWitness, artifacts: CircuitArtifacts): Promise<Groth16Proof> {
+      const { groth16 } = await import("snarkjs");
+      let result: Awaited<ReturnType<typeof groth16.fullProve>>;
+      try {
+        result = await groth16.fullProve(
+          circuitInputs(witness),
+          artifacts.wasm,
+          artifacts.zkey,
+          undefined,
+          undefined,
+          { singleThread: options.singleThread ?? false },
+        );
+      } catch {
+        // The underlying error can name witness signals; it is not passed on.
+        throw new CyphrasError("prover_failed", "the witness generator or the prover failed");
+      }
+      const { pi_a, pi_b, pi_c } = result.proof;
+      const [bx, by, bz] = pi_b;
+      if (bz?.[0] !== "1" || bz[1] !== "0" || bx?.length !== 2 || by?.length !== 2) {
+        throw new TypeError("snarkjs returned a proof point that is not affine");
+      }
+      return {
+        a: affine(pi_a),
+        b: [
+          [decimal(bx[0]), decimal(bx[1])],
+          [decimal(by[0]), decimal(by[1])],
+        ],
+        c: affine(pi_c),
+        publicSignals: result.publicSignals.map(decimal),
+      };
+    },
+
+    async close(): Promise<void> {
+      const curve = (globalThis as { curve_bn128?: { terminate(): Promise<void> } }).curve_bn128;
+      await curve?.terminate();
+    },
+  };
+}
