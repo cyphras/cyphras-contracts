@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stellar/go-stellar-sdk/keypair"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
@@ -18,14 +20,51 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 )
 
 // fixtureDeadline is the ExtData deadline every fixture proof is bound to.
 const fixtureDeadline = 10_000_000
 
+// failedOnChain is a relay that failed with no error the relayer can tell, which counts as the
+// relayer's own.
 func failedOnChain() protocol.GetTransactionResponse {
 	r, _ := xdr.MarshalBase64(xdr.TransactionResult{FeeCharged: 900_100, Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxFailed, Results: &[]xdr.OperationResult{}}})
 	return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusFailed, ResultXDR: r, Ledger: 1001}}
+}
+
+// failedWith is a relay whose contract call trapped with a contract's error, as the diagnostic
+// events report it.
+func failedWith(contract string, code uint32) protocol.GetTransactionResponse {
+	trapped := xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped
+	r, _ := xdr.MarshalBase64(xdr.TransactionResult{FeeCharged: 900_100, Result: xdr.TransactionResultResult{
+		Code: xdr.TransactionResultCodeTxFailed,
+		Results: &[]xdr.OperationResult{{Code: xdr.OperationResultCodeOpInner, Tr: &xdr.OperationResultTr{
+			Type: xdr.OperationTypeInvokeHostFunction, InvokeHostFunctionResult: &xdr.InvokeHostFunctionResult{Code: trapped},
+		}}},
+	}})
+	raw, _ := strkey.Decode(strkey.VersionByteContract, contract)
+	id := xdr.ContractId(raw)
+	c := xdr.Uint32(code)
+	sym := xdr.ScSymbol("error")
+	event, _ := xdr.MarshalBase64(xdr.DiagnosticEvent{Event: xdr.ContractEvent{ContractId: &id, Type: xdr.ContractEventTypeDiagnostic,
+		Body: xdr.ContractEventBody{V: 0, V0: &xdr.ContractEventV0{Topics: []xdr.ScVal{
+			{Type: xdr.ScValTypeScvSymbol, Sym: &sym},
+			{Type: xdr.ScValTypeScvError, Error: &xdr.ScError{Type: xdr.ScErrorTypeSceContract, ContractCode: &c}},
+		}, Data: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}}}})
+	return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{
+		Status: protocol.TransactionStatusFailed, ResultXDR: r, Ledger: 1001, DiagnosticEventsXDR: []string{event},
+	}}
+}
+
+// failedRace is a relay whose notes another transaction spent first.
+func failedRace() protocol.GetTransactionResponse {
+	return failedWith(vaulttest.Vault, vaultNullifierSpent)
+}
+
+// failedReceive is a relay whose destination stopped receiving after it was checked.
+func failedReceive() protocol.GetTransactionResponse {
+	return failedWith(vaulttest.Vault, vaultCannotReceive)
 }
 
 // sentEnvelopes records what the harness's RPC was asked to send.
@@ -188,9 +227,10 @@ func TestAHeldRequestCanBeCancelledByItsID(t *testing.T) {
 	}
 }
 
-func TestAFailureOnChainCoolsDownItsNotesAndDestination(t *testing.T) {
+func TestAReceiveFailureCoolsDownItsNotesAndDestination(t *testing.T) {
+	const destination = "MA53HZCSOZI5ZUDYCMYXXUGHO7XEZSM3BYW4M5FGSTYGKWMGVL7QKAAAAEPXD6YEZNZKQ"
 	h := newHarness(t, vault.Status{})
-	h.setTxStatus(failedOnChain())
+	h.setTxStatus(failedReceive())
 	if code, out := h.post(fixture(t, "unshield_muxed")); code != http.StatusAccepted {
 		t.Fatalf("submit answered %d %v", code, out)
 	}
@@ -207,17 +247,112 @@ func TestAFailureOnChainCoolsDownItsNotesAndDestination(t *testing.T) {
 	if rows != 3 {
 		t.Fatalf("%d cooldowns stored", rows)
 	}
-	// A restart remembers them.
+	// A restart remembers them; the destination rests ten minutes after its first failure.
 	again, err := New(context.Background(), h.r.cfg, h.fake, h.r.engine, nil, h.screen, h.r.db, 1_000_000, &alert.Alerter{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	account, _ := vault.AccountOf("MA53HZCSOZI5ZUDYCMYXXUGHO7XEZSM3BYW4M5FGSTYGKWMGVL7QKAAAAEPXD6YEZNZKQ")
-	if !again.cool.cooling(h.now.Unix(), destinationKey(account)) {
+	if !again.cool.cooling(h.now.Unix(), destinationKey(destination)) {
 		t.Fatal("the destination's cooldown was forgotten")
 	}
-	if again.cool.cooling(h.now.Add(25*time.Hour).Unix(), destinationKey(account)) {
-		t.Fatal("a cooldown outlived its day")
+	if again.cool.cooling(h.now.Add(11*time.Minute).Unix(), destinationKey(destination)) {
+		t.Fatal("a first failure rested the destination past ten minutes")
+	}
+	// Each failure that follows within a day doubles the rest, up to a day.
+	now := h.now.Unix()
+	var rests []int64
+	for range 10 {
+		until, _ := again.cool.strike(destinationKey(destination), now)
+		rests = append(rests, until-now)
+		now = until
+	}
+	if rests[0] != 20*60 || rests[1] != 40*60 || rests[len(rests)-1] != 24*3600 {
+		t.Fatalf("rests %v", rests)
+	}
+	// After a quiet day the count starts again.
+	if until, n := again.cool.strike(destinationKey(destination), now+25*3600); n != 1 || until != now+25*3600+600 {
+		t.Fatalf("after a quiet day: %d strikes", n)
+	}
+}
+
+func TestOneRaceRestsNeitherOtherUsersNorTheDestination(t *testing.T) {
+	h := trapdoorHarness(t)
+	ctx := context.Background()
+	exchange := keypair.MustRandom().Address()
+	h.fund(exchange)
+	// A receive failure to one muxed ID of an account rests that address only.
+	h.setTxStatus(failedReceive())
+	if _, f := h.r.Submit(ctx, h.forged(t, muxed(t, exchange, 1), -20_000_000, 5_000_000)); f != nil {
+		t.Fatalf("the relay that fails: %v", f)
+	}
+	h.waitIdle()
+	h.setTxStatus(success(900_000))
+	if _, f := h.r.Submit(ctx, h.forged(t, muxed(t, exchange, 777), -20_000_000, 5_000_000)); f != nil {
+		t.Fatalf("another user of the same account: %v", f)
+	}
+	h.waitIdle()
+	if _, f := h.r.Submit(ctx, h.forged(t, muxed(t, exchange, 1), -20_000_000, 5_000_000)); f == nil || f.code != CodeRejected {
+		t.Fatalf("the address that failed to receive: %v", f)
+	}
+	// Notes spent first by another transaction say nothing about the destination.
+	other := keypair.MustRandom().Address()
+	h.fund(other)
+	h.setTxStatus(failedRace())
+	if _, f := h.r.Submit(ctx, h.forged(t, other, -20_000_000, 5_000_000)); f != nil {
+		t.Fatalf("the relay that loses a race: %v", f)
+	}
+	h.waitIdle()
+	h.setTxStatus(success(900_000))
+	if _, f := h.r.Submit(ctx, h.forged(t, other, -20_000_000, 5_000_000)); f != nil {
+		t.Fatalf("the destination after a race on the notes: %v", f)
+	}
+	h.waitIdle()
+}
+
+func TestRacesNeverPauseRelayingButGuardIt(t *testing.T) {
+	h := trapdoorHarness(t)
+	ctx := context.Background()
+	lose := func(n int, st protocol.GetTransactionResponse) {
+		h.setTxStatus(st)
+		for range n {
+			dest := keypair.MustRandom().Address()
+			h.fund(dest)
+			if _, f := h.r.Submit(ctx, h.forged(t, dest, -20_000_000, 5_000_000)); f != nil {
+				t.Fatalf("not sent: %v", f)
+			}
+			h.waitIdle()
+		}
+	}
+	lose(2, failedRace())
+	lose(2, failedReceive())
+	if code, health := h.get("/v1/health"); code != http.StatusOK || health["ready"] != true || health["guarded"] != false {
+		t.Fatalf("after four races: %d %v", code, health)
+	}
+	// The fifth race puts relaying in its guarded mode: twice the deadline margin, still relaying.
+	lose(1, failedRace())
+	if code, health := h.get("/v1/health"); code != http.StatusOK || health["ready"] != true || health["paused"] != false || health["guarded"] != true {
+		t.Fatalf("after five races: %d %v", code, health)
+	}
+	if !h.r.alerts.Open("relaying_guarded") || h.r.alerts.Open("relaying_paused") {
+		t.Fatal("alerts")
+	}
+	h.setTxStatus(success(900_000))
+	dest := keypair.MustRandom().Address()
+	h.fund(dest)
+	// 30 ledgers out passes the usual margin of 20, not the guarded one of 40.
+	if _, f := h.r.Submit(ctx, h.forgedUntil(t, dest, -20_000_000, 5_000_000, 1000+30)); f == nil || f.code != CodeRejected {
+		t.Fatalf("a deadline inside the guarded margin: %v", f)
+	}
+	if _, f := h.r.Submit(ctx, h.forged(t, dest, -20_000_000, 5_000_000)); f != nil {
+		t.Fatalf("relaying stopped: %v", f)
+	}
+	h.waitIdle()
+	// The guarded mode ends on its own.
+	h.mu.Lock()
+	h.now = h.now.Add(61 * time.Minute)
+	h.mu.Unlock()
+	if h.r.guarded() {
+		t.Fatal("still guarded after an hour")
 	}
 }
 
@@ -320,10 +455,13 @@ func TestARestartHoldsTheNotesAndChannelOfAPendingRelay(t *testing.T) {
 	}
 	h.setTxStatus(success(900_000))
 	h.waitIdle()
-	if code, out := h.post(body); code != http.StatusAccepted {
+	// Once it succeeded its notes are known spent, and its channel is free again.
+	if code, out := h.post(body); code != http.StatusUnprocessableEntity || out["error"] != CodeRejected {
 		t.Fatalf("after the outcome: %d %v", code, out)
 	}
-	h.waitIdle()
+	if h.r.channels.ready() != h.r.channels.total || h.fake.CallCount("simulateTransaction") != 0 {
+		t.Fatalf("%d of %d channels free, %d simulated", h.r.channels.ready(), h.r.channels.total, h.fake.CallCount("simulateTransaction"))
+	}
 }
 
 func TestAWithheldDestinationIsRefusedWithoutAReason(t *testing.T) {

@@ -16,10 +16,12 @@ import (
 	"sync"
 	"time"
 
+	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
+	"github.com/cyphras/cyphras-contracts/services/internal/follow"
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 	"github.com/cyphras/cyphras-contracts/services/internal/groth16"
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
@@ -59,16 +61,24 @@ type Config struct {
 	// before it costs anything.
 	Key *groth16.Key
 	// DeadlineMargin is how many ledgers past the latest one a proof's deadline must be when the
-	// request is accepted, and again when a held one is sent; 20 when unset.
+	// request is accepted, and again when a held one is sent; 20 when unset, and twice that in the
+	// guarded mode.
 	DeadlineMargin uint32
-	// Cooldown is how long the nullifiers and destination of a relay that failed on chain are
-	// refused; 24 hours when unset.
+	// Cooldown is how long the nullifiers of a relay that failed on chain for a reason the request
+	// carries are refused; 24 hours when unset. A destination that stopped receiving rests ten
+	// minutes after its first failure, doubling with each one in a row up to a day.
 	Cooldown time.Duration
-	// BreakerFailures failures on chain within BreakerWindow pause relaying for BreakerPause;
-	// 3, an hour and 30 minutes when unset.
+	// BreakerFailures failures on chain within BreakerWindow that point at the relayer itself
+	// pause relaying for BreakerPause; 3, an hour and 30 minutes when unset.
 	BreakerFailures int
 	BreakerWindow   time.Duration
 	BreakerPause    time.Duration
+	// RaceFailures relays lost within RaceWindow to a race a client can start, notes spent first or
+	// a destination that stopped receiving, put relaying in its guarded mode for GuardedFor; 5, an
+	// hour and an hour when unset. Relaying never stops for them.
+	RaceFailures int
+	RaceWindow   time.Duration
+	GuardedFor   time.Duration
 }
 
 func (c *Config) defaults() {
@@ -86,6 +96,15 @@ func (c *Config) defaults() {
 	}
 	if c.BreakerPause == 0 {
 		c.BreakerPause = 30 * time.Minute
+	}
+	if c.RaceFailures == 0 {
+		c.RaceFailures = 5
+	}
+	if c.RaceWindow == 0 {
+		c.RaceWindow = time.Hour
+	}
+	if c.GuardedFor == 0 {
+		c.GuardedFor = time.Hour
 	}
 	if c.LedgerSeconds == 0 {
 		c.LedgerSeconds = 5
@@ -122,8 +141,13 @@ type Relayer struct {
 
 	cool    cooldowns
 	brk     *breaker
+	races   *breaker
 	results outcomes
 	clock   *ledgerClock
+	known   spentSet
+	told    verdicts
+	// nfNext is the next ledger whose new_nullifier events the spent set takes in; only Run uses it.
+	nfNext uint32
 	// following counts the transactions being followed to their outcome.
 	following sync.WaitGroup
 
@@ -178,17 +202,41 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		cfg: cfg, rpc: client, engine: engine, channels: newChannelPool(channels), costs: NewCosts(bootstrapCost, samples),
 		screen: screen, db: db, alerts: alerts, log: log, now: time.Now, ctx: ctx,
 		costly: httpapi.NewLimiter(600, 100), simulateLimit: httpapi.NewLimiter(300, 50), lookups: httpapi.NewLimiter(3000, 300),
-		brk:      &breaker{failures: cfg.BreakerFailures, window: cfg.BreakerWindow, pause: cfg.BreakerPause},
-		clock:    &ledgerClock{fallback: float64(cfg.LedgerSeconds)},
+		brk:   &breaker{failures: cfg.BreakerFailures, window: cfg.BreakerWindow, pause: cfg.BreakerPause},
+		races: &breaker{failures: cfg.RaceFailures, window: cfg.RaceWindow, pause: cfg.GuardedFor},
+		clock: &ledgerClock{fallback: float64(cfg.LedgerSeconds)},
+		known: spentSet{max: maxKnownSpent}, told: verdicts{ttl: verdictLifetime, max: maxVerdicts},
 		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[string]*heldRequest{},
 	}
 	for _, ok := range past {
 		r.results.add(ok)
 	}
-	for k, until := range cooling {
-		r.cool.add([]string{k}, until)
+	for k, c := range cooling {
+		r.cool.restore(k, c.until, c.strikes)
 	}
 	return r, nil
+}
+
+const (
+	// maxKnownSpent bounds the spent nullifiers kept in memory.
+	maxKnownSpent = 1_000_000
+	// verdictLifetime is how long a refusal is answered from memory; maxVerdicts bounds them.
+	verdictLifetime = 10 * time.Minute
+	maxVerdicts     = 10_000
+)
+
+// guarded reports the mode relaying takes while clients keep winning races against it: deadlines
+// need twice the margin, and a transaction is checked against the chain once more right before
+// it is sent.
+func (r *Relayer) guarded() bool {
+	return r.races.open(r.now())
+}
+
+func (r *Relayer) deadlineMargin() uint64 {
+	if r.guarded() {
+		return 2 * uint64(r.cfg.DeadlineMargin)
+	}
+	return uint64(r.cfg.DeadlineMargin)
 }
 
 // Refresh reads the vault's state and the chain tip, and publishes a quote.
@@ -205,7 +253,7 @@ func (r *Relayer) Refresh(ctx context.Context) error {
 	r.inst, r.latest, r.latestClose = &inst, h.LatestLedger, h.LatestLedgerCloseTime
 	r.chainMu.Unlock()
 	r.clock.observe(h.LatestLedger, h.LatestLedgerCloseTime)
-	if err := r.db.forgetCooldowns(ctx, r.now().Unix()); err != nil {
+	if err := r.db.forgetCooldowns(ctx, r.now().Unix()-strikeMemory); err != nil {
 		return err
 	}
 	if err := r.readRoots(ctx); err != nil {
@@ -213,6 +261,54 @@ func (r *Relayer) Refresh(ctx context.Context) error {
 	}
 	_, err = r.Quote(ctx)
 	return err
+}
+
+// nullifierWindow is the most ledgers one read of new_nullifier events covers, and
+// nullifierReads the most reads one round makes.
+const (
+	nullifierWindow = 2_000
+	nullifierReads  = 20
+)
+
+// FollowNullifiers takes into the spent set the nullifiers the vault's new_nullifier events name,
+// from the oldest ledger the RPC keeps on the first round and from where it stopped after that.
+func (r *Relayer) FollowNullifiers(ctx context.Context) error {
+	src := follow.RPCSource{Client: r.rpc, Contract: r.cfg.Vault, Topics: newNullifierTopics(), PageLimit: 1000}
+	for range nullifierReads {
+		h, err := r.rpc.GetHealth(ctx)
+		if err != nil {
+			return err
+		}
+		if h.OldestLedger > h.LatestLedger {
+			return fmt.Errorf("relayer: the RPC reports its oldest ledger %d past its latest %d", h.OldestLedger, h.LatestLedger)
+		}
+		from := max(r.nfNext, h.OldestLedger)
+		if from > h.LatestLedger {
+			return nil
+		}
+		to := min(from+nullifierWindow-1, h.LatestLedger)
+		raw, err := src.Events(ctx, from, to)
+		if err != nil {
+			return err
+		}
+		for _, e := range raw {
+			ev, err := vault.Decode(e)
+			if err != nil {
+				return err
+			}
+			if n, ok := ev.Body.(vault.NewNullifier); ok {
+				r.known.add(n.Nullifier)
+			}
+		}
+		r.nfNext = to + 1
+	}
+	return nil
+}
+
+func newNullifierTopics() []protocol.TopicFilter {
+	sym := xdr.ScSymbol("new_nullifier")
+	name := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &sym}
+	return []protocol.TopicFilter{{{ScVal: &name}}}
 }
 
 // readRoots reads the vault's root history.
@@ -303,7 +399,7 @@ func (r *Relayer) fresh(ctx context.Context, req Request) *failure {
 		return fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
 	r.clock.observe(h.LatestLedger, h.LatestLedgerCloseTime)
-	if uint64(req.Ext.Deadline) < uint64(h.LatestLedger)+uint64(r.cfg.DeadlineMargin) {
+	if uint64(req.Ext.Deadline) < uint64(h.LatestLedger)+r.deadlineMargin() {
 		return fail(http.StatusUnprocessableEntity, CodeRejected)
 	}
 	spent, err := r.spent(ctx, req.Proof.Nullifiers)
@@ -311,7 +407,8 @@ func (r *Relayer) fresh(ctx context.Context, req Request) *failure {
 		return fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
 	if spent {
-		return fail(http.StatusUnprocessableEntity, CodeRejected)
+		r.known.add(req.Proof.Nullifiers[0], req.Proof.Nullifiers[1])
+		return settledFail(http.StatusUnprocessableEntity, CodeRejected)
 	}
 	if req.Ext.ExtAmount.Sign() < 0 {
 		ok, err := r.CanReceive(ctx, req.Ext.Recipient, new(big.Int).Neg(req.Ext.ExtAmount))
@@ -319,7 +416,7 @@ func (r *Relayer) fresh(ctx context.Context, req Request) *failure {
 			return fail(http.StatusServiceUnavailable, CodeUnavailable)
 		}
 		if !ok {
-			return fail(http.StatusUnprocessableEntity, CodeRejected)
+			return settledFail(http.StatusUnprocessableEntity, CodeRejected)
 		}
 	}
 	return nil
@@ -334,9 +431,7 @@ func (r *Relayer) guard(req Request) *failure {
 	}
 	keys := []string{nullifierKey(req.Proof.Nullifiers[0].Hex()), nullifierKey(req.Proof.Nullifiers[1].Hex())}
 	if req.Ext.ExtAmount.Sign() < 0 {
-		if account, err := vault.AccountOf(req.Ext.Recipient); err == nil {
-			keys = append(keys, destinationKey(account))
-		}
+		keys = append(keys, destinationKey(req.Ext.Recipient))
 	}
 	if r.cool.cooling(now.Unix(), keys...) {
 		return fail(http.StatusUnprocessableEntity, CodeRejected)
@@ -430,11 +525,18 @@ type failure struct {
 	status int
 	code   string
 	reason *uint32
+	// settled marks an answer the same proof would get again, which is kept for a while.
+	settled bool
 }
 
 func (f *failure) Error() string { return f.code }
 
 func fail(status int, code string) *failure { return &failure{status: status, code: code} }
+
+// settledFail is fail for an answer that does not change when the same proof is sent again soon.
+func settledFail(status int, code string) *failure {
+	return &failure{status: status, code: code, settled: true}
+}
 
 // check compares a parsed request with the relayer and the vault.
 func (r *Relayer) check(req Request) *failure {
@@ -471,13 +573,13 @@ func (r *Relayer) check(req Request) *failure {
 	// one before anything is sent. A held request must still be valid at the end of its window,
 	// whose ledger the pace of recent ledgers predicts.
 	now := r.now().Unix()
-	minDeadline := uint64(latest) + uint64(r.cfg.DeadlineMargin)
+	minDeadline := uint64(latest) + r.deadlineMargin()
 	if req.NotBefore != nil {
 		if *req.NotBefore > now+24*3600 {
 			return fail(http.StatusBadRequest, CodeBadRequest)
 		}
 		if *req.NotBefore > now {
-			minDeadline = uint64(r.clock.ledgerAt(*req.NotBefore+int64(r.cfg.Jitter.Seconds()))) + uint64(r.cfg.DeadlineMargin)
+			minDeadline = uint64(r.clock.ledgerAt(*req.NotBefore+int64(r.cfg.Jitter.Seconds()))) + r.deadlineMargin()
 		}
 	}
 	if uint64(e.Deadline) < minDeadline {
@@ -534,13 +636,13 @@ func (r *Relayer) screenDestination(ctx context.Context, e vault.ExtData) *failu
 	defer cancel()
 	allow, reason, err := r.screen.Screen(sctx, e.Recipient)
 	if errors.Is(err, ErrWithheld) {
-		return fail(http.StatusUnprocessableEntity, CodeRejected)
+		return settledFail(http.StatusUnprocessableEntity, CodeRejected)
 	}
 	if err != nil {
 		return fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
 	if !allow {
-		f := fail(http.StatusForbidden, CodeRefused)
+		f := settledFail(http.StatusForbidden, CodeRefused)
 		f.reason = &reason
 		return f
 	}
@@ -563,6 +665,14 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 		return Accepted{}, f
 	}
 	if f := r.local(ctx, req); f != nil {
+		return Accepted{}, f
+	}
+	// A proof already used, or already refused once it had cost the network, is answered from
+	// memory, so replaying public proofs cannot spend the budget honest requests need.
+	if r.known.any(req.Proof.Nullifiers) {
+		return Accepted{}, fail(http.StatusUnprocessableEntity, CodeRejected)
+	}
+	if f := r.told.recall(proofKey(req), r.now()); f != nil {
 		return Accepted{}, f
 	}
 	if f := r.guard(req); f != nil {
@@ -591,6 +701,14 @@ func (r *Relayer) relay(ctx context.Context, req Request) (string, *failure) {
 	if !r.costly.Allow() {
 		return "", fail(http.StatusTooManyRequests, CodeRateLimited)
 	}
+	hash, f := r.costlySteps(ctx, req)
+	if f != nil && f.settled {
+		r.told.remember(proofKey(req), *f, r.now())
+	}
+	return hash, f
+}
+
+func (r *Relayer) costlySteps(ctx context.Context, req Request) (string, *failure) {
 	if f := r.fresh(ctx, req); f != nil {
 		return "", f
 	}
@@ -655,7 +773,7 @@ func (r *Relayer) HeldStatus(ctx context.Context, id string) (txStatus, string, 
 	case hash == "":
 		return txStatus{Status: "held"}, "", nil, true
 	}
-	s, found := r.Status(ctx, hash)
+	s, found, _ := r.Status(ctx, hash)
 	if !found {
 		s = txStatus{Status: "pending"}
 	}
@@ -814,9 +932,14 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	prepared, err := r.engine.PrepareUntil(ctx, ch, op, req.Ext.Deadline)
 	if err != nil {
 		if errors.Is(err, submit.ErrSimulation) {
-			return "", fail(http.StatusUnprocessableEntity, CodeRejected)
+			return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
 		}
 		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	if r.guarded() {
+		if f := r.fresh(ctx, req); f != nil {
+			return "", f
+		}
 	}
 	signed, err := r.engine.Send(ctx, prepared)
 	if err != nil {
@@ -853,8 +976,10 @@ func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, nfs [2]fr.Element
 }
 
 // finish records a relayed transaction's outcome. Only here is a relay logged, so no log line
-// carries the time of the request that caused it. A failure on chain cools down the notes and the
-// destination it was sent with, and counts towards pausing relaying altogether.
+// carries the time of the request that caused it. A failure on chain is judged by its cause: one a
+// client can bring about, by spending the notes first or by making the destination stop
+// receiving, rests the notes and the destination and puts relaying in its guarded mode; one that
+// points at the relayer itself counts toward pausing relaying altogether.
 func (r *Relayer) finish(res submit.Result, sent Record) {
 	rec := Record{Hash: res.Hash, Ledger: res.Ledger, NetworkFee: res.FeeCharged, ResourceFee: res.ResourceFeeCharged}
 	switch res.Outcome {
@@ -863,17 +988,30 @@ func (r *Relayer) finish(res submit.Result, sent Record) {
 		r.setStatus(res.Hash, txStatus{Status: "success", ExitID: rec.ExitID})
 		r.costs.Add(res.ResourceFeeCharged)
 		r.results.add(true)
+		r.known.add(sentNullifiers(sent)...)
 		r.log.Info("confirmed", "tx", res.Hash, "ledger", res.Ledger, "network_fee", res.FeeCharged)
 	case submit.Failed:
 		rec.Outcome = outcomeFailed
 		r.setStatus(res.Hash, txStatus{Status: "failed", Code: CodeRejected})
 		r.results.add(false)
-		r.log.Warn("failed on chain", "tx", res.Hash, "result", res.Code, "network_fee", res.FeeCharged)
-		r.alerts.Raise(r.ctx, alert.Warning, "relay_failed", "relayed transaction %s failed on chain: %s", res.Hash, res.Code)
-		r.coolDown(sent)
-		if r.brk.failed(r.now()) {
-			r.alerts.Raise(r.ctx, alert.Critical, "relaying_paused", "%d relayed transactions failed on chain within %s; relaying pauses for %s",
-				r.cfg.BreakerFailures, r.cfg.BreakerWindow, r.cfg.BreakerPause)
+		c := r.classify(res, sent)
+		r.log.Warn("failed on chain", "tx", res.Hash, "result", res.Code, "cause", c.String(), "network_fee", res.FeeCharged)
+		r.coolDown(sent, c)
+		switch c {
+		case causeSpent, causeReceive:
+			if c == causeSpent {
+				r.known.add(sentNullifiers(sent)...)
+			}
+			if r.races.failed(r.now()) {
+				r.alerts.Raise(r.ctx, alert.Warning, "relaying_guarded", "%d relays lost races within %s; relaying stays on with twice the deadline margin and a last check before each send for %s",
+					r.cfg.RaceFailures, r.cfg.RaceWindow, r.cfg.GuardedFor)
+			}
+		default:
+			r.alerts.Raise(r.ctx, alert.Warning, "relay_failed", "relayed transaction %s failed on chain: %s (%s)", res.Hash, res.Code, c)
+			if r.brk.failed(r.now()) {
+				r.alerts.Raise(r.ctx, alert.Critical, "relaying_paused", "%d relayed transactions failed on chain within %s for reasons of the relayer's own; relaying pauses for %s",
+					r.cfg.BreakerFailures, r.cfg.BreakerWindow, r.cfg.BreakerPause)
+			}
 		}
 	case submit.Expired:
 		rec.Outcome = outcomeExpired
@@ -885,23 +1023,132 @@ func (r *Relayer) finish(res submit.Result, sent Record) {
 	}
 }
 
-// coolDown refuses the nullifiers and the destination of a relay that failed on chain, in memory
-// and in the database, so a restart does not forget them.
-func (r *Relayer) coolDown(rec Record) {
+func sentNullifiers(rec Record) []fr.Element {
+	var out []fr.Element
+	for _, h := range rec.Nullifiers {
+		if nf, err := fr.SetHex(h); err == nil && h != "" {
+			out = append(out, nf)
+		}
+	}
+	return out
+}
+
+// cause is why a relayed transaction failed on chain.
+type cause int
+
+const (
+	// causeRelayer is a failure of the relayer's own making: its sequence, fee or resources.
+	causeRelayer cause = iota
+	// causeVault is a vault error a checked request should not meet, or one that cannot be told.
+	causeVault
+	// causeSpent is notes another transaction spent first.
+	causeSpent
+	// causeReceive is a destination that stopped receiving after it was checked.
+	causeReceive
+)
+
+func (c cause) String() string {
+	return [...]string{"relayer", "vault", "notes spent first", "destination stopped receiving"}[c]
+}
+
+// The vault's error codes a client can bring about after its request was checked. Codes below
+// 100 are the asset contract's, which reach the vault's callers unchanged.
+const (
+	vaultNullifierSpent = 123
+	vaultCannotReceive  = 144
+	firstVaultCode      = 100
+)
+
+// classify tells why a relayed transaction failed. It trusts the contract error the network
+// reports; reads of the chain only tell apart the parties a failed transfer may concern, and
+// stand in for the error when the RPC reports none.
+func (r *Relayer) classify(res submit.Result, sent Record) cause {
+	if res.Code != xdr.TransactionResultCodeTxFailed.String() {
+		return causeRelayer
+	}
+	if res.InvokeCode != nil && *res.InvokeCode != xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped {
+		return causeRelayer
+	}
+	ctx, cancel := context.WithTimeout(r.ctx, 10*time.Second)
+	defer cancel()
+	e := res.ContractError
+	switch {
+	case e == nil:
+		if nfs := sentNullifiers(sent); len(nfs) == 2 {
+			if spent, err := r.spent(ctx, [2]fr.Element{nfs[0], nfs[1]}); err == nil && spent {
+				return causeSpent
+			}
+		}
+		return causeVault
+	case e.Contract == r.cfg.Vault && e.Code == vaultNullifierSpent:
+		return causeSpent
+	case e.Contract == r.cfg.Vault && e.Code == vaultCannotReceive:
+		// The vault checks the fee address too; only the destination is the client's to change.
+		if ok, err := r.CanReceive(ctx, r.cfg.FeeAddress, new(big.Int)); err == nil && !ok {
+			return causeRelayer
+		}
+		return causeReceive
+	case e.Code < firstVaultCode && sent.Destination != "":
+		// A transfer the asset contract refused: the destination's doing, unless the vault itself
+		// may not pay.
+		if ok, err := r.vaultCanPay(ctx); err == nil && !ok {
+			return causeRelayer
+		}
+		return causeReceive
+	}
+	return causeVault
+}
+
+// vaultCanPay reports whether the issuer lets the vault hold, and so send, its asset.
+func (r *Relayer) vaultCanPay(ctx context.Context) (bool, error) {
+	inst, _, _ := r.view()
+	if inst == nil {
+		return false, errors.New("relayer: no vault state")
+	}
+	key, err := vault.BalanceKey(inst.Config.Token, r.cfg.Vault)
+	if err != nil {
+		return false, err
+	}
+	e, _, err := rpc.One(ctx, r.rpc, key)
+	if errors.Is(err, rpc.ErrMissing) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	v, err := rpc.ContractValue(e)
+	if err != nil {
+		return false, err
+	}
+	_, authorized, err := vault.DecodeBalance(v)
+	return authorized, err
+}
+
+// coolDown rests what a failed relay carried, in memory and in the database, so a restart does
+// not forget it: the notes, unless the relayer was at fault, for a day; and after a receive
+// failure the destination, for longer each time it fails again.
+func (r *Relayer) coolDown(rec Record, c cause) {
+	if c == causeRelayer {
+		return
+	}
+	now := r.now()
 	var keys []string
 	for _, nf := range rec.Nullifiers {
 		if nf != "" {
 			keys = append(keys, nullifierKey(nf))
 		}
 	}
-	if rec.Destination != "" {
-		if account, err := vault.AccountOf(rec.Destination); err == nil {
-			keys = append(keys, destinationKey(account))
-		}
-	}
-	until := r.now().Add(r.cfg.Cooldown).Unix()
+	until := now.Add(r.cfg.Cooldown).Unix()
 	r.cool.add(keys, until)
 	if err := r.db.coolDown(r.ctx, keys, until); err != nil {
+		r.alerts.Raise(r.ctx, alert.Warning, "cooldown_not_stored", "a cooldown was kept in memory only: %v", err)
+	}
+	if c != causeReceive || rec.Destination == "" {
+		return
+	}
+	key := destinationKey(rec.Destination)
+	rest, strikes := r.cool.strike(key, now.Unix())
+	if err := r.db.strike(r.ctx, key, rest, strikes); err != nil {
 		r.alerts.Raise(r.ctx, alert.Warning, "cooldown_not_stored", "a cooldown was kept in memory only: %v", err)
 	}
 }
@@ -974,31 +1221,38 @@ func (r *Relayer) Wait() {
 	r.following.Wait()
 }
 
+// errLookupBudget reports a status lookup refused because the lookups that reach the database are
+// over budget, which is not the same as an unknown transaction.
+var errLookupBudget = errors.New("relayer: status lookups over budget")
+
 // Status reports a transaction this relayer submitted. A hash not in memory is looked up in the
-// records on a budget of its own.
-func (r *Relayer) Status(ctx context.Context, hash string) (txStatus, bool) {
+// records on a budget of its own; it reports false for a hash it never submitted.
+func (r *Relayer) Status(ctx context.Context, hash string) (txStatus, bool, error) {
 	r.mu.Lock()
 	s, ok := r.statuses[hash]
 	r.mu.Unlock()
 	if ok {
-		return s, true
+		return s, true, nil
 	}
 	if !r.lookups.Allow() {
-		return txStatus{}, false
+		return txStatus{}, false, errLookupBudget
 	}
 	outcome, exitID, found, err := r.db.lookup(ctx, hash)
-	if err != nil || !found {
-		return txStatus{}, false
+	if err != nil {
+		return txStatus{}, false, err
+	}
+	if !found {
+		return txStatus{}, false, nil
 	}
 	switch outcome {
 	case outcomeSuccess:
-		return txStatus{Status: "success", ExitID: exitID}, true
+		return txStatus{Status: "success", ExitID: exitID}, true, nil
 	case outcomeFailed:
-		return txStatus{Status: "failed", Code: CodeRejected}, true
+		return txStatus{Status: "failed", Code: CodeRejected}, true, nil
 	case outcomeExpired:
-		return txStatus{Status: "failed", Code: CodeUnavailable}, true
+		return txStatus{Status: "failed", Code: CodeUnavailable}, true, nil
 	}
-	return txStatus{Status: "pending"}, true
+	return txStatus{Status: "pending"}, true, nil
 }
 
 // channelPool hands each channel account to one transaction at a time.

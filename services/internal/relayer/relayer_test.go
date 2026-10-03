@@ -395,6 +395,16 @@ func TestUnshieldsAreScreenedAndTheRelayerFailsClosed(t *testing.T) {
 	if code, out := h.post(body); code != http.StatusForbidden || out["error"] != CodeRefused || out["reason"].(float64) != 1 {
 		t.Fatalf("refused destination: %d %v", code, out)
 	}
+	// The same proof sent again soon is answered from memory, without asking screening again.
+	if code, out := h.post(body); code != http.StatusForbidden || out["reason"].(float64) != 1 || len(h.screen.asked) != 1 {
+		t.Fatalf("the same proof again: %d %v, screening asked %d times", code, out, len(h.screen.asked))
+	}
+	h.mu.Lock()
+	h.now = h.now.Add(verdictLifetime)
+	h.mu.Unlock()
+	if err := h.r.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	h.screen.err = errors.New("timeout")
 	if code, out := h.post(body); code != http.StatusServiceUnavailable || out["error"] != CodeUnavailable {
 		t.Fatalf("screening down: %d %v", code, out)

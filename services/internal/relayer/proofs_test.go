@@ -69,8 +69,8 @@ func TestAHeldRequestIsRefusedWhenItsDestinationCoolsDownDuringTheHold(t *testin
 	if f != nil || !accepted.Held {
 		t.Fatalf("held request: %+v %v", accepted, f)
 	}
-	// While it waits, another relay to the same destination fails on chain.
-	h.setTxStatus(failedOnChain())
+	// While it waits, another relay to the same destination fails on chain: it no longer receives.
+	h.setTxStatus(failedReceive())
 	if _, f := h.r.Submit(ctx, h.forged(t, dest, -20_000_000, 5_000_000)); f != nil {
 		t.Fatalf("the relay that fails: %v", f)
 	}

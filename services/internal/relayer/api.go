@@ -2,6 +2,7 @@ package relayer
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -20,6 +21,7 @@ func (r *Relayer) Handler() http.Handler {
 		body := map[string]any{
 			"ready": inst != nil && r.channels.ready() > 0 && !paused, "vault": r.cfg.Vault, "network_id": hex.EncodeToString(r.cfg.NetworkID[:]),
 			"fee_address": r.cfg.FeeAddress, "ready_channels": r.channels.ready(), "channels": r.channels.total, "paused": paused,
+			"guarded": r.guarded(),
 		}
 		status := http.StatusOK
 		if inst == nil {
@@ -77,8 +79,15 @@ func (r *Relayer) Handler() http.Handler {
 			httpapi.Fail(w, http.StatusBadRequest, CodeBadRequest)
 			return
 		}
-		s, ok := r.Status(req.Context(), hash)
-		if !ok {
+		s, ok, err := r.Status(req.Context(), hash)
+		switch {
+		case errors.Is(err, errLookupBudget):
+			httpapi.Fail(w, http.StatusTooManyRequests, CodeRateLimited)
+			return
+		case err != nil:
+			httpapi.Fail(w, http.StatusServiceUnavailable, CodeUnavailable)
+			return
+		case !ok:
 			httpapi.Fail(w, http.StatusNotFound, "not_found")
 			return
 		}
@@ -125,11 +134,14 @@ func (r *Relayer) Handler() http.Handler {
 	return httpapi.Public(mux)
 }
 
-// Run keeps the vault state and the quote fresh until the context ends.
+// Run keeps the vault state, the quote and the spent nullifiers fresh until the context ends.
 func (r *Relayer) Run(every time.Duration) {
 	for r.ctx.Err() == nil {
 		if err := r.Refresh(r.ctx); err != nil {
 			r.log.Warn("refresh failed", "error", fmt.Sprint(err))
+		}
+		if err := r.FollowNullifiers(r.ctx); err != nil {
+			r.log.Warn("nullifier follow failed", "error", fmt.Sprint(err))
 		}
 		t := time.NewTimer(every)
 		select {
