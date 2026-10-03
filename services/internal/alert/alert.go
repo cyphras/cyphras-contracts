@@ -161,6 +161,16 @@ func (a *Alerter) Raise(ctx context.Context, sev Severity, code, format string, 
 		return
 	}
 	a.last[code] = now
+	if len(a.last) > 256 {
+		// Codes unique to one event would otherwise accumulate; a condition that persists is
+		// raised again well within a day.
+		for c, t := range a.last {
+			if now.Sub(t) > max(a.Cooldown, 24*time.Hour) {
+				delete(a.last, c)
+				delete(a.open, c)
+			}
+		}
+	}
 	a.mu.Unlock()
 	a.deliver(ctx, Alert{Service: a.Service, Severity: sev, Code: code, Message: fmt.Sprintf(format, args...), Time: now.UTC()})
 }

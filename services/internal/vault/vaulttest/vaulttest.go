@@ -363,3 +363,24 @@ func ExitEntry(recipient string, payout, fee int64, queuedAt uint64) xdr.ScVal {
 		vault.Field{Name: "queued_at", Value: vault.U64(queuedAt)},
 	)
 }
+
+// Transfer emits the asset contract's transfer of amount from the vault to an address, in the
+// current transaction, as the Stellar Asset Contract reports it.
+func (c *Chain) Transfer(to string, amount int64) {
+	account, err := vault.AccountOf(to)
+	if err != nil {
+		panic(err)
+	}
+	asset := xdr.ScString("native")
+	data := i128(big.NewInt(amount))
+	if account != to {
+		a, _ := vault.ScAddress(to)
+		data = vault.Struct(vault.Field{Name: "amount", Value: data}, vault.Field{Name: "to_muxed_id", Value: vault.U64(uint64(a.MuxedAccount.Id))})
+	}
+	c.Events = append(c.Events, vault.RawEvent{
+		Ledger: c.Ledger, ClosedAt: c.ClosedAt, TxHash: c.hash, Tx: c.tx, Op: 0, Index: c.index, Contract: Token,
+		Topics: []string{b64(vault.Symbol("transfer")), b64(addr(Vault)), b64(addr(account)), b64(xdr.ScVal{Type: xdr.ScValTypeScvString, Str: &asset})},
+		Value:  b64(data),
+	})
+	c.index++
+}
