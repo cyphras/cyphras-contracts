@@ -95,6 +95,9 @@ func TestAWriterWaitsForItsLockWhileAnotherHoldsIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Its session is left alone even when it has the process id of the session that held the
+	// lock, as a reused id would.
+	h.s.lock.pid = other.pid
 	if err := h.s.FlagManually(ctx, id, ReasonFraud, "reviewer", "report 1"); !errors.Is(err, errLockMissing) {
 		t.Fatalf("a flag while another holds the lock: %v", err)
 	}
