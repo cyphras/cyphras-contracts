@@ -10,6 +10,7 @@ mod invariants;
 mod queue;
 mod setup;
 mod shield;
+mod stranded;
 mod tamper;
 mod transact;
 pub mod trapdoor;

@@ -1,11 +1,14 @@
 use soroban_sdk::{
-    testutils::storage::{Instance as _, Persistent as _, Temporary as _},
+    testutils::{
+        storage::{Instance as _, Persistent as _, Temporary as _},
+        Ledger,
+    },
     Vec,
 };
 
 use super::{
     queue::authorizers,
-    setup::{limits, Setup, DAY, DELAY_SMALL, XLM},
+    setup::{account_address, limits, Setup, DAY, DELAY_SMALL, XLM},
 };
 use crate::{DataKey, Limits};
 
@@ -151,4 +154,22 @@ fn the_exit_queue_writes_only_the_entries_it_changes() {
     s.advance(DAY);
     assert_eq!(s.vault.release(&1), 1);
     assert_eq!(writes(), 5);
+
+    // A payout too small to create its missing account strands.
+    s.transact(&relayer, &s.ext(-8 * XLM, 0, &relayer, &relayer))
+        .unwrap();
+    let missing = account_address(&s.env, "missing");
+    s.transact(&relayer, &s.ext(-XLM / 2, 0, &missing, &relayer))
+        .unwrap();
+    s.advance(DAY);
+    s.env.ledger().with_mut(|l| l.base_reserve = 5_000_000);
+    // Stranding it writes the instance, the exit, the stranded exit and the vault's balance,
+    // which the refused transfer debited before it was rolled back.
+    assert_eq!(s.vault.release(&1), 1);
+    assert_eq!(writes(), 4);
+    assert_eq!(persistent_ttl(&s, &DataKey::Stranded(2)), WRITE_TTL);
+    // Claiming it writes the instance, the stranded exit and two balances.
+    s.account("missing", XLM);
+    s.vault.claim(&2);
+    assert_eq!(writes(), 4);
 }

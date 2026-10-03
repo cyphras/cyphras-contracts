@@ -1,7 +1,7 @@
 //! The exit queue: an exit that does not fit today's outflow window waits in ID order, and anyone
 //! releases the queue as the window allows.
 
-use soroban_sdk::{testutils::Events as _, Address, Event};
+use soroban_sdk::{testutils::Events as _, Address, Event, MuxedAddress};
 
 use super::{
     queue::authorizers,
@@ -12,7 +12,7 @@ use crate::{events, Error, Exit, Status};
 const HALT: u64 = 72 * 3_600;
 
 /// A vault holding six admitted deposits of 2,500 XLM, three days of outflow.
-fn funded() -> Setup {
+pub fn funded() -> Setup {
     let s = Setup::new();
     for i in 0..6 {
         s.fund_pool(&std::format!("funder {i}"), 2_500 * XLM);
@@ -43,7 +43,13 @@ pub fn fill_window(s: &Setup, to: &Address) {
 }
 
 /// Submits an unshield that must wait in the queue, and returns its exit ID.
-pub fn queue(s: &Setup, payout: i128, fee: i128, recipient: &Address, relayer: &Address) -> u64 {
+pub fn queue(
+    s: &Setup,
+    payout: i128,
+    fee: i128,
+    recipient: impl Into<MuxedAddress>,
+    relayer: &Address,
+) -> u64 {
     let id = s.vault.status().exit_tail;
     let ext = s.ext(-payout, fee, recipient, relayer);
     assert_eq!(s.transact(relayer, &ext), Ok(()));

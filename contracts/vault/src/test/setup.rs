@@ -149,10 +149,19 @@ impl Setup {
         Self::build(limits, false)
     }
 
+    /// A testnet vault of `token` that verifies with the trapdoor key.
+    pub fn with_token(env: Env, token: Address, limits: Limits) -> Self {
+        Self::deploy(env, token, limits, true)
+    }
+
     fn build(limits: Limits, trapdoor: bool) -> Self {
-        let trapdoor = trapdoor.then(trapdoor::enable);
         let env = env(TESTNET);
         let token = native_asset(&env);
+        Self::deploy(env, token, limits, trapdoor)
+    }
+
+    fn deploy(env: Env, token: Address, limits: Limits, trapdoor: bool) -> Self {
+        let trapdoor = trapdoor.then(trapdoor::enable);
         let guardian = Address::generate(&env);
         let asp = Address::generate(&env);
         let id = env.register_at(

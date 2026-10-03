@@ -28,6 +28,7 @@ pub enum DataKey {
     Nullifier(U256),
     Pending(u64),
     Exit(u64),
+    Stranded(u64),
     DepositorDay(Address, u64),
 }
 
@@ -64,7 +65,7 @@ pub struct QueuedLimits {
 }
 
 /// `tvl` is all value the vault holds for users: `pending_total` of it is in pending deposits,
-/// `queued_total` is owed to exits in the exit queue, and the rest belongs to unspent notes.
+/// `queued_total` is owed to queued and stranded exits, and the rest belongs to unspent notes.
 /// `exit_head` is the ID of the oldest exit still queued and `exit_tail` the ID the next queued
 /// exit takes, so the queue is empty when they are equal. `outflow` is the total paid out on day
 /// `outflow_day`; a later day starts from zero.
@@ -110,8 +111,8 @@ pub struct PendingDeposit {
     pub flagged_at: u64,
 }
 
-/// An exit waiting in the exit queue: what `transact` owes `recipient` and `relayer`, and the time
-/// it was queued.
+/// An exit owed by the vault: what `transact` owes `recipient` and `relayer`, and the time it was
+/// queued. A stranded exit holds only the parts its release could not pay.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Exit {
@@ -219,6 +220,18 @@ pub fn set_exit(env: &Env, id: u64, exit: &Exit) {
 
 pub fn remove_exit(env: &Env, id: u64) {
     env.storage().persistent().remove(&DataKey::Exit(id));
+}
+
+pub fn stranded(env: &Env, id: u64) -> Option<Exit> {
+    get(env, &DataKey::Stranded(id))
+}
+
+pub fn set_stranded(env: &Env, id: u64, exit: &Exit) {
+    set(env, &DataKey::Stranded(id), exit);
+}
+
+pub fn remove_stranded(env: &Env, id: u64) {
+    env.storage().persistent().remove(&DataKey::Stranded(id));
 }
 
 pub fn day_total(env: &Env, depositor: &Address, day: u64) -> i128 {

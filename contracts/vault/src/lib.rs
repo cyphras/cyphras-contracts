@@ -345,8 +345,10 @@ impl Vault {
 
     /// Anyone pays queued exits from the head of the exit queue, in ID order, while each fits
     /// what is left of today's outflow window. It stops at the first exit that does not fit,
-    /// never skipping it, or after `max` exits, and returns how many it paid. Refused while
-    /// halted; works while paused.
+    /// never skipping it, or after `max` exits, and returns how many it released. A part the
+    /// asset contract refuses to transfer is set aside as a stranded exit for `claim`, so that a
+    /// recipient who cannot receive never holds up the exits behind it. Refused while halted;
+    /// works while paused.
     pub fn release(env: Env, max: u32) -> Result<u32, Error> {
         let mut status = storage::status(&env);
         let now = env.ledger().timestamp();
@@ -363,33 +365,43 @@ impl Vault {
             let id = status.exit_head;
             let exit = storage::exit(&env, id).unwrap();
             let outflow = exit.payout.checked_add(exit.fee).ok_or(Error::Overflow)?;
-            let after = today.checked_add(outflow).ok_or(Error::Overflow)?;
-            if after > max_daily_outflow {
+            if today.checked_add(outflow).ok_or(Error::Overflow)? > max_daily_outflow {
                 break;
             }
-            today = after;
-            status.tvl = status.tvl.checked_sub(outflow).ok_or(Error::Overflow)?;
+            storage::remove_exit(&env, id);
+            status.exit_head = id + 1;
+            count += 1;
+
+            let unpaid = Exit {
+                payout: try_pay(&token, &vault, &exit.recipient, exit.payout),
+                fee: try_pay(&token, &vault, &MuxedAddress::from(&exit.relayer), exit.fee),
+                ..exit.clone()
+            };
+            let paid = outflow - unpaid.payout - unpaid.fee;
+            today = today.checked_add(paid).ok_or(Error::Overflow)?;
+            status.tvl = status.tvl.checked_sub(paid).ok_or(Error::Overflow)?;
             status.queued_total = status
                 .queued_total
-                .checked_sub(outflow)
+                .checked_sub(paid)
                 .ok_or(Error::Overflow)?;
-            status.exit_head = id + 1;
-            storage::remove_exit(&env, id);
-            events::Settled {
-                ext_amount: -exit.payout,
-                fee: exit.fee,
-                recipient: exit.recipient.clone(),
-                relayer: exit.relayer.clone(),
-                exit_id: Some(id),
+            if paid == outflow {
+                events::Settled {
+                    ext_amount: -exit.payout,
+                    fee: exit.fee,
+                    recipient: exit.recipient,
+                    relayer: exit.relayer,
+                    exit_id: Some(id),
+                }
+                .publish(&env);
+            } else {
+                storage::set_stranded(&env, id, &unpaid);
+                events::ExitStranded {
+                    id,
+                    payout: unpaid.payout,
+                    fee: unpaid.fee,
+                }
+                .publish(&env);
             }
-            .publish(&env);
-            if exit.payout > 0 {
-                token.transfer(&vault, &exit.recipient, &exit.payout);
-            }
-            if exit.fee > 0 {
-                token.transfer(&vault, &exit.relayer, &exit.fee);
-            }
-            count += 1;
         }
         if count > 0 {
             status.outflow_day = day;
@@ -397,6 +409,54 @@ impl Vault {
             storage::set_status(&env, &status);
         }
         Ok(count)
+    }
+
+    /// Anyone pays the unpaid parts of a stranded exit to its recipient and relayer, within what
+    /// is left of today's outflow window. The transfers are plain ones: while a party still
+    /// cannot receive, the call fails and the exit stays stranded. Refused while halted; works
+    /// while paused.
+    pub fn claim(env: Env, id: u64) -> Result<(), Error> {
+        let mut status = storage::status(&env);
+        let now = env.ledger().timestamp();
+        if status.halted(now) {
+            return Err(Error::Halted);
+        }
+        let exit = storage::stranded(&env, id).ok_or(Error::NotStranded)?;
+        let outflow = exit.payout.checked_add(exit.fee).ok_or(Error::Overflow)?;
+        let day = now / DAY;
+        let today = outflow_today(&status, day)
+            .checked_add(outflow)
+            .ok_or(Error::Overflow)?;
+        if today > storage::limits(&env).max_daily_outflow {
+            return Err(Error::OutflowLimit);
+        }
+
+        storage::remove_stranded(&env, id);
+        status.tvl = status.tvl.checked_sub(outflow).ok_or(Error::Overflow)?;
+        status.queued_total = status
+            .queued_total
+            .checked_sub(outflow)
+            .ok_or(Error::Overflow)?;
+        status.outflow_day = day;
+        status.outflow = today;
+        storage::set_status(&env, &status);
+        events::Settled {
+            ext_amount: -exit.payout,
+            fee: exit.fee,
+            recipient: exit.recipient.clone(),
+            relayer: exit.relayer.clone(),
+            exit_id: Some(id),
+        }
+        .publish(&env);
+        let token = TokenClient::new(&env, &storage::config(&env).token);
+        let vault = env.current_contract_address();
+        if exit.payout > 0 {
+            token.transfer(&vault, &exit.recipient, &exit.payout);
+        }
+        if exit.fee > 0 {
+            token.transfer(&vault, &exit.relayer, &exit.fee);
+        }
+        Ok(())
     }
 
     /// The ASP asserts that every unflagged deposit with an ID up to `up_to` passed screening.
@@ -528,8 +588,8 @@ impl Vault {
         return_deposit(&env, id, deposit, reason)
     }
 
-    /// The guardian stops or resumes deposits and transfers. Unshields, releases of queued exits,
-    /// cancellations and refunds are never paused.
+    /// The guardian stops or resumes deposits and transfers. Unshields, releases and claims of
+    /// exits, cancellations and refunds are never paused.
     pub fn set_pause(env: Env, deposits: bool, transfers: bool) -> Result<(), Error> {
         storage::config(&env).guardian.require_auth();
         let mut status = storage::status(&env);
@@ -544,9 +604,9 @@ impl Vault {
         Ok(())
     }
 
-    /// The guardian stops `shield`, `transact`, `admit`, `attest` and `release` for 72 hours. The
-    /// next halt is allowed 7 days after this one ends, so users always get a week to exit between
-    /// halts.
+    /// The guardian stops `shield`, `transact`, `admit`, `attest`, `release` and `claim` for 72
+    /// hours. The next halt is allowed 7 days after this one ends, so users always get a week to
+    /// exit between halts.
     pub fn halt(env: Env) -> Result<(), Error> {
         storage::config(&env).guardian.require_auth();
         let mut status = storage::status(&env);
@@ -703,6 +763,10 @@ impl Vault {
     pub fn exit(env: Env, id: u64) -> Option<Exit> {
         storage::exit(&env, id)
     }
+
+    pub fn stranded(env: Env, id: u64) -> Option<Exit> {
+        storage::stranded(&env, id)
+    }
 }
 
 fn on_mainnet(env: &Env) -> bool {
@@ -742,6 +806,17 @@ fn outflow_today(status: &Status, day: u64) -> i128 {
         status.outflow
     } else {
         0
+    }
+}
+
+/// Pays `amount` from the vault without failing the call, and returns the part left unpaid: all of
+/// it when the asset contract refuses the transfer, for want of a trustline, an authorization or
+/// an account. A refused transfer changes nothing.
+fn try_pay(token: &TokenClient, vault: &Address, to: &MuxedAddress, amount: i128) -> i128 {
+    if amount == 0 || matches!(token.try_transfer(vault, to, &amount), Ok(Ok(()))) {
+        0
+    } else {
+        amount
     }
 }
 
