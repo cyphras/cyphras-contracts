@@ -2,12 +2,8 @@ package screening
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/strkey"
@@ -18,112 +14,10 @@ import (
 // FunderWindow is how far back the accounts that sent value to an address count as its funders.
 const FunderWindow = 30 * 24 * time.Hour
 
-// Funders finds the accounts that sent value to an account since a time.
+// Funders finds the accounts that sent value to an account since a time; horizon.Client is one.
 type Funders interface {
 	// Funders returns the senders and whether the history was read in full.
 	Funders(ctx context.Context, account string, since time.Time) ([]string, bool, error)
-}
-
-// Horizon reads payment history from a Horizon server.
-type Horizon struct {
-	URL      string
-	HTTP     *http.Client
-	MaxPages int
-}
-
-type horizonPage struct {
-	Links struct {
-		Next struct {
-			Href string `json:"href"`
-		} `json:"next"`
-	} `json:"_links"`
-	Embedded struct {
-		Records []struct {
-			Type      string    `json:"type"`
-			CreatedAt time.Time `json:"created_at"`
-			From      string    `json:"from"`
-			To        string    `json:"to"`
-			Funder    string    `json:"funder"`
-			Account   string    `json:"account"`
-			Into      string    `json:"into"`
-			Changes   []struct {
-				From string `json:"from"`
-				To   string `json:"to"`
-			} `json:"asset_balance_changes"`
-		} `json:"records"`
-	} `json:"_embedded"`
-}
-
-const horizonPageSize = 200
-
-// Funders implements Funders.
-func (h Horizon) Funders(ctx context.Context, account string, since time.Time) ([]string, bool, error) {
-	seen := map[string]bool{}
-	var out []string
-	add := func(a string) {
-		if a != "" && a != account && !seen[a] {
-			seen[a] = true
-			out = append(out, a)
-		}
-	}
-	next := fmt.Sprintf("%s/accounts/%s/payments?order=desc&limit=%d", strings.TrimSuffix(h.URL, "/"), url.PathEscape(account), horizonPageSize)
-	for page := 0; next != ""; page++ {
-		if page == h.MaxPages {
-			return out, false, nil
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, next, nil)
-		if err != nil {
-			return nil, false, err
-		}
-		resp, err := h.HTTP.Do(req)
-		if err != nil {
-			return nil, false, errors.New("horizon unreachable")
-		}
-		if resp.StatusCode == http.StatusNotFound {
-			resp.Body.Close()
-			return out, true, nil
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return nil, false, fmt.Errorf("horizon answered %d", resp.StatusCode)
-		}
-		var p horizonPage
-		err = json.NewDecoder(resp.Body).Decode(&p)
-		resp.Body.Close()
-		if err != nil {
-			return nil, false, fmt.Errorf("horizon: %w", err)
-		}
-		for _, r := range p.Embedded.Records {
-			if r.CreatedAt.Before(since) {
-				return out, true, nil
-			}
-			switch r.Type {
-			case "payment", "path_payment_strict_receive", "path_payment_strict_send":
-				if r.To == account {
-					add(r.From)
-				}
-			case "create_account":
-				if r.Account == account {
-					add(r.Funder)
-				}
-			case "account_merge":
-				if r.Into == account {
-					add(r.Account)
-				}
-			case "invoke_host_function":
-				for _, c := range r.Changes {
-					if c.To == account {
-						add(c.From)
-					}
-				}
-			}
-		}
-		next = ""
-		if len(p.Embedded.Records) == horizonPageSize {
-			next = p.Links.Next.Href
-		}
-	}
-	return out, true, nil
 }
 
 // ErrUnavailable reports that a check could not run: a source is stale or unreachable. Screening

@@ -21,6 +21,7 @@ import (
 
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
+	"github.com/cyphras/cyphras-contracts/services/internal/horizon"
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/screening"
@@ -105,13 +106,13 @@ func build(ctx context.Context, base *service.Base) (*screening.Screener, error)
 	if err != nil {
 		return nil, err
 	}
-	horizon, err := config.Value("HORIZON_URL")
+	horizonURL, err := config.Value("HORIZON_URL")
 	if err != nil {
 		return nil, err
 	}
 	check := &screening.Checker{
 		Sources:    sources,
-		Funders:    screening.Horizon{URL: horizon, HTTP: &http.Client{Timeout: 20 * time.Second}, MaxPages: 10},
+		Funders:    horizon.Client{URL: horizonURL, HTTP: &http.Client{Timeout: 20 * time.Second}, MaxPages: 10},
 		MaxFunders: int(maxFunders),
 	}
 	return screening.New(ctx, screening.Config{

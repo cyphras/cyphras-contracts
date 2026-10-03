@@ -193,36 +193,6 @@ func TestTheCheckerFollowsFunders(t *testing.T) {
 	}
 }
 
-func TestHorizonFundersAreTheIncomingSenders(t *testing.T) {
-	now := time.Now().UTC()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/accounts/"+clean) {
-			http.NotFound(w, r)
-			return
-		}
-		records := []map[string]any{
-			{"type": "payment", "created_at": now, "from": funder, "to": clean},
-			{"type": "payment", "created_at": now, "from": clean, "to": thief},
-			{"type": "invoke_host_function", "created_at": now, "asset_balance_changes": []map[string]string{{"from": contract, "to": clean}}},
-			{"type": "create_account", "created_at": now.Add(-40 * 24 * time.Hour), "funder": grandpa, "account": clean},
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": records}})
-	}))
-	defer srv.Close()
-	h := Horizon{URL: srv.URL, HTTP: srv.Client(), MaxPages: 3}
-	got, complete, err := h.Funders(context.Background(), clean, now.Add(-FunderWindow))
-	if err != nil || !complete {
-		t.Fatal(err)
-	}
-	if len(got) != 2 || got[0] != funder || got[1] != contract {
-		t.Fatalf("funders %v", got)
-	}
-	got, complete, err = h.Funders(context.Background(), thief, now.Add(-FunderWindow))
-	if err != nil || !complete || len(got) != 0 {
-		t.Fatalf("missing account: %v %v", got, err)
-	}
-}
-
 func TestSEP53SignaturesAreVerified(t *testing.T) {
 	kp := keypair.MustRandom()
 	msg := SelfReportMessage("testnet", kp.Address(), "2026-10-03")
