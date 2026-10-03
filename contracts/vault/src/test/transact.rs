@@ -6,7 +6,7 @@ use soroban_sdk::{
     Address, Event, IntoVal, MuxedAddress, Symbol,
 };
 
-use super::setup::{Setup, DAY, XLM};
+use super::setup::{outcome, Setup, DAY, XLM};
 use crate::{events, Error};
 
 /// A vault holding three admitted deposits of 2,500 XLM.
@@ -201,6 +201,26 @@ fn ciphertexts_and_binding_are_checked_for_transact_too() {
     let mut ext = s.ext(-XLM, 0, &relayer, &relayer);
     ext.network_id = soroban_sdk::BytesN::from_array(&s.env, &[1; 32]);
     assert_eq!(s.transact(&relayer, &ext), Err(Error::WrongNetwork));
+}
+
+#[test]
+fn the_vault_never_pays_itself() {
+    let s = funded();
+    let vault = s.vault.address.clone();
+    let relayer = s.account("relayer", 0);
+    let tvl = s.vault.status().tvl;
+    for (recipient, payer) in [(&vault, &relayer), (&relayer, &vault), (&vault, &vault)] {
+        let ext = s.ext(-10 * XLM, XLM, recipient, payer);
+        assert_eq!(s.transact(&relayer, &ext), Err(Error::BadParties));
+    }
+    let ext = s.ext(0, XLM, &vault, &vault);
+    assert_eq!(s.transact(&relayer, &ext), Err(Error::BadParties));
+    // Nor can it shield as its own depositor.
+    let ext = s.ext(XLM, 0, &vault, &vault);
+    let result = outcome(s.vault.try_shield(&s.prove(&ext), &ext, &vault));
+    assert_eq!(result, Err(Error::BadParties));
+    assert_eq!(s.vault.status().tvl, tvl);
+    assert_eq!(s.balance(&vault), tvl);
 }
 
 #[test]

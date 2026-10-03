@@ -28,14 +28,20 @@ pub fn public_amount(env: &Env, ext_amount: i128, fee: i128) -> Result<U256, Err
     })
 }
 
-/// The ExtData checks both entry points make: the proof is for this vault on this network, and
-/// both outputs are full-size ciphertexts.
+/// The ExtData checks both entry points make: the proof is for this vault on this network, it
+/// pays no one the vault itself, and both outputs are full-size ciphertexts.
 pub fn check_binding(env: &Env, ext: &ExtData) -> Result<(), Error> {
-    if ext.vault != env.current_contract_address() {
+    let vault = env.current_contract_address();
+    if ext.vault != vault {
         return Err(Error::WrongVault);
     }
     if ext.network_id != env.ledger().network_id() {
         return Err(Error::WrongNetwork);
+    }
+    // A payment to the vault would leave its balance unchanged while the TVL drops, so the value
+    // would sit in the vault with no note behind it.
+    if ext.recipient.address() == vault || ext.relayer == vault {
+        return Err(Error::BadParties);
     }
     if ext.encrypted_output0.len() != CIPHERTEXT_LEN
         || ext.encrypted_output1.len() != CIPHERTEXT_LEN
