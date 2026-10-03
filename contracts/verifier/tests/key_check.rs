@@ -11,6 +11,8 @@ use num_bigint::BigUint;
 use serde_json::{json, Value};
 
 const FORGEABLE: &[u8] = include_bytes!("../keys/testnet-forgeable/verification_key.json");
+// The key snarkjs exported after one phase-2 contribution in a dry run of the ceremony.
+const DRY_RUN: &[u8] = include_bytes!("dry_run_verification_key.json");
 
 fn decimal(f: Fq) -> String {
     BigUint::from(f.into_bigint()).to_string()
@@ -86,6 +88,17 @@ fn the_mainnet_build_refuses_the_forgeable_key_even_when_pinned_to_it() {
         .err()
         .unwrap();
     assert!(err.contains("testnet-forgeable"), "{err}");
+}
+
+#[test]
+fn a_key_from_a_fresh_phase_2_contribution_passes_the_mainnet_checks_under_its_own_pin() {
+    let key = check::parse(DRY_RUN).unwrap();
+    assert_eq!(key.ic.len(), check::PUBLIC_INPUTS + 1);
+    let pin = check::sha256_hex(DRY_RUN);
+    assert!(check::mainnet(DRY_RUN, FORGEABLE, Some(&pin)).is_ok());
+    // Without its pin, or under another, it is still refused.
+    assert!(check::mainnet(DRY_RUN, FORGEABLE, None).is_err());
+    assert!(check::mainnet(DRY_RUN, FORGEABLE, Some(check::FORGEABLE_SHA256)).is_err());
 }
 
 #[test]

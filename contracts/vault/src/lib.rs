@@ -34,6 +34,11 @@ const LOOSENING_DELAY: u64 = 7 * DAY;
 // Anyone may refund a flagged deposit only this long after it was flagged, which leaves the ASP
 // time to correct a mistaken flag. The depositor can cancel at any time.
 const REFUND_DELAY: u64 = DAY;
+// The asset contract creates a missing account from a native payment of at least two base
+// reserves. A contract cannot read the base reserve, so this is two reserves of 0.5 XLM. Should
+// the reserve rise, a payment from here up to two of the new reserves fails like any refused
+// transfer.
+const NATIVE_ACCOUNT_MIN: i128 = 10_000_000;
 
 // sha256("Public Global Stellar Network ; September 2015")
 const MAINNET_NETWORK_ID: [u8; 32] = [
@@ -213,7 +218,9 @@ impl Vault {
     /// Settles a transfer (`ext_amount == 0`) or an unshield (`ext_amount < 0`). `submitter` is
     /// the relayer, or the user when self-relaying. The payout and the fee are paid at once when
     /// no exit is queued and they fit what is left of today's outflow window. Otherwise the exit
-    /// joins the exit queue and `release` pays it in turn.
+    /// joins the exit queue and `release` pays it in turn. Fails with `CannotReceive` when a party
+    /// it would pay cannot receive the asset now. An account must exist, except that an XLM payout
+    /// of at least 1 XLM creates the recipient's account.
     pub fn transact(
         env: Env,
         proof: TxProof,
@@ -263,10 +270,11 @@ impl Vault {
             return Err(Error::ExceedsAdmittedValue);
         }
         // Refused before anything is spent, an exit to a party that cannot receive is never
-        // queued only to strand, and paying at once and queueing treat it alike.
+        // queued only to strand, and paying at once and queueing treat it alike. Only a payout
+        // may create an account: a fee can be paid in parts of any size, so a relayer must exist.
         let asset = StellarAssetClient::new(&env, &config.token);
-        if (payout > 0 && !can_receive(&env, &asset, &ext.recipient.address()))
-            || (ext.fee > 0 && !can_receive(&env, &asset, &ext.relayer))
+        if (payout > 0 && !can_receive(&env, &asset, &ext.recipient.address(), payout))
+            || (ext.fee > 0 && !can_receive(&env, &asset, &ext.relayer, 0))
         {
             return Err(Error::CannotReceive);
         }
@@ -353,15 +361,17 @@ impl Vault {
         Ok(())
     }
 
-    /// Anyone pays queued exits from the head of the exit queue, in ID order, until today's
-    /// outflow window is full or `max` exits were handled, and returns how many were. Of an exit
-    /// that does not fit, it pays what does, payout first, and the rest stays at the head for the
-    /// next day, so no window goes unused. When the asset contract refuses a transfer, everything
-    /// the exit still owes is set aside as a stranded exit for `claim`, so that a recipient who
-    /// cannot receive never holds up the exits behind it. While the issuer keeps the vault itself
-    /// from holding the asset, or the vault holds less than the next payment, it stops with the
-    /// queue as it is, and fails with `VaultCannotPay` if it paid nothing. Refused while halted;
-    /// works while paused.
+    /// Anyone pays queued exits from the head of the exit queue, in ID order, until today's outflow
+    /// window is full or `max` exits were handled, and returns how many were. Of an exit that does
+    /// not fit, it pays what does, payout first, and the rest stays at the head for the next day,
+    /// so no window goes unused. The one exception is a payout to an account that does not exist
+    /// yet, which is never paid in a part below 1 XLM, the least that creates the account: with
+    /// less room left, release stops and the exit waits for the next day. When the asset contract
+    /// refuses a transfer, everything the exit still owes is set aside as a stranded exit for
+    /// `claim`, so that a recipient who cannot receive never holds up the exits behind it. While
+    /// the issuer keeps the vault itself from holding the asset, or the vault holds less than the
+    /// next payment, it stops with the queue as it is, and fails with `VaultCannotPay` if it paid
+    /// nothing. Refused while halted; works while paused.
     pub fn release(env: Env, max: u32) -> Result<u32, Error> {
         let mut status = storage::status(&env);
         let now = env.ledger().timestamp();
@@ -390,6 +400,16 @@ impl Vault {
             // Payout first, then the fee, as far as the window reaches.
             let payout = exit.payout.min(room);
             let fee = exit.fee.min(room - payout);
+            // A part below NATIVE_ACCOUNT_MIN cannot create a missing account, so paying it would
+            // strand an exit that the next window, which pays the payout whole, can pay. The exit
+            // waits at the head instead.
+            if payout < NATIVE_ACCOUNT_MIN
+                && exit.payout >= NATIVE_ACCOUNT_MIN
+                && is_missing_account(&env, &exit.recipient.address())
+                && is_native(&env, &config.token)
+            {
+                break;
+            }
             // Transfers the issuer would refuse to the vault itself must not strand the exit, so
             // a vault that cannot pay stops instead, with the queue as it is.
             let available = match funds {
@@ -459,10 +479,11 @@ impl Vault {
         Ok(count)
     }
 
-    /// Anyone moves the parts of a stranded exit whose party can receive now back into the exit
-    /// queue, at its tail, as a new exit that `release` pays in turn like any other, and returns
-    /// its ID. A part whose party still cannot receive stays stranded. Fails with
-    /// `NothingClaimable` when no part can move. Refused while halted; works while paused.
+    /// Anyone moves the parts of a stranded exit whose party can receive now, judged as `transact`
+    /// judges it, back into the exit queue, at its tail, as a new exit that `release` pays in turn
+    /// like any other, and returns its ID. A part whose party still cannot receive stays stranded.
+    /// Fails with `NothingClaimable` when no part can move. Refused while halted; works while
+    /// paused.
     pub fn claim(env: Env, id: u64) -> Result<u64, Error> {
         let mut status = storage::status(&env);
         let now = env.ledger().timestamp();
@@ -471,12 +492,14 @@ impl Vault {
         }
         let exit = storage::stranded(&env, id).ok_or(Error::NotStranded)?;
         let asset = StellarAssetClient::new(&env, &storage::config(&env).token);
-        let payout = if exit.payout > 0 && can_receive(&env, &asset, &exit.recipient.address()) {
+        let payout = if exit.payout > 0
+            && can_receive(&env, &asset, &exit.recipient.address(), exit.payout)
+        {
             exit.payout
         } else {
             0
         };
-        let fee = if exit.fee > 0 && can_receive(&env, &asset, &exit.relayer) {
+        let fee = if exit.fee > 0 && can_receive(&env, &asset, &exit.relayer, 0) {
             exit.fee
         } else {
             0
@@ -872,20 +895,37 @@ fn outflow_today(status: &Status, day: u64) -> i128 {
     }
 }
 
-/// Whether `to` can receive the asset now, judged from reads alone: an account must exist, and the
-/// asset contract must let `to` hold the asset. A contract address needs only the second, as the
-/// asset contract credits any contract address.
-fn can_receive(env: &Env, asset: &StellarAssetClient, to: &Address) -> bool {
-    if is_account(env, to) && !to.exists() {
+/// Whether `to` can receive `amount` of the asset now, judged from reads alone: an account must
+/// exist, unless `amount` is a native payment large enough to create it, and the asset contract
+/// must let `to` hold the asset. A contract address needs only the second, as the asset contract
+/// credits any contract address.
+fn can_receive(env: &Env, asset: &StellarAssetClient, to: &Address, amount: i128) -> bool {
+    if is_missing_account(env, to)
+        && !(amount >= NATIVE_ACCOUNT_MIN && is_native(env, &asset.address))
+    {
         return false;
     }
     matches!(asset.try_authorized(to), Ok(Ok(true)))
+}
+
+fn is_missing_account(env: &Env, address: &Address) -> bool {
+    is_account(env, address) && !address.exists()
 }
 
 /// Whether `address` is an account rather than a contract. Its XDR is the ScVal tag followed by
 /// the ScAddress tag, which is 0 for an account.
 fn is_account(env: &Env, address: &Address) -> bool {
     address.clone().to_xdr(env).get(7) == Some(0)
+}
+
+/// Whether `token` is the contract of the native asset, whose address follows from the network
+/// and the asset's XDR, four zero bytes.
+fn is_native(env: &Env, token: &Address) -> bool {
+    *token
+        == env
+            .deployer()
+            .with_stellar_asset(Bytes::from_array(env, &[0; 4]))
+            .deployed_address()
 }
 
 /// What the vault can pay out: its balance of the asset, or `VaultCannotPay` while the issuer keeps

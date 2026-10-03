@@ -5,6 +5,7 @@ mod domain;
 mod e2e;
 mod exits;
 mod fixtures;
+mod fresh;
 mod guardian;
 mod invariants;
 mod queue;

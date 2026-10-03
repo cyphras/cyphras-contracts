@@ -1,22 +1,44 @@
 //! A random sequence of calls against a model of the spec. After every call the vault's result
 //! must match the model's, its whole state must match, and the invariants of vault.md must hold.
-//! The vault holds a classic asset whose issuer revokes and restores the authorization of the
-//! parties exits pay, so that payments are refused and exits strand.
+//! Most runs hold a classic asset whose issuer revokes and restores the authorization of the
+//! parties exits pay, so that payments are refused and exits strand. The others hold XLM and pay
+//! accounts that do not exist yet while the base reserve rises and falls.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-
-use soroban_sdk::{
-    testutils::MuxedAddress as _, token::StellarAssetClient, Address, MuxedAddress, Vec, U256,
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    rc::Rc,
 };
 
-use super::setup::{outcome, Classic, Setup, DAY, DELAY_LARGE, DELAY_SMALL, XLM};
+use soroban_sdk::{
+    testutils::{Ledger, MuxedAddress as _},
+    token::StellarAssetClient,
+    xdr::{self, ScAddress},
+    Address, Env, InvokeError, MuxedAddress, Vec, U256,
+};
+
+use super::setup::{
+    account_address, create_account, outcome, Classic, Setup, DAY, DELAY_LARGE, DELAY_SMALL, XLM,
+};
 use crate::{Error, Exit, Limits, QueuedLimits, Status};
 
 const HALT: u64 = 72 * 3_600;
 const WEEK: u64 = 7 * DAY;
 // The accounts exits pay, as recipients and as relayers.
 const PARTIES: usize = 3;
+// In a run of XLM, further parties whose accounts exist only once a payment or someone else
+// creates them.
+const FRESH: usize = 24;
 const MUXED_ID: u64 = 77;
+// The least XLM payout that may go to an account that does not exist yet.
+const ACCOUNT_MIN: i128 = XLM;
+// What each party that exists from the start holds in a run of XLM, far more than any reserve.
+const HELD: i128 = 1_000 * XLM;
+// The base reserve of the live networks, in stroops.
+const RESERVE: u32 = 5_000_000;
+// The asset contract's own codes for the payments it refuses.
+const BALANCE_ERROR: u32 = 10;
+const BALANCE_DEAUTHORIZED: u32 = 11;
+const INSUFFICIENT_ACCOUNT_RESERVE: u32 = 14;
 
 #[derive(Clone)]
 struct Deposit {
@@ -26,6 +48,16 @@ struct Deposit {
     delay: u64,
     flag: Option<u32>,
     flagged_at: u64,
+}
+
+#[derive(Clone)]
+struct Party {
+    // The issuer lets the party hold the asset, as it always does for XLM.
+    authorized: bool,
+    exists: bool,
+    // What the party holds. An account of XLM must hold two base reserves after any payment it
+    // takes, and a missing one is created by a payment of two.
+    balance: i128,
 }
 
 /// A queued exit, or the unpaid parts of a stranded one.
@@ -67,6 +99,10 @@ enum Op {
     Claim(u64),
     // The issuer authorizes a party to hold the asset, or revokes it.
     Authorize(usize, bool),
+    // The network's base reserve changes.
+    Reserve(u32),
+    // Someone else creates the account of a party that does not exist yet, holding this much.
+    Create(usize, i128),
     BumpTtl,
     Advance(u64),
 }
@@ -79,12 +115,28 @@ enum Done {
     Count(u32),
 }
 
-/// Which calls a run draws: every entry point, or mostly those around the exit queue, with the
-/// parties' right to hold the asset revoked as often as restored.
+/// Why a call failed: the vault refused it, or the asset contract refused a payment the vault
+/// made at once, which fails the whole call with that contract's own error code.
+#[derive(Debug, PartialEq)]
+enum Refusal {
+    Vault(Error),
+    Asset(u32),
+}
+
+impl From<Error> for Refusal {
+    fn from(error: Error) -> Self {
+        Refusal::Vault(error)
+    }
+}
+
+/// Which calls a run draws: every entry point; mostly those around the exit queue, with the
+/// parties' right to hold the asset revoked as often as restored; or those around the exit queue
+/// of XLM, with exits to accounts that do not exist yet.
 #[derive(Clone, Copy, PartialEq)]
 enum Mix {
     Everything,
     Exits,
+    Fresh,
 }
 
 #[derive(Clone)]
@@ -98,8 +150,10 @@ struct Model {
     notes: i128,
     exits: VecDeque<Owed>,
     stranded: BTreeMap<u64, Owed>,
-    can_receive: [bool; PARTIES],
-    received: [i128; PARTIES],
+    // Whether the asset is XLM, and the network's base reserve.
+    native: bool,
+    reserve: i128,
+    parties: std::vec::Vec<Party>,
     next_leaf: u64,
     highest_outflow_cap: i128,
 }
@@ -161,6 +215,33 @@ impl Model {
         Ok(())
     }
 
+    /// Whether `party` can receive `amount` now, as the vault judges it from reads alone.
+    fn can_receive(&self, party: usize, amount: i128) -> bool {
+        let p = &self.parties[party];
+        p.authorized && (p.exists || (self.native && amount >= ACCOUNT_MIN))
+    }
+
+    /// Pays `amount` to `party` if the asset contract takes it, or returns the code with which it
+    /// refuses.
+    fn take(&mut self, party: usize, amount: i128) -> Result<(), u32> {
+        let (native, minimum) = (self.native, 2 * self.reserve);
+        let p = &mut self.parties[party];
+        if !p.authorized {
+            return Err(BALANCE_DEAUTHORIZED);
+        }
+        if native {
+            if p.exists && p.balance + amount < minimum {
+                return Err(BALANCE_ERROR);
+            }
+            if !p.exists && amount < minimum {
+                return Err(INSUFFICIENT_ACCOUNT_RESERVE);
+            }
+        }
+        p.exists = true;
+        p.balance += amount;
+        Ok(())
+    }
+
     /// Records `amount` of outflow paid today.
     fn pay(&mut self, day: u64, amount: i128) {
         self.status.tvl -= amount;
@@ -169,31 +250,31 @@ impl Model {
     }
 
     /// The result the spec gives for `op`; the model changes only when it succeeds.
-    fn expect(&mut self, op: &Op, now: u64) -> Result<Done, Error> {
+    fn expect(&mut self, op: &Op, now: u64) -> Result<Done, Refusal> {
         let day = now / DAY;
         match op {
             Op::Shield(depositor, amount) => {
                 if self.halted(now) {
-                    return Err(Error::Halted);
+                    return Err(Error::Halted.into());
                 }
                 if self.status.deposits_paused {
-                    return Err(Error::DepositsPaused);
+                    return Err(Error::DepositsPaused.into());
                 }
                 if *amount <= 0 {
-                    return Err(Error::BadAmount);
+                    return Err(Error::BadAmount.into());
                 }
                 if *amount < self.limits.min_deposit {
-                    return Err(Error::DepositTooSmall);
+                    return Err(Error::DepositTooSmall.into());
                 }
                 if *amount > self.limits.max_deposit {
-                    return Err(Error::DepositTooLarge);
+                    return Err(Error::DepositTooLarge.into());
                 }
                 let total = self.day_totals.get(&(*depositor, day)).unwrap_or(&0) + amount;
                 if total > self.limits.max_daily_per_depositor {
-                    return Err(Error::DepositorDailyLimit);
+                    return Err(Error::DepositorDailyLimit.into());
                 }
                 if self.status.tvl + amount > self.limits.tvl_cap {
-                    return Err(Error::TvlCapExceeded);
+                    return Err(Error::TvlCapExceeded.into());
                 }
                 let id = self.status.next_deposit_id;
                 self.status.next_deposit_id += 1;
@@ -220,28 +301,28 @@ impl Model {
                 reuse,
             } => {
                 if self.halted(now) {
-                    return Err(Error::Halted);
+                    return Err(Error::Halted.into());
                 }
                 if *payout == 0 && self.status.transfers_paused {
-                    return Err(Error::TransfersPaused);
+                    return Err(Error::TransfersPaused.into());
                 }
                 if *fee < 0 || *fee > self.limits.max_fee {
-                    return Err(Error::BadFee);
+                    return Err(Error::BadFee.into());
                 }
                 let outflow = payout + fee;
                 if outflow > self.limits.max_daily_outflow {
-                    return Err(Error::ExceedsDailyOutflow);
+                    return Err(Error::ExceedsDailyOutflow.into());
                 }
                 if outflow > self.notes {
-                    return Err(Error::ExceedsAdmittedValue);
+                    return Err(Error::ExceedsAdmittedValue.into());
                 }
-                if (*payout > 0 && !self.can_receive[*recipient])
-                    || (*fee > 0 && !self.can_receive[*relayer])
+                if (*payout > 0 && !self.can_receive(*recipient, *payout))
+                    || (*fee > 0 && !self.can_receive(*relayer, 0))
                 {
-                    return Err(Error::CannotReceive);
+                    return Err(Error::CannotReceive.into());
                 }
                 if reuse.is_some() {
-                    return Err(Error::NullifierSpent);
+                    return Err(Error::NullifierSpent.into());
                 }
                 self.notes -= outflow;
                 self.next_leaf += 2;
@@ -262,24 +343,28 @@ impl Model {
                     self.status.queued_total += outflow;
                     return Ok(Done::Unit);
                 }
-                self.received[*recipient] += payout;
-                self.received[*relayer] += fee;
+                // Paid at once, a payment the asset contract refuses fails the whole call.
+                for (party, amount) in [(*recipient, *payout), (*relayer, *fee)] {
+                    if amount > 0 {
+                        self.take(party, amount).map_err(Refusal::Asset)?;
+                    }
+                }
                 self.pay(day, outflow);
                 Ok(Done::Unit)
             }
             Op::Attest(up_to) => {
                 if self.halted(now) {
-                    return Err(Error::Halted);
+                    return Err(Error::Halted.into());
                 }
                 if *up_to <= self.status.attested_up_to || *up_to >= self.status.next_deposit_id {
-                    return Err(Error::BadAttestation);
+                    return Err(Error::BadAttestation.into());
                 }
                 self.status.attested_up_to = *up_to;
                 Ok(Done::Unit)
             }
             Op::Flag(id, reason) => {
                 if *reason == 0 {
-                    return Err(Error::BadReason);
+                    return Err(Error::BadReason.into());
                 }
                 let deposit = self.pending.get_mut(id).ok_or(Error::UnknownDeposit)?;
                 if deposit.flag.is_none() {
@@ -296,10 +381,10 @@ impl Model {
             }
             Op::Admit(ids) => {
                 if self.halted(now) {
-                    return Err(Error::Halted);
+                    return Err(Error::Halted.into());
                 }
                 if ids.windows(2).any(|w| w[0] >= w[1]) {
-                    return Err(Error::BadIds);
+                    return Err(Error::BadIds.into());
                 }
                 let admitted: std::vec::Vec<u64> = ids
                     .iter()
@@ -319,7 +404,7 @@ impl Model {
                 if matches!(op, Op::Refund(_)) {
                     deposit.flag.ok_or(Error::NotFlagged)?;
                     if now < deposit.flagged_at + DAY {
-                        return Err(Error::RefundTooEarly);
+                        return Err(Error::RefundTooEarly.into());
                     }
                 }
                 self.status.tvl -= deposit.amount;
@@ -334,7 +419,7 @@ impl Model {
             }
             Op::Halt => {
                 if now < self.status.next_halt_at {
-                    return Err(Error::HaltCooldown);
+                    return Err(Error::HaltCooldown.into());
                 }
                 self.status.halted_until = now + HALT;
                 self.status.next_halt_at = now + HALT + WEEK;
@@ -342,7 +427,7 @@ impl Model {
             }
             Op::Resume => {
                 if !self.halted(now) {
-                    return Err(Error::NotHalted);
+                    return Err(Error::NotHalted.into());
                 }
                 self.status.halted_until = now;
                 self.status.next_halt_at = now + WEEK;
@@ -372,7 +457,7 @@ impl Model {
             Op::ApplyLimits => {
                 let queued = self.queued.clone().ok_or(Error::NoQueuedLimits)?;
                 if now < queued.ready_at {
-                    return Err(Error::LimitsNotReady);
+                    return Err(Error::LimitsNotReady.into());
                 }
                 self.check_change(&queued.limits)?;
                 self.limits = queued.limits;
@@ -385,31 +470,41 @@ impl Model {
             }
             Op::Release(max) => {
                 if self.halted(now) {
-                    return Err(Error::Halted);
+                    return Err(Error::Halted.into());
                 }
                 let mut count = 0;
                 while count < *max {
                     let room = self.limits.max_daily_outflow - self.outflow_today(day);
-                    if room == 0 || self.exits.is_empty() {
+                    let Some(head) = self.exits.front() else {
+                        break;
+                    };
+                    if room == 0 {
+                        break;
+                    }
+                    // Payout first, then the fee, as far as the window reaches.
+                    let payout = head.payout.min(room);
+                    let fee = head.fee.min(room - payout);
+                    // A payout that would create its account is never paid in a part too small to
+                    // do so; the exit waits at the head for the next window.
+                    if self.native
+                        && payout < ACCOUNT_MIN
+                        && head.payout >= ACCOUNT_MIN
+                        && !self.parties[head.recipient].exists
+                    {
                         break;
                     }
                     let mut exit = self.exits.pop_front().unwrap();
                     count += 1;
-                    // Payout first, then the fee, as far as the window reaches.
-                    let payout = exit.payout.min(room);
-                    let fee = exit.fee.min(room - payout);
-                    let payout_paid = if self.can_receive[exit.recipient] {
+                    let payout_paid = if payout > 0 && self.take(exit.recipient, payout).is_ok() {
                         payout
                     } else {
                         0
                     };
-                    let fee_paid = if self.can_receive[exit.relayer] {
+                    let fee_paid = if fee > 0 && self.take(exit.relayer, fee).is_ok() {
                         fee
                     } else {
                         0
                     };
-                    self.received[exit.recipient] += payout_paid;
-                    self.received[exit.relayer] += fee_paid;
                     exit.payout -= payout_paid;
                     exit.fee -= fee_paid;
                     self.status.queued_total -= payout_paid + fee_paid;
@@ -427,23 +522,23 @@ impl Model {
             }
             Op::Claim(id) => {
                 if self.halted(now) {
-                    return Err(Error::Halted);
+                    return Err(Error::Halted.into());
                 }
                 let mut owed = self.stranded.get(id).ok_or(Error::NotStranded)?.clone();
                 // The parts whose party can receive now move to the tail of the queue; the value
                 // stays owed and nothing is paid.
-                let payout = if self.can_receive[owed.recipient] {
+                let payout = if self.can_receive(owed.recipient, owed.payout) {
                     owed.payout
                 } else {
                     0
                 };
-                let fee = if self.can_receive[owed.relayer] {
+                let fee = if self.can_receive(owed.relayer, 0) {
                     owed.fee
                 } else {
                     0
                 };
                 if payout + fee == 0 {
-                    return Err(Error::NothingClaimable);
+                    return Err(Error::NothingClaimable.into());
                 }
                 let new_id = self.status.exit_tail;
                 self.exits.push_back(Owed {
@@ -464,7 +559,19 @@ impl Model {
                 Ok(Done::Id(new_id))
             }
             Op::Authorize(party, authorized) => {
-                self.can_receive[*party] = *authorized;
+                self.parties[*party].authorized = *authorized;
+                Ok(Done::Unit)
+            }
+            Op::Reserve(reserve) => {
+                self.reserve = *reserve as i128;
+                Ok(Done::Unit)
+            }
+            Op::Create(party, balance) => {
+                let p = &mut self.parties[*party];
+                if !p.exists {
+                    p.exists = true;
+                    p.balance = *balance;
+                }
                 Ok(Done::Unit)
             }
             Op::BumpTtl | Op::Advance(_) => Ok(Done::Unit),
@@ -479,36 +586,85 @@ struct Run {
     model: Model,
     depositors: std::vec::Vec<Address>,
     parties: std::vec::Vec<Address>,
+    // What the parties' accounts got from anyone but the vault.
+    outside: i128,
     spent: std::vec::Vec<U256>,
     // The outflow the parties actually received on each day.
     received_on: BTreeMap<u64, i128>,
 }
 
+/// The XLM an account holds, or None if it does not exist, read from the ledger, as the asset
+/// contract does not report a balance below the account's reserve.
+fn account_balance(env: &Env, address: &Address) -> Option<i128> {
+    let ScAddress::Account(account_id) = ScAddress::from(address) else {
+        panic!("not an account address");
+    };
+    let key = Rc::new(xdr::LedgerKey::Account(xdr::LedgerKeyAccount {
+        account_id,
+    }));
+    let (entry, _) = env.host().get_ledger_entry(&key).unwrap()?;
+    let xdr::LedgerEntryData::Account(account) = &entry.data else {
+        panic!("not an account entry");
+    };
+    Some(account.balance.into())
+}
+
 impl Run {
     fn new(seed: u64, mix: Mix) -> Self {
+        let native = mix == Mix::Fresh;
+        // Exits of XLM run in a window a few times the least payout that may create an account,
+        // so that what is left of a window is often less than that.
+        let window = if native { 10 * XLM } else { 100 * XLM };
         let limits = Limits {
             min_deposit: XLM / 10,
-            max_deposit: 100 * XLM,
-            max_daily_per_depositor: 250 * XLM,
-            tvl_cap: 700 * XLM,
+            max_deposit: window,
+            max_daily_per_depositor: 5 * window / 2,
+            tvl_cap: 7 * window,
             // Small next to the pool, so that exits often wait in the exit queue.
-            max_daily_outflow: 100 * XLM,
+            max_daily_outflow: window,
             max_fee: 2 * XLM,
-            large_deposit_threshold: 50 * XLM,
+            large_deposit_threshold: window / 2,
         };
-        let classic = Classic::new(limits.clone());
-        for _ in 0..seed {
-            classic.s.next_u64();
-        }
-        let depositors = (0..3)
-            .map(|i| classic.holder(&std::format!("depositor {i}"), 1_000_000 * XLM))
-            .collect();
-        let parties = (0..PARTIES)
-            .map(|i| classic.holder(&std::format!("party {i}"), 0))
-            .collect();
         // The pool starts with four days of outflow in spendable notes.
-        classic.fund(4, 100 * XLM);
-        let Classic { s, asset } = classic;
+        let (s, asset, depositors, parties, outside) = if native {
+            let s = Setup::with_limits(limits.clone());
+            for _ in 0..seed {
+                s.next_u64();
+            }
+            let depositors = (0..3)
+                .map(|i| s.account(&std::format!("depositor {i}"), 1_000_000 * XLM))
+                .collect();
+            let parties: std::vec::Vec<Address> = (0..PARTIES + FRESH)
+                .map(|i| {
+                    let tag = std::format!("party {i}");
+                    if i < PARTIES {
+                        s.account(&tag, HELD)
+                    } else {
+                        account_address(&s.env, &tag)
+                    }
+                })
+                .collect();
+            for i in 0..4 {
+                s.fund_pool(&std::format!("funder {i}"), window);
+            }
+            s.env.ledger().with_mut(|l| l.base_reserve = RESERVE);
+            let asset = StellarAssetClient::new(&s.env, &s.token.address);
+            (s, asset, depositors, parties, PARTIES as i128 * HELD)
+        } else {
+            let classic = Classic::new(limits.clone());
+            for _ in 0..seed {
+                classic.s.next_u64();
+            }
+            let depositors = (0..3)
+                .map(|i| classic.holder(&std::format!("depositor {i}"), 1_000_000 * XLM))
+                .collect();
+            let parties = (0..PARTIES)
+                .map(|i| classic.holder(&std::format!("party {i}"), 0))
+                .collect();
+            classic.fund(4, window);
+            let Classic { s, asset } = classic;
+            (s, asset, depositors, parties, 0)
+        };
         let model = Model {
             highest_outflow_cap: limits.max_daily_outflow,
             limits,
@@ -517,11 +673,18 @@ impl Run {
             pending: BTreeMap::new(),
             resolved: (1..=4).collect(),
             day_totals: BTreeMap::new(),
-            notes: 400 * XLM,
+            notes: 4 * window,
             exits: VecDeque::new(),
             stranded: BTreeMap::new(),
-            can_receive: [true; PARTIES],
-            received: [0; PARTIES],
+            native,
+            reserve: if native { RESERVE.into() } else { 0 },
+            parties: (0..parties.len())
+                .map(|i| Party {
+                    authorized: true,
+                    exists: !native || i < PARTIES,
+                    balance: if native && i < PARTIES { HELD } else { 0 },
+                })
+                .collect(),
             next_leaf: 8,
         };
         Run {
@@ -531,6 +694,7 @@ impl Run {
             model,
             depositors,
             parties,
+            outside,
             spent: std::vec::Vec::new(),
             received_on: BTreeMap::new(),
         }
@@ -577,7 +741,7 @@ impl Run {
     /// Mostly a party that can receive, so that most payments go through.
     fn party(&self) -> usize {
         let able: std::vec::Vec<usize> = (0..PARTIES)
-            .filter(|p| self.model.can_receive[*p])
+            .filter(|p| self.model.parties[*p].authorized)
             .collect();
         if able.is_empty() || self.s.below(5) == 0 {
             return self.s.below(PARTIES as u64) as usize;
@@ -642,7 +806,7 @@ impl Run {
         // strands, often with both of its parts.
         if let Some(head) = m.exits.front() {
             let party = self.pick(&[head.recipient, head.relayer]);
-            if m.can_receive[party] && s.below(4) == 0 {
+            if m.parties[party].authorized && s.below(4) == 0 {
                 return Op::Authorize(party, false);
             }
         }
@@ -665,9 +829,106 @@ impl Run {
         }
     }
 
+    /// Of the parties for which `wanted` holds, one at random, or None if there is none.
+    fn party_where(&self, wanted: impl Fn(&Party) -> bool) -> Option<usize> {
+        let parties: std::vec::Vec<usize> = (0..self.model.parties.len())
+            .filter(|p| wanted(&self.model.parties[*p]))
+            .collect();
+        (!parties.is_empty()).then(|| parties[self.s.below(parties.len() as u64) as usize])
+    }
+
+    /// An exit of XLM to an existing account or, half of the time, to one that does not exist
+    /// yet, of a size around the least payout that may create it or, unless `small`, one that
+    /// leaves less than that of today's window. Now and then the relayer does not exist either.
+    fn fresh_transact(&self, small: bool) -> Op {
+        let s = &self.s;
+        let m = &self.model;
+        // One time in `odds` a party that does not exist yet, if there is one, else one that does.
+        let party = |odds: u64| match self.party_where(|p| !p.exists) {
+            Some(missing) if s.below(odds) == 0 => missing,
+            _ => self.party_where(|p| p.exists).unwrap(),
+        };
+        let relayer = party(8);
+        let fee = self
+            .pick(&[0, 0, XLM / 10, XLM, m.limits.max_fee])
+            .min(m.notes);
+        let window = m.limits.max_daily_outflow;
+        let room = window - m.outflow_today(s.now() / DAY);
+        let payout = match if small { 0 } else { s.below(6) } {
+            0..=2 => self.pick(&[
+                ACCOUNT_MIN - 1,
+                ACCOUNT_MIN,
+                ACCOUNT_MIN + 1,
+                3 * ACCOUNT_MIN / 2,
+                2 * ACCOUNT_MIN,
+                3 * ACCOUNT_MIN,
+            ]),
+            3 | 4 => room - fee - self.pick(&[0, XLM / 2, ACCOUNT_MIN - 1]),
+            _ => window - fee - self.pick(&[0, XLM / 2]),
+        }
+        .clamp(0, m.notes - fee);
+        // A transfer names its relayer as the recipient.
+        let (recipient, muxed) = if payout == 0 {
+            (relayer, false)
+        } else {
+            (party(2), s.below(4) == 0)
+        };
+        Op::Transact {
+            payout,
+            fee,
+            recipient,
+            muxed,
+            relayer,
+            reuse: None,
+        }
+    }
+
+    /// Exits of XLM to accounts that may not exist yet, releases and claims, the base reserve
+    /// rising and falling, accounts created by others, and time passing, with deposits now and
+    /// then so that there are notes to spend.
+    fn fresh_op(&self) -> Op {
+        let s = &self.s;
+        let m = &self.model;
+        let now = s.now();
+        let room = m.limits.max_daily_outflow - m.outflow_today(now / DAY);
+        // With the queue empty an exit may be paid at once. While the base reserve is raised, such
+        // an exit is small, so that it often falls short of creating its recipient's account.
+        if m.exits.is_empty() && s.below(3) == 0 {
+            return self.fresh_transact(m.reserve > i128::from(RESERVE));
+        }
+        // While less than 1 XLM of the window is left, which an exit that would create its
+        // account waits out, the queue is released now and then.
+        if !m.exits.is_empty() && room > 0 && room < ACCOUNT_MIN && s.below(2) == 0 {
+            return Op::Release(self.pick(&[1, 50]));
+        }
+        if let Some(&last) = m.pending.keys().last() {
+            if s.below(4) == 0 {
+                return if last > m.status.attested_up_to {
+                    Op::Attest(last)
+                } else {
+                    Op::Admit(m.pending.keys().copied().take(4).collect())
+                };
+            }
+        }
+        match s.below(20) {
+            0..=4 => self.fresh_transact(false),
+            5..=8 => Op::Release(self.pick(&[1, 2, 50])),
+            9 | 10 => Op::Claim(self.some_stranded()),
+            11 | 12 => Op::Reserve(self.pick(&[RESERVE, 2 * RESERVE, 3 * RESERVE])),
+            13 => Op::Create(
+                self.party_where(|p| !p.exists).unwrap_or(0),
+                self.pick(&[XLM, 5 * XLM]),
+            ),
+            14 | 15 => Op::Shield(s.below(3) as usize, self.pick(&[2 * XLM, 9 * XLM])),
+            _ => Op::Advance(self.pick(&[3_600, 6 * 3_600, DAY - now % DAY])),
+        }
+    }
+
     fn random_op(&self) -> Op {
-        if self.mix == Mix::Exits {
-            return self.exit_op();
+        match self.mix {
+            Mix::Exits => return self.exit_op(),
+            Mix::Fresh => return self.fresh_op(),
+            Mix::Everything => {}
         }
         let s = &self.s;
         let m = &self.model;
@@ -685,7 +946,7 @@ impl Run {
         // loses the right to hold the asset first, so that the head strands.
         if let Some(head) = m.exits.front() {
             if s.below(4) == 0 {
-                return if s.below(4) == 0 && m.can_receive[head.recipient] {
+                return if s.below(4) == 0 && m.parties[head.recipient].authorized {
                     Op::Authorize(head.recipient, false)
                 } else if room > 0 {
                     Op::Release(self.pick(&[1, 2, 50]))
@@ -697,9 +958,9 @@ impl Run {
         // A stranded exit is claimed once its parties can receive again.
         if let Some(exit) = m.stranded.values().next() {
             if s.below(5) == 0 {
-                return if exit.payout > 0 && !m.can_receive[exit.recipient] {
+                return if exit.payout > 0 && !m.parties[exit.recipient].authorized {
                     Op::Authorize(exit.recipient, true)
-                } else if exit.fee > 0 && !m.can_receive[exit.relayer] {
+                } else if exit.fee > 0 && !m.parties[exit.relayer].authorized {
                     Op::Authorize(exit.relayer, true)
                 } else {
                     Op::Claim(exit.id)
@@ -823,15 +1084,30 @@ impl Run {
         }
     }
 
-    fn received(&self) -> i128 {
-        self.parties.iter().map(|p| self.s.balance(p)).sum()
+    /// What `party` holds, or None if its account does not exist.
+    fn balance(&self, party: &Address) -> Option<i128> {
+        if self.model.native {
+            account_balance(&self.s.env, party)
+        } else {
+            Some(self.s.balance(party))
+        }
     }
 
-    fn execute(&mut self, op: &Op) -> Result<Done, Error> {
+    /// What the vault has paid the parties.
+    fn received(&self) -> i128 {
+        let held: i128 = self
+            .parties
+            .iter()
+            .map(|p| self.balance(p).unwrap_or(0))
+            .sum();
+        held - self.outside
+    }
+
+    fn execute(&mut self, op: &Op) -> Result<Done, Refusal> {
         let s = &self.s;
         let v = &s.vault;
         let ids = |list: &[u64]| Vec::from_slice(&s.env, list);
-        match op {
+        let result = match op {
             Op::Shield(d, amount) => {
                 let depositor = &self.depositors[*d];
                 let ext = s.ext(*amount, 0, depositor, depositor);
@@ -867,7 +1143,10 @@ impl Run {
                     };
                     proof = s.prove_with(&ext, proof.root, nullifiers, [s.field(), s.field()]);
                 }
-                let result = outcome(v.try_transact(&proof, &ext, relayer)).map(|_| Done::Unit);
+                let result = match v.try_transact(&proof, &ext, relayer) {
+                    Err(Err(InvokeError::Contract(code))) => return Err(Refusal::Asset(code)),
+                    result => outcome(result).map(|_| Done::Unit),
+                };
                 if result.is_ok() {
                     self.spent.extend(proof.input_nullifiers.iter());
                 }
@@ -893,6 +1172,18 @@ impl Run {
                 self.asset.set_authorized(&self.parties[*party], authorized);
                 Ok(Done::Unit)
             }
+            Op::Reserve(reserve) => {
+                s.env.ledger().with_mut(|l| l.base_reserve = *reserve);
+                Ok(Done::Unit)
+            }
+            Op::Create(party, balance) => {
+                let address = &self.parties[*party];
+                if !address.exists() {
+                    create_account(&s.env, address, *balance);
+                    self.outside += balance;
+                }
+                Ok(Done::Unit)
+            }
             Op::BumpTtl => {
                 let m = &self.model;
                 let pending: std::vec::Vec<u64> = m.pending.keys().copied().collect();
@@ -909,7 +1200,8 @@ impl Run {
                 s.advance(*seconds);
                 Ok(Done::Unit)
             }
-        }
+        };
+        result.map_err(Refusal::Vault)
     }
 
     /// The vault matches the model, and the invariants of vault.md hold.
@@ -991,8 +1283,8 @@ impl Run {
                 assert_eq!(s.vault.stranded(&exit.id), None);
             }
         }
-        for (party, received) in self.parties.iter().zip(m.received) {
-            assert_eq!(s.balance(party), received);
+        for (address, party) in self.parties.iter().zip(&m.parties) {
+            assert_eq!(self.balance(address), party.exists.then_some(party.balance));
         }
         self.model.highest_outflow_cap = limits.max_daily_outflow;
     }
@@ -1027,7 +1319,7 @@ fn run(seed: u64, steps: usize, mix: Mix) -> BTreeMap<std::string::String, usize
             Op::Transact {
                 reuse: Some(slot), ..
             },
-            Err(Error::NullifierSpent),
+            Err(Refusal::Vault(Error::NullifierSpent)),
         ) = (&op, &actual)
         {
             *seen
@@ -1037,8 +1329,26 @@ fn run(seed: u64, steps: usize, mix: Mix) -> BTreeMap<std::string::String, usize
         if run.model.status.exit_tail > before.status.exit_tail {
             *seen.entry("Transact queued".into()).or_insert(0) += 1;
         }
-        if matches!(op, Op::Transact { .. }) && actual == Err(Error::CannotReceive) {
+        if matches!(op, Op::Transact { .. }) && actual == Err(Error::CannotReceive.into()) {
             *seen.entry("Transact cannot receive".into()).or_insert(0) += 1;
+        }
+        if matches!(actual, Err(Refusal::Asset(_))) {
+            *seen
+                .entry("Transact refused by the asset".into())
+                .or_insert(0) += 1;
+        }
+        let created = (0..run.model.parties.len())
+            .any(|p| run.model.parties[p].exists && !before.parties[p].exists);
+        if created && matches!(op, Op::Transact { .. } | Op::Release(_)) {
+            *seen
+                .entry(std::format!("{name} created an account"))
+                .or_insert(0) += 1;
+        }
+        if let (Op::Release(max), Ok(Done::Count(count))) = (&op, &actual) {
+            let room = run.model.limits.max_daily_outflow - run.model.outflow_today(now / DAY);
+            if count < max && room > 0 && !run.model.exits.is_empty() {
+                *seen.entry("Release waited for room".into()).or_insert(0) += 1;
+            }
         }
         if run.model.stranded.len() > before.stranded.len() {
             *seen.entry("Release stranded".into()).or_insert(0) += 1;
@@ -1052,7 +1362,7 @@ fn run(seed: u64, steps: usize, mix: Mix) -> BTreeMap<std::string::String, usize
             if actual.is_ok() && run.model.stranded.contains_key(id) {
                 *seen.entry("Claim moved one part".into()).or_insert(0) += 1;
             }
-            if actual == Err(Error::NothingClaimable) {
+            if actual == Err(Error::NothingClaimable.into()) {
                 *seen.entry("Claim moved nothing".into()).or_insert(0) += 1;
             }
         }
@@ -1129,6 +1439,30 @@ fn random_exit_sequences_keep_the_vault_equal_to_the_spec_model() {
         "Claim ok",
         "Claim moved one part",
         "Claim moved nothing",
+        "Transact cannot receive",
+    ] {
+        assert!(seen.contains_key(case), "never {case}: {seen:?}");
+    }
+}
+
+#[test]
+fn random_fresh_account_sequences_keep_the_vault_equal_to_the_spec_model() {
+    let mut seen = BTreeMap::new();
+    for seed in 0..4 {
+        for (k, n) in run(seed, 150, Mix::Fresh) {
+            *seen.entry(k).or_insert(0) += n;
+        }
+    }
+    // Payouts that created accounts at once and from the queue, a release that stopped to wait
+    // for room to create one, payments below two raised reserves that failed a call or stranded
+    // an exit and were claimed, and exits refused because a party cannot receive.
+    for case in [
+        "Transact created an account",
+        "Release created an account",
+        "Release waited for room",
+        "Transact refused by the asset",
+        "Release stranded",
+        "Claim ok",
         "Transact cannot receive",
     ] {
         assert!(seen.contains_key(case), "never {case}: {seen:?}");

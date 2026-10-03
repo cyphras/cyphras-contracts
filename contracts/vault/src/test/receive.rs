@@ -3,12 +3,13 @@
 
 use soroban_sdk::{
     testutils::{Address as _, MuxedAddress as _},
-    Address, MuxedAddress,
+    xdr::{self, ScAddress},
+    Address, MuxedAddress, TryFromVal,
 };
 
 use super::{
     exits::{fill_window, funded, used},
-    setup::{account_address, limits, outcome, Classic, Setup, XLM},
+    setup::{limits, outcome, Classic, Setup, XLM},
 };
 use crate::Error;
 
@@ -20,7 +21,7 @@ fn classic() -> Classic {
 }
 
 /// Submits an unshield and returns its result, checking that a refused one spent nothing.
-fn exit(
+pub fn exit(
     s: &Setup,
     payout: i128,
     fee: i128,
@@ -78,25 +79,6 @@ fn a_recipient_whose_authorization_is_revoked_is_refused_until_it_is_restored() 
     c.asset.set_authorized(&frozen, &true);
     assert_eq!(exit(s, 10 * XLM, 0, frozen.clone().into(), &filler), Ok(()));
     assert_eq!(s.balance(&frozen), 10 * XLM);
-}
-
-#[test]
-fn a_native_account_that_does_not_exist_yet_is_refused() {
-    let s = funded();
-    let filler = s.account("filler", 0);
-    let missing = account_address(&s.env, "missing");
-    // Two base reserves would create the account, but an exit only pays existing accounts.
-    assert_eq!(
-        exit(&s, 10 * XLM, 0, missing.clone().into(), &filler),
-        Err(Error::CannotReceive)
-    );
-    fill_window(&s, &filler);
-    assert_eq!(
-        exit(&s, 10 * XLM, 0, missing.clone().into(), &filler),
-        Err(Error::CannotReceive)
-    );
-    s.account("missing", 0);
-    assert_eq!(exit(&s, 10 * XLM, 0, missing.into(), &filler), Ok(()));
 }
 
 #[test]
@@ -167,4 +149,22 @@ fn a_relayer_that_cannot_receive_is_refused_only_when_it_has_a_fee_to_take() {
     assert_eq!(exit(s, 10 * XLM, 0, user.clone().into(), &relayer), Ok(()));
     assert_eq!(s.balance(&user), 10 * XLM);
     assert_eq!(used(s), 10 * XLM);
+}
+
+#[test]
+fn only_an_account_or_a_contract_can_be_named_as_a_party() {
+    // The host builds an address object only for an account or a contract, so a call naming a
+    // liquidity pool or a claimable balance fails before the vault runs, and the check of
+    // whether a party can receive never meets one.
+    let s = funded();
+    let pool = ScAddress::LiquidityPool(xdr::PoolId(xdr::Hash([7; 32])));
+    let balance = ScAddress::ClaimableBalance(xdr::ClaimableBalanceId::ClaimableBalanceIdTypeV0(
+        xdr::Hash([9; 32]),
+    ));
+    for address in [pool, balance] {
+        assert!(
+            Address::try_from_val(&s.env, &address).is_err(),
+            "{address:?}"
+        );
+    }
 }
