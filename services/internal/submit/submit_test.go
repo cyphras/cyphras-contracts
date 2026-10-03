@@ -8,6 +8,7 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/keypair"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
@@ -339,5 +340,45 @@ func TestALedgerBoundStopsInclusionAtTheDeadline(t *testing.T) {
 	// Without a bound, the same transaction keeps waiting for its time bound.
 	if q, err := h.engine.Prepare(context.Background(), h.account, invoke()); err != nil || q.MaxLedger != 0 {
 		t.Fatalf("unbounded %+v %v", q, err)
+	}
+}
+
+func TestAFailedCallNamesTheErrorClosestToItsCause(t *testing.T) {
+	trapped := xdr.InvokeHostFunctionResultCodeInvokeHostFunctionTrapped
+	tr, _ := xdr.MarshalBase64(xdr.TransactionResult{FeeCharged: 100, Result: xdr.TransactionResultResult{
+		Code: xdr.TransactionResultCodeTxFailed,
+		Results: &[]xdr.OperationResult{{Code: xdr.OperationResultCodeOpInner, Tr: &xdr.OperationResultTr{
+			Type: xdr.OperationTypeInvokeHostFunction, InvokeHostFunctionResult: &xdr.InvokeHostFunctionResult{Code: trapped},
+		}}},
+	}})
+	errorEvent := func(contract byte, code uint32) string {
+		id := xdr.ContractId{contract}
+		c := xdr.Uint32(code)
+		sym := xdr.ScSymbol("error")
+		raw, _ := xdr.MarshalBase64(xdr.DiagnosticEvent{Event: xdr.ContractEvent{
+			ContractId: &id, Type: xdr.ContractEventTypeDiagnostic,
+			Body: xdr.ContractEventBody{V: 0, V0: &xdr.ContractEventV0{Topics: []xdr.ScVal{
+				{Type: xdr.ScValTypeScvSymbol, Sym: &sym},
+				{Type: xdr.ScValTypeScvError, Error: &xdr.ScError{Type: xdr.ScErrorTypeSceContract, ContractCode: &c}},
+			}, Data: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}},
+		}})
+		return raw
+	}
+	resp := protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{
+		Status: protocol.TransactionStatusFailed, ResultXDR: tr,
+		// The asset contract refused a transfer, and the vault passed its error up unchanged.
+		DiagnosticEventsXDR: []string{errorEvent(1, 13), errorEvent(2, 13)},
+	}}
+	res := (&Engine{}).result(&Signed{Hash: "h"}, resp)
+	if res.Outcome != Failed || res.InvokeCode == nil || *res.InvokeCode != trapped {
+		t.Fatalf("result %+v", res)
+	}
+	want := strkey.MustEncode(strkey.VersionByteContract, []byte{1, 31: 0})
+	if res.ContractError == nil || res.ContractError.Code != 13 || res.ContractError.Contract != want {
+		t.Fatalf("contract error %+v", res.ContractError)
+	}
+	resp.Status, resp.DiagnosticEventsXDR = protocol.TransactionStatusSuccess, nil
+	if res := (&Engine{}).result(&Signed{Hash: "h"}, resp); res.ContractError != nil {
+		t.Fatal("a success named an error")
 	}
 }

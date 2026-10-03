@@ -11,6 +11,7 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/keypair"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
@@ -371,6 +372,17 @@ type Result struct {
 	Return             *xdr.ScVal
 	// Events are the contract events of a successful transaction.
 	Events []xdr.ContractEvent
+	// InvokeCode is the result code of a failed contract call, when the transaction got that far.
+	InvokeCode *xdr.InvokeHostFunctionResultCode
+	// ContractError is the first contract error the diagnostic events of a failed call name, when
+	// the RPC returns them.
+	ContractError *ContractError
+}
+
+// ContractError is an error a contract raised: the contract and its code.
+type ContractError struct {
+	Contract string
+	Code     uint32
 }
 
 // Track polls until the transaction succeeded, failed or can no longer be included, and keeps the
@@ -426,9 +438,22 @@ func (e *Engine) result(s *Signed, resp protocol.GetTransactionResponse) Result 
 	if err := xdr.SafeUnmarshalBase64(resp.ResultXDR, &tr); err == nil {
 		r.FeeCharged = int64(tr.FeeCharged)
 		r.Code = tr.Result.Code.String()
+		if results, ok := tr.Result.GetResults(); ok && len(results) > 0 {
+			if inner, ok := results[0].GetTr(); ok && inner.InvokeHostFunctionResult != nil {
+				code := inner.InvokeHostFunctionResult.Code
+				r.InvokeCode = &code
+			}
+		}
 	}
 	if resp.Status == protocol.TransactionStatusFailed {
 		r.Outcome = Failed
+	}
+	var diagnostics []xdr.DiagnosticEvent
+	for _, raw := range resp.DiagnosticEventsXDR {
+		var d xdr.DiagnosticEvent
+		if xdr.SafeUnmarshalBase64(raw, &d) == nil {
+			diagnostics = append(diagnostics, d)
+		}
 	}
 	var meta xdr.TransactionMeta
 	if err := xdr.SafeUnmarshalBase64(resp.ResultMetaXDR, &meta); err == nil {
@@ -440,6 +465,7 @@ func (e *Engine) result(s *Signed, resp protocol.GetTransactionResponse) Result 
 				v := sm.ReturnValue
 				r.Return = &v
 				r.Events = sm.Events
+				diagnostics = append(diagnostics, sm.DiagnosticEvents...)
 			}
 		case 4:
 			v4 := meta.MustV4()
@@ -450,12 +476,39 @@ func (e *Engine) result(s *Signed, resp protocol.GetTransactionResponse) Result 
 			for _, op := range v4.Operations {
 				r.Events = append(r.Events, op.Events...)
 			}
+			diagnostics = append(diagnostics, v4.DiagnosticEvents...)
 		}
 		if ext.V1 != nil {
 			r.ResourceFeeCharged = int64(ext.V1.TotalNonRefundableResourceFeeCharged + ext.V1.TotalRefundableResourceFeeCharged)
 		}
 	}
+	if r.Outcome == Failed {
+		r.ContractError = contractError(diagnostics)
+	}
 	return r
+}
+
+// contractError finds the first contract error in diagnostic events: the one closest to the cause,
+// since a call that fails passes its callee's error up unchanged.
+func contractError(events []xdr.DiagnosticEvent) *ContractError {
+	for _, d := range events {
+		body, ok := d.Event.Body.GetV0()
+		if !ok {
+			continue
+		}
+		for _, t := range body.Topics {
+			e, ok := t.GetError()
+			if !ok || e.Type != xdr.ScErrorTypeSceContract || e.ContractCode == nil {
+				continue
+			}
+			out := &ContractError{Code: uint32(*e.ContractCode)}
+			if d.Event.ContractId != nil {
+				out.Contract = strkey.MustEncode(strkey.VersionByteContract, d.Event.ContractId[:])
+			}
+			return out
+		}
+	}
+	return nil
 }
 
 // ErrNotWorth reports a call whose simulation showed it would achieve nothing, so it was not sent.
