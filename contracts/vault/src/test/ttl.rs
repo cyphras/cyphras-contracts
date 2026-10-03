@@ -5,9 +5,9 @@ use soroban_sdk::{
 
 use super::{
     queue::authorizers,
-    setup::{outcome, Setup, DAY, DELAY_SMALL, XLM},
+    setup::{Setup, DAY, DELAY_SMALL, XLM},
 };
-use crate::{DataKey, Error};
+use crate::DataKey;
 
 // 30 days and one hour of five-second ledgers.
 const WRITE_TTL: u32 = 30 * 17_280 + 720;
@@ -98,50 +98,38 @@ fn bump_ttl_extends_the_instance_the_tree_and_the_listed_deposits_to_the_maximum
 }
 
 #[test]
-fn the_reentrancy_lock_is_released_after_every_guarded_call() {
+fn each_call_writes_only_the_entries_it_changes() {
     let s = Setup::new();
-    s.fund_pool("funder", 10 * XLM);
-    let depositor = s.account("depositor", 100 * XLM);
+    s.fund_pool("funder", 100 * XLM);
     let relayer = s.account("relayer", 0);
-    s.shield(&depositor, XLM).unwrap();
-    s.shield(&depositor, XLM).unwrap();
-    let id = s.vault.status().next_deposit_id - 1;
-    s.vault.flag(&id, &1);
-    let held = || {
-        s.env.as_contract(&s.vault.address, || {
-            s.env.storage().temporary().has(&DataKey::Lock)
-        })
-    };
-    assert!(!held());
-    s.transact(&relayer, &s.ext(-XLM, 0, &relayer, &relayer))
+    let user = s.account("user", 0);
+    let depositor = s.account("depositor", 100 * XLM);
+    let writes = || s.env.cost_estimate().resources().write_entries;
+
+    // A call that needs an authorization also writes the signer's nonce. A relayed unshield
+    // writes the instance, two nullifiers, three tree entries and three balances.
+    s.transact(&relayer, &s.ext(-XLM, XLM, &user, &relayer))
         .unwrap();
-    assert!(!held());
-    s.vault.cancel(&(id - 1));
-    assert!(!held());
-    s.vault.refund(&id);
-    assert!(!held());
-}
-
-#[test]
-fn a_held_lock_refuses_every_entry_point_that_calls_out() {
-    let s = Setup::new();
-    s.fund_pool("funder", 10 * XLM);
-    let depositor = s.account("depositor", 100 * XLM);
-    let relayer = s.account("relayer", 0);
+    assert_eq!(writes(), 10);
+    // A transfer without a fee moves no balance.
+    s.transact(&relayer, &s.ext(0, 0, &relayer, &relayer))
+        .unwrap();
+    assert_eq!(writes(), 7);
+    // The instance, two nullifiers, the deposit, the day total and two balances.
     s.shield(&depositor, XLM).unwrap();
-    let id = s.vault.status().next_deposit_id - 1;
-    s.vault.flag(&id, &1);
-    s.env.as_contract(&s.vault.address, || {
-        s.env.storage().temporary().set(&DataKey::Lock, &())
-    });
-
-    assert_eq!(s.shield(&depositor, XLM), Err(Error::Reentered));
-    assert_eq!(
-        s.transact(&relayer, &s.ext(-XLM, 0, &relayer, &relayer)),
-        Err(Error::Reentered)
-    );
-    assert_eq!(outcome(s.vault.try_cancel(&id)), Err(Error::Reentered));
-    assert_eq!(outcome(s.vault.try_refund(&id)), Err(Error::Reentered));
-    // Entry points that move no funds do not take the lock.
-    s.vault.unflag(&id);
+    assert_eq!(writes(), 8);
+    s.shield(&depositor, XLM).unwrap();
+    s.shield(&depositor, XLM).unwrap();
+    s.vault.attest(&4);
+    s.advance(DELAY_SMALL);
+    // The deposit and three tree entries.
+    s.vault.admit(&Vec::from_slice(&s.env, &[2]));
+    assert_eq!(writes(), 4);
+    // The instance, the deposit and two balances.
+    s.vault.cancel(&3);
+    assert_eq!(writes(), 5);
+    s.vault.flag(&4, &1);
+    s.advance(DAY);
+    s.vault.refund(&4);
+    assert_eq!(writes(), 4);
 }

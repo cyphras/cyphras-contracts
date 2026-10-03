@@ -27,7 +27,6 @@ pub enum DataKey {
     Nullifier(U256),
     Pending(u64),
     DepositorDay(Address, u64),
-    Lock,
 }
 
 #[contracttype]
@@ -217,26 +216,5 @@ pub fn bump(env: &Env, pending_ids: &Vec<u64>) {
         if storage.has(&key) {
             storage.extend_ttl(&key, max, max);
         }
-    }
-}
-
-/// Held for the duration of an entry point that calls out to another contract. The host already
-/// refuses re-entry into a contract on the call stack; this lock does not depend on it.
-pub struct Lock<'a>(&'a Env);
-
-impl<'a> Lock<'a> {
-    pub fn acquire(env: &'a Env) -> Option<Self> {
-        let storage = env.storage().temporary();
-        if storage.has(&DataKey::Lock) {
-            return None;
-        }
-        storage.set(&DataKey::Lock, &());
-        Some(Lock(env))
-    }
-}
-
-impl Drop for Lock<'_> {
-    fn drop(&mut self) {
-        self.0.storage().temporary().remove(&DataKey::Lock);
     }
 }

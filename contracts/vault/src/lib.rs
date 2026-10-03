@@ -98,7 +98,6 @@ impl Vault {
         ext: ExtData,
         depositor: Address,
     ) -> Result<u64, Error> {
-        let _lock = storage::Lock::acquire(&env).ok_or(Error::Reentered)?;
         depositor.require_auth();
         let config = storage::config(&env);
         let limits = storage::limits(&env);
@@ -197,7 +196,6 @@ impl Vault {
         ext: ExtData,
         submitter: Address,
     ) -> Result<(), Error> {
-        let _lock = storage::Lock::acquire(&env).ok_or(Error::Reentered)?;
         submitter.require_auth();
         let config = storage::config(&env);
         let limits = storage::limits(&env);
@@ -389,7 +387,6 @@ impl Vault {
     /// The depositor takes back a deposit that is not yet admitted, flagged or not. Works while
     /// halted.
     pub fn cancel(env: Env, id: u64) -> Result<(), Error> {
-        let _lock = storage::Lock::acquire(&env).ok_or(Error::Reentered)?;
         let deposit = storage::pending(&env, id).ok_or(Error::UnknownDeposit)?;
         deposit.depositor.require_auth();
         release(&env, id, deposit, 0);
@@ -398,7 +395,6 @@ impl Vault {
 
     /// Anyone returns a flagged deposit to its depositor. Works while halted.
     pub fn refund(env: Env, id: u64) -> Result<(), Error> {
-        let _lock = storage::Lock::acquire(&env).ok_or(Error::Reentered)?;
         let deposit = storage::pending(&env, id).ok_or(Error::UnknownDeposit)?;
         let reason = deposit.flag.ok_or(Error::NotFlagged)?;
         release(&env, id, deposit, reason);
