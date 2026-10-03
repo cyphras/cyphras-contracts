@@ -42,6 +42,13 @@ func main() {
 	if err := r.Resume(); err != nil {
 		service.Fatal(log, "resume", err)
 	}
+	diagnosed, err := r.CheckDiagnostics(ctx)
+	if err != nil {
+		service.Fatal(log, "diagnostics check", err)
+	}
+	if !diagnosed {
+		log.Warn("the RPC returns no diagnostic events; failures that cannot be told count as races")
+	}
 	go r.Run(10 * time.Second)
 	addr := config.Env("LISTEN_ADDR", "127.0.0.1:8081")
 	log.Info("serving", "vault", base.Vault.Vault, "addr", addr)

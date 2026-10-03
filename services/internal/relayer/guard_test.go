@@ -378,7 +378,7 @@ func TestRacesNeverPauseRelayingButGuardIt(t *testing.T) {
 
 func TestRepeatedFailuresPauseRelayingAndRaiseTheFee(t *testing.T) {
 	h := newHarness(t, vault.Status{}, func(c *Config) { c.BreakerFailures = 1 })
-	h.setTxStatus(failedOnChain())
+	h.setTxStatus(failedWith(vaulttest.Vault, 101))
 	if code, _ := h.post(fixture(t, "unshield_muxed")); code != http.StatusAccepted {
 		t.Fatal("not sent")
 	}

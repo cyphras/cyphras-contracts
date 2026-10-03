@@ -467,6 +467,9 @@ type Result struct {
 	// ContractError is the first contract error the diagnostic events of a failed call name, when
 	// the RPC returns them.
 	ContractError *ContractError
+	// Diagnosed is set when the RPC returned diagnostic events for the transaction; one that does
+	// not keeps the cause of a failure from being told.
+	Diagnosed bool
 }
 
 // ContractError is an error a contract raised: the contract and its code.
@@ -575,6 +578,7 @@ func (e *Engine) result(s *Signed, resp protocol.GetTransactionResponse) Result 
 	if r.Outcome == Failed {
 		r.ContractError = contractError(diagnostics)
 	}
+	r.Diagnosed = len(diagnostics) > 0
 	return r
 }
 

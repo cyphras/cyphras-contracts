@@ -920,6 +920,42 @@ func (r *Relayer) transact(req Request, channel string) (txnbuild.Operation, err
 	}}, nil
 }
 
+// CheckDiagnostics simulates a call the vault always refuses, a function it does not have, and
+// reports whether the RPC returned diagnostic events for it. Without them the cause of a failed
+// relay cannot be told: the relayer then runs on, counting every such failure as a race that rests
+// its notes and destination rather than as its own, and raises a Warning.
+func (r *Relayer) CheckDiagnostics(ctx context.Context) (bool, error) {
+	addr, err := vault.ScAddress(r.cfg.Vault)
+	if err != nil {
+		return false, err
+	}
+	source := r.channels.any()
+	tx, err := txnbuild.NewTransaction(txnbuild.TransactionParams{
+		SourceAccount: &txnbuild.SimpleAccount{AccountID: source, Sequence: 0}, IncrementSequenceNum: true, BaseFee: txnbuild.MinBaseFee,
+		Preconditions: txnbuild.Preconditions{TimeBounds: txnbuild.NewInfiniteTimeout()},
+		Operations: []txnbuild.Operation{&txnbuild.InvokeHostFunction{HostFunction: xdr.HostFunction{
+			Type:           xdr.HostFunctionTypeHostFunctionTypeInvokeContract,
+			InvokeContract: &xdr.InvokeContractArgs{ContractAddress: addr, FunctionName: "no_such_function"},
+		}}},
+	})
+	if err != nil {
+		return false, err
+	}
+	encoded, err := tx.Base64()
+	if err != nil {
+		return false, err
+	}
+	sim, err := r.rpc.SimulateTransaction(ctx, protocol.SimulateTransactionRequest{Transaction: encoded})
+	if err != nil {
+		return false, err
+	}
+	if sim.Error != "" && len(sim.EventsXDR) > 0 {
+		return true, nil
+	}
+	r.alerts.Raise(ctx, alert.Warning, "rpc_no_diagnostics", "the RPC returned no diagnostic events for a call that fails, so the cause of a failed relay cannot be told; every such failure counts as a race and rests its notes and destination. Use an RPC that returns diagnostic events.")
+	return false, nil
+}
+
 // sendWait bounds how long one send may take, from waiting for a channel to the network holding
 // the transaction.
 const sendWait = 2 * time.Minute
@@ -1025,8 +1061,11 @@ func (r *Relayer) finish(res submit.Result, sent Record) {
 		c := r.classify(res, sent)
 		r.log.Warn("failed on chain", "tx", res.Hash, "result", res.Code, "cause", c.String(), "network_fee", res.FeeCharged)
 		r.coolDown(sent, c)
+		if c == causeUnclear {
+			r.alerts.Raise(r.ctx, alert.Warning, "rpc_no_diagnostics", "the RPC returned no diagnostic events for failed transaction %s, so its cause cannot be told; it counts as a race and rests its notes and destination. Use an RPC that returns diagnostic events.", res.Hash)
+		}
 		switch c {
-		case causeSpent, causeReceive, causeRace:
+		case causeSpent, causeReceive, causeRace, causeUnclear:
 			if c == causeSpent {
 				r.known.add(sentNullifiers(sent)...)
 			}
@@ -1076,10 +1115,12 @@ const (
 	// causeRace is the chain moving under the call between its simulation and its ledger: the root
 	// it was proved against pushed out of the vault's history, or the fee address's entries changed.
 	causeRace
+	// causeUnclear is a failure the RPC returned no diagnostic events for, which cannot be told.
+	causeUnclear
 )
 
 func (c cause) String() string {
-	return [...]string{"relayer", "vault", "notes spent first", "destination stopped receiving", "the chain moved under the call"}[c]
+	return [...]string{"relayer", "vault", "notes spent first", "destination stopped receiving", "the chain moved under the call", "no diagnostics"}[c]
 }
 
 // The vault's error codes a client can bring about after its request was checked. Codes below
@@ -1116,6 +1157,9 @@ func (r *Relayer) classify(res submit.Result, sent Record) cause {
 			if spent, err := r.spent(ctx, [2]fr.Element{nfs[0], nfs[1]}); err == nil && spent {
 				return causeSpent
 			}
+		}
+		if !res.Diagnosed {
+			return causeUnclear
 		}
 		return causeVault
 	case e.Contract == r.cfg.Vault && e.Code == vaultNullifierSpent:
@@ -1206,8 +1250,8 @@ func (r *Relayer) vaultCanPay(ctx context.Context) (bool, error) {
 
 // coolDown rests what a failed relay carried, in memory and in the database, so a restart does
 // not forget it: the request itself and, unless the relayer was at fault or the chain moved under
-// the call, its notes, for a day; and after a receive failure the destination, for longer each
-// time it fails again.
+// the call, its notes, for a day; and after a receive failure, or one that cannot be told, the
+// destination, for longer each time it fails again.
 func (r *Relayer) coolDown(rec Record, c cause) {
 	now := r.now()
 	until := now.Add(r.cfg.Cooldown).Unix()
@@ -1230,7 +1274,7 @@ func (r *Relayer) coolDown(rec Record, c cause) {
 			r.alerts.Raise(r.ctx, alert.Warning, "cooldown_not_stored", "a cooldown was kept in memory only: %v", err)
 		}
 	}
-	if c != causeReceive || rec.Destination == "" {
+	if (c != causeReceive && c != causeUnclear) || rec.Destination == "" {
 		return
 	}
 	key := destinationKey(rec.Destination)
@@ -1345,13 +1389,19 @@ func (r *Relayer) Status(ctx context.Context, hash string) (txStatus, bool, erro
 // channelPool hands each channel account to one transaction at a time.
 type channelPool struct {
 	mu    sync.Mutex
+	all   []*submit.Account
 	free  []*submit.Account
 	freed chan struct{}
 	total int
 }
 
 func newChannelPool(accounts []*submit.Account) *channelPool {
-	return &channelPool{free: slices.Clone(accounts), freed: make(chan struct{}, len(accounts)), total: len(accounts)}
+	return &channelPool{free: slices.Clone(accounts), all: slices.Clone(accounts), freed: make(chan struct{}, len(accounts)), total: len(accounts)}
+}
+
+// any names one channel account, for calls that are simulated only.
+func (p *channelPool) any() string {
+	return p.all[0].ID
 }
 
 func (p *channelPool) pop(id string) *submit.Account {

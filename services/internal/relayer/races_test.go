@@ -164,3 +164,46 @@ func TestAnAccountGrownAfterTheSimulationIsARaceItsOwnerRestsFor(t *testing.T) {
 		t.Fatal("a resource shortfall of the relayer's own did not count")
 	}
 }
+
+func TestAFailureWithoutDiagnosticsIsARaceThatRestsEverythingItNamed(t *testing.T) {
+	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t); c.BreakerFailures = 1 })
+	h.setTxStatus(failedOnChain())
+	dest := keypair.MustRandom().Address()
+	h.fund(dest)
+	req := h.lose(t, func() Request { return h.forged(t, dest, -20_000_000, 5_000_000) })
+	now := h.clock().Unix()
+	if h.r.brk.open(h.clock()) || !h.r.cool.cooling(now, destinationKey(dest)) || !h.r.cool.cooling(now, nullifierKey(req.Proof.Nullifiers[0].Hex())) {
+		t.Fatal("a failure that cannot be told was not a race resting its notes and destination")
+	}
+	if !h.r.alerts.Open("rpc_no_diagnostics") {
+		t.Fatal("no warning that the RPC gives no diagnostics")
+	}
+}
+
+func TestTheRPCIsCheckedForDiagnosticEvents(t *testing.T) {
+	h := newHarness(t, vault.Status{})
+	ctx := context.Background()
+	event, err := xdr.MarshalBase64(xdr.DiagnosticEvent{Event: xdr.ContractEvent{Type: xdr.ContractEventTypeDiagnostic,
+		Body: xdr.ContractEventBody{V: 0, V0: &xdr.ContractEventV0{Data: xdr.ScVal{Type: xdr.ScValTypeScvVoid}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var asked protocol.SimulateTransactionRequest
+	h.fake.Simulate = func(r protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		asked = r
+		return protocol.SimulateTransactionResponse{Error: "HostError: Error(WasmVm, MissingValue)", EventsXDR: []string{event}}, nil
+	}
+	if ok, err := h.r.CheckDiagnostics(ctx); err != nil || !ok || h.r.alerts.Open("rpc_no_diagnostics") {
+		t.Fatalf("an RPC with diagnostics: %v %v", ok, err)
+	}
+	var env xdr.TransactionEnvelope
+	if err := xdr.SafeUnmarshalBase64(asked.Transaction, &env); err != nil || env.V1.Tx.Operations[0].Body.InvokeHostFunctionOp.HostFunction.InvokeContract.FunctionName != "no_such_function" {
+		t.Fatalf("simulated %v", err)
+	}
+	h.fake.Simulate = func(protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		return protocol.SimulateTransactionResponse{Error: "HostError: Error(WasmVm, MissingValue)"}, nil
+	}
+	if ok, err := h.r.CheckDiagnostics(ctx); err != nil || ok || !h.r.alerts.Open("rpc_no_diagnostics") {
+		t.Fatalf("an RPC without diagnostics: %v %v", ok, err)
+	}
+}
