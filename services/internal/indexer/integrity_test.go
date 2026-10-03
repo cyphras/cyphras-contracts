@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -255,6 +256,66 @@ func sumPlan(node map[string]any, field string) float64 {
 		}
 	}
 	return total
+}
+
+func TestTheStreamIsServedOnlyWhileReady(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.ready()
+	srv := httptest.NewServer(h.ix.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/v1/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	if line, _ := reader.ReadString('\n'); !strings.HasPrefix(line, "retry:") {
+		t.Fatalf("first line %q", line)
+	}
+	// The chain disagrees with the indexer: data is no longer served, and neither are wakes.
+	h.fake.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), vaulttest.RootRing(fr.SetUint64(1), 4), h.chain.Ledger, nil)
+	if err := h.ix.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if h.ix.Health().Code != CodeMismatch {
+		t.Fatalf("no mismatch: %+v", h.ix.Health())
+	}
+	h.chain.NextLedger(5)
+	h.chain.Shield(vaulttest.Depositor, 5)
+	h.chain.NextLedger(5)
+	h.publish()
+	h.drain()
+	ended := make(chan string, 1)
+	go func() {
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				ended <- ""
+				return
+			}
+			if strings.HasPrefix(line, "data: ") {
+				ended <- line
+				return
+			}
+		}
+	}()
+	select {
+	case line := <-ended:
+		if line != "" {
+			t.Fatalf("a wake while not ready: %q", line)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the stream stayed open while not ready: %+v", h.ix.Health())
+	}
+	again, err := http.Get(srv.URL + "/v1/stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again.Body.Close()
+	if again.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("the stream answered %d while not ready", again.StatusCode)
+	}
 }
 
 // lyingSource answers any range with no events and no error.
