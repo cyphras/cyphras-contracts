@@ -20,12 +20,14 @@ CREATE TABLE IF NOT EXISTS relays (
 	network_fee bigint NOT NULL,
 	resource_fee bigint NOT NULL,
 	destination text,
-	screening text
+	screening text,
+	exit_id bigint
 );
 CREATE INDEX IF NOT EXISTS relays_by_ledger ON relays (ledger);
 `
 
-// Record is one relayed transaction.
+// Record is one relayed transaction. ExitID is set when its payment, the fee included, waited in
+// the exit queue.
 type Record struct {
 	Hash        string
 	Ledger      uint32
@@ -35,6 +37,7 @@ type Record struct {
 	ResourceFee int64
 	Destination string
 	Screening   string
+	ExitID      *uint64
 }
 
 type store struct {
@@ -47,19 +50,28 @@ func NewStore(pool *pgxpool.Pool) store {
 }
 
 func (s store) record(ctx context.Context, r Record) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO relays (tx_hash, ledger, kind, fee, network_fee, resource_fee, destination, screening)
-		VALUES ($1, $2, $3, $4::numeric, $5, $6, NULLIF($7, ''), NULLIF($8, '')) ON CONFLICT (tx_hash) DO NOTHING`,
-		r.Hash, int64(r.Ledger), r.Kind, r.Fee, r.NetworkFee, r.ResourceFee, r.Destination, r.Screening)
+	var exitID *int64
+	if r.ExitID != nil {
+		id := int64(*r.ExitID)
+		exitID = &id
+	}
+	_, err := s.pool.Exec(ctx, `INSERT INTO relays (tx_hash, ledger, kind, fee, network_fee, resource_fee, destination, screening, exit_id)
+		VALUES ($1, $2, $3, $4::numeric, $5, $6, NULLIF($7, ''), NULLIF($8, ''), $9) ON CONFLICT (tx_hash) DO NOTHING`,
+		r.Hash, int64(r.Ledger), r.Kind, r.Fee, r.NetworkFee, r.ResourceFee, r.Destination, r.Screening, exitID)
 	return err
 }
 
-func (s store) has(ctx context.Context, hash string) (bool, error) {
-	var one int
-	err := s.pool.QueryRow(ctx, `SELECT 1 FROM relays WHERE tx_hash = $1`, hash).Scan(&one)
+func (s store) has(ctx context.Context, hash string) (bool, *uint64, error) {
+	var exitID *int64
+	err := s.pool.QueryRow(ctx, `SELECT exit_id FROM relays WHERE tx_hash = $1`, hash).Scan(&exitID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return false, nil, nil
 	}
-	return err == nil, err
+	if err != nil || exitID == nil {
+		return err == nil, nil, err
+	}
+	id := uint64(*exitID)
+	return true, &id, nil
 }
 
 // recentResourceFees returns the resource fees of the last n relays, oldest first.

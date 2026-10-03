@@ -88,9 +88,12 @@ type Relayer struct {
 	latestClose int64
 }
 
+// txStatus is a submitted transaction's state. ExitID is set when the transaction succeeded but
+// its payment waits in the vault's exit queue, which pays it later in turn.
 type txStatus struct {
-	Status string `json:"status"`
-	Code   string `json:"code,omitempty"`
+	Status string  `json:"status"`
+	Code   string  `json:"code,omitempty"`
+	ExitID *uint64 `json:"exit_id,omitempty"`
 }
 
 // maxStatuses bounds the transaction statuses kept in memory.
@@ -426,9 +429,10 @@ func (r *Relayer) track(s *submit.Signed, ch *submit.Account, req Request) {
 	}
 	switch res.Outcome {
 	case submit.Success:
-		r.setStatus(s.Hash, txStatus{Status: "success"})
+		exitID := r.queuedExit(res.Events)
+		r.setStatus(s.Hash, txStatus{Status: "success", ExitID: exitID})
 		r.costs.Add(res.ResourceFeeCharged)
-		rec := Record{Hash: s.Hash, Ledger: res.Ledger, Fee: req.Ext.Fee.String(), NetworkFee: res.FeeCharged, ResourceFee: res.ResourceFeeCharged, Kind: "transfer"}
+		rec := Record{Hash: s.Hash, Ledger: res.Ledger, Fee: req.Ext.Fee.String(), NetworkFee: res.FeeCharged, ResourceFee: res.ResourceFeeCharged, Kind: "transfer", ExitID: exitID}
 		if req.Ext.ExtAmount.Sign() < 0 {
 			rec.Kind, rec.Destination, rec.Screening = "unshield", req.Ext.Recipient, "allow"
 		}
@@ -446,6 +450,24 @@ func (r *Relayer) track(s *submit.Signed, ch *submit.Account, req Request) {
 	}
 }
 
+// queuedExit returns the exit ID of a transact whose payment joined the exit queue: its fee, like
+// its payout, reaches the fee address only when release pays the exit.
+func (r *Relayer) queuedExit(events []xdr.ContractEvent) *uint64 {
+	for _, e := range events {
+		raw, err := vault.RawFromXDR(e)
+		if err != nil || raw.Contract != r.cfg.Vault {
+			continue
+		}
+		if ev, err := vault.Decode(raw); err == nil {
+			if q, ok := ev.Body.(vault.ExitQueued); ok {
+				id := q.ID
+				return &id
+			}
+		}
+	}
+	return nil
+}
+
 // Status reports a transaction this relayer submitted.
 func (r *Relayer) Status(ctx context.Context, hash string) (txStatus, bool) {
 	r.mu.Lock()
@@ -454,8 +476,8 @@ func (r *Relayer) Status(ctx context.Context, hash string) (txStatus, bool) {
 	if ok {
 		return s, true
 	}
-	if found, err := r.db.has(ctx, hash); err == nil && found {
-		return txStatus{Status: "success"}, true
+	if found, exitID, err := r.db.has(ctx, hash); err == nil && found {
+		return txStatus{Status: "success", ExitID: exitID}, true
 	}
 	return txStatus{}, false
 }

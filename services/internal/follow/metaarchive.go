@@ -267,28 +267,11 @@ func ledgerEvents(lcm xdr.LedgerCloseMeta, contract xdr.ContractId) ([]vault.Raw
 }
 
 func rawFromXDR(e xdr.ContractEvent, lcm xdr.LedgerCloseMeta, hash string, tx, op, index uint32) (vault.RawEvent, error) {
-	body, ok := e.Body.GetV0()
-	if !ok {
-		return vault.RawEvent{}, fmt.Errorf("%w: event body version %d", vault.ErrMalformed, e.Body.V)
-	}
-	topics := make([]string, len(body.Topics))
-	for i, t := range body.Topics {
-		s, err := xdr.MarshalBase64(t)
-		if err != nil {
-			return vault.RawEvent{}, err
-		}
-		topics[i] = s
-	}
-	value, err := xdr.MarshalBase64(body.Data)
+	raw, err := vault.RawFromXDR(e)
 	if err != nil {
 		return vault.RawEvent{}, err
 	}
-	contract, err := strkey.Encode(strkey.VersionByteContract, e.ContractId[:])
-	if err != nil {
-		return vault.RawEvent{}, err
-	}
-	return vault.RawEvent{
-		Ledger: lcm.LedgerSequence(), ClosedAt: lcm.LedgerCloseTime(), TxHash: hash,
-		Tx: tx, Op: op, Index: index, Contract: contract, Topics: topics, Value: value,
-	}, nil
+	raw.Ledger, raw.ClosedAt, raw.TxHash = lcm.LedgerSequence(), lcm.LedgerCloseTime(), hash
+	raw.Tx, raw.Op, raw.Index = tx, op, index
+	return raw, nil
 }

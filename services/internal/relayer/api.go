@@ -24,6 +24,8 @@ func (r *Relayer) Handler() http.Handler {
 			status = http.StatusServiceUnavailable
 		} else {
 			body["max_fee"] = inst.Limits.MaxFee.String()
+			// The largest exit, payout and fee together, the vault accepts; larger ones are split.
+			body["max_daily_outflow"] = inst.Limits.MaxDailyOutflow.String()
 		}
 		if r.channels.ready() == 0 {
 			status = http.StatusServiceUnavailable

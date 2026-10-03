@@ -18,6 +18,7 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/keypair"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
@@ -386,6 +387,46 @@ func TestAnExitNoWindowCanPayIsRefused(t *testing.T) {
 	}
 }
 
+func TestAnExitThatWaitsInTheQueueReportsItsID(t *testing.T) {
+	h := newHarness(t, vault.Status{})
+	raw, err := strkey.Decode(strkey.VersionByteContract, vaulttest.Vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := xdr.ContractId(raw)
+	sym := xdr.ScSymbol("exit_queued")
+	recipient, _ := vault.Address("MA53HZCSOZI5ZUDYCMYXXUGHO7XEZSM3BYW4M5FGSTYGKWMGVL7QKAAAAEPXD6YEZNZKQ")
+	relayer, _ := vault.Address(feeAddress)
+	amount := func(n int64) xdr.ScVal { v, _ := vault.I128(big.NewInt(n)); return v }
+	queued := xdr.ContractEvent{ContractId: &id, Type: xdr.ContractEventTypeContract, Body: xdr.ContractEventBody{V: 0, V0: &xdr.ContractEventV0{
+		Topics: []xdr.ScVal{{Type: xdr.ScValTypeScvSymbol, Sym: &sym}},
+		Data: vault.Struct(vault.Field{Name: "id", Value: vault.U64(7)}, vault.Field{Name: "ext_amount", Value: amount(-10)},
+			vault.Field{Name: "fee", Value: amount(5)}, vault.Field{Name: "recipient", Value: recipient}, vault.Field{Name: "relayer", Value: relayer}),
+	}}}
+	st := success(900_000)
+	var meta xdr.TransactionMeta
+	_ = xdr.SafeUnmarshalBase64(st.ResultMetaXDR, &meta)
+	meta.V4.Operations = []xdr.OperationMetaV2{{Events: []xdr.ContractEvent{queued}}}
+	st.ResultMetaXDR, _ = xdr.MarshalBase64(meta)
+	h.status = st
+	code, body := h.post(fixture(t, "unshield_muxed"))
+	if code != http.StatusAccepted {
+		t.Fatalf("submit answered %d %v", code, body)
+	}
+	h.waitIdle()
+	hash := body["hash"].(string)
+	if _, out := h.get("/v1/tx/" + hash); out["status"] != "success" || out["exit_id"].(float64) != 7 {
+		t.Fatalf("status %v", out)
+	}
+	// The record keeps the exit ID after the in-memory status is gone.
+	h.r.mu.Lock()
+	delete(h.r.statuses, hash)
+	h.r.mu.Unlock()
+	if _, out := h.get("/v1/tx/" + hash); out["exit_id"].(float64) != 7 {
+		t.Fatalf("status from the record %v", out)
+	}
+}
+
 func TestADelayedRequestIsHeldThenSent(t *testing.T) {
 	h := newHarness(t, vault.Status{})
 	body := fixture(t, "transfer")
@@ -415,7 +456,7 @@ func TestADelayedRequestIsHeldThenSent(t *testing.T) {
 func TestHealthAndQuoteReportIdentity(t *testing.T) {
 	h := newHarness(t, vault.Status{})
 	_, health := h.get("/v1/health")
-	if health["ready"] != true || health["fee_address"] != feeAddress || health["ready_channels"].(float64) != 2 || health["network_id"] != "cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472" {
+	if health["ready"] != true || health["fee_address"] != feeAddress || health["ready_channels"].(float64) != 2 || health["network_id"] != "cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472" || health["max_daily_outflow"] != "1000000000000" {
 		t.Fatalf("health %v", health)
 	}
 	_, quote := h.get("/v1/quote")

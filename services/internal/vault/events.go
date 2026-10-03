@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
@@ -168,6 +169,32 @@ type Event struct {
 	Name string
 	// Body is one of the event types of this package.
 	Body any
+}
+
+// RawFromXDR converts a contract event from transaction metadata. The position fields are the
+// caller's to fill.
+func RawFromXDR(e xdr.ContractEvent) (RawEvent, error) {
+	body, ok := e.Body.GetV0()
+	if !ok || e.ContractId == nil {
+		return RawEvent{}, malformed("event body version %d", e.Body.V)
+	}
+	topics := make([]string, len(body.Topics))
+	for i, t := range body.Topics {
+		s, err := xdr.MarshalBase64(t)
+		if err != nil {
+			return RawEvent{}, err
+		}
+		topics[i] = s
+	}
+	value, err := xdr.MarshalBase64(body.Data)
+	if err != nil {
+		return RawEvent{}, err
+	}
+	contract, err := strkey.Encode(strkey.VersionByteContract, e.ContractId[:])
+	if err != nil {
+		return RawEvent{}, err
+	}
+	return RawEvent{Contract: contract, Topics: topics, Value: value}, nil
 }
 
 // Decode dispatches on the topic before it reads the data, so an unknown event never reaches a

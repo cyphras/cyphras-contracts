@@ -348,6 +348,8 @@ type Result struct {
 	ResourceFeeCharged int64
 	Code               string
 	Return             *xdr.ScVal
+	// Events are the contract events of a successful transaction.
+	Events []xdr.ContractEvent
 }
 
 // Track polls until the transaction succeeded, failed or can no longer be included, and keeps the
@@ -394,11 +396,16 @@ func (e *Engine) result(s *Signed, resp protocol.GetTransactionResponse) Result 
 				ext = sm.Ext
 				v := sm.ReturnValue
 				r.Return = &v
+				r.Events = sm.Events
 			}
 		case 4:
-			if sm := meta.MustV4().SorobanMeta; sm != nil {
+			v4 := meta.MustV4()
+			if sm := v4.SorobanMeta; sm != nil {
 				ext = sm.Ext
 				r.Return = sm.ReturnValue
+			}
+			for _, op := range v4.Operations {
+				r.Events = append(r.Events, op.Events...)
 			}
 		}
 		if ext.V1 != nil {
