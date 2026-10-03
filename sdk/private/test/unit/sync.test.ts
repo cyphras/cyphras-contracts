@@ -303,6 +303,7 @@ describe("plan fate", () => {
   it("starts a landed plan over once the checked spends of its ledger refute its landing", () => {
     const { state, plan, note } = walletWith(40);
     Object.assign(plan, { state: "settled", txHash: "aa".repeat(32), ledger: 205 });
+    plan.exit = { id: 3, parts: [], ledger: 205, event: undefined };
     // Until the spends of its ledger are checked, nothing refutes it.
     advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "settled");
@@ -318,6 +319,7 @@ describe("plan fate", () => {
     advancePlans(state, [viewAt(250, 40)]);
     assert.equal(plan.state, "submitted");
     assert.equal(plan.ledger, undefined);
+    assert.equal(plan.exit, undefined);
   });
 
   it("supersedes a plan whose notes a landed plan of the same wallet spent", () => {

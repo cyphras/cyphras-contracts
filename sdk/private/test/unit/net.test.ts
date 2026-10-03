@@ -8,8 +8,8 @@ import { Fields, type FetchLike, MAX_REPLY_BYTES } from "../../src/net/http.ts";
 import { IndexerClient } from "../../src/net/indexer.ts";
 import { RelayerClient } from "../../src/net/relayer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
-import { StrKey, xdr } from "@stellar/stellar-base";
-import { IndexerSource } from "../../src/wallet/sources.ts";
+import { StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
+import { IndexerSource, RpcEventSource } from "../../src/wallet/sources.ts";
 import { vaultErrorName } from "../../src/vault/errors.ts";
 import { parseVaultErrors } from "../../scripts/vault-errors.ts";
 import { SDK_ROOT } from "../helpers.ts";
@@ -660,6 +660,46 @@ describe("RPC client", () => {
     const page = await rpc.getEvents({ contractId: "C", startLedger: 1_500 });
     assert.equal(page.latestCloseTime, 1_700_005_000);
     assert.equal(page.oldestCloseTime, 1_700_000_000);
+  });
+
+  it("gives the close times of the oldest ledger RPC holds, of the first event's and of the latest", async () => {
+    const vault = StrKey.encodeContract(Buffer.alloc(32, 9));
+    const spend = {
+      type: "contract",
+      ledger: 1_500,
+      ledgerClosedAt: new Date(1_700_002_500_000).toISOString(),
+      contractId: vault,
+      id: "000000001500-00000000",
+      txHash: "ab".repeat(32),
+      inSuccessfulContractCall: true,
+      topic: [xdr.ScVal.scvSymbol("new_nullifier").toXDR("base64")],
+      value: xdr.ScVal.scvMap([
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol("nullifier"),
+          val: nativeToScVal(7n, { type: "u256" }),
+        }),
+      ]).toXDR("base64"),
+    };
+    const rpc = new SorobanRpc(
+      "http://rpc",
+      reply(200, {
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          events: [spend],
+          latestLedger: 2_000,
+          oldestLedger: 1_000,
+          latestLedgerCloseTime: "1700005000",
+          oldestLedgerCloseTime: "1700000000",
+        },
+      }),
+    );
+    const events = await new RpcEventSource(rpc, vault, 1_200, 1).events();
+    assert.deepEqual(events.times, [
+      { ledger: 1_000, at: 1_700_000_000 },
+      { ledger: 1_500, at: 1_700_002_500 },
+      { ledger: 2_000, at: 1_700_005_000 },
+    ]);
   });
 
   it("reads the vault error of a failed simulation", async () => {
