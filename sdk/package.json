@@ -28,7 +28,8 @@
     "test": "node --test \"test/unit/**/*.test.ts\"",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\" \"scripts/**/*.ts\"",
-    "test:proof": "node --test --test-timeout=900000 \"test/proof/**/*.test.ts\""
+    "test:proof": "node --test --test-timeout=900000 \"test/proof/**/*.test.ts\"",
+    "size": "node scripts/size.ts"
   },
   "dependencies": {
     "@noble/ciphers": "1.3.0",
