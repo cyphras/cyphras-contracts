@@ -36,6 +36,7 @@ type Queue struct {
 	pending []delivery
 	nextID  int64
 	lanes   []*lane
+	pruned  sync.Once
 }
 
 // delivery is one channel's copy of an alert.
@@ -156,6 +157,23 @@ func (q *Queue) Put(a Alert) {
 	}
 }
 
+// prune drops, once, the stored copies of channels no longer configured, which no lane reads.
+func (q *Queue) prune(ctx context.Context) {
+	q.pruned.Do(func() {
+		if q.Store == nil {
+			return
+		}
+		n, err := q.Store.dropChannels(ctx, q.Name, len(q.Channels))
+		if err != nil {
+			q.logError("alert outbox prune failed", "", err)
+			return
+		}
+		if n > 0 && q.Log != nil {
+			q.Log.Warn("alert copies of removed channels dropped", "queue", q.Name, "copies", n)
+		}
+	})
+}
+
 func (q *Queue) wakeAll() {
 	for i := range q.Channels {
 		select {
@@ -178,6 +196,7 @@ func (q *Queue) logError(msg, code string, err error) {
 
 // Run delivers on every lane until ctx ends.
 func (q *Queue) Run(ctx context.Context) {
+	q.prune(ctx)
 	var wg sync.WaitGroup
 	for i := range q.Channels {
 		wg.Go(func() {
@@ -198,6 +217,7 @@ func (q *Queue) Run(ctx context.Context) {
 
 // Flush runs one pass of every lane and returns how long until a lane has work again.
 func (q *Queue) Flush(ctx context.Context) time.Duration {
+	q.prune(ctx)
 	waits := make([]time.Duration, len(q.Channels))
 	var wg sync.WaitGroup
 	for i := range q.Channels {
@@ -474,6 +494,11 @@ func (s *Store) due(ctx context.Context, queue string, channel int, now time.Tim
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) dropChannels(ctx context.Context, queue string, channels int) (int64, error) {
+	tag, err := s.Pool.Exec(ctx, `DELETE FROM alert_outbox WHERE queue = $1 AND channel >= $2`, queue, channels)
+	return tag.RowsAffected(), err
 }
 
 func (s *Store) done(ctx context.Context, id int64) error {

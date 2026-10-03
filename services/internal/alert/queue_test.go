@@ -423,6 +423,31 @@ func TestAFullQueueDropsItsLowestSeverityFirst(t *testing.T) {
 	}
 }
 
+func TestCopiesForARemovedChannelAreDropped(t *testing.T) {
+	ctx := context.Background()
+	store := outboxStore(t)
+	now := time.Unix(1_728_000_000, 0)
+	clock := func() time.Time { return now }
+	q := &Queue{Name: "operator", Channels: []Channel{&recorder{}, &counted{}}, Store: store, Now: clock}
+	q.Put(Alert{Severity: Critical, Code: "invariant", Time: now})
+	q.Flush(ctx)
+	if n, err := q.Waiting(ctx); err != nil || n != 1 {
+		t.Fatalf("%d copies wait, %v", n, err)
+	}
+	public := &Queue{Name: "public", Channels: []Channel{&counted{}, &counted{}}, Store: store, Now: clock}
+	public.Put(Alert{Severity: Info, Code: "governance", Time: now})
+	// The process restarts with the dead channel taken out of its configuration.
+	now = now.Add(time.Hour)
+	restarted := &Queue{Name: "operator", Channels: []Channel{&recorder{}}, Store: store, Now: clock}
+	restarted.Flush(ctx)
+	if n, err := restarted.Waiting(ctx); err != nil || n != 0 {
+		t.Fatalf("%d copies of the removed channel still wait, %v", n, err)
+	}
+	if n, err := public.Waiting(ctx); err != nil || n != 2 {
+		t.Fatalf("the public queue keeps %d of its 2 copies, %v", n, err)
+	}
+}
+
 // discordLike answers as Discord does: 400 to a message over 2000 characters or one it cannot
 // take, 404 once its webhook is deleted, and takes the rest.
 type discordLike struct {
