@@ -2,24 +2,21 @@ import { bn254 } from "@noble/curves/bn254.js";
 import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
-  closeSync,
   copyFileSync,
+  cpSync,
   mkdirSync,
   mkdtempSync,
-  openSync,
   readFileSync,
-  readSync,
   readdirSync,
   rmSync,
   writeFileSync,
-  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import * as snarkjs from "snarkjs";
 import { BEACON_ITERATIONS_EXP, PTAU_NAME, mem, quiet, readZkey, run } from "./common.mjs";
-import { fetchRound, firstRoundAt, roundTime } from "./drand.mjs";
+import { fetchRound, firstRoundAt, roundTime, verifyRound } from "./drand.mjs";
 import { checkVerificationKey } from "./vk.mjs";
 
 const USAGE = `Runs the whole ceremony on this machine and checks that the kit refuses bad input.
@@ -30,8 +27,9 @@ Usage:
 A coordinator initializes the ceremony, three contributors each install the kit with npm ci and
 contribute from their own directory, the coordinator announces a drand quicknet round a few
 seconds ahead and applies it as the beacon once drand has produced it, and a verifier checks the
-result. Then every negative check must fail. Everything is written to a temporary directory that
-is deleted at the end: one machine made all of it, so none of it may ever be used.`;
+result. Every negative check must then fail with its expected reason. Everything is written to a
+temporary directory that is deleted at the end: one machine made all of it, so none of it may
+ever be used.`;
 
 const KIT = import.meta.dirname;
 const CIRCUITS = resolve(KIT, "..", "..");
@@ -58,10 +56,25 @@ function pass(label, cwd, args, input) {
   return r.output;
 }
 
-function refuse(label, cwd, args) {
+// A negative check passes only if the step fails for the expected reason.
+function refuse(label, cwd, args, reason) {
   const r = exec(cwd, args);
-  if (r.status === 0) throw new Error(`negative check passed when it must fail: ${label}`);
-  refusals.push([label, r.output.match(/ERROR: (.*)/)?.[1] ?? `exit ${r.status}`]);
+  const error = r.output.match(/ERROR: (.*)/)?.[1] ?? "";
+  if (r.status === 0 || !error.includes(reason)) {
+    throw new Error(`"${label}" must fail with "${reason}", got exit ${r.status}: ${error}`);
+  }
+  refusals.push([label, error]);
+}
+
+async function refuseCall(label, work, reason) {
+  let error = "";
+  try {
+    await work();
+  } catch (e) {
+    error = e.message;
+  }
+  if (!error.includes(reason)) throw new Error(`"${label}" must fail with "${reason}": ${error}`);
+  refusals.push([label, error]);
 }
 
 async function timed(label, work) {
@@ -71,8 +84,9 @@ async function timed(label, work) {
   return out;
 }
 
-const sha256 = (path) => createHash("sha256").update(readFileSync(path)).digest("hex");
+const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 const attested = (out) => out.match(/Contribution hash \(blake2b-512\): ([0-9a-f]{128})/)[1];
+const flipLast = (hex) => `${hex.slice(0, -1)}${hex.endsWith("0") ? "1" : "0"}`;
 
 // Each person gets their own copy of the kit, installed from the lockfile, and the public inputs.
 function person(root, name, r1cs, ptau) {
@@ -88,25 +102,49 @@ function person(root, name, r1cs, ptau) {
   return dir;
 }
 
-function sectionOffset(path, wanted) {
-  const buf = readFileSync(path);
+function sectionOffset(data, wanted) {
   let pos = 12;
-  for (let i = buf.readUInt32LE(8); i > 0; i--) {
-    if (buf.readUInt32LE(pos) === wanted) return pos + 12;
-    pos += 12 + Number(buf.readBigUInt64LE(pos + 4));
+  for (let i = data.readUInt32LE(8); i > 0; i--) {
+    if (data.readUInt32LE(pos) === wanted) return pos + 12;
+    pos += 12 + Number(data.readBigUInt64LE(pos + 4));
   }
-  throw new Error(`no section ${wanted} in ${path}`);
+  throw new Error(`no section ${wanted}`);
 }
 
-function flipByte(src, dest, offset) {
-  copyFileSync(src, dest);
-  const fd = openSync(dest, "r+");
-  const b = Buffer.alloc(1);
-  readSync(fd, b, 0, 1, offset);
-  b[0] ^= 1;
-  writeSync(fd, b, 0, 1, offset);
-  closeSync(fd);
+// Contribution records follow the 64-byte circuit hash and the 4-byte count.
+function recordOffset(data, index) {
+  let at = sectionOffset(data, 10) + 68;
+  for (const c of readZkey(data, "fixture").contributions.slice(0, index)) at += c.raw.length;
+  return at;
 }
+
+function tamper(src, dest, change) {
+  const data = Buffer.from(readFileSync(src));
+  writeFileSync(dest, change(data) ?? data);
+  return dest;
+}
+
+const flip = (offset) => (data) => {
+  data[offset] ^= 1;
+};
+
+// A record holds 384 bytes of points and transcript, its type and its parameter length, then
+// the name's parameter id and length. Names are not covered by the contribution hash, so a
+// rename of the same length keeps the chain valid for snarkjs.
+const rename = (index, name) => (data) => {
+  const at = recordOffset(data, index) + 394;
+  if (data[at - 1] !== name.length) throw new Error("a rename must keep the name's length");
+  data.write(name, at, "latin1");
+};
+
+const appendSection = (data) => {
+  const extra = Buffer.alloc(16);
+  extra.writeUInt32LE(11, 0);
+  extra.writeBigUInt64LE(4n, 4);
+  const out = Buffer.concat([data, extra]);
+  out.writeUInt32LE(data.readUInt32LE(8) + 1, 8);
+  return out;
+};
 
 // A point on the G2 twist outside the order-r subgroup, which the vault build refuses.
 function pointOutsideG2() {
@@ -120,38 +158,55 @@ function pointOutsideG2() {
     } catch {
       continue;
     }
-    if (!bn254.G2.Point.fromAffine({ x, y }).isTorsionFree()) return g2Json({ x, y });
+    if (!bn254.G2.Point.fromAffine({ x, y }).isTorsionFree()) {
+      return [
+        [`${x.c0}`, `${x.c1}`],
+        [`${y.c0}`, `${y.c1}`],
+        ["1", "0"],
+      ];
+    }
   }
 }
 
-const g2Json = (p) => [
-  [`${p.x.c0}`, `${p.x.c1}`],
-  [`${p.y.c0}`, `${p.y.c1}`],
-  ["1", "0"],
-];
-
-function refuseBadKeys(vk) {
+async function refuseBadKeys(vk) {
   const key = JSON.parse(vk);
-  const changes = [
-    ["delta equal to gamma", { vk_delta_2: key.vk_gamma_2 }],
-    ["delta at the G2 generator", { vk_gamma_2: key.vk_delta_2, vk_delta_2: key.vk_gamma_2 }],
-    ["7 public inputs", { nPublic: 7 }],
-    ["8 IC points", { IC: key.IC.slice(0, 8) }],
-    ["PLONK", { protocol: "plonk" }],
-    ["a G1 point off the curve", { vk_alpha_1: [key.vk_alpha_1[0], "5", "1"] }],
-    ["a G1 point at (0, 0)", { IC: [["0", "0", "1"], ...key.IC.slice(1)] }],
-    ["the point at infinity", { vk_alpha_1: ["0", "1", "0"] }],
-    ["a coordinate equal to p", { vk_alpha_1: [`${bn254.fields.Fp.ORDER}`, "1", "1"] }],
-    ["a G2 point on the twist outside G2", { vk_beta_2: pointOutsideG2() }],
+  const changed = (change) => JSON.stringify({ ...key, ...change });
+  const cases = [
+    ["delta equal to gamma", changed({ vk_delta_2: key.vk_gamma_2 }), "never changed"],
+    [
+      "delta at the G2 generator",
+      changed({ vk_gamma_2: key.vk_delta_2, vk_delta_2: key.vk_gamma_2 }),
+      "never changed",
+    ],
+    ["7 public inputs", changed({ nPublic: 7 }), "8 public inputs"],
+    ["nPublic written as 8.0", vk.replace('"nPublic": 8', '"nPublic": 8.0'), "as an integer"],
+    ["8 IC points", changed({ IC: key.IC.slice(0, 8) }), "9 IC points"],
+    ["PLONK", changed({ protocol: "plonk" }), "Groth16 over BN254"],
+    [
+      "a G1 point off the curve",
+      changed({ vk_alpha_1: [key.vk_alpha_1[0], "5", "1"] }),
+      "not on the curve",
+    ],
+    [
+      "a G1 point at (0, 0)",
+      changed({ IC: [["0", "0", "1"], ...key.IC.slice(1)] }),
+      "not on the curve",
+    ],
+    ["the point at infinity", changed({ vk_alpha_1: ["0", "1", "0"] }), "not an affine point"],
+    [
+      "a coordinate equal to p",
+      changed({ vk_alpha_1: [`${bn254.fields.Fp.ORDER}`, "1", "1"] }),
+      "below the field modulus",
+    ],
+    [
+      "a coordinate with a leading zero",
+      changed({ vk_alpha_1: [`0${key.vk_alpha_1[0]}`, key.vk_alpha_1[1], "1"] }),
+      "not a decimal string",
+    ],
+    ["a G2 point on the twist outside G2", changed({ vk_beta_2: pointOutsideG2() }), "not in G2"],
   ];
-  for (const [label, change] of changes) {
-    try {
-      checkVerificationKey(Buffer.from(JSON.stringify({ ...key, ...change })));
-    } catch (e) {
-      refusals.push([`vk rules: ${label}`, e.message]);
-      continue;
-    }
-    throw new Error(`negative check passed when it must fail: vk rules: ${label}`);
+  for (const [label, text, reason] of cases) {
+    await refuseCall(`vk rules: ${label}`, () => checkVerificationKey(Buffer.from(text)), reason);
   }
 }
 
@@ -160,107 +215,305 @@ async function dryRun(root, r1cs, ptau) {
   const people = await timed("npm ci in 5 separate kit copies", () =>
     names.map((name) => person(root, name, r1cs, ptau)),
   );
-  const [mallory, verifier] = people.slice(3);
+  const [one, two, three, mallory, verifier] = people;
   const coordinator = join(root, "coordinator");
-  const coord = (...args) => [join(KIT, "coordinator.mjs"), ...args, "--dir", coordinator];
-  const announced = () =>
-    JSON.parse(readFileSync(join(coordinator, "ceremony-state.json"), "utf8")).zkeys.at(-1);
+  const coord = (dir, ...args) => [join(KIT, "coordinator.mjs"), ...args, "--dir", dir];
+  const record = (dir) => JSON.parse(readFileSync(join(dir, "ceremony-state.json"), "utf8"));
+  const badR1cs = tamper(r1cs, join(root, "other.r1cs"), flip(1000));
+  const badPtau = tamper(ptau, join(root, "other.ptau"), flip(1000));
 
-  pass("coordinator init", KIT, coord("init", "--r1cs", r1cs, "--ptau", ptau));
+  const elsewhere = join(root, "coordinator-refused");
+  refuse(
+    "init: a different r1cs",
+    KIT,
+    coord(elsewhere, "init", "--r1cs", badR1cs, "--ptau", ptau),
+    "is not the frozen v2 r1cs",
+  );
+  refuse(
+    "init: a different ptau",
+    KIT,
+    coord(elsewhere, "init", "--r1cs", r1cs, "--ptau", badPtau),
+    `is not the ${PTAU_NAME}`,
+  );
+  pass("coordinator init", KIT, coord(coordinator, "init", "--r1cs", r1cs, "--ptau", ptau));
 
-  const attestations = [];
-  for (let i = 1; i <= 3; i++) {
-    const dir = people[i - 1];
-    const name = `Dry Run ${i} (github: dry-run-${i})`;
-    const input = announced().file;
-    copyFileSync(join(coordinator, input), join(dir, input));
-    const output = `transaction_000${i}.zkey`;
-    const args = ["contribute.mjs", input, output, name, "--r1cs", "transaction.r1cs"];
-    args.push("--ptau", PTAU_NAME, "--expect");
-    if (i === 1) {
-      refuse("contribute: input differs from the announced sha256", dir, [...args, "f".repeat(64)]);
-    }
-    args.push(announced().sha256);
-    const label = `contributor ${i}: verify the input, contribute`;
-    const out =
-      i === 2
-        ? pass(label, dir, [...args, "--extra-entropy"], randomBytes(32))
-        : pass(label, dir, args);
-    const hash = attested(out);
-    attestations.push(`${hash} ${name}`);
-    const returned = join(dir, output);
+  // The coordinator hands out the last accepted zkey and announces its sha256.
+  const handOut = (dir) => {
+    const last = record(coordinator).zkeys.at(-1);
+    copyFileSync(join(coordinator, last.file), join(dir, last.file));
+    return ["contribute.mjs", last.file, "--expect", last.sha256];
+  };
+  const checked = ["--r1cs", "transaction.r1cs", "--ptau", PTAU_NAME];
+  const name1 = "Dry Run 1 (github: dry-run-1)";
+  const name2 = "Dry Run 2 (github: dry-run-2)";
+  const name3 = "Dry Run 3 (github: dry-run-3)";
 
-    if (i === 1) {
-      refuse(
-        "receive: wrong attested hash",
-        KIT,
-        coord("receive", returned, name, "a".repeat(128)),
-      );
-      refuse("receive: wrong name", KIT, coord("receive", returned, "Someone Else", hash));
-    }
-    if (i === 3) {
-      const first = join(coordinator, "transaction_0001.zkey");
-      copyFileSync(first, join(mallory, "transaction_0001.zkey"));
-      const skip = [
-        "contribute.mjs",
-        "transaction_0001.zkey",
-        "skip.zkey",
-        "Mallory (github: mallory)",
-      ];
-      const out = pass("mallory: contribute on 0001, skipping 0002", mallory, [
-        ...skip,
-        "--expect",
-        sha256(first),
-      ]);
-      refuse(
-        "receive: zkey that skips contribution #2",
-        KIT,
-        coord("receive", join(mallory, "skip.zkey"), skip[3], attested(out)),
-      );
-      const [hash1, ...name1] = attestations[0].split(" ");
-      refuse(
-        "receive: contribution #1 again as #3",
-        KIT,
-        coord("receive", join(people[0], "transaction_0001.zkey"), name1.join(" "), hash1),
-      );
-      refuse("beacon: only 2 contributions", KIT, coord("beacon", "1"));
-    }
-    pass(`coordinator receive #${i}`, KIT, coord("receive", returned, name, hash));
+  const [script, input, , expect] = handOut(one);
+  const out1 = join(one, "transaction_0001.zkey");
+  const args1 = [script, input, out1, name1];
+  refuse(
+    "contribute: input differs from the announced sha256",
+    one,
+    [...args1, "--expect", "f".repeat(64)],
+    "not the announced",
+  );
+  refuse(
+    "contribute: a different r1cs",
+    one,
+    [...args1, "--expect", expect, "--r1cs", badR1cs, "--ptau", PTAU_NAME],
+    "is not the frozen v2 r1cs",
+  );
+  refuse(
+    "contribute: an email address as the name",
+    one,
+    [script, input, "x.zkey", "Dry Run (dry@run.example)", "--expect", expect],
+    "looks like an email address",
+  );
+  writeFileSync(`${out1}.part`, "left over");
+  refuse(
+    "contribute: the output's part file exists",
+    one,
+    [...args1, "--expect", expect],
+    "already exists",
+  );
+  rmSync(`${out1}.part`);
+  const label1 = "contributor 1: verify the input, contribute";
+  const h1 = attested(pass(label1, one, [...args1, "--expect", expect, ...checked]));
+  refuse(
+    "receive: wrong attested hash",
+    KIT,
+    coord(coordinator, "receive", out1, name1, "a".repeat(128)),
+    "not the attested",
+  );
+  refuse(
+    "receive: wrong name",
+    KIT,
+    coord(coordinator, "receive", out1, "Someone Else", h1),
+    "is named",
+  );
+  pass("coordinator receive #1", KIT, coord(coordinator, "receive", out1, name1, h1));
+
+  const out2 = join(two, "transaction_0002.zkey");
+  const args2 = [...handOut(two), ...checked, "--extra-entropy"];
+  args2.splice(2, 0, out2, name2);
+  const label2 = "contributor 2: verify the input, contribute with piped extra entropy";
+  const h2 = attested(pass(label2, two, args2, randomBytes(32)));
+  const renamedFirst = tamper(
+    out2,
+    join(two, "renamed.zkey"),
+    rename(0, "Dry Run X (github: dry-run-x)"),
+  );
+  refuse(
+    "receive: #2 with contribution #1 renamed, the count still right",
+    KIT,
+    coord(coordinator, "receive", renamedFirst, name2, h2),
+    "contribution #1 differs from the one in the previous zkey",
+  );
+  pass("coordinator receive #2", KIT, coord(coordinator, "receive", out2, name2, h2));
+
+  for (const [label, name] of [
+    ["receive: contributor 1 again under the same name", name1],
+    ["receive: contributor 1 again under the same handle", "Dry Run Uno (github: dry-run-1)"],
+  ]) {
+    const again = [...handOut(one)];
+    again.splice(2, 0, join(one, "again.zkey"), name);
+    const hash = attested(pass(`${label.slice(9)}: contribute`, one, again));
+    refuse(
+      label,
+      KIT,
+      coord(coordinator, "receive", join(one, "again.zkey"), name, hash),
+      "is the contributor of #1",
+    );
+    rmSync(join(one, "again.zkey"));
   }
 
-  // A real ceremony announces the round at least a day ahead; here it is produced in seconds.
+  const first = join(coordinator, "transaction_0001.zkey");
+  copyFileSync(first, join(mallory, "transaction_0001.zkey"));
+  const skip = [
+    "contribute.mjs",
+    "transaction_0001.zkey",
+    "skip.zkey",
+    "Mallory (github: mallory)",
+  ];
+  const hSkip = attested(
+    pass("mallory: contribute on 0001, skipping 0002", mallory, [
+      ...skip,
+      "--expect",
+      sha256(readFileSync(first)),
+    ]),
+  );
+  refuse(
+    "receive: zkey that skips contribution #2",
+    KIT,
+    coord(coordinator, "receive", join(mallory, "skip.zkey"), skip[3], hSkip),
+    "must hold the 2 earlier contributions plus one, but holds 2",
+  );
+  refuse(
+    "receive: contribution #1 again as #3",
+    KIT,
+    coord(coordinator, "receive", out1, name1, h1),
+    "is already in the chain as #1",
+  );
+  refuse(
+    "beacon: only 2 contributions",
+    KIT,
+    coord(coordinator, "beacon", "1"),
+    "the beacon needs 3 contributions first",
+  );
+
+  const out3 = join(three, "transaction_0003.zkey");
+  const args3 = [...handOut(three), ...checked];
+  args3.splice(2, 0, out3, name3);
+  const h3 = attested(pass("contributor 3: verify the input, contribute", three, args3));
+  const data3 = readFileSync(out3);
+  const corrupt = tamper(out3, join(three, "corrupt.zkey"), flip(sectionOffset(data3, 9) + 1000));
+  const thief = "Thieves 3 (github: thieves-3)";
+  const stolen = tamper(out3, join(mallory, "stolen.zkey"), rename(2, thief));
+  refuse(
+    "receive: #3 with a corrupted H section",
+    KIT,
+    coord(coordinator, "receive", corrupt, name3, h3),
+    "snarkjs zkey verify rejects",
+  );
+  refuse(
+    "receive: #3 renamed by a thief after its owner's file arrived",
+    KIT,
+    coord(coordinator, "receive", stolen, thief, h3),
+    `was already shown under "${name3}"`,
+  );
+  pass("coordinator receive #3", KIT, coord(coordinator, "receive", out3, name3, h3));
+  refuse(
+    "receive: the thief's copy after #3 is accepted",
+    KIT,
+    coord(coordinator, "receive", stolen, thief, h3),
+    "is already in the chain as #3",
+  );
+
+  // A real ceremony announces the round at least a day ahead; here drand produces it in seconds.
+  const lastAccepted = new Date(record(coordinator).zkeys.at(-1).at);
   const round = firstRoundAt(new Date(Date.now() + 15_000));
   const produced = roundTime(round);
-  pass("coordinator round", KIT, coord("round", produced.toISOString()));
   const link = "https://example.invalid/cyphras-ceremony-dry-run";
-  pass("coordinator announce", KIT, coord("announce", `${round}`, link, new Date().toISOString()));
+  const old = firstRoundAt(new Date(lastAccepted - 60_000));
+  refuse(
+    "announce: a round produced before the last accepted contribution",
+    KIT,
+    coord(
+      coordinator,
+      "announce",
+      `${old}`,
+      link,
+      new Date(roundTime(old) - 86_400_000).toISOString(),
+    ),
+    "before transaction_0003.zkey was accepted",
+  );
+  refuse(
+    "announce: a round produced before its announcement",
+    KIT,
+    coord(
+      coordinator,
+      "announce",
+      `${round}`,
+      link,
+      new Date(produced.getTime() + 1000).toISOString(),
+    ),
+    "before the announcement",
+  );
+  refuse(
+    "beacon: no round announced",
+    KIT,
+    coord(coordinator, "beacon", `${round}`),
+    "no round is announced yet",
+  );
+  pass("coordinator round", KIT, coord(coordinator, "round", produced.toISOString()));
+  pass(
+    "coordinator announce",
+    KIT,
+    coord(coordinator, "announce", `${round}`, link, new Date().toISOString()),
+  );
+  refuse(
+    "beacon: a round other than the announced one",
+    KIT,
+    coord(coordinator, "beacon", `${round + 1}`),
+    `the last announced round is ${round}`,
+  );
+  // A copy of the ceremony in which one more contribution arrives after the announced round.
+  const late = join(root, "coordinator-late");
+  cpSync(coordinator, late, { recursive: true });
   await new Promise((done) => setTimeout(done, produced - Date.now() + 5_000));
-  pass(`coordinator beacon (drand quicknet round ${round})`, KIT, coord("beacon", String(round)));
-  pass("coordinator status", KIT, coord("status"));
+  pass(
+    `coordinator beacon (drand quicknet round ${round})`,
+    KIT,
+    coord(coordinator, "beacon", `${round}`),
+  );
+  pass("coordinator status", KIT, coord(coordinator, "status"));
+  const lateArgs = [
+    "contribute.mjs",
+    "transaction_0003.zkey",
+    "late.zkey",
+    "Late Four (github: late-4)",
+  ];
+  const hLate = attested(
+    pass("late copy: contribute after the announced round", three, [
+      ...lateArgs,
+      "--expect",
+      sha256(data3),
+    ]),
+  );
+  pass(
+    "late copy: receive #4 after the announced round",
+    KIT,
+    coord(late, "receive", join(three, "late.zkey"), lateArgs[3], hLate),
+  );
+  refuse(
+    "beacon: the announced round was produced before the last accepted contribution",
+    KIT,
+    coord(late, "beacon", `${round}`),
+    "before transaction_0004.zkey was accepted",
+  );
 
-  // The verifier gets the published files from the coordinator and the hashes from the
-  // contributors' attestations, never from the coordinator.
+  // The verifier takes the published files and the transcript's values from the coordinator, and
+  // the hashes and names from the contributors' attestations.
   copyFileSync(join(coordinator, FINAL), join(verifier, FINAL));
   copyFileSync(join(coordinator, VK), join(verifier, VK));
-  const list = join(verifier, "contributions.txt");
-  writeFileSync(list, `${attestations.join("\n")}\n`);
-  const verify = (zkey, ...extra) => [
+  const transcript = record(coordinator);
+  const attestations = [`${h1} ${name1}`, `${h2} ${name2}`, `${h3} ${name3}`];
+  const list = (lines) =>
+    writeFileSync(join(verifier, "contributions.txt"), `${lines.join("\n")}\n`);
+  list(attestations);
+  const { randomness, signature } = await fetchRound(round);
+  const next = await fetchRound(round + 1);
+  const verify = (
+    { r1cs = "transaction.r1cs", ptau = PTAU_NAME, zkey = FINAL, n = round },
+    ...more
+  ) => [
     "verify.mjs",
-    "transaction.r1cs",
-    PTAU_NAME,
+    r1cs,
+    ptau,
     zkey,
     "--contributions",
     "contributions.txt",
     "--vk",
     VK,
-    ...extra,
+    "--drand-round",
+    `${n}`,
+    ...more,
   ];
-  const { randomness, signature } = await fetchRound(round);
-  const online = (zkey, ...extra) => verify(zkey, "--drand-round", `${round}`, ...extra);
-  const offline = (zkey, ...extra) => online(zkey, "--drand-signature", signature, ...extra);
-  const pin = sha256(join(verifier, VK));
-  pass("verify (online)", verifier, online(FINAL, "--vk-sha256", pin));
-  pass("verify (offline)", verifier, offline(FINAL, "--beacon", randomness));
+  const offline = (files, ...more) => verify(files, "--drand-signature", signature, ...more);
+  pass(
+    "verify (online, every pin)",
+    verifier,
+    verify(
+      {},
+      "--vk-sha256",
+      sha256(readFileSync(join(verifier, VK))),
+      "--zkey-sha256",
+      transcript.final.sha256,
+      "--not-before",
+      transcript.zkeys.at(-1).at,
+    ),
+  );
+  pass("verify (offline)", verifier, offline({}, "--beacon", randomness));
 
   const bin = join(verifier, "node_modules", ".bin", "snarkjs");
   spawnSync(bin, ["zkey", "export", "verificationkey", FINAL, "cli.json"], { cwd: verifier });
@@ -269,65 +522,163 @@ async function dryRun(root, r1cs, ptau) {
   }
   console.log(`\nsnarkjs zkey export verificationkey writes the same bytes as ${VK}.`);
 
-  const final = join(verifier, FINAL);
-  flipByte(final, join(verifier, "h.zkey"), sectionOffset(final, 9) + 1000);
-  refuse("verify: final zkey with one byte flipped in its H section", verifier, online("h.zkey"));
-  const first = readZkey(readFileSync(final), final).contributions[0];
-  const second = sectionOffset(final, 10) + 68 + first.raw.length;
-  flipByte(final, join(verifier, "c2.zkey"), second + 74);
+  const finalPath = join(verifier, FINAL);
+  const final = readFileSync(finalPath);
+  const fixture = (name, change) => tamper(finalPath, join(verifier, name), change);
+  const second = recordOffset(final, 1);
   refuse(
-    "verify: final zkey with one byte flipped in contribution #2",
+    "verify: final zkey with one byte flipped in its H section",
     verifier,
-    online("c2.zkey"),
+    offline({ zkey: fixture("h.zkey", flip(sectionOffset(final, 9) + 1000)) }),
+    "snarkjs zkey verify rejects the final zkey",
   );
-
-  const beacon = async (from, to, value) => {
-    const out = { type: "mem" };
-    const label = `drand quicknet round ${round}`;
-    await snarkjs.zKey.beacon(
-      mem(readFileSync(from)),
-      out,
-      label,
-      value,
-      BEACON_ITERATIONS_EXP,
-      quiet,
-    );
-    writeFileSync(join(verifier, to), out.data);
-  };
-  await beacon(join(mallory, "skip.zkey"), "skip.zkey", randomness);
-  const alone = await timed("snarkjs zkey verify alone, on the chain that skips #2", () =>
+  refuse(
+    "verify: final zkey with a point of contribution #2 changed",
+    verifier,
+    offline({ zkey: fixture("point.zkey", flip(second + 74)) }),
+    "is not in G1",
+  );
+  refuse(
+    "verify: final zkey with the transcript of contribution #2 changed",
+    verifier,
+    offline({ zkey: fixture("transcript.zkey", flip(second + 330)) }),
+    "contribution #2 has hash",
+  );
+  refuse(
+    "verify: final zkey with an extra section",
+    verifier,
+    offline({ zkey: fixture("section.zkey", appendSection) }),
+    "has an unknown section 11",
+  );
+  const renamed = fixture("renamed.zkey", rename(0, "Dry Run X (github: dry-run-x)"));
+  const alone = await timed("snarkjs zkey verify alone, on the final zkey with #1 renamed", () =>
     snarkjs.zKey.verifyFromR1cs(
       mem(readFileSync(r1cs)),
       mem(readFileSync(ptau)),
-      mem(readFileSync(join(verifier, "skip.zkey"))),
+      mem(readFileSync(renamed)),
       quiet,
     ),
   );
   console.log(
-    `\nsnarkjs zkey verify alone, on the chain that skips #2: ${alone ? "ZKey Ok!" : "rejected"}`,
+    `\nsnarkjs zkey verify alone, final zkey with #1 renamed: ${alone ? "ZKey Ok!" : "no"}`,
   );
-  refuse("verify: final zkey on a chain that skips contribution #2", verifier, online("skip.zkey"));
+  refuse(
+    "verify: final zkey with contribution #1 renamed",
+    verifier,
+    offline({ zkey: renamed }),
+    `contribution #1 is named "Dry Run X (github: dry-run-x)", not "${name1}"`,
+  );
+  refuse(
+    "verify: wrong --zkey-sha256",
+    verifier,
+    offline({}, "--zkey-sha256", "0".repeat(64)),
+    "is not the final zkey of the transcript",
+  );
+  refuse(
+    "verify: a different r1cs",
+    verifier,
+    offline({ r1cs: badR1cs }),
+    "is not the frozen v2 r1cs",
+  );
+  refuse(
+    "verify: a different ptau",
+    verifier,
+    offline({ ptau: badPtau }),
+    `is not the ${PTAU_NAME}`,
+  );
 
-  await beacon(
-    join(coordinator, "transaction_0003.zkey"),
-    "beacon.zkey",
-    (await fetchRound(round + 1)).randomness,
+  const beacon = async (
+    from,
+    to,
+    { value = randomness, exp = BEACON_ITERATIONS_EXP, label } = {},
+  ) => {
+    const out = { type: "mem" };
+    const name = label ?? `drand quicknet round ${round}`;
+    await snarkjs.zKey.beacon(mem(readFileSync(from)), out, name, value, exp, quiet);
+    writeFileSync(join(verifier, to), out.data);
+    return to;
+  };
+  const zkeyN = (n) => join(coordinator, `transaction_000${n}.zkey`);
+  const skipFinal = await beacon(join(mallory, "skip.zkey"), "skip.zkey");
+  const skipAlone = await timed("snarkjs zkey verify alone, on the chain that skips #2", () =>
+    snarkjs.zKey.verifyFromR1cs(
+      mem(readFileSync(r1cs)),
+      mem(readFileSync(ptau)),
+      mem(readFileSync(join(verifier, skipFinal))),
+      quiet,
+    ),
+  );
+  console.log(`\nsnarkjs zkey verify alone, chain that skips #2: ${skipAlone ? "ZKey Ok!" : "no"}`);
+  refuse(
+    "verify: final zkey on a chain that skips contribution #2",
+    verifier,
+    offline({ zkey: skipFinal }),
+    "the zkey holds 3 contributions, but 3 are attested",
   );
   refuse(
     "verify: final zkey made with the next round's randomness",
     verifier,
-    online("beacon.zkey"),
+    offline({ zkey: await beacon(zkeyN(3), "next.zkey", { value: next.randomness }) }),
+    `the zkey must end with the beacon ${randomness}`,
   );
+  refuse(
+    "verify: final zkey with numIterationsExp 11",
+    verifier,
+    offline({ zkey: await beacon(zkeyN(3), "iterations.zkey", { exp: 11 }) }),
+    "the beacon must use numIterationsExp 10",
+  );
+  refuse(
+    "verify: final zkey whose beacon is labeled with another round",
+    verifier,
+    offline({ zkey: await beacon(zkeyN(3), "label.zkey", { label: "drand quicknet round 1" }) }),
+    `the beacon is labeled "drand quicknet round 1"`,
+  );
+  list(attestations.slice(0, 2));
+  refuse(
+    "verify: final zkey with only 2 contributions",
+    verifier,
+    offline({ zkey: await beacon(zkeyN(2), "two.zkey") }),
+    "the plan needs 3 contributions, there are 2",
+  );
+  list(attestations);
   refuse(
     "verify: honest final zkey against the next round",
     verifier,
-    verify(FINAL, "--drand-round", `${round + 1}`),
+    verify({ n: round + 1 }),
+    `the zkey must end with the beacon ${next.randomness}`,
   );
-  const altered = `${randomness.slice(0, -1)}${randomness.endsWith("0") ? "1" : "0"}`;
   refuse(
-    "verify: honest final zkey against altered randomness",
+    "verify: --beacon that is not the round's randomness",
     verifier,
-    online(FINAL, "--beacon", altered),
+    verify({}, "--beacon", flipLast(randomness)),
+    `is not the randomness of drand round ${round}`,
+  );
+  refuse(
+    "verify: offline with the next round's signature",
+    verifier,
+    verify({}, "--drand-signature", next.signature),
+    "does not verify under the quicknet key",
+  );
+  refuse(
+    "verify: beacon round produced before --not-before",
+    verifier,
+    offline({}, "--not-before", new Date(produced.getTime() + 1000).toISOString()),
+    `drand round ${round} was produced before`,
+  );
+  await refuseCall(
+    "drand: a round's signature checked as the next round",
+    () => verifyRound(round + 1, signature, randomness),
+    "does not verify under the quicknet key",
+  );
+  await refuseCall(
+    "drand: a signature with one bit flipped",
+    () => verifyRound(round, flipLast(signature), randomness),
+    "does not verify under the quicknet key",
+  );
+  await refuseCall(
+    "drand: randomness that is not the signature's hash",
+    () => verifyRound(round, signature, next.randomness),
+    "is not the hash of its signature",
   );
 
   const vk = readFileSync(join(verifier, VK), "utf8");
@@ -336,25 +687,52 @@ async function dryRun(root, r1cs, ptau) {
     join(verifier, VK),
     `${vk.slice(0, digit)}${vk[digit] === "1" ? "2" : "1"}${vk.slice(digit + 1)}`,
   );
-  refuse(`verify: ${VK} with one digit changed`, verifier, online(FINAL));
+  const size = Buffer.byteLength(vk);
+  refuse(
+    `verify: ${VK} with one digit changed, same length`,
+    verifier,
+    offline({}),
+    `first at byte ${digit} (${size} bytes exported, ${size} published)`,
+  );
   writeFileSync(join(verifier, VK), `${vk}\n`);
-  refuse(`verify: ${VK} with one byte appended`, verifier, online(FINAL));
+  refuse(
+    `verify: ${VK} with one byte appended`,
+    verifier,
+    offline({}),
+    `first at byte ${size} (${size} bytes exported, ${size + 1} published)`,
+  );
   writeFileSync(join(verifier, VK), vk);
-  refuse("verify: wrong vk pin", verifier, offline(FINAL, "--vk-sha256", "0".repeat(64)));
+  refuse(
+    "verify: wrong vk pin",
+    verifier,
+    offline({}, "--vk-sha256", "0".repeat(64)),
+    "the vault build pins",
+  );
 
   const [a, b, c] = attestations;
-  const lists = {
-    "one hex digit changed in hash #2": [a, `${b[0] === "a" ? "b" : "a"}${b.slice(1)}`, c],
-    "hashes #1 and #2 swapped": [b, a, c],
-    "contribution #2 missing": [a, c],
-    "name of #1 changed": [`${a.slice(0, 128)} Someone Else`, b, c],
-  };
-  for (const [label, lines] of Object.entries(lists)) {
-    writeFileSync(list, `${lines.join("\n")}\n`);
-    refuse(`verify: attestation list with ${label}`, verifier, offline(FINAL));
+  const lists = [
+    ["hashes without names", [a, b, c].map((l) => l.slice(0, 128)), "<128 hex characters> <name>"],
+    [
+      "one hex digit changed in hash #2",
+      [a, flipLast(b.slice(0, 128)) + b.slice(128), c],
+      "not the attested",
+    ],
+    ["hashes #1 and #2 swapped", [b, a, c], "not the attested"],
+    ["contribution #2 missing", [a, c], "the zkey holds 4 contributions, but 2 are attested"],
+    ["name of #1 changed", [`${a.slice(0, 128)} Someone Else`, b, c], "contribution #1 is named"],
+    [
+      "#3 under #1's handle",
+      [a, b, `${c.slice(0, 128)} Dry Run Three (github: dry-run-1)`],
+      "is the same contributor as",
+    ],
+    ["an email address as a name", [a, b, `${c.slice(0, 128)} dry [at] run`], "email address"],
+  ];
+  for (const [label, lines, reason] of lists) {
+    list(lines);
+    refuse(`verify: attestation list with ${label}`, verifier, offline({}), reason);
   }
 
-  refuseBadKeys(vk);
+  await refuseBadKeys(vk);
 }
 
 run(USAGE, async (argv) => {
@@ -376,7 +754,7 @@ run(USAGE, async (argv) => {
 
   console.log("\nStep timings:");
   for (const [label, s] of timings) console.log(`  ${s.toFixed(1).padStart(7)} s  ${label}`);
-  console.log(`\nNegative checks, each refused as required (${refusals.length}):`);
+  console.log(`\nNegative checks, each refused for its expected reason (${refusals.length}):`);
   for (const [label, reason] of refusals) console.log(`  ${label}\n    -> ${reason}`);
   console.log("\nDRY RUN PASSED");
 });
