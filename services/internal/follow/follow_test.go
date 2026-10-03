@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
+	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
@@ -157,6 +158,25 @@ func TestAnUnknownTopicIsAFaultAndNothingIsApplied(t *testing.T) {
 	}
 	if sink.cursor != 9 {
 		t.Fatal("a faulty window was applied")
+	}
+}
+
+func TestMalformedEventsFromTheRPCAreAFault(t *testing.T) {
+	c := vaulttest.New(10, 1_728_000_000)
+	c.Shield(vaulttest.Depositor, 5)
+	f := rpctest.New(passphrase, 0)
+	for _, e := range c.Events {
+		info := rpctest.EventInfo(e)
+		info.EventType = protocol.EventTypeSystem
+		f.AddEvent(info)
+	}
+	sink := &memSink{cursor: 9}
+	fl := &Follower{RPC: f, Live: RPCSource{Client: f, Contract: vaulttest.Vault}, Window: 10, Sink: sink}
+	if _, err := fl.Step(context.Background()); !errors.Is(err, ErrFault) || !errors.Is(err, vault.ErrMalformed) {
+		t.Fatalf("a system event: %v", err)
+	}
+	if sink.cursor != 9 {
+		t.Fatal("a malformed window was applied")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
@@ -82,16 +83,67 @@ func TestATornLineCannotSwallowTheNextWrite(t *testing.T) {
 	}
 }
 
-func TestOtherContractsAreIgnored(t *testing.T) {
+func TestAnEventOfAnotherContractFailsTheRead(t *testing.T) {
 	dir := t.TempDir()
 	other := event(5, 1, 0)
 	other.Contract = "CCVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKUD2U"
 	if err := (Writer{Dir: dir}).Append([]vault.RawEvent{other, event(5, 1, 1)}, 5, 5); err != nil {
 		t.Fatal(err)
 	}
-	got, err := Reader{Dir: dir, Vault: testVault}.Events(context.Background(), 5, 5)
-	if err != nil || len(got) != 1 || got[0].Index != 1 {
-		t.Fatalf("events %+v, %v", got, err)
+	if _, err := (Reader{Dir: dir, Vault: testVault}).Events(context.Background(), 5, 5); !errors.Is(err, ErrDamaged) {
+		t.Fatalf("read %v", err)
+	}
+}
+
+func TestADamagedLineOfAFinishedWriteFailsTheRead(t *testing.T) {
+	write := func(t *testing.T) (string, []string) {
+		dir := t.TempDir()
+		events := []vault.RawEvent{event(100, 1, 0), event(101, 1, 0), event(102, 1, 0)}
+		if err := (Writer{Dir: dir}).Append(events, 100, 110); err != nil {
+			t.Fatal(err)
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, "0000000000.jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return dir, strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	}
+	for name, damage := range map[string]func([]string) []string{
+		"a cut line": func(l []string) []string {
+			l[1] = l[1][:len(l[1])-3]
+			return l
+		},
+		"another contract": func(l []string) []string {
+			l[2] = strings.Replace(l[2], testVault, "CCVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKUD2U", 1)
+			return l
+		},
+		"a changed value": func(l []string) []string {
+			l[0] = strings.Replace(l[0], `"value":"v"`, `"value":"w"`, 1)
+			return l
+		},
+		"a line gone": func(l []string) []string {
+			return append(l[:1], l[2:]...)
+		},
+		"two torn lines": func(l []string) []string {
+			return append(l, `{"write":9,"event":{"ledger":111`, `{"write":9,"event":{"ledger":112`)
+		},
+	} {
+		dir, lines := write(t)
+		if err := os.WriteFile(filepath.Join(dir, "0000000000.jsonl"), []byte(strings.Join(damage(lines), "\n")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := (Reader{Dir: dir, Vault: testVault}).Events(context.Background(), 100, 110); !errors.Is(err, ErrDamaged) {
+			t.Fatalf("%s: read %d events, %v", name, len(got), err)
+		}
+	}
+	// A crash that tears the last line of a write leaves the writes before it readable.
+	dir, lines := write(t)
+	torn := strings.Join(lines, "\n") + "\n" + `{"write":9,"event":{"ledger":111`
+	if err := os.WriteFile(filepath.Join(dir, "0000000000.jsonl"), []byte(torn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := (Reader{Dir: dir, Vault: testVault}).Events(context.Background(), 100, 110); err != nil || len(got) != 3 {
+		t.Fatalf("after a torn tail: %d events, %v", len(got), err)
 	}
 }
 

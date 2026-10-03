@@ -1,10 +1,12 @@
 package indexer
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"math/big"
 	"net/http"
+	"slices"
 	"strconv"
 	"time"
 
@@ -70,14 +72,17 @@ func (ix *Indexer) leaves(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ix.mu.RLock()
+	vouched := ix.vouched
+	ix.mu.RUnlock()
 	leaves, err := ix.db.leaves(r.Context(), page, h.IngestedLedger)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
 	complete := len(leaves) == PageSize
-	if complete {
-		// A full page never changes.
+	if complete && (page+1)*PageSize <= vouched {
+		// A full page the chain has vouched for never changes.
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
 	httpapi.JSON(w, http.StatusOK, map[string]any{
@@ -114,39 +119,7 @@ func (ix *Indexer) deposits(w http.ResponseWriter, r *http.Request) {
 	if _, ok := ix.serving(w); !ok {
 		return
 	}
-	ix.mu.RLock()
-	// The stored rows are cut at the ledger of the state read here.
-	upTo := ix.cursor
-	inst := ix.instance
-	attested := ix.state.AttestedUpTo
-	delays := make(map[uint64]uint64, len(ix.delays))
-	for id, d := range ix.delays {
-		delays[id] = d
-	}
-	ix.mu.RUnlock()
-	rows, err := ix.db.pending(r.Context(), upTo)
-	if err != nil {
-		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
-		return
-	}
-	pending := make([]PendingDeposit, 0, len(rows))
-	for _, d := range rows {
-		p := PendingDeposit{ID: uint64(d.id), Depositor: d.depositor, Amount: d.amount, CreatedAt: uint64(d.createdAt), Attested: uint64(d.id) <= attested}
-		if d.flag != nil {
-			reason := uint32(*d.flag)
-			p.FlagReason = &reason
-		}
-		if d.flaggedAt != nil {
-			at := uint64(*d.flaggedAt)
-			p.FlaggedAt = &at
-		}
-		if delay, ok := delays[p.ID]; ok && inst != nil {
-			amount, _ := new(big.Int).SetString(d.amount, 10)
-			eligible := vault.PendingDeposit{Amount: amount, CreatedAt: p.CreatedAt, Delay: delay}.EligibleAt(inst.Config, inst.Limits)
-			p.EarliestAdmission = &eligible
-		}
-		pending = append(pending, p)
-	}
+	upTo, attested, pending := ix.pendingDeposits()
 	resolved, err := ix.db.resolved(r.Context(), ix.now().Add(-resolvedWindow).Unix(), upTo)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
@@ -155,6 +128,28 @@ func (ix *Indexer) deposits(w http.ResponseWriter, r *http.Request) {
 	httpapi.JSON(w, http.StatusOK, map[string]any{
 		"pending": pending, "resolved": resolved, "attested_up_to": attested, "complete_to": upTo,
 	})
+}
+
+// pendingDeposits lists the entry queue from the state in memory, with the ledger it describes, at
+// which the resolved deposits are cut.
+func (ix *Indexer) pendingDeposits() (uint32, uint64, []PendingDeposit) {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	attested := ix.state.AttestedUpTo
+	pending := make([]PendingDeposit, 0, len(ix.state.Pending))
+	for _, d := range ix.state.Pending {
+		p := PendingDeposit{ID: d.ID, Depositor: d.Depositor, Amount: d.Amount.String(), CreatedAt: d.CreatedAt, Attested: d.ID <= attested}
+		if d.Flag != nil {
+			p.FlagReason, p.FlaggedAt = ptr(*d.Flag), ptr(d.FlaggedAt)
+		}
+		if delay, ok := ix.delays[d.ID]; ok && ix.instance != nil {
+			eligible := vault.PendingDeposit{Amount: new(big.Int).Set(d.Amount), CreatedAt: d.CreatedAt, Delay: delay}.EligibleAt(ix.instance.Config, ix.instance.Limits)
+			p.EarliestAdmission = &eligible
+		}
+		pending = append(pending, p)
+	}
+	slices.SortFunc(pending, func(a, b PendingDeposit) int { return cmp.Compare(a.ID, b.ID) })
+	return ix.cursor, attested, pending
 }
 
 func (ix *Indexer) stats(w http.ResponseWriter, r *http.Request) {

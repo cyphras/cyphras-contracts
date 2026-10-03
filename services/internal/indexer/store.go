@@ -90,11 +90,17 @@ type Nullifier struct {
 	TxHash    string `json:"tx_hash"`
 }
 
+// nullifiersQuery reads a page of nullifiers. Sequence numbers grow with the ledger, so the scan
+// starts at the first nullifier spent at or after the ledger asked for and walks the primary key,
+// rather than filtering every row after the cursor by ledger.
+const nullifiersQuery = `SELECT seq, nullifier, ledger, tx_hash FROM nullifiers
+	WHERE seq >= greatest($3::bigint, coalesce((SELECT seq FROM nullifiers WHERE ledger >= $1 ORDER BY ledger, seq LIMIT 1), 9223372036854775807))
+	AND ledger >= $1 AND ledger <= $2 ORDER BY seq LIMIT $4`
+
 // nullifiers returns up to MaxNullifiers nullifiers spent from the ledger since to upTo, from the
 // cursor on, and the cursor of the next page, empty when this is the last.
 func (s store) nullifiers(ctx context.Context, sinceLedger, upTo uint32, cursor uint64) ([]Nullifier, string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT seq, nullifier, ledger, tx_hash FROM nullifiers
-		WHERE ledger >= $1 AND ledger <= $2 AND seq >= $3 ORDER BY seq LIMIT $4`, int64(sinceLedger), int64(upTo), int64(cursor), MaxNullifiers+1)
+	rows, err := s.pool.Query(ctx, nullifiersQuery, int64(sinceLedger), int64(upTo), int64(cursor), MaxNullifiers+1)
 	if err != nil {
 		return nil, "", err
 	}
@@ -141,31 +147,6 @@ type ResolvedDeposit struct {
 	ResolvedAt uint64  `json:"resolved_at"`
 	LeafIndex0 *uint64 `json:"leaf_index0"`
 	LeafIndex1 *uint64 `json:"leaf_index1"`
-}
-
-type depositRow struct {
-	id, createdAt     int64
-	depositor, amount string
-	flag              *int32
-	flaggedAt         *int64
-}
-
-func (s store) pending(ctx context.Context, upTo uint32) ([]depositRow, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, depositor, amount::text, created_at, flag_reason, flagged_at
-		FROM deposits WHERE created_ledger <= $1 AND (resolved_ledger IS NULL OR resolved_ledger > $1) ORDER BY id`, int64(upTo))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []depositRow
-	for rows.Next() {
-		var d depositRow
-		if err := rows.Scan(&d.id, &d.depositor, &d.amount, &d.createdAt, &d.flag, &d.flaggedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, d)
-	}
-	return out, rows.Err()
 }
 
 func (s store) resolved(ctx context.Context, since int64, upTo uint32) ([]ResolvedDeposit, error) {

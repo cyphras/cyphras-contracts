@@ -145,12 +145,7 @@ type snapshot struct {
 }
 
 func snapshotOf(ledger uint32, s *chainstate.State) snapshot {
-	out := snapshot{ledger: ledger, status: vault.Status{
-		DepositsPaused: s.DepositsPaused, TransfersPaused: s.TransfersPaused, HaltedUntil: s.HaltedUntil, NextHaltAt: s.NextHaltAt,
-		NextDepositID: s.NextDepositID, AttestedUpTo: s.AttestedUpTo, Tvl: new(big.Int).Set(s.Tvl),
-		PendingTotal: new(big.Int).Set(s.PendingTotal), QueuedTotal: new(big.Int).Set(s.QueuedTotal), ExitHead: s.ExitHead,
-		ExitTail: s.ExitTail, OutflowDay: s.OutflowDay, Outflow: new(big.Int).Set(s.Outflow),
-	}}
+	out := snapshot{ledger: ledger, status: s.Status()}
 	if s.Limits != nil {
 		l := *s.Limits
 		out.limits = &l

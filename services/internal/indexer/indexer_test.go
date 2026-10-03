@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
@@ -58,7 +59,7 @@ func newHarness(t *testing.T) *harness {
 	h.cfg = Config{Vault: vaulttest.Vault, NetworkID: rpc.NetworkID(passphrase), DeployLedger: 10, ArchiveDir: t.TempDir(), MaxLag: 12, ProbeMaxAge: 30 * time.Second}
 	h.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	h.open()
-	h.setInstance(0)
+	h.setInstance(vault.Status{NextDepositID: 1, ExitHead: 1, ExitTail: 1}, 10)
 	return h
 }
 
@@ -80,11 +81,42 @@ func (h *harness) open() {
 	h.f = &follow.Follower{RPC: h.fake, Live: follow.RPCSource{Client: h.fake, Contract: vaulttest.Vault, PageLimit: 10}, Window: 5, Sink: ix}
 }
 
-func (h *harness) setInstance(attested uint64) {
+func (h *harness) setInstance(status vault.Status, modified uint32) {
 	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Vault)), vaulttest.Instance(vaulttest.InstanceOptions{
-		DelaySmall: 3600, DelayLarge: 86400, Limit: 1_000_000_000_000, Large: 5_000_000_000,
-		Status: vault.Status{AttestedUpTo: attested},
-	}), 10, nil)
+		DelaySmall: 3600, DelayLarge: 86400, Limit: 1_000_000_000_000, Large: 5_000_000_000, Status: status,
+	}), modified, nil)
+}
+
+// replayStatus is the vault's status after the chain's events, up to the first ledger whose events
+// the vault could not have emitted, and the last ledger applied.
+func (h *harness) replayStatus() (vault.Status, uint32) {
+	s, last := chainstate.New(), uint32(10)
+	var ledgers []uint32
+	byLedger := map[uint32][]vault.Event{}
+	for _, raw := range h.chain.Events {
+		e, err := vault.Decode(raw)
+		if err != nil {
+			byLedger[raw.Ledger] = nil
+			ledgers = append(ledgers, raw.Ledger)
+			break
+		}
+		if _, ok := byLedger[raw.Ledger]; !ok {
+			ledgers = append(ledgers, raw.Ledger)
+		}
+		byLedger[raw.Ledger] = append(byLedger[raw.Ledger], e)
+	}
+	for _, l := range ledgers {
+		txs, err := vault.ParseTxs(byLedger[l])
+		if err != nil || len(byLedger[l]) == 0 {
+			break
+		}
+		next := s.Clone()
+		if _, err := next.Apply(txs); err != nil {
+			break
+		}
+		s, last = next, l
+	}
+	return s.Status(), last
 }
 
 func mustKey[T any](k T, err error) T {
@@ -123,6 +155,7 @@ func (h *harness) publish() {
 	}
 	h.fake.SetContractData(mustKey(vault.NextLeafKey(vaulttest.Vault)), vault.U64(tr.Len()), modified, nil)
 	h.fake.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), vaulttest.RootRing(tr.Root(), uint32(tr.Len()/2)%vault.RootHistory), modified, nil)
+	h.setInstance(h.replayStatus())
 }
 
 func (h *harness) leafValues() []fr.Element {
@@ -279,6 +312,16 @@ func TestAMismatchStopsServingUntilARebuild(t *testing.T) {
 	}
 	if len(h.pages.alerts) == 0 || h.pages.alerts[0].Code != "reconcile_mismatch" {
 		t.Fatalf("alerts %+v", h.pages.alerts)
+	}
+	// The chain agreeing again does not clear it either.
+	h.publish()
+	if err := h.ix.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/v1/leaves?page=0", "/v1/nullifiers", "/v1/deposits"} {
+		if code, _ := h.get(path); code != http.StatusServiceUnavailable {
+			t.Fatalf("%s served after a mismatch: %d", path, code)
+		}
 	}
 	// It keeps ingesting, and a restart does not clear the mismatch.
 	h.chain.Shield(vaulttest.Depositor, 1)
@@ -585,19 +628,32 @@ func TestBulkResponsesAreServedFromMemoryForAFewSeconds(t *testing.T) {
 	}
 }
 
+// lagging serves ledger entries as a node some ledgers behind the chain would.
+type lagging struct {
+	*rpctest.Fake
+	by uint32
+}
+
+func (l *lagging) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
+	resp, err := l.Fake.GetLedgerEntries(ctx, req)
+	resp.LatestLedger -= l.by
+	return resp, err
+}
+
 func TestOnlyAFullAndRecentReconciliationMakesTheIndexerReady(t *testing.T) {
 	h := newHarness(t)
 	h.activity()
 	h.publish()
 	leaves := h.leafValues()
-	// The chain reads as if only the first pair had been inserted: a prefix the indexer agrees
-	// with, which says nothing about the leaves after it.
+	// A node behind the indexer reads the chain as it was when only the first pair was inserted: a
+	// prefix the indexer agrees with, which says nothing about the leaves after it.
 	var tr tree.Tree
 	if _, err := tr.AppendPair(leaves[0], leaves[1]); err != nil {
 		t.Fatal(err)
 	}
 	h.fake.SetContractData(mustKey(vault.NextLeafKey(vaulttest.Vault)), vault.U64(tr.Len()), 10, nil)
 	h.fake.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), vaulttest.RootRing(tr.Root(), 1), 10, nil)
+	h.ix.rpc = &lagging{Fake: h.fake, by: 5}
 	for range 50 {
 		if progressed, err := h.f.Step(context.Background()); err != nil || !progressed {
 			break
@@ -607,9 +663,10 @@ func TestOnlyAFullAndRecentReconciliationMakesTheIndexerReady(t *testing.T) {
 	if err := h.ix.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.ix.Health(); got.Ready {
+	if got := h.ix.Health(); got.Ready || got.Code != CodeLagging {
 		t.Fatalf("ready on a prefix: %+v", got)
 	}
+	h.ix.rpc = h.fake
 	h.publish()
 	if err := h.ix.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)

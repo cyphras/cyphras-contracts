@@ -1,17 +1,21 @@
 // Package archive keeps every raw vault event in append-only files, one per window of ledgers, so
 // the vault can be rebuilt after RPC has dropped the events. Each write ends with the ledger range
-// it covers, so a reader can tell an empty range from a missing one, and a write that never
-// finished from one that did.
+// it covers and the number and SHA-256 of the event lines it wrote, so a reader can tell an empty
+// range from a missing one, a write that never finished from one that did, and a damaged write
+// from a sound one.
 package archive
 
 import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"os"
 	"path/filepath"
 	"slices"
@@ -25,12 +29,19 @@ const WindowLedgers = 17_280
 // ErrNotCovered reports a ledger range the archive does not hold.
 var ErrNotCovered = errors.New("archive: range not covered")
 
+// ErrDamaged reports a file with a line that is neither part of a sound write nor the torn end of
+// a write a crash cut short. It is malformed data, as an ingest fault is.
+var ErrDamaged = fmt.Errorf("archive: damaged file: %w", vault.ErrMalformed)
+
 // line is one record of a file. Write groups the records of one Append, and the covered record
-// closes it.
+// closes it with the number of event lines the write put in the file and their SHA-256, newlines
+// included.
 type line struct {
 	Write   uint64          `json:"write"`
 	Event   *vault.RawEvent `json:"event,omitempty"`
 	Covered *[2]uint32      `json:"covered,omitempty"`
+	Count   *int            `json:"count,omitempty"`
+	SHA256  string          `json:"sha256,omitempty"`
 }
 
 func windowStart(ledger uint32) uint32 {
@@ -73,16 +84,28 @@ func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 			f.Close()
 			return err
 		}
-		enc := json.NewEncoder(buf)
+		sum, count := sha256.New(), 0
 		for i := range events {
 			if events[i].Ledger >= lo && events[i].Ledger <= hi {
-				if err := enc.Encode(line{Write: write, Event: &events[i]}); err != nil {
+				b, err := json.Marshal(line{Write: write, Event: &events[i]})
+				if err != nil {
+					f.Close()
+					return err
+				}
+				b = append(b, '\n')
+				sum.Write(b)
+				count++
+				if _, err := buf.Write(b); err != nil {
 					f.Close()
 					return err
 				}
 			}
 		}
-		if err := enc.Encode(line{Write: write, Covered: &[2]uint32{lo, hi}}); err != nil {
+		closing, err := json.Marshal(line{Write: write, Covered: &[2]uint32{lo, hi}, Count: &count, SHA256: hex.EncodeToString(sum.Sum(nil))})
+		if err == nil {
+			_, err = buf.Write(append(closing, '\n'))
+		}
+		if err != nil {
 			f.Close()
 			return err
 		}
@@ -199,30 +222,75 @@ func (r Reader) Events(ctx context.Context, from, to uint32) ([]vault.RawEvent, 
 	return out, nil
 }
 
-// file returns the finished writes of one file in the order they were made. A write a crash cut
-// short has no covered record and is left out.
+// file returns the finished writes of one file in the order they were made, each checked against
+// the count and SHA-256 its covered record holds. A write a crash cut short has no covered record
+// and is left out; the one line a crash can tear is its last, and only a new write may follow it.
+// Any other line that does not belong to a sound write fails the read.
 func (r Reader) file(name string) ([]finished, error) {
 	f, err := os.Open(name)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	open := map[uint64][]vault.RawEvent{}
+	type openWrite struct {
+		events []vault.RawEvent
+		sum    hash.Hash
+		count  int
+	}
+	open := map[uint64]*openWrite{}
+	// ended holds the writes that finished or were torn; none of them may write again.
+	ended := map[uint64]bool{}
 	var done []finished
+	damaged := func(n int, why string) error {
+		return fmt.Errorf("%w: %s line %d: %s", ErrDamaged, filepath.Base(name), n, why)
+	}
+	torn := false
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
+	for n := 1; scanner.Scan(); n++ {
 		var l line
 		if err := json.Unmarshal(scanner.Bytes(), &l); err != nil {
-			// A torn line belongs to a write that never finished.
+			if torn {
+				return nil, damaged(n, "a second unreadable line")
+			}
+			// Only a crash leaves an unreadable line, and it ends the write it cut short.
+			torn = true
+			for w := range open {
+				ended[w] = true
+				delete(open, w)
+			}
 			continue
 		}
+		if ended[l.Write] {
+			return nil, damaged(n, "a line of a write that had ended")
+		}
+		w, known := open[l.Write]
+		torn = false
 		switch {
-		case l.Event != nil && l.Event.Contract == r.Vault:
-			open[l.Write] = append(open[l.Write], *l.Event)
-		case l.Covered != nil && l.Covered[0] <= l.Covered[1]:
-			done = append(done, finished{covered: *l.Covered, events: open[l.Write]})
+		case l.Event != nil && l.Covered == nil && l.Count == nil && l.SHA256 == "":
+			if l.Event.Contract != r.Vault {
+				return nil, damaged(n, "an event of another contract")
+			}
+			if !known {
+				w = &openWrite{sum: sha256.New()}
+				open[l.Write] = w
+			}
+			w.events = append(w.events, *l.Event)
+			w.sum.Write(scanner.Bytes())
+			w.sum.Write([]byte{'\n'})
+			w.count++
+		case l.Event == nil && l.Covered != nil && l.Count != nil && l.Covered[0] <= l.Covered[1]:
+			if !known {
+				w = &openWrite{sum: sha256.New()}
+			}
+			if w.count != *l.Count || hex.EncodeToString(w.sum.Sum(nil)) != l.SHA256 {
+				return nil, damaged(n, fmt.Sprintf("the write holds %d event lines that do not match its record of %d", w.count, *l.Count))
+			}
+			done = append(done, finished{covered: *l.Covered, events: w.events})
 			delete(open, l.Write)
+			ended[l.Write] = true
+		default:
+			return nil, damaged(n, "neither an event nor a covered record")
 		}
 	}
 	return done, scanner.Err()

@@ -164,28 +164,9 @@ func (w *Watcher) checkAuthorization(ctx context.Context, authorized bool) {
 
 // statusDiff lists the fields where the vault's status and the watcher's replay differ.
 func statusDiff(inst vault.Instance, s snapshot, now uint64) []string {
-	st, ours := inst.Status, s.status
-	var out []string
-	check := func(name string, equal bool, chain, replayed any) {
-		if !equal {
-			out = append(out, fmt.Sprintf("%s is %v on chain, %v replayed", name, chain, replayed))
-		}
-	}
-	check("tvl", st.Tvl.Cmp(ours.Tvl) == 0, st.Tvl, ours.Tvl)
-	check("pending_total", st.PendingTotal.Cmp(ours.PendingTotal) == 0, st.PendingTotal, ours.PendingTotal)
-	check("queued_total", st.QueuedTotal.Cmp(ours.QueuedTotal) == 0, st.QueuedTotal, ours.QueuedTotal)
-	check("exit_head", st.ExitHead == ours.ExitHead, st.ExitHead, ours.ExitHead)
-	check("exit_tail", st.ExitTail == ours.ExitTail, st.ExitTail, ours.ExitTail)
-	check("next_deposit_id", st.NextDepositID == ours.NextDepositID, st.NextDepositID, ours.NextDepositID)
-	check("attested_up_to", st.AttestedUpTo == ours.AttestedUpTo, st.AttestedUpTo, ours.AttestedUpTo)
-	check("deposits_paused", st.DepositsPaused == ours.DepositsPaused, st.DepositsPaused, ours.DepositsPaused)
-	check("transfers_paused", st.TransfersPaused == ours.TransfersPaused, st.TransfersPaused, ours.TransfersPaused)
-	check("halted_until", st.HaltedUntil == ours.HaltedUntil, st.HaltedUntil, ours.HaltedUntil)
-	check("next_halt_at", st.NextHaltAt == ours.NextHaltAt, st.NextHaltAt, ours.NextHaltAt)
-	day := now / secondsPerDay
-	check("today's outflow", st.OutflowOn(day).Cmp(ours.OutflowOn(day)) == 0, st.OutflowOn(day), ours.OutflowOn(day))
-	if s.limits != nil {
-		check("limits", limitsText(*s.limits) == limitsText(inst.Limits), limitsText(inst.Limits), limitsText(*s.limits))
+	out := chainstate.StatusDiff(inst.Status, s.status, now/secondsPerDay)
+	if s.limits != nil && limitsText(*s.limits) != limitsText(inst.Limits) {
+		out = append(out, fmt.Sprintf("limits is %v on chain, %v replayed", limitsText(inst.Limits), limitsText(*s.limits)))
 	}
 	return out
 }

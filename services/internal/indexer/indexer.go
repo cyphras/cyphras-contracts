@@ -4,9 +4,14 @@ package indexer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"log/slog"
+	"maps"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,13 +57,16 @@ type Indexer struct {
 	db      store
 	archive *archive.Writer
 	// archiveMu orders the archive's writers, ingest and the copy from RPC that runs even when
-	// ingest is stuck, and guards archivedTo.
+	// ingest is stuck, and guards archivedTo and archived.
 	archiveMu  sync.Mutex
 	archivedTo uint32
-	alerts     *alert.Alerter
-	log        *slog.Logger
-	hub        *hub
-	now        func() time.Time
+	// archived holds a digest of the events archived for each ledger ingest has not applied yet, so
+	// an applied window is archived again only when its events differ from the copy kept.
+	archived map[uint32][32]byte
+	alerts   *alert.Alerter
+	log      *slog.Logger
+	hub      *hub
+	now      func() time.Time
 
 	mu         sync.RWMutex
 	state      *chainstate.State
@@ -73,6 +81,10 @@ type Indexer struct {
 	delays     map[uint64]uint64
 	// reconciledAt is when the chain last vouched for every leaf served.
 	reconciledAt time.Time
+	// vouched is the most leaves the chain has vouched for: a full page below it never changes.
+	vouched uint64
+	// unstored is a mismatch latched in memory whose database write has not succeeded yet.
+	unstored *mismatchNote
 	// roots holds the tree's recent roots by leaf count, as the vault's root ring does.
 	roots     map[uint64]fr.Element
 	rootOrder []uint64
@@ -103,7 +115,7 @@ func (ix *Indexer) keepRoot(r chainstate.RootAt) {
 func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.Store, alerts *alert.Alerter, log *slog.Logger) (*Indexer, error) {
 	ix := &Indexer{
 		cfg: cfg, rpc: client, chain: chain, db: store{chain.Pool}, alerts: alerts, log: log,
-		hub: newHub(1000), now: time.Now, delays: map[uint64]uint64{}, memos: map[string]*memoEntry{},
+		hub: newHub(1000), now: time.Now, delays: map[uint64]uint64{}, memos: map[string]*memoEntry{}, archived: map[uint32][32]byte{},
 	}
 	state, cursor, err := chain.Load(ctx, cfg.Vault, cfg.DeployLedger)
 	if err != nil {
@@ -144,6 +156,10 @@ func (ix *Indexer) Apply(ctx context.Context, b follow.Batch) error {
 	delta, err := next.Apply(b.Txs)
 	if err != nil {
 		return fmt.Errorf("%w: %w", follow.ErrFault, err)
+	}
+	// The archive must hold what was applied, not an earlier copy of the window that faulted.
+	if err := ix.confirm(ctx, b.Raw, b.From, b.To); err != nil {
+		return fmt.Errorf("archive: %w", err)
 	}
 	if err := ix.chain.Commit(ctx, b.From, b.To, next, delta, nil); err != nil {
 		if errors.Is(err, chainstate.ErrInconsistent) {
@@ -189,10 +205,20 @@ func (ix *Indexer) Fault(ctx context.Context, err error) {
 	ix.log.Warn("ingest retry", "error", err.Error())
 }
 
-// Reconcile compares the vault's current root with the indexer's root at the vault's next leaf
-// index. Roots are kept by leaf count, so the comparison holds even when the vault moves on between
-// the read and the ingest.
+// Reconcile compares the vault's storage with the indexer's state. Entries the vault last modified
+// at or before the indexer's ledger, read at or after it, must match the state at that ledger
+// exactly: the tree's leaf count and root, and the vault's status. Otherwise the vault's current
+// root is compared with the indexer's root at the vault's leaf count, which the indexer keeps by
+// leaf count so the comparison holds when the vault moved on between the read and the ingest, and
+// the status waits for a later round.
 func (ix *Indexer) Reconcile(ctx context.Context) error {
+	if err := ix.storeMismatch(ctx); err != nil {
+		return err
+	}
+	instKey, err := vault.InstanceKey(ix.cfg.Vault)
+	if err != nil {
+		return err
+	}
 	nextKey, err := vault.NextLeafKey(ix.cfg.Vault)
 	if err != nil {
 		return err
@@ -201,17 +227,18 @@ func (ix *Indexer) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	entries, latest, err := rpc.Entries(ctx, ix.rpc, []xdr.LedgerKey{nextKey, rootsKey})
+	entries, latest, err := rpc.Entries(ctx, ix.rpc, []xdr.LedgerKey{instKey, nextKey, rootsKey})
 	if err != nil {
 		return err
 	}
 	ix.mu.RLock()
-	cursor := ix.cursor
+	cursor, have, root, status := ix.cursor, ix.state.Tree.Len(), ix.state.Tree.Root(), ix.state.Status()
 	ix.mu.RUnlock()
+	instEntry, ok0 := entries[mustKeyString(instKey)]
 	nextEntry, ok1 := entries[mustKeyString(nextKey)]
 	rootsEntry, ok2 := entries[mustKeyString(rootsKey)]
-	if !ok1 || !ok2 {
-		return ix.mismatchAt(ctx, cursor, "the vault's tree entries are missing or archived")
+	if !ok0 || !ok1 || !ok2 {
+		return ix.mismatchAt(ctx, cursor, "the vault's instance or tree entries are missing")
 	}
 	nextVal, err := rpc.ContractValue(nextEntry)
 	if err != nil {
@@ -230,40 +257,90 @@ func (ix *Indexer) Reconcile(ctx context.Context) error {
 		return ix.mismatchAt(ctx, cursor, "the root ring does not decode")
 	}
 	n := uint64(nextLeaf)
-	ix.mu.RLock()
-	ours, known := ix.roots[n]
-	have := ix.state.Tree.Len()
-	ix.mu.RUnlock()
-	if n > have || !known {
-		// The chain is ahead of the indexer, or the read is older than the roots kept; compare on
-		// the next round.
-		return nil
-	}
-	if ring.Current() != ours {
-		return ix.mismatchAt(ctx, cursor, fmt.Sprintf("at %d leaves the chain has root %s, the indexer %s", n, ring.Current().Hex(), ours.Hex()))
-	}
-	if n < have {
+	modified := max(nextEntry.LastModified, rootsEntry.LastModified)
+	full := false
+	switch {
+	case modified <= cursor && cursor <= latest:
+		if n != have || ring.Current() != root {
+			return ix.mismatchAt(ctx, cursor, fmt.Sprintf("the chain holds %d leaves with root %s, the indexer %d with root %s", n, ring.Current().Hex(), have, root.Hex()))
+		}
+		full = true
+	case n > have && modified <= cursor:
+		return ix.mismatchAt(ctx, cursor, fmt.Sprintf("the chain held %d leaves by ledger %d, the indexer holds %d", n, modified, have))
+	case n > have:
+		// The chain is ahead of the indexer; compare on the next round.
+	default:
+		ix.mu.RLock()
+		ours, known := ix.roots[n]
+		ix.mu.RUnlock()
+		if !known {
+			// The read is older than the roots kept; compare on the next round.
+			break
+		}
+		if ring.Current() != ours {
+			return ix.mismatchAt(ctx, cursor, fmt.Sprintf("at %d leaves the chain has root %s, the indexer %s", n, ring.Current().Hex(), ours.Hex()))
+		}
+		ix.mu.Lock()
+		ix.vouched = max(ix.vouched, n)
+		ix.mu.Unlock()
 		// The read vouches only for the leaves up to n; the ones after it wait for a later round.
-		return nil
+		full = n == have
+	}
+	if instEntry.LastModified <= cursor && cursor <= latest {
+		instVal, err := rpc.ContractValue(instEntry)
+		if err != nil {
+			return err
+		}
+		inst, err := vault.DecodeInstance(instVal)
+		if err != nil {
+			return ix.mismatchAt(ctx, cursor, "the vault's instance does not decode")
+		}
+		if diff := chainstate.StatusDiff(inst.Status, status, max(inst.Status.OutflowDay, status.OutflowDay)); len(diff) > 0 {
+			return ix.mismatchAt(ctx, cursor, strings.Join(diff, "; "))
+		}
 	}
 	ix.mu.Lock()
-	ix.reconciled, ix.matched, ix.reconciledAt = cursor, true, ix.now()
+	if full {
+		ix.reconciled, ix.matched, ix.reconciledAt = cursor, true, ix.now()
+		ix.vouched = max(ix.vouched, have)
+	}
 	ix.latest = max(ix.latest, latest)
 	ix.mu.Unlock()
 	return nil
 }
 
+// mismatchNote is the first mismatch found, as the database keeps it.
+type mismatchNote struct {
+	ledger uint32
+	detail string
+}
+
 func (ix *Indexer) mismatchAt(ctx context.Context, ledger uint32, detail string) error {
 	ix.mu.Lock()
-	already := ix.mismatch
+	if !ix.mismatch {
+		ix.unstored = &mismatchNote{ledger: ledger, detail: detail}
+	}
 	ix.mismatch, ix.matched = true, false
 	ix.mu.Unlock()
-	if !already {
-		if err := ix.db.setMismatch(ctx, ledger, detail); err != nil {
-			return err
-		}
-	}
 	ix.alerts.Raise(ctx, alert.Critical, "reconcile_mismatch", "at ledger %d: %s", ledger, detail)
+	return ix.storeMismatch(ctx)
+}
+
+// storeMismatch writes a mismatch latched in memory to the database, so a restart keeps it. A write
+// that fails is tried again at the next reconciliation.
+func (ix *Indexer) storeMismatch(ctx context.Context) error {
+	ix.mu.RLock()
+	note := ix.unstored
+	ix.mu.RUnlock()
+	if note == nil {
+		return nil
+	}
+	if err := ix.db.setMismatch(ctx, note.ledger, note.detail); err != nil {
+		return fmt.Errorf("store the mismatch: %w", err)
+	}
+	ix.mu.Lock()
+	ix.unstored = nil
+	ix.mu.Unlock()
 	return nil
 }
 
@@ -378,7 +455,78 @@ func (ix *Indexer) keep(raw []vault.RawEvent, from, to uint32) error {
 		return err
 	}
 	ix.archivedTo = to
+	if len(ix.archived) > maxArchivedDigests {
+		// Ledgers forgotten here are archived again once applied, which costs only space.
+		clear(ix.archived)
+	}
+	for l, d := range digests(events, from, to) {
+		ix.archived[l] = d
+	}
 	return nil
+}
+
+// maxArchivedDigests bounds the digests kept while ingest is stuck and the archive copies ahead.
+const maxArchivedDigests = 200_000
+
+// confirm archives an applied window again unless the archive already holds the same events for
+// each of its ledgers: as this process archived them, or, for ledgers archived before it started,
+// as the archive reads them back.
+func (ix *Indexer) confirm(ctx context.Context, raw []vault.RawEvent, from, to uint32) error {
+	if ix.archive == nil {
+		return nil
+	}
+	ix.archiveMu.Lock()
+	defer ix.archiveMu.Unlock()
+	applied := digests(raw, from, to)
+	same, unknown := true, false
+	for l, d := range applied {
+		kept, ok := ix.archived[l]
+		unknown = unknown || !ok
+		same = same && (!ok || kept == d)
+	}
+	if same && unknown {
+		events, err := archive.Reader{Dir: ix.cfg.ArchiveDir, Vault: ix.cfg.Vault}.Events(ctx, from, to)
+		same = err == nil && maps.Equal(applied, digests(events, from, to))
+	}
+	if !same {
+		if err := ix.archive.Append(raw, from, to); err != nil {
+			return err
+		}
+		ix.archivedTo = max(ix.archivedTo, to)
+	}
+	for l := range applied {
+		delete(ix.archived, l)
+	}
+	return nil
+}
+
+// digests gives each ledger of [from, to] a digest of its events in chain order; equal events give
+// equal digests, and a ledger without events the zero digest.
+func digests(raw []vault.RawEvent, from, to uint32) map[uint32][32]byte {
+	sums := map[uint32]hash.Hash{}
+	for _, e := range raw {
+		if e.Ledger < from || e.Ledger > to {
+			continue
+		}
+		h, ok := sums[e.Ledger]
+		if !ok {
+			h = sha256.New()
+			sums[e.Ledger] = h
+		}
+		b, _ := json.Marshal(e)
+		h.Write(append(b, '\n'))
+	}
+	out := make(map[uint32][32]byte, int(to-from)+1)
+	for l := from; ; l++ {
+		var d [32]byte
+		if h, ok := sums[l]; ok {
+			copy(d[:], h.Sum(nil))
+		}
+		out[l] = d
+		if l == to {
+			return out
+		}
+	}
 }
 
 // ArchiveStep copies the next window of the vault's raw events from RPC into the archive, whether

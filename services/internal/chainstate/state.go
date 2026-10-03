@@ -138,6 +138,41 @@ func (e Exit) Paid() (payout, fee *big.Int) {
 	return payout.Sub(payout, e.MovedPayout), fee.Sub(fee, e.MovedFee)
 }
 
+// Status is the vault status the state replays.
+func (s *State) Status() vault.Status {
+	return vault.Status{
+		DepositsPaused: s.DepositsPaused, TransfersPaused: s.TransfersPaused, HaltedUntil: s.HaltedUntil, NextHaltAt: s.NextHaltAt,
+		NextDepositID: s.NextDepositID, AttestedUpTo: s.AttestedUpTo, Tvl: new(big.Int).Set(s.Tvl),
+		PendingTotal: new(big.Int).Set(s.PendingTotal), QueuedTotal: new(big.Int).Set(s.QueuedTotal), ExitHead: s.ExitHead,
+		ExitTail: s.ExitTail, OutflowDay: s.OutflowDay, Outflow: new(big.Int).Set(s.Outflow),
+	}
+}
+
+// StatusDiff lists the fields where a status the vault holds and a replayed one differ. What was
+// paid out is compared for one day only: the vault moves its outflow day even on a payment of
+// nothing, so the stored day alone may differ while every window agrees.
+func StatusDiff(chain, replayed vault.Status, day uint64) []string {
+	var out []string
+	check := func(name string, equal bool, chain, replayed any) {
+		if !equal {
+			out = append(out, fmt.Sprintf("%s is %v on chain, %v replayed", name, chain, replayed))
+		}
+	}
+	check("tvl", chain.Tvl.Cmp(replayed.Tvl) == 0, chain.Tvl, replayed.Tvl)
+	check("pending_total", chain.PendingTotal.Cmp(replayed.PendingTotal) == 0, chain.PendingTotal, replayed.PendingTotal)
+	check("queued_total", chain.QueuedTotal.Cmp(replayed.QueuedTotal) == 0, chain.QueuedTotal, replayed.QueuedTotal)
+	check("exit_head", chain.ExitHead == replayed.ExitHead, chain.ExitHead, replayed.ExitHead)
+	check("exit_tail", chain.ExitTail == replayed.ExitTail, chain.ExitTail, replayed.ExitTail)
+	check("next_deposit_id", chain.NextDepositID == replayed.NextDepositID, chain.NextDepositID, replayed.NextDepositID)
+	check("attested_up_to", chain.AttestedUpTo == replayed.AttestedUpTo, chain.AttestedUpTo, replayed.AttestedUpTo)
+	check("deposits_paused", chain.DepositsPaused == replayed.DepositsPaused, chain.DepositsPaused, replayed.DepositsPaused)
+	check("transfers_paused", chain.TransfersPaused == replayed.TransfersPaused, chain.TransfersPaused, replayed.TransfersPaused)
+	check("halted_until", chain.HaltedUntil == replayed.HaltedUntil, chain.HaltedUntil, replayed.HaltedUntil)
+	check("next_halt_at", chain.NextHaltAt == replayed.NextHaltAt, chain.NextHaltAt, replayed.NextHaltAt)
+	check("today's outflow", chain.OutflowOn(day).Cmp(replayed.OutflowOn(day)) == 0, chain.OutflowOn(day), replayed.OutflowOn(day))
+	return out
+}
+
 // Clone returns a deep copy, so a window can be applied and discarded on failure.
 func (s *State) Clone() *State {
 	c := *s

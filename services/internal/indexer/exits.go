@@ -125,60 +125,75 @@ func (ix *Indexer) exits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := uint64(ix.now().Unix())
+	q := ix.queue(now)
+	if q.maxDaily == nil {
+		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
+		return
+	}
+	list := q.list
+	for i, at := range paidBy(q.owed, now, q.haltedUntil, q.maxDaily) {
+		list[i].PaidBy = at
+	}
+	resolved, err := ix.db.resolvedExits(r.Context(), ix.now().Add(-resolvedWindow).Unix(), q.upTo)
+	if err != nil {
+		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
+		return
+	}
+	list = append(list, resolved...)
+	slices.SortFunc(list[len(q.owed):], func(a, b Exit) int { return cmp.Compare(a.ID, b.ID) })
+	if list == nil {
+		list = []Exit{}
+	}
+	today := now / secondsPerDay
+	httpapi.JSON(w, http.StatusOK, map[string]any{
+		"head": q.head, "tail": q.tail, "queued_total": q.queuedTotal, "max_daily_outflow": q.maxDaily.String(),
+		"window":       Window{Day: today, Used: q.used.String(), ResetsAt: (today + 1) * secondsPerDay},
+		"halted_until": q.haltedUntil, "exits": list, "complete_to": q.upTo,
+	})
+}
+
+// exitQueue is what the exits response takes from the state in memory: the queue in order, with
+// what each queued exit takes from the windows, then the stranded exits.
+type exitQueue struct {
+	upTo                    uint32
+	head, tail, haltedUntil uint64
+	queuedTotal             string
+	used, maxDaily          *big.Int
+	list                    []Exit
+	owed                    []*big.Int
+}
+
+// queue reads the exit queue from the state in memory. The stored rows the response adds are cut at
+// the same ledger, so neither shows an exit the other has moved on.
+func (ix *Indexer) queue(now uint64) exitQueue {
 	ix.mu.RLock()
-	// The stored rows are cut at the ledger of the state in memory, so neither shows an exit the
-	// other has moved on.
-	s, upTo := ix.state, ix.cursor
-	var maxDaily *big.Int
+	defer ix.mu.RUnlock()
+	s := ix.state
+	q := exitQueue{
+		upTo: ix.cursor, head: s.ExitHead, tail: s.ExitTail, haltedUntil: s.HaltedUntil,
+		queuedTotal: s.QueuedTotal.String(), used: s.OutflowOn(now / secondsPerDay),
+	}
 	switch {
 	case ix.instance != nil:
-		maxDaily = new(big.Int).Set(ix.instance.Limits.MaxDailyOutflow)
+		q.maxDaily = new(big.Int).Set(ix.instance.Limits.MaxDailyOutflow)
 	case s.Limits != nil:
-		maxDaily = new(big.Int).Set(s.Limits.MaxDailyOutflow)
+		q.maxDaily = new(big.Int).Set(s.Limits.MaxDailyOutflow)
 	}
-	head, tail, haltedUntil := s.ExitHead, s.ExitTail, s.HaltedUntil
-	queuedTotal, used := s.QueuedTotal.String(), s.OutflowOn(now/secondsPerDay)
-	var list []Exit
-	var owed []*big.Int
-	for id := head; id < tail; id++ {
+	for id := q.head; id < q.tail; id++ {
 		e := s.Exits[id]
 		state := ExitQueued
 		if e.Payout.Cmp(e.QueuedPayout) != 0 || e.Fee.Cmp(e.QueuedFee) != 0 {
 			state = ExitPaidInPart
 		}
 		x := fromState(e, state)
-		x.Position = ptr(id - head)
-		list = append(list, x)
-		owed = append(owed, ix.takes(e))
+		x.Position = ptr(id - q.head)
+		q.list = append(q.list, x)
+		q.owed = append(q.owed, ix.takes(e))
 	}
-	queued := len(list)
 	for _, e := range s.Stranded {
 		x := fromState(e, ExitStranded)
 		x.StrandedLedger, x.StrandedAt, x.StrandedTx = ptr(e.StrandedLedger), ptr(uint64(e.StrandedAt)), ptr(e.StrandedTx)
-		list = append(list, x)
+		q.list = append(q.list, x)
 	}
-	ix.mu.RUnlock()
-	if maxDaily == nil {
-		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
-		return
-	}
-	for i, at := range paidBy(owed, now, haltedUntil, maxDaily) {
-		list[i].PaidBy = at
-	}
-	resolved, err := ix.db.resolvedExits(r.Context(), ix.now().Add(-resolvedWindow).Unix(), upTo)
-	if err != nil {
-		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
-		return
-	}
-	list = append(list, resolved...)
-	slices.SortFunc(list[queued:], func(a, b Exit) int { return cmp.Compare(a.ID, b.ID) })
-	if list == nil {
-		list = []Exit{}
-	}
-	today := now / secondsPerDay
-	httpapi.JSON(w, http.StatusOK, map[string]any{
-		"head": head, "tail": tail, "queued_total": queuedTotal, "max_daily_outflow": maxDaily.String(),
-		"window":       Window{Day: today, Used: used.String(), ResetsAt: (today + 1) * secondsPerDay},
-		"halted_until": haltedUntil, "exits": list, "complete_to": upTo,
-	})
+	return q
 }

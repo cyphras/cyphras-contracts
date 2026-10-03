@@ -60,6 +60,10 @@ func (f *Follower) Step(ctx context.Context) (bool, error) {
 		to = min(to, health.OldestLedger-1)
 	}
 	raw, err := f.read(ctx, next, to, health.OldestLedger)
+	if errors.Is(err, vault.ErrMalformed) {
+		// Data the vault cannot have emitted is a fault whichever source gave it.
+		return false, fmt.Errorf("%w: %w", ErrFault, err)
+	}
 	if err != nil {
 		return false, err
 	}
