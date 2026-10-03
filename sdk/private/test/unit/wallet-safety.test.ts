@@ -728,6 +728,98 @@ describe("wallet safety: a second RPC provider", () => {
     assert.equal((await bob.balance()).spendable, 0n);
   });
 
+  it("declares no payment dead on spends the first RPC provider alone serves while the indexer is down", async () => {
+    const { world, store } = await funded();
+    let hidden: string | undefined;
+    let busy = false;
+    // The first provider hides the payment's landing; the second is honest, but its events are out
+    // of reach for a while.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (url.origin === SECOND) {
+        if (busy && body?.method === "getEvents") {
+          const error = { code: -32603, message: "busy" };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+        }
+        return world.fetch(RPC, init);
+      }
+      const res = await world.fetch(input, init);
+      if (hidden === undefined || url.origin !== RPC || body?.method !== "getEvents") return res;
+      const reply = await res.json();
+      const events = reply.result.events as { txHash: string }[];
+      reply.result.events = events.filter((e) => e.txHash !== hidden);
+      return new Response(JSON.stringify(reply), { status: 200 });
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, store, undefined, {
+      secondRpcUrl: SECOND,
+    });
+    const bob = await openWallet(world, 1);
+    world.indexer.down = true;
+    // With the second provider's events in reach, the first's are checked against them.
+    let summary = await alice.sync();
+    assert.equal(summary.source, "rpc");
+    assert.equal(summary.crossChecked, true);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    hidden = world.vault.leaves.at(-1)?.txHash;
+    busy = true;
+    world.advance(130 * 5);
+    summary = await alice.sync();
+    assert.equal(summary.crossChecked, false);
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    // Once the second provider's events are in reach, a recheck against them finds the landing.
+    busy = false;
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    hidden = undefined;
+    world.indexer.down = false;
+    await alice.rescan();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
+  it("declares no payment dead on spends that only the indexer and the first RPC provider vouch for", async () => {
+    const { world, store } = await funded();
+    let hidden: string | undefined;
+    // The indexer and the first provider hide the payment's landing; the second is honest.
+    const liars: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (url.origin === SECOND) return world.fetch(RPC, init);
+      const res = await world.fetch(input, init);
+      if (hidden === undefined || res.status !== 200) return res;
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (url.origin !== INDEXER && body?.method !== "getEvents") return res;
+      const reply = await res.json();
+      const shown = (x: { tx_hash?: string; txHash?: string }) =>
+        (x.tx_hash ?? x.txHash) !== hidden;
+      if (reply.leaves !== undefined) reply.leaves = reply.leaves.filter(shown);
+      if (reply.nullifiers !== undefined) reply.nullifiers = reply.nullifiers.filter(shown);
+      if (reply.result?.events !== undefined)
+        reply.result.events = reply.result.events.filter(shown);
+      return new Response(JSON.stringify(reply), { status: 200 });
+    };
+    const alice = await openWallet({ ...world, fetch: liars }, 0, store, undefined, {
+      secondRpcUrl: SECOND,
+    });
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    hidden = world.vault.leaves.at(-1)?.txHash;
+    world.advance(130 * 5);
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    hidden = undefined;
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
   it("refuses a tree a second RPC provider contradicts", async () => {
     const { world, store } = await funded();
     // Another vault at the same address, with other leaves.

@@ -140,11 +140,11 @@ function chunksOf(leaves: readonly Leaf[]): LeafChunk[] {
   return chunks;
 }
 
-// Compares what the indexer served with the vault's events from RPC since the same ledger. Every
-// served leaf is compared by its index, whatever ledger the indexer gave it; only a leaf added
-// before that ledger, which RPC no longer shows, rests on the root check alone. Unverified when
-// RPC cannot cover the range; a difference raises indexer_fault, since either the indexer or the
-// RPC is wrong, and neither is trusted until it is resolved.
+// Compares what a source served with the vault's events from one RPC provider since the same
+// ledger. Every served leaf is compared by its index, whatever ledger the source gave it; only a
+// leaf added before that ledger, which RPC no longer shows, rests on the root check alone.
+// Unverified when RPC cannot cover the range; a difference raises indexer_fault, since either the
+// source or the RPC is wrong, and neither is trusted until it is resolved.
 export async function crossCheck(
   rpc: SorobanRpc,
   vault: string,
@@ -158,10 +158,7 @@ export async function crossCheck(
     if (err instanceof CyphrasError) return { verified: false, events: undefined };
     throw err;
   }
-  if (data.completeTo > Math.max(events.head, data.horizon)) {
-    fail("indexer_fault", "the indexer claims to be complete past the chain's latest ledger");
-  }
-  // RPC stopped short of the horizon, at its page cap or behind the indexer: nothing is proven.
+  // RPC stopped short of the horizon, at its page cap or behind the source: nothing is proven.
   if (events.latest < data.horizon) return { verified: false, events };
   const differ = (): never =>
     fail("indexer_fault", "the indexer's leaves or nullifiers differ from the vault's events");
@@ -480,15 +477,35 @@ function addUnchecked(state: WalletState, range: UncheckedRange): void {
   };
 }
 
+// How far the leaves of an unchecked range are confirmed by the vault's events from one RPC
+// provider, whose leaves `shown` must follow one another from the range's first: each run of them
+// it shows in full must be the run the sync took. Returns the position after the last run
+// confirmed.
+function confirmedRuns(
+  leaves: NonNullable<UncheckedRange["leaves"]>,
+  shown: readonly Leaf[],
+  differ: () => never,
+): number {
+  const { first } = leaves;
+  if (shown.some((l, i) => l.index !== first + i)) differ();
+  let next = first;
+  for (const chunk of leaves.chunks) {
+    if (chunk.end > first + shown.length) break;
+    if (digestOf(shown.slice(next - first, chunk.end - first)) !== chunk.digest) differ();
+    next = chunk.end;
+  }
+  return next;
+}
+
 // Checks what the wallet kept from the oldest range a sync took unchecked, against the vault's own
-// events while RPC still holds them: every leaf the sync took, by the digests of runs of them, and
-// the spends of the wallet's notes in the range's ledgers. A difference is the indexer's. The
-// ledgers of the leaves checked become the vault's own. Returns the events of the ledgers whose
-// spends were checked; what RPC does not reach yet stays in the range, and a range RPC no longer
-// holds is kept, as lost.
+// events from every RPC provider while each still holds them: every leaf the sync took, by the
+// digests of runs of them, and the spends of the wallet's notes in the range's ledgers. A
+// difference is the indexer's. The ledgers of the leaves checked become the vault's own. Returns
+// the first provider's events of the ledgers whose spends were checked; what a provider does not
+// reach yet stays in the range, and a range a provider no longer holds is kept, as lost.
 export async function recheck(
   state: WalletState,
-  rpc: SorobanRpc,
+  rpcs: readonly SorobanRpc[],
   vault: string,
   maxPages: number,
 ): Promise<VaultEvents | undefined> {
@@ -499,32 +516,29 @@ export async function recheck(
     range.from <= range.to ? range.from : Number.POSITIVE_INFINITY,
     range.leaves?.ledger ?? Number.POSITIVE_INFINITY,
   );
-  let events: VaultEvents;
-  try {
-    events = await new RpcEventSource(rpc, vault, start, maxPages).events();
-  } catch (err) {
-    if (!(err instanceof CyphrasError)) throw err;
-    // A busy RPC is asked again in the next sync.
-    if (err.code === "history_unavailable") state.unchecked[at] = { ...range, lost: true };
-    return undefined;
+  const all: VaultEvents[] = [];
+  for (const rpc of rpcs) {
+    try {
+      all.push(await new RpcEventSource(rpc, vault, start, maxPages).events());
+    } catch (err) {
+      if (!(err instanceof CyphrasError)) throw err;
+      // A busy RPC is asked again in the next sync.
+      if (err.code === "history_unavailable") state.unchecked[at] = { ...range, lost: true };
+      return undefined;
+    }
   }
+  const events = all[0] as VaultEvents;
+  const latest = Math.min(...all.map((e) => e.latest));
   const differ = (): never =>
     fail("indexer_fault", "the vault's events contradict what an unchecked sync took");
-  let leaves = range.leaves;
-  if (leaves !== undefined) {
-    const { first, end } = leaves;
-    // The leaves RPC shows follow one another from the range's first, up to the last ledger it
-    // covers; each run of them it shows in full must be the run the sync took.
-    const shown = events.leaves.filter((l) => l.index >= first && l.index < end);
-    if (shown.some((l, i) => l.index !== first + i)) differ();
-    let next = first;
-    let chunks = leaves.chunks;
-    for (const chunk of leaves.chunks) {
-      if (chunk.end > first + shown.length) break;
-      if (digestOf(shown.slice(next - first, chunk.end - first)) !== chunk.digest) differ();
-      next = chunk.end;
-      chunks = chunks.slice(1);
-    }
+  const taken = range.leaves;
+  let leaves = taken;
+  if (taken !== undefined) {
+    const { first, end } = taken;
+    const shownBy = (e: VaultEvents): Leaf[] =>
+      e.leaves.filter((l) => l.index >= first && l.index < end);
+    const next = Math.min(...all.map((e) => confirmedRuns(taken, shownBy(e), differ)));
+    const shown = shownBy(events);
     const lastChecked = shown[next - 1 - first];
     if (lastChecked !== undefined) {
       state.checkedLeafLedger = Math.max(state.checkedLeafLedger, lastChecked.ledger);
@@ -535,21 +549,22 @@ export async function recheck(
         : {
             first: next,
             end,
-            ledger:
-              shown[next - first]?.ledger ?? (next === first ? leaves.ledger : events.latest + 1),
-            chunks,
+            ledger: shown[next - first]?.ledger ?? (next === first ? taken.ledger : latest + 1),
+            chunks: taken.chunks.filter((c) => c.end > next),
           };
   }
-  const to = Math.min(range.to, events.latest);
+  const to = Math.min(range.to, latest);
   const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
     xs.filter((x) => x.ledger >= range.from && x.ledger <= to);
-  const spends = new Map(within(events.nullifiers).map((n) => [n.nullifier, n]));
-  for (const note of state.notes) {
-    if (note.nf === undefined) continue;
-    const chain = spends.get(note.nf);
-    const kept =
-      note.spent !== undefined && note.spent.ledger >= range.from && note.spent.ledger <= to;
-    if (chain === undefined ? kept : chain.txHash !== note.spent?.txHash) differ();
+  for (const e of all) {
+    const spends = new Map(within(e.nullifiers).map((n) => [n.nullifier, n]));
+    for (const note of state.notes) {
+      if (note.nf === undefined) continue;
+      const chain = spends.get(note.nf);
+      const kept =
+        note.spent !== undefined && note.spent.ledger >= range.from && note.spent.ledger <= to;
+      if (chain === undefined ? kept : chain.txHash !== note.spent?.txHash) differ();
+    }
   }
   const rest: UncheckedRange = {
     from: range.from <= range.to ? to + 1 : range.from,

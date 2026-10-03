@@ -157,7 +157,8 @@ export interface SyncSummary {
   readonly newNotes: number;
   readonly source: "indexer" | "rpc";
   readonly rootVerified: boolean;
-  // The indexer's new data matched the vault's RPC events for the same ledgers.
+  // The new data matched the vault's events from every RPC provider other than the one it came
+  // from, for the same ledgers.
   readonly crossChecked: boolean;
   // Ledgers whose spends, and leaves whose contents, came from the indexer alone: later syncs check
   // them against the vault's events while RPC still holds them.
@@ -665,20 +666,31 @@ export class PrivateWallet {
     }
     const { views, data } = download;
     const view = views[0] as ChainView;
-    let crossChecked = false;
-    // The vault's own events, from RPC, for the ledgers of this sync, when RPC held them.
+    const vault = core.deployment.vault;
+    const rpcs = second === undefined ? [core.services.rpc] : [core.services.rpc, second.rpc];
+    // The new data matched the vault's events from every RPC provider other than its source.
+    let crossChecked: boolean;
+    // The new data counts as the vault's own: cross-checked, or from the only RPC provider.
+    let checked: boolean;
+    // The vault's own events, from the first RPC provider, for the ledgers of this sync, when it
+    // held them.
     let events: VaultEvents | undefined;
     if (source.kind === "indexer") {
-      const check = await crossCheck(
-        core.services.rpc,
-        core.deployment.vault,
-        data,
-        limits.eventPages,
-      );
-      crossChecked = check.verified;
-      events = check.events;
+      const matches = [];
+      for (const rpc of rpcs) matches.push(await crossCheck(rpc, vault, data, limits.eventPages));
+      const heads = matches.flatMap((m) => (m.events === undefined ? [] : [m.events.head]));
+      if (heads.length > 0 && data.completeTo > Math.max(data.horizon, ...heads)) {
+        fail("indexer_fault", "the indexer claims to be complete past the chain's latest ledger");
+      }
+      crossChecked = matches.every((m) => m.verified);
+      checked = crossChecked;
+      events = matches[0]?.events;
     } else {
       events = await source.events();
+      crossChecked =
+        second !== undefined &&
+        (await crossCheck(second.rpc, vault, data, limits.eventPages)).verified;
+      checked = second === undefined || crossChecked;
     }
     const checks = views.map((v) => (v === undefined ? undefined : checkRoot(data.tree, v.roots)));
     if (checks.some((c) => c?.state === "mismatch")) {
@@ -694,23 +706,17 @@ export class PrivateWallet {
     const verified = checks.every((c) => c?.state === "verified");
     let newNotes = 0;
     if (verified) {
-      const checked = source.kind === "rpc" || crossChecked;
       newNotes = applyDownload(core.state, core.scan, data, checked, views.length);
       core.state.rootCheck = check;
-      // RPC's events count towards a plan's fate only where they matched the indexer's data.
+      // RPC's events count towards a plan's fate only where every provider's matched the data.
       if (crossChecked && events !== undefined) {
         recordEvents(core.state.plans, eventsUpTo(events, data.horizon));
       }
     } else {
-      stageDownload(core.state, core.scan, data, source.kind === "rpc" || crossChecked);
+      stageDownload(core.state, core.scan, data, checked);
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
-    const rechecked = await recheck(
-      core.state,
-      core.services.rpc,
-      core.deployment.vault,
-      limits.eventPages,
-    );
+    const rechecked = await recheck(core.state, rpcs, vault, limits.eventPages);
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
     if (verified) advancePlans(core.state, views as [ChainView, ...ChainView[]]);
     const live = source.kind === "indexer" ? indexer : undefined;

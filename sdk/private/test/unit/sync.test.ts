@@ -363,8 +363,8 @@ describe("unchecked ranges", () => {
     ),
   });
 
-  // An RPC whose getEvents shows the vault adding these leaves.
-  function showing(leaves: readonly Leaf[]): SorobanRpc {
+  // An RPC whose getEvents shows the vault adding these leaves, up to the ledger `latest`.
+  function showing(leaves: readonly Leaf[], latest = 70): SorobanRpc {
     const events = leaves.map((l, i) => ({
       type: "contract",
       ledger: l.ledger,
@@ -382,7 +382,7 @@ describe("unchecked ranges", () => {
     }));
     return new SorobanRpc("http://rpc", async (_input, init) => {
       const { id } = JSON.parse(String(init?.body));
-      const result = { events, latestLedger: 70, oldestLedger: 1 };
+      const result = { events, latestLedger: latest, oldestLedger: 1 };
       return new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
     });
   }
@@ -407,14 +407,14 @@ describe("unchecked ranges", () => {
 
   it("checks every leaf of a range by its runs, clears it and takes the ledgers as checked", async () => {
     const state = walletAfter(four);
-    await recheck(state, showing(four), VAULT, 1);
+    await recheck(state, [showing(four)], VAULT, 1);
     assert.deepEqual(state.unchecked, []);
     assert.equal(state.checkedLeafLedger, 60);
   });
 
   it("checks the runs RPC shows in full and keeps the rest of the range", async () => {
     const state = walletAfter(four);
-    await recheck(state, showing(four.slice(0, 3)), VAULT, 1);
+    await recheck(state, [showing(four.slice(0, 3))], VAULT, 1);
     const [rest] = state.unchecked;
     assert.equal(rest?.leaves?.first, 6);
     assert.equal(rest?.leaves?.ledger, 60);
@@ -424,19 +424,44 @@ describe("unchecked ranges", () => {
   it("refuses a leaf whose ledger or transaction the sync took otherwise", async () => {
     const forged = [...four.slice(0, 3), { ...leafAt(7), ledger: 400 }];
     await assert.rejects(
-      recheck(walletAfter(forged), showing(four), VAULT, 1),
+      recheck(walletAfter(forged), [showing(four)], VAULT, 1),
       (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
     );
     const renamed = [...four.slice(0, 3), { ...leafAt(7), txHash: "cd".repeat(32) }];
     await assert.rejects(
-      recheck(walletAfter(renamed), showing(four), VAULT, 1),
+      recheck(walletAfter(renamed), [showing(four)], VAULT, 1),
+      (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
+    );
+  });
+
+  it("takes a range's spends as checked only up to the ledger every RPC provider reaches", async () => {
+    const state = emptyState(1);
+    state.nullifierSince = 120;
+    state.unchecked = [{ from: 60, to: 100, leaves: undefined, lost: false }];
+    await recheck(state, [showing([], 90), showing([], 80)], VAULT, 1);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.from, r.to]),
+      [[81, 100]],
+    );
+  });
+
+  it("checks a range against every RPC provider, as far as the one that reaches least", async () => {
+    const state = walletAfter(four);
+    await recheck(state, [showing(four), showing(four.slice(0, 3))], VAULT, 1);
+    assert.equal(state.unchecked[0]?.leaves?.first, 6);
+    await recheck(state, [showing(four), showing(four)], VAULT, 1);
+    assert.deepEqual(state.unchecked, []);
+    // A provider whose events differ from what the sync took is as much a fault as the first.
+    const forged = [...four.slice(0, 3), { ...leafAt(7), ledger: 400 }];
+    await assert.rejects(
+      recheck(walletAfter(forged), [showing(forged), showing(four)], VAULT, 1),
       (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
     );
   });
 
   it("refuses leaves RPC shows with a gap after the range's first", async () => {
     await assert.rejects(
-      recheck(walletAfter(four), showing(four.slice(2)), VAULT, 1),
+      recheck(walletAfter(four), [showing(four.slice(2))], VAULT, 1),
       (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
     );
   });
