@@ -191,7 +191,8 @@ function checkOutflow(instance: VaultInstance, outflow: bigint, now: number): bo
       maxPerTransaction: limits.maxDailyOutflow.toString(),
     });
   }
-  if (outflow > status.tvl - status.pendingTotal) {
+  // Pending deposits stay claimable by their depositors and queued exits are owed already.
+  if (outflow > status.tvl - status.pendingTotal - (status.queuedTotal ?? 0n)) {
     fail("vault_unavailable", "the vault holds too little admitted value for this payout");
   }
   const day = BigInt(Math.floor(now / 86_400_000));
@@ -207,7 +208,8 @@ function checkOutflow(instance: VaultInstance, outflow: bigint, now: number): bo
     }
     return false;
   }
-  return windowFull || (status.exitTail as bigint) > (status.exitHead as bigint);
+  // An exit that pays nothing never waits.
+  return outflow > 0n && (windowFull || (status.exitTail as bigint) > (status.exitHead as bigint));
 }
 
 function planOf(

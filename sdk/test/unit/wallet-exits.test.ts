@@ -100,7 +100,8 @@ describe("the exit queue", () => {
     await alice.sync();
     const [plan] = await alice.plans();
     assert.equal(plan?.state, "queued");
-    assert.equal(plan?.exitId, 0);
+    // exit IDs start at 1
+    assert.equal(plan?.exitId, 1);
     assert.equal((await alice.balance()).awaitingPayout, 20n * XLM);
     const position = await alice.exitPosition(sub.planId);
     assert.equal(position?.ahead, 0);
@@ -139,8 +140,11 @@ describe("the exit queue", () => {
     await alice.releaseExits(world.signer("anyone"));
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "stranded");
+    // the relayer's fee was paid at release; only the payout waits
+    assert.equal(world.vault.queuedTotal, 10n * XLM);
+    await assert.rejects(alice.claimExit(1, world.signer("anyone")), isError("transaction_failed"));
     world.vault.unpayable.delete(destination);
-    await alice.claimExit(0, world.signer("anyone"));
+    await alice.claimExit(1, world.signer("anyone"));
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "claimed");
     assert.deepEqual(

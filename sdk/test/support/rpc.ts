@@ -178,8 +178,7 @@ export class MockRpc {
         v.refund(Number(scValToBigInt(args[0] as xdr.ScVal)));
         return xdr.ScVal.scvVoid();
       case "release":
-        v.release((args[0] as xdr.ScVal).u32());
-        return xdr.ScVal.scvVoid();
+        return xdr.ScVal.scvU32(v.release((args[0] as xdr.ScVal).u32()));
       case "claim":
         v.claim(Number(scValToBigInt(args[0] as xdr.ScVal)));
         return xdr.ScVal.scvVoid();

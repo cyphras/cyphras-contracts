@@ -47,6 +47,7 @@ export const ERROR = {
   ExceedsAdmittedValue: 41,
   DepositTooSmall: 42,
   ExceedsDailyOutflow: 43,
+  NotStranded: 44,
 } as const;
 
 export class VaultError extends Error {
@@ -145,9 +146,12 @@ export class MockVault {
   pendingTotal = 0n;
   outflowDay = 0n;
   outflow = 0n;
+  // The vault of c189d8a on the contracts branch has an exit queue; an older one refuses an exit
+  // that does not fit today's window instead.
   exitQueue = false;
-  exitHead = 0;
-  exitTail = 0;
+  exitHead = 1;
+  exitTail = 1;
+  queuedTotal = 0n;
 
   readonly tree = CommitmentTree.empty();
   readonly leaves: {
@@ -350,23 +354,25 @@ export class MockVault {
     const outflow = payout + ext.fee;
     const day = this.timestamp / DAY;
     const usedToday = this.outflowDay === day ? this.outflow : 0n;
-    let queue = false;
     if (this.exitQueue) {
       if (outflow > this.limits.maxDailyOutflow) refuse(ERROR.ExceedsDailyOutflow);
-      queue = this.exitTail > this.exitHead || usedToday + outflow > this.limits.maxDailyOutflow;
     } else if (usedToday + outflow > this.limits.maxDailyOutflow) {
       refuse(ERROR.OutflowLimit);
     }
-    if (outflow > this.tvl - this.pendingTotal) refuse(ERROR.ExceedsAdmittedValue);
+    if (outflow > this.tvl - this.pendingTotal - this.queuedTotal) {
+      refuse(ERROR.ExceedsAdmittedValue);
+    }
     this.#shape(proof, ext);
     if (proof.root === 0n || !this.roots.includes(proof.root)) refuse(ERROR.UnknownRoot);
     this.#spend(proof, ext);
     if (this.dryRun) return;
     this.#spendNullifiers(proof);
     this.#insertPair(proof.outputCommitments, [ext.encryptedOutput0, ext.encryptedOutput1]);
-    this.tvl -= outflow;
-    if (queue) {
+    const fits =
+      this.exitHead === this.exitTail && usedToday + outflow <= this.limits.maxDailyOutflow;
+    if (this.exitQueue && outflow > 0n && !fits) {
       const id = this.exitTail++;
+      this.queuedTotal += outflow;
       this.exits.set(id, {
         id,
         payout,
@@ -378,53 +384,93 @@ export class MockVault {
       });
       this.#emit("exit_queued", [
         ["id", u64(id)],
-        ["payout", i128(payout)],
+        ["ext_amount", i128(ext.extAmount)],
         ["fee", i128(ext.fee)],
+        ["recipient", new Address(ext.recipient).toScVal()],
+        ["relayer", new Address(ext.relayer).toScVal()],
       ]);
       return;
     }
+    this.tvl -= outflow;
     this.outflowDay = day;
     this.outflow = usedToday + outflow;
-    this.#emit("settled", [
-      ["ext_amount", i128(ext.extAmount)],
-      ["fee", i128(ext.fee)],
-      ["recipient", new Address(ext.recipient).toScVal()],
-      ["relayer", new Address(ext.relayer).toScVal()],
-    ]);
+    this.#settled(ext.extAmount, ext.fee, ext.recipient, ext.relayer, undefined);
     this.#pay(ext.recipient, payout);
     this.#pay(ext.relayer, ext.fee);
   }
 
-  release(max: number): void {
-    if (this.dryRun) return;
+  #settled(
+    extAmount: bigint,
+    fee: bigint,
+    recipient: string,
+    relayer: string,
+    exitId: number | undefined,
+  ): void {
+    this.#emit("settled", [
+      ["ext_amount", i128(extAmount)],
+      ["fee", i128(fee)],
+      ["recipient", new Address(recipient).toScVal()],
+      ["relayer", new Address(relayer).toScVal()],
+      ["exit_id", exitId === undefined ? xdr.ScVal.scvVoid() : u64(exitId)],
+    ]);
+  }
+
+  // Pays queued exits from the head while each fits today's window. A payout the recipient
+  // cannot receive is set aside as a stranded exit, so it never holds up the exits behind it.
+  release(max: number): number {
+    if (this.#halted()) refuse(ERROR.Halted);
+    if (this.dryRun) return 0;
     const day = this.timestamp / DAY;
-    for (let n = 0; n < max && this.exitHead < this.exitTail; n++) {
+    let today = this.outflowDay === day ? this.outflow : 0n;
+    let count = 0;
+    while (count < max && this.exitHead < this.exitTail) {
       const exit = this.exits.get(this.exitHead) as Exit;
-      const usedToday = this.outflowDay === day ? this.outflow : 0n;
-      if (usedToday + exit.payout + exit.fee > this.limits.maxDailyOutflow) break;
+      if (today + exit.payout + exit.fee > this.limits.maxDailyOutflow) break;
       this.exits.delete(exit.id);
       this.exitHead++;
-      this.outflowDay = day;
-      this.outflow = usedToday + exit.payout + exit.fee;
-      if (this.unpayable.has(baseAccount(exit.recipient))) {
-        this.stranded.set(exit.id, exit);
-        this.resolvedExits.push({ id: exit.id, outcome: "stranded", txHash: exit.txHash });
-        continue;
-      }
-      this.#pay(exit.recipient, exit.payout);
+      count++;
+      const unpaid = this.unpayable.has(baseAccount(exit.recipient)) ? exit.payout : 0n;
+      const paid = exit.payout + exit.fee - unpaid;
+      today += paid;
+      this.tvl -= paid;
+      this.queuedTotal -= paid;
       this.#pay(exit.relayer, exit.fee);
-      this.resolvedExits.push({ id: exit.id, outcome: "paid", txHash: exit.txHash });
-      this.#emit("settled", [["exit_id", u64(exit.id)]]);
+      if (unpaid === 0n) {
+        this.#pay(exit.recipient, exit.payout);
+        this.resolvedExits.push({ id: exit.id, outcome: "paid", txHash: exit.txHash });
+        this.#settled(-exit.payout, exit.fee, exit.recipient, exit.relayer, exit.id);
+      } else {
+        this.stranded.set(exit.id, { ...exit, fee: 0n });
+        this.resolvedExits.push({ id: exit.id, outcome: "stranded", txHash: exit.txHash });
+        this.#emit("exit_stranded", [
+          ["id", u64(exit.id)],
+          ["payout", i128(unpaid)],
+          ["fee", i128(0n)],
+        ]);
+      }
     }
+    if (count > 0) {
+      this.outflowDay = day;
+      this.outflow = today;
+    }
+    return count;
   }
 
   claim(id: number): void {
-    const exit = this.stranded.get(id);
-    if (exit === undefined || this.unpayable.has(baseAccount(exit.recipient)))
-      refuse(ERROR.UnknownDeposit);
+    if (this.#halted()) refuse(ERROR.Halted);
+    const exit = this.stranded.get(id) ?? refuse(ERROR.NotStranded);
+    const day = this.timestamp / DAY;
+    const today = (this.outflowDay === day ? this.outflow : 0n) + exit.payout + exit.fee;
+    if (today > this.limits.maxDailyOutflow) refuse(ERROR.OutflowLimit);
+    if (this.unpayable.has(baseAccount(exit.recipient))) throw new Error("transfer refused");
     if (this.dryRun) return;
     this.stranded.delete(id);
-    this.#pay((exit as Exit).recipient, (exit as Exit).payout);
+    this.tvl -= exit.payout + exit.fee;
+    this.queuedTotal -= exit.payout + exit.fee;
+    this.outflowDay = day;
+    this.outflow = today;
+    this.#settled(-exit.payout, exit.fee, exit.recipient, exit.relayer, id);
+    this.#pay(exit.recipient, exit.payout);
     const entry = this.resolvedExits.find((e) => e.id === id);
     if (entry !== undefined) entry.outcome = "claimed";
   }
@@ -528,11 +574,11 @@ export class MockVault {
       ["outflow", i128(this.outflow)],
     ];
     if (this.exitQueue) {
-      status.push(["exit_head", u64(this.exitHead)], ["exit_tail", u64(this.exitTail)]);
-      status.push([
-        "queued_total",
-        i128([...this.exits.values()].reduce((s, e) => s + e.payout + e.fee, 0n)),
-      ]);
+      status.push(
+        ["exit_head", u64(this.exitHead)],
+        ["exit_tail", u64(this.exitTail)],
+        ["queued_total", i128(this.queuedTotal)],
+      );
     }
     return [
       new xdr.ScMapEntry({
