@@ -180,4 +180,4 @@ template Transaction(levels, nIns, nOuts) {
   signal domainSquare <== domain * domain;
 }
 
-component main {public [root, publicAmount, extDataHash, domain, nf, cmOut]} = Transaction(20, 2, 2);
+component main {public [root, publicAmount, extDataHash, domain, nf, cmOut]} = Transaction(32, 2, 2);

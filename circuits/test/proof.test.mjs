@@ -3,10 +3,9 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import * as snarkjs from "snarkjs";
 import { F } from "../reference/babyjub.mjs";
+import { PTAU } from "../scripts/ptau.mjs";
 import { PUBLIC_SIGNALS, transactionInput, transfer, unshield } from "./fixtures.mjs";
-import { ROOT, transactionCircuit } from "./helpers.mjs";
-
-const PTAU = join(ROOT, "build", "ptau", "powersOfTau28_hez_final_16.ptau");
+import { OUT, transactionCircuit } from "./helpers.mjs";
 
 describe("Groth16 proof", () => {
   let circuit;
@@ -18,7 +17,7 @@ describe("Groth16 proof", () => {
     if (!existsSync(PTAU)) throw new Error(`missing ${PTAU}, run: npm run ptau`);
     circuit = await transactionCircuit();
     // phase 2 skipped: anyone can forge with this key, which is fine for a test fixture
-    zkey = join(ROOT, "build", "test", "transaction.zkey");
+    zkey = join(OUT, "transaction.zkey");
     await snarkjs.zKey.newZKey(circuit.r1csPath, PTAU, zkey);
     vk = await snarkjs.zKey.exportVerificationKey(zkey);
   });

@@ -6,15 +6,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 R1CS="$ROOT/build/transaction.r1cs"
-PTAU="$ROOT/build/ptau/powersOfTau28_hez_final_16.ptau"
+PTAU="$ROOT/build/ptau/powersOfTau28_hez_final_15.ptau"
 OUT="$ROOT/build/testnet-forgeable"
 SNARKJS="$ROOT/node_modules/.bin/snarkjs"
 
-if [ ! -f "$R1CS" ]; then
-  echo "missing $R1CS, run: npm run compile" >&2
-  exit 1
-fi
-
+# compile.mjs refuses anything but the frozen r1cs; ptau.mjs checks the published hash
+node "$ROOT/scripts/compile.mjs"
 node "$ROOT/scripts/ptau.mjs"
 mkdir -p "$OUT"
 

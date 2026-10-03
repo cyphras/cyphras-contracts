@@ -1,55 +1,78 @@
-import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { readR1cs } from "r1csfile";
+import { basename, join } from "node:path";
 import { F, P } from "../reference/babyjub.mjs";
+import { ROOT, circom, loadR1cs } from "../scripts/circom.mjs";
 
-export const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const OUT = join(ROOT, "build", "test");
+export { ROOT };
+export const OUT = join(ROOT, "build", "test");
 const require = createRequire(import.meta.url);
 
 export const randomField = () => BigInt("0x" + randomBytes(64).toString("hex")) % P;
 
-class Circuit {
-  constructor(dir, name, calculator, r1cs, symbols) {
+export class Circuit {
+  constructor(dir, name, calculator, r1cs, symbols, names) {
     this.r1csPath = join(dir, `${name}.r1cs`);
     this.wasmPath = join(dir, `${name}_js`, `${name}.wasm`);
     this.calculator = calculator;
     this.nConstraints = r1cs.nConstraints;
-    // [signal, coefficient] pairs evaluate far faster than the sparse objects r1csfile returns
+    // [wire, coefficient] pairs evaluate far faster than the sparse objects r1csfile returns
     this.constraints = r1cs.constraints.map((c) =>
       c.map((lc) => Object.entries(lc).map(([i, k]) => [Number(i), k])),
     );
+    this.labels = r1cs.map;
     this.symbols = symbols;
+    this.names = names;
   }
 
   static async load(dir, name) {
     const builder = require(join(dir, `${name}_js`, "witness_calculator.js"));
     const calculator = await builder(readFileSync(join(dir, `${name}_js`, `${name}.wasm`)));
-    const r1cs = await readR1cs(join(dir, `${name}.r1cs`), { loadConstraints: true, F });
+    const r1cs = await loadR1cs(join(dir, `${name}.r1cs`), {
+      loadConstraints: true,
+      loadMap: true,
+    });
     const symbols = new Map();
+    const names = new Map();
     for (const line of readFileSync(join(dir, `${name}.sym`), "utf8").split("\n")) {
-      const [, witnessIndex, , signal] = line.split(",");
-      if (signal) symbols.set(signal, Number(witnessIndex));
+      const [label, wire, , signal] = line.split(",");
+      if (!signal) continue;
+      symbols.set(signal, Number(wire));
+      names.set(Number(label), signal);
     }
-    return new Circuit(dir, name, calculator, r1cs, symbols);
+    return new Circuit(dir, name, calculator, r1cs, symbols, names);
   }
 
   witness(input) {
     return this.calculator.calculateWitness(input, true);
   }
 
-  // Number of R1CS constraints the witness violates, independent of the witness generator.
-  violations(witness) {
+  // Indexes of the R1CS constraints the witness violates, independent of the witness generator.
+  violated(witness) {
     const evaluate = (lc) => lc.reduce((acc, [i, k]) => F.add(acc, F.mul(k, witness[i])), 0n);
-    let count = 0;
-    for (const [a, b, c] of this.constraints) {
-      if (F.sub(F.mul(evaluate(a), evaluate(b)), evaluate(c)) !== 0n) count++;
+    const out = [];
+    this.constraints.forEach(([a, b, c], i) => {
+      if (F.sub(F.mul(evaluate(a), evaluate(b)), evaluate(c)) !== 0n) out.push(i);
+    });
+    return out;
+  }
+
+  violations(witness) {
+    return this.violated(witness).length;
+  }
+
+  // The components whose signals appear in the given constraints.
+  components(indexes) {
+    const out = new Set();
+    for (const i of indexes) {
+      for (const lc of this.constraints[i]) {
+        for (const [wire] of lc) {
+          if (wire !== 0) out.add(this.names.get(this.labels[wire]).replace(/\.[^.]*$/, ""));
+        }
+      }
     }
-    return count;
+    return [...out].sort();
   }
 
   index(signal) {
@@ -71,18 +94,16 @@ class Circuit {
 
 const compiled = new Map();
 
-// Same flags as `npm run compile`, so the tests exercise the constraint system that ships.
-function compile(source, name) {
+// The circom wrapper pins the compiler version and flags, so tests exercise the shipped system.
+export function compile(source, name, options) {
   if (!compiled.has(name)) {
     const dir = join(OUT, name);
+    const stem = basename(source, ".circom");
     mkdirSync(dir, { recursive: true });
-    const lib = ["-l", join(ROOT, "lib"), "-l", join(ROOT, "node_modules")];
-    execFileSync("circom", [source, "--r1cs", "--wasm", "--sym", ...lib, "-o", dir], {
-      stdio: "pipe",
-    });
+    circom(source, dir, options);
     // circom emits a CommonJS witness calculator; this package is ESM by default
-    writeFileSync(join(dir, `${name}_js`, "package.json"), '{ "type": "commonjs" }\n');
-    compiled.set(name, Circuit.load(dir, name));
+    writeFileSync(join(dir, `${stem}_js`, "package.json"), '{ "type": "commonjs" }\n');
+    compiled.set(name, Circuit.load(dir, stem));
   }
   return compiled.get(name);
 }

@@ -30,9 +30,9 @@ cargo build --target wasm32v1-none --release
 
 ## Circuits
 
-Requires Node.js and Circom 2.2.3. From `circuits/`: `npm install`, `npm run compile`,
-`npm run ptau`, then `npm test`. `npm run setup:testnet-forgeable` makes dev-only testnet keys:
-whoever runs it can forge proofs.
+Requires Node.js and circom 2.2.3. From `circuits/`: `npm ci`, `npm run compile` (fails unless
+the r1cs is the frozen one), `npm run ptau`, `npm test` and `npm run check:o2`.
+`npm run setup:testnet-forgeable` makes dev-only testnet keys: whoever runs it can forge proofs.
 
 ## Networks
 

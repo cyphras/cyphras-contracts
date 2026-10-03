@@ -6,12 +6,13 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "compile": "mkdir -p build && circom src/transaction.circom --r1cs --wasm --sym -l lib -l node_modules -o build",
+    "compile": "node scripts/compile.mjs",
     "info": "snarkjs r1cs info build/transaction.r1cs",
+    "check:o2": "node scripts/check-o2.mjs",
     "ptau": "node scripts/ptau.mjs",
     "setup:testnet-forgeable": "bash scripts/setup-testnet-forgeable.sh",
     "vectors": "node scripts/gen-vectors.mjs",
-    "test": "mocha \"test/**/*.test.mjs\" --timeout 600000",
+    "test": "mocha \"test/**/*.test.mjs\"",
     "format": "prettier --write \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\"",
     "format:check": "prettier --check \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\""
   },

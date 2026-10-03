@@ -84,7 +84,7 @@ const NOTE_CASES = [
   { value: 1n, rcm: 1, pos: 1 },
   { value: 250_000_000n, rcm: 2, pos: 1234 },
   { value: 250_000_000n, rcm: 2, pos: 1235 },
-  { value: (1n << 64n) - 1n, rcm: 3, pos: (1 << LEVELS) - 1 },
+  { value: (1n << 64n) - 1n, rcm: 3, pos: 2 ** LEVELS - 1 },
 ];
 
 export function noteVectors() {

@@ -1,7 +1,7 @@
 import { compress, hash } from "./poseidon2.mjs";
 import { TAG, fold } from "./keys.mjs";
 
-export const LEVELS = 20;
+export const LEVELS = 32;
 
 export function addressFold(gd, pkd) {
   return hash([fold(gd, TAG.gd), fold(pkd, TAG.pkd)], TAG.address);
