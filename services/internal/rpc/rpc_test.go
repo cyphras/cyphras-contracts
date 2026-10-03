@@ -3,6 +3,9 @@ package rpc_test
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stellar/go-stellar-sdk/xdr"
@@ -74,4 +77,27 @@ func TestTheMaximumEntryTTLIsRead(t *testing.T) {
 	if err != nil || got != 3_110_400 {
 		t.Fatalf("max ttl %d, %v", got, err)
 	}
+}
+
+func TestErrorsLeaveTheAccessKeyOut(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	for _, u := range []string{srv.URL + "/v1/aaaaaaaaaaaa?token=bbbbbbbbbbbb", "http://127.0.0.1:1/aaaaaaaaaaaa"} {
+		_, err := rpc.Dial(u).GetHealth(context.Background())
+		if err == nil || strings.Contains(err.Error(), "aaaa") || strings.Contains(err.Error(), "bbbb") {
+			t.Fatalf("error %v", err)
+		}
+	}
+	_, err := rpc.Dial("http://127.0.0.1:1/aaaaaaaaaaaa").GetHealth(canceled())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("the cause is lost: %v", err)
+	}
+}
+
+func canceled() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
 }

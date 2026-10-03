@@ -49,7 +49,7 @@ func TestAlertsAreSentOncePerCooldownAndResolved(t *testing.T) {
 func TestWebhookFormats(t *testing.T) {
 	var got []string
 	var mu sync.Mutex
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		mu.Lock()
 		got = append(got, r.URL.Path+" "+string(b))
@@ -62,7 +62,9 @@ func TestWebhookFormats(t *testing.T) {
 	}
 	a := Alert{Service: "watcher", Severity: Warning, Code: "root_mismatch", Message: "m"}
 	for _, ch := range channels {
-		if err := ch.Send(context.Background(), a); err != nil {
+		w := ch.(Webhook)
+		w.HTTP = srv.Client()
+		if err := w.Send(context.Background(), a); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -80,7 +82,7 @@ func TestWebhookFormats(t *testing.T) {
 			}
 		}
 	}
-	for _, bad := range []string{"slack", "pager https://x", "slack ftp://x", "slack https://"} {
+	for _, bad := range []string{"slack", "pager https://x", "slack ftp://x", "slack https://", "slack http://hooks.example/x"} {
 		if _, err := ParseWebhooks([]byte(bad)); err == nil {
 			t.Fatalf("%q accepted", bad)
 		}

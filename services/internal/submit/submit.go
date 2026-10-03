@@ -57,6 +57,9 @@ type Engine struct {
 	MaxInclusionFee int64
 	// ResourceMarginPct pads the simulated resource fee; the unused refundable part is refunded.
 	ResourceMarginPct int64
+	// MaxResourceFee refuses a simulation that asks for more, so a lying RPC cannot drain the
+	// source's float.
+	MaxResourceFee int64
 	// Validity is how long a signed transaction may wait for inclusion.
 	Validity time.Duration
 	// Poll is the interval between getTransaction calls.
@@ -194,6 +197,9 @@ func (e *Engine) Prepare(ctx context.Context, a *Account, op txnbuild.Operation)
 	if err := xdr.SafeUnmarshalBase64(sim.TransactionDataXDR, &data); err != nil {
 		return nil, fmt.Errorf("simulation data: %w", err)
 	}
+	if e.MaxResourceFee > 0 && sim.MinResourceFee > e.MaxResourceFee {
+		return nil, fmt.Errorf("%w: a resource fee of %d stroops is above the cap", ErrSimulation, sim.MinResourceFee)
+	}
 	resource := sim.MinResourceFee + sim.MinResourceFee*e.ResourceMarginPct/100
 	data.ResourceFee = xdr.Int64(resource)
 	sop.setExt(xdr.TransactionExt{V: 1, SorobanData: &data})
@@ -233,7 +239,9 @@ type Signed struct {
 }
 
 // Send signs and submits the transaction and returns once the network holds it. A
-// TRY_AGAIN_LATER resends the same envelope until the time bound passes.
+// TRY_AGAIN_LATER resends the same envelope until the time bound passes. When an earlier attempt
+// may have reached the network unanswered, a refusal or an expiry is checked against the
+// envelope's own hash before it is believed, since the first copy may already be applied.
 func (e *Engine) Send(ctx context.Context, p *Prepared) (*Signed, error) {
 	signed, err := p.Tx.Sign(e.Passphrase, p.Account.Signer)
 	if err != nil {
@@ -247,21 +255,31 @@ func (e *Engine) Send(ctx context.Context, p *Prepared) (*Signed, error) {
 	if err != nil {
 		return nil, err
 	}
-	backoff := e.Poll
+	s := &Signed{Prepared: p, Hash: hash}
+	backoff := e.poll()
+	ambiguous := false
+	closed := e.now().Unix()
 	for {
 		resp, err := e.RPC.SendTransaction(ctx, protocol.SendTransactionRequest{Transaction: envelope})
 		switch {
 		case err != nil:
-			// The RPC may or may not have the envelope; resending the same one is safe.
+			ambiguous = true
 		case resp.Status == "PENDING" || resp.Status == "DUPLICATE":
-			return &Signed{Prepared: p, Hash: hash}, nil
+			return s, nil
 		case resp.Status == "ERROR":
-			code := resultCode(resp.ErrorResultXDR)
+			if ambiguous {
+				return e.resolve(ctx, s)
+			}
 			// Any refusal may leave the cached sequence wrong, so it is read again next time.
 			p.Account.known = false
-			return nil, fmt.Errorf("%w: %s", ErrRejected, code)
+			return nil, fmt.Errorf("%w: %s", ErrRejected, resultCode(resp.ErrorResultXDR))
+		default:
+			closed = max(closed, resp.LatestLedgerCloseTime)
 		}
-		if e.now().Unix() > p.MaxTime {
+		if closed > p.MaxTime {
+			if ambiguous {
+				return e.resolve(ctx, s)
+			}
 			p.Account.known = false
 			return nil, ErrExpired
 		}
@@ -270,7 +288,35 @@ func (e *Engine) Send(ctx context.Context, p *Prepared) (*Signed, error) {
 			return nil, err
 		}
 		backoff = min(backoff*2, 10*time.Second)
+		closed = max(closed, e.now().Unix())
 	}
+}
+
+// resolve asks for the envelope's own hash until it is known whether the network applied it.
+func (e *Engine) resolve(ctx context.Context, s *Signed) (*Signed, error) {
+	for {
+		resp, err := e.RPC.GetTransaction(ctx, protocol.GetTransactionRequest{Hash: s.Hash})
+		if err == nil {
+			switch resp.Status {
+			case protocol.TransactionStatusSuccess, protocol.TransactionStatusFailed:
+				return s, nil
+			case protocol.TransactionStatusNotFound:
+				if resp.LatestLedgerCloseTime > s.MaxTime {
+					s.Account.known = false
+					return nil, ErrExpired
+				}
+			}
+		}
+		if err := wait(ctx, e.poll()); err != nil {
+			s.Account.known = false
+			return nil, err
+		}
+	}
+}
+
+// poll is the polling interval, never zero.
+func (e *Engine) poll() time.Duration {
+	return max(e.Poll, 50*time.Millisecond)
 }
 
 func resultCode(b64 string) string {
@@ -322,7 +368,7 @@ func (e *Engine) Track(ctx context.Context, s *Signed) (Result, error) {
 				}
 			}
 		}
-		if err := wait(ctx, e.Poll); err != nil {
+		if err := wait(ctx, e.poll()); err != nil {
 			s.Account.known = false
 			return Result{}, err
 		}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/klauspost/compress/zstd"
@@ -302,5 +303,59 @@ func TestTheLedgerArchiveExtractsTheVaultsEventsWithRPCPositions(t *testing.T) {
 	wrong := &LedgerArchive{BaseURL: srv.URL + "/pubnet", Passphrase: "Public Global Stellar Network ; September 2015", Vault: vaulttest.Vault}
 	if _, err := wrong.Events(context.Background(), ledger, ledger); err == nil {
 		t.Fatal("archive of another network accepted")
+	}
+}
+
+func TestTheLedgerArchiveRefusesGapsAndRetriesItsLayout(t *testing.T) {
+	const ledger = 63_000_200
+	compress := func(seq uint32) []byte {
+		batch := xdr.LedgerCloseMetaBatch{StartSequence: xdr.Uint32(seq), EndSequence: xdr.Uint32(seq), LedgerCloseMetas: []xdr.LedgerCloseMeta{lcmWithEvents(t, seq, 1_750_000_000, vaulttest.Vault)}}
+		raw, err := batch.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		enc, _ := zstd.NewWriter(&out)
+		_, _ = enc.Write(raw)
+		_ = enc.Close()
+		return out.Bytes()
+	}
+	schema := archiveSchema{LedgersPerBatch: 1, BatchesPerPartition: 64000}
+	failures := 1
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/pubnet/.config.json":
+			if failures > 0 {
+				failures--
+				http.Error(w, "busy", http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"networkPassphrase":"` + passphrase + `","compression":"zstd","ledgersPerBatch":1,"batchesPerPartition":64000}`))
+		case "/pubnet/" + schema.objectKey(ledger):
+			// The file of one ledger that holds the next one instead.
+			_, _ = w.Write(compress(ledger + 1))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	a := &LedgerArchive{BaseURL: srv.URL + "/pubnet", Passphrase: passphrase, Vault: vaulttest.Vault}
+	if _, err := a.Events(context.Background(), ledger, ledger); err == nil {
+		t.Fatal("an unreadable layout was accepted")
+	}
+	if _, err := a.Events(context.Background(), ledger, ledger); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("a batch without its ledger: %v", err)
+	}
+}
+
+func TestAnUnknownMetaVersionIsAnError(t *testing.T) {
+	lcm := lcmWithEvents(t, 7, 1, vaulttest.Vault)
+	lcm.V2.TxProcessing[0].TxApplyProcessing = xdr.TransactionMeta{V: 9}
+	raw, err := strkey.Decode(strkey.VersionByteContract, vaulttest.Vault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ledgerEvents(lcm, xdr.ContractId(raw)); !errors.Is(err, vault.ErrMalformed) {
+		t.Fatalf("unknown meta version: %v", err)
 	}
 }

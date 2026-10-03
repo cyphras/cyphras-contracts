@@ -80,7 +80,10 @@ func (s RPCSource) Events(ctx context.Context, from, to uint32) ([]vault.RawEven
 		if err != nil {
 			return nil, fmt.Errorf("cursor %q: %w", resp.Cursor, err)
 		}
-		if uint(len(resp.Events)) < limit && cursor.Ledger >= to {
+		// The server marks the end of what it scanned with the largest cursor of that ledger. A short
+		// page alone proves nothing, since a provider may cap pages below the asked limit.
+		end := protocol.MaxCursor
+		if cursor.Ledger > to || (cursor.Ledger == to && cursor.Tx == end.Tx && cursor.Op == end.Op && cursor.Event == end.Event) {
 			return out, nil
 		}
 		if cursor.Cmp(progress) <= 0 {

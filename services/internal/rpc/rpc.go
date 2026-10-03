@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
@@ -16,7 +18,7 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
-// Client is implemented by *rpcclient.Client.
+// Client is the part of *rpcclient.Client the services use.
 type Client interface {
 	GetHealth(ctx context.Context) (protocol.GetHealthResponse, error)
 	GetNetwork(ctx context.Context) (protocol.GetNetworkResponse, error)
@@ -30,9 +32,84 @@ type Client interface {
 
 var _ Client = (*rpcclient.Client)(nil)
 
-// Dial returns a client for the RPC at url with bounded request times.
-func Dial(url string) *rpcclient.Client {
-	return rpcclient.NewClient(url, &http.Client{Timeout: 30 * time.Second})
+// Dial returns a client for the RPC at url with bounded request times. Its errors never show the
+// URL, which may carry an access key.
+func Dial(rawURL string) Client {
+	hide := []string{rawURL}
+	if u, err := url.Parse(rawURL); err == nil {
+		if rest := strings.TrimPrefix(u.RequestURI(), "/"); rest != "" {
+			hide = append(hide, rest, url.PathEscape(rest))
+		}
+	}
+	return scrubbed{inner: rpcclient.NewClient(rawURL, &http.Client{Timeout: 30 * time.Second}), hide: hide}
+}
+
+type scrubbed struct {
+	inner *rpcclient.Client
+	hide  []string
+}
+
+// hiddenError keeps the cause for errors.Is while its text leaves the URL out.
+type hiddenError struct {
+	text  string
+	cause error
+}
+
+func (e hiddenError) Error() string { return e.text }
+func (e hiddenError) Unwrap() error { return e.cause }
+
+func (s scrubbed) clean(err error) error {
+	if err == nil {
+		return nil
+	}
+	text := err.Error()
+	for _, h := range s.hide {
+		text = strings.ReplaceAll(text, h, "[rpc]")
+	}
+	if text == err.Error() {
+		return err
+	}
+	return hiddenError{text: text, cause: err}
+}
+
+func (s scrubbed) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
+	r, err := s.inner.GetHealth(ctx)
+	return r, s.clean(err)
+}
+
+func (s scrubbed) GetNetwork(ctx context.Context) (protocol.GetNetworkResponse, error) {
+	r, err := s.inner.GetNetwork(ctx)
+	return r, s.clean(err)
+}
+
+func (s scrubbed) GetEvents(ctx context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error) {
+	r, err := s.inner.GetEvents(ctx, req)
+	return r, s.clean(err)
+}
+
+func (s scrubbed) GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error) {
+	r, err := s.inner.GetLedgerEntries(ctx, req)
+	return r, s.clean(err)
+}
+
+func (s scrubbed) GetFeeStats(ctx context.Context) (protocol.GetFeeStatsResponse, error) {
+	r, err := s.inner.GetFeeStats(ctx)
+	return r, s.clean(err)
+}
+
+func (s scrubbed) SimulateTransaction(ctx context.Context, req protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+	r, err := s.inner.SimulateTransaction(ctx, req)
+	return r, s.clean(err)
+}
+
+func (s scrubbed) SendTransaction(ctx context.Context, req protocol.SendTransactionRequest) (protocol.SendTransactionResponse, error) {
+	r, err := s.inner.SendTransaction(ctx, req)
+	return r, s.clean(err)
+}
+
+func (s scrubbed) GetTransaction(ctx context.Context, req protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
+	r, err := s.inner.GetTransaction(ctx, req)
+	return r, s.clean(err)
 }
 
 // NetworkID is the SHA-256 of the network passphrase.
@@ -56,7 +133,8 @@ func CheckNetwork(ctx context.Context, c Client, passphrase string) error {
 type Entry struct {
 	Data         xdr.LedgerEntryData
 	LastModified uint32
-	// LiveUntil is the last ledger the entry is live in; nil for entries without a TTL.
+	// LiveUntil is the last ledger the entry is live in; nil for entries without a TTL. An archived
+	// entry has one below the latest ledger.
 	LiveUntil *uint32
 }
 
@@ -101,7 +179,8 @@ func Entries(ctx context.Context, c Client, keys []xdr.LedgerKey) (map[string]En
 	return out, latest, nil
 }
 
-// ErrMissing reports a ledger entry that does not exist or is archived.
+// ErrMissing reports a ledger entry that does not exist. An archived entry is still returned,
+// with a LiveUntil below the latest ledger.
 var ErrMissing = errors.New("rpc: ledger entry missing")
 
 // One reads a single ledger entry.

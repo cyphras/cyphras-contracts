@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
@@ -72,20 +74,41 @@ func Secret(name string) ([]byte, error) {
 	return ReadSecret(path)
 }
 
-// ReadSecret reads a secret file and checks its mode.
+// ReadSecret reads a secret file that only this process's user owns and can read. The checks look
+// at the opened file, so the path cannot be swapped between the check and the read.
 func ReadSecret(path string) ([]byte, error) {
-	info, err := os.Stat(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: secret file: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("config: secret file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("config: secret file %s is not a regular file", path)
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		return nil, fmt.Errorf("%w: %s", ErrExposedSecret, path)
 	}
-	data, err := os.ReadFile(path)
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+		return nil, fmt.Errorf("%w: %s belongs to another user", ErrExposedSecret, path)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 1<<20))
 	if err != nil {
 		return nil, fmt.Errorf("config: secret file: %w", err)
 	}
 	return data, nil
+}
+
+// Value reads the variable name, or the secret file named by name + "_FILE" for a value such as a
+// provider URL that may carry an access key.
+func Value(name string) (string, error) {
+	if os.Getenv(name+"_FILE") != "" {
+		return SecretString(name)
+	}
+	return Required(name)
 }
 
 // SecretString reads a secret and trims surrounding whitespace.

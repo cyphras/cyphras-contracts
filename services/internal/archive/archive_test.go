@@ -94,3 +94,35 @@ func TestOtherContractsAreIgnored(t *testing.T) {
 		t.Fatalf("events %+v, %v", got, err)
 	}
 }
+
+func TestALaterWriteReplacesAnEarlierOneAndAnUnfinishedWriteIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	w := Writer{Dir: dir}
+	if err := w.Append([]vault.RawEvent{event(20, 1, 0), event(21, 1, 0), event(22, 3, 0)}, 20, 22); err != nil {
+		t.Fatal(err)
+	}
+	// The same ledgers again, where ledger 21 turned out to hold no event.
+	if err := w.Append([]vault.RawEvent{event(20, 1, 0)}, 20, 21); err != nil {
+		t.Fatal(err)
+	}
+	// A write a crash cut short before its coverage record.
+	f, err := os.OpenFile(filepath.Join(dir, "0000000000.jsonl"), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"write":7,"event":{"ledger":22,"closed_at":0,"tx_hash":"h","tx":9,"op":0,"index":0,"contract":"` + testVault + `","topics":["t"],"value":"v"}}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	got, err := Reader{Dir: dir, Vault: testVault}.Events(context.Background(), 20, 22)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Ledger != 20 || got[1].Ledger != 22 || got[1].Tx != 3 {
+		t.Fatalf("events %+v", got)
+	}
+	last, err := LastCovered(dir)
+	if err != nil || last != 22 {
+		t.Fatalf("last covered %d, %v", last, err)
+	}
+}

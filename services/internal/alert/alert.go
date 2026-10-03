@@ -117,9 +117,10 @@ func ParseWebhooks(data []byte) ([]Channel, error) {
 		default:
 			return nil, fmt.Errorf("alert: line %d has unknown format %q", n, format)
 		}
+		// The URL carries the channel's token, so it only travels encrypted.
 		u, err := url.Parse(strings.TrimSpace(target))
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-			return nil, fmt.Errorf("alert: line %d has no valid URL", n)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return nil, fmt.Errorf("alert: line %d has no valid https URL", n)
 		}
 		out = append(out, Webhook{Format: format, URL: u.String()})
 	}

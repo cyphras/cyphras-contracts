@@ -1,11 +1,14 @@
 // Package archive keeps every raw vault event in append-only files, one per window of ledgers, so
-// the vault can be rebuilt after RPC has dropped the events. Each write also records the ledger
-// range it covers, so a reader can tell an empty range from a missing one.
+// the vault can be rebuilt after RPC has dropped the events. Each write ends with the ledger range
+// it covers, so a reader can tell an empty range from a missing one, and a write that never
+// finished from one that did.
 package archive
 
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,7 +25,10 @@ const WindowLedgers = 17_280
 // ErrNotCovered reports a ledger range the archive does not hold.
 var ErrNotCovered = errors.New("archive: range not covered")
 
+// line is one record of a file. Write groups the records of one Append, and the covered record
+// closes it.
 type line struct {
+	Write   uint64          `json:"write"`
 	Event   *vault.RawEvent `json:"event,omitempty"`
 	Covered *[2]uint32      `json:"covered,omitempty"`
 }
@@ -41,14 +47,24 @@ type Writer struct {
 }
 
 // Append records the events of ledgers [from, to] and that the range is complete. It returns
-// only once the data is on disk.
+// only once the data is on disk. A later write of the same ledgers replaces an earlier one.
 func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 	if err := os.MkdirAll(w.Dir, 0o700); err != nil {
 		return err
 	}
+	var id [8]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return err
+	}
+	write := binary.BigEndian.Uint64(id[:])
+	created := false
 	for start := windowStart(from); start <= to; start += WindowLedgers {
 		lo, hi := max(from, start), min(to, start+WindowLedgers-1)
-		f, err := os.OpenFile(path(w.Dir, start), os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o600)
+		name := path(w.Dir, start)
+		if _, err := os.Stat(name); errors.Is(err, os.ErrNotExist) {
+			created = true
+		}
+		f, err := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o600)
 		if err != nil {
 			return err
 		}
@@ -60,13 +76,13 @@ func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 		enc := json.NewEncoder(buf)
 		for i := range events {
 			if events[i].Ledger >= lo && events[i].Ledger <= hi {
-				if err := enc.Encode(line{Event: &events[i]}); err != nil {
+				if err := enc.Encode(line{Write: write, Event: &events[i]}); err != nil {
 					f.Close()
 					return err
 				}
 			}
 		}
-		if err := enc.Encode(line{Covered: &[2]uint32{lo, hi}}); err != nil {
+		if err := enc.Encode(line{Write: write, Covered: &[2]uint32{lo, hi}}); err != nil {
 			f.Close()
 			return err
 		}
@@ -82,7 +98,20 @@ func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 			return err
 		}
 	}
+	if created {
+		// A new file is only durable once its directory entry is.
+		return syncDir(w.Dir)
+	}
 	return nil
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // terminateTornLine ends a line a crash left half written, so it cannot swallow the next one.
@@ -107,48 +136,51 @@ type Reader struct {
 	Vault string
 }
 
-// Events returns the archived events of ledgers [from, to] in chain order.
+// finished is one completed write of one file.
+type finished struct {
+	covered [2]uint32
+	events  []vault.RawEvent
+}
+
+// Events returns the archived events of ledgers [from, to] in chain order. Each ledger is read
+// from the last finished write that covers it.
 func (r Reader) Events(ctx context.Context, from, to uint32) ([]vault.RawEvent, error) {
-	seen := map[vault.Position]vault.RawEvent{}
-	var covered [][2]uint32
+	var writes []finished
 	for start := windowStart(from); start <= to; start += WindowLedgers {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		f, err := os.Open(path(r.Dir, start))
+		done, err := r.file(path(r.Dir, start))
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("%w: no file for ledger %d", ErrNotCovered, start)
 		}
 		if err != nil {
 			return nil, err
 		}
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-		for scanner.Scan() {
-			var l line
-			if err := json.Unmarshal(scanner.Bytes(), &l); err != nil {
-				// A crash can leave a torn last line, which the next write supersedes.
-				continue
-			}
-			switch {
-			case l.Event != nil && l.Event.Contract == r.Vault && l.Event.Ledger >= from && l.Event.Ledger <= to:
-				seen[l.Event.Pos()] = *l.Event
-			case l.Covered != nil:
-				covered = append(covered, *l.Covered)
+		writes = append(writes, done...)
+	}
+	owner := make([]int, uint64(to)-uint64(from)+1)
+	for i := range owner {
+		owner[i] = -1
+	}
+	for i, w := range writes {
+		for l := max(w.covered[0], from); l <= min(w.covered[1], to); l++ {
+			owner[l-from] = i
+			if l == to {
+				break
 			}
 		}
-		err = scanner.Err()
-		f.Close()
-		if err != nil {
-			return nil, err
+	}
+	if i := slices.Index(owner, -1); i >= 0 {
+		return nil, fmt.Errorf("%w: ledger %d of %d to %d", ErrNotCovered, from+uint32(i), from, to)
+	}
+	var out []vault.RawEvent
+	for i, w := range writes {
+		for _, e := range w.events {
+			if e.Ledger >= from && e.Ledger <= to && owner[e.Ledger-from] == i {
+				out = append(out, e)
+			}
 		}
-	}
-	if !contains(covered, from, to) {
-		return nil, fmt.Errorf("%w: %d to %d", ErrNotCovered, from, to)
-	}
-	out := make([]vault.RawEvent, 0, len(seen))
-	for _, e := range seen {
-		out = append(out, e)
 	}
 	slices.SortFunc(out, func(a, b vault.RawEvent) int {
 		switch {
@@ -159,7 +191,41 @@ func (r Reader) Events(ctx context.Context, from, to uint32) ([]vault.RawEvent, 
 		}
 		return 0
 	})
+	for i := 1; i < len(out); i++ {
+		if out[i].Pos() == out[i-1].Pos() {
+			return nil, fmt.Errorf("%w: two archived events at ledger %d", vault.ErrMalformed, out[i].Ledger)
+		}
+	}
 	return out, nil
+}
+
+// file returns the finished writes of one file in the order they were made. A write a crash cut
+// short has no covered record and is left out.
+func (r Reader) file(name string) ([]finished, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	open := map[uint64][]vault.RawEvent{}
+	var done []finished
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		var l line
+		if err := json.Unmarshal(scanner.Bytes(), &l); err != nil {
+			// A torn line belongs to a write that never finished.
+			continue
+		}
+		switch {
+		case l.Event != nil && l.Event.Contract == r.Vault:
+			open[l.Write] = append(open[l.Write], *l.Event)
+		case l.Covered != nil && l.Covered[0] <= l.Covered[1]:
+			done = append(done, finished{covered: *l.Covered, events: open[l.Write]})
+			delete(open, l.Write)
+		}
+	}
+	return done, scanner.Err()
 }
 
 // LastCovered returns the last ledger of the newest file's coverage, or 0 for an empty archive.
@@ -184,17 +250,4 @@ func LastCovered(dir string) (uint32, error) {
 		}
 	}
 	return last, scanner.Err()
-}
-
-// contains reports whether the union of the ranges covers [from, to].
-func contains(ranges [][2]uint32, from, to uint32) bool {
-	slices.SortFunc(ranges, func(a, b [2]uint32) int { return int(a[0]) - int(b[0]) })
-	next := uint64(from)
-	for _, r := range ranges {
-		if uint64(r[0]) > next {
-			break
-		}
-		next = max(next, uint64(r[1])+1)
-	}
-	return next > uint64(to)
 }

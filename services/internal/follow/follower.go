@@ -106,6 +106,7 @@ func (f *Follower) read(ctx context.Context, from, to, oldest uint32) ([]vault.R
 // Run follows until ctx ends. Errors are passed to onError and retried with backoff; a fault is
 // retried too, because the data might have come from a faulty RPC.
 func (f *Follower) Run(ctx context.Context, poll time.Duration, onError func(error)) {
+	poll = max(poll, 100*time.Millisecond)
 	backoff := poll
 	for ctx.Err() == nil {
 		progressed, err := f.Step(ctx)

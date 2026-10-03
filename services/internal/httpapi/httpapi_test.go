@@ -37,6 +37,9 @@ func TestReadJSONIsStrict(t *testing.T) {
 		`{"a":1,"b":2}`:                       false,
 		`{"a":1}{"a":2}`:                      false,
 		`{"a":1} x`:                           false,
+		`{"a":1}]`:                            false,
+		`{"a":1,"a":2}`:                       false,
+		`{"A":1}`:                             false,
 		strings.Repeat(" ", 2048) + `{"a":1}`: false,
 	} {
 		var b body

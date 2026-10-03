@@ -373,8 +373,11 @@ func (r *Relayer) transact(req Request, channel string) (txnbuild.Operation, err
 }
 
 // send simulates on a free channel, signs and submits, and tracks the transaction in the
-// background. It returns once the network holds the transaction.
-func (r *Relayer) send(ctx context.Context, req Request) (string, *failure) {
+// background. It returns once the network holds the transaction. It runs on the relayer's own
+// context, so a client that disconnects cannot leave a sent transaction untracked.
+func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
+	ctx, cancel := context.WithTimeout(r.ctx, 2*time.Minute)
+	defer cancel()
 	ch, ok := r.channels.acquire(ctx, 10*time.Second)
 	if !ok {
 		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)

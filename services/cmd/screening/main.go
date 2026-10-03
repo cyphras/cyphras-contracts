@@ -103,7 +103,7 @@ func build(ctx context.Context, base *service.Base) (*screening.Screener, error)
 	if err != nil {
 		return nil, err
 	}
-	horizon, err := config.Required("HORIZON_URL")
+	horizon, err := config.Value("HORIZON_URL")
 	if err != nil {
 		return nil, err
 	}

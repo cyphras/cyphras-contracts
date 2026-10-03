@@ -6,7 +6,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	jsonv2 "encoding/json/v2"
 	"io"
 	"log"
 	"net"
@@ -51,17 +51,11 @@ func Public(next http.Handler) http.Handler {
 	})
 }
 
-// ReadJSON decodes a body of at most limit bytes into v, refusing unknown fields and trailing data.
+// ReadJSON decodes a body of at most limit bytes into v. Member names must match exactly and
+// appear once, unknown members are refused, and nothing may follow the value, so a body has one
+// reading only.
 func ReadJSON(w http.ResponseWriter, r *http.Request, limit int64, v any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		return err
-	}
-	if dec.More() {
-		return errors.New("trailing data")
-	}
-	return nil
+	return jsonv2.UnmarshalRead(http.MaxBytesReader(w, r.Body, limit), v, jsonv2.RejectUnknownMembers(true))
 }
 
 // Limiter is a token bucket shared by every client of an endpoint.

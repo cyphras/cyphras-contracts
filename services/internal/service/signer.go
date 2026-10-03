@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -47,14 +48,22 @@ func CheckSigner(ctx context.Context, c rpc.Client, account string, key *keypair
 	return nil
 }
 
-// Engine builds the submission engine from INCLUSION_FEE_CAP and the defaults the services share.
+// Engine builds the submission engine from INCLUSION_FEE_CAP and RESOURCE_FEE_CAP, in stroops,
+// and the defaults the services share.
 func Engine(c rpc.Client, passphrase string) (*submit.Engine, error) {
-	capFee, err := config.Int("INCLUSION_FEE_CAP", 1_000_000)
+	inclusionCap, err := config.Int("INCLUSION_FEE_CAP", 1_000_000)
 	if err != nil {
 		return nil, err
 	}
+	resourceCap, err := config.Int("RESOURCE_FEE_CAP", 50_000_000)
+	if err != nil {
+		return nil, err
+	}
+	if inclusionCap <= 0 || resourceCap <= 0 {
+		return nil, errors.New("fee caps must be positive")
+	}
 	return &submit.Engine{
-		RPC: c, Passphrase: passphrase, MaxInclusionFee: capFee, ResourceMarginPct: 15,
+		RPC: c, Passphrase: passphrase, MaxInclusionFee: inclusionCap, MaxResourceFee: resourceCap, ResourceMarginPct: 15,
 		Validity: 90 * time.Second, Poll: 2 * time.Second,
 	}, nil
 }

@@ -261,3 +261,53 @@ func TestTheInclusionFeeIsTheCappedP90(t *testing.T) {
 		}
 	}
 }
+
+func TestAnUnansweredSendIsResolvedByItsHash(t *testing.T) {
+	h := newHarness(t)
+	sends := 0
+	h.fake.Send = func(req protocol.SendTransactionRequest) (protocol.SendTransactionResponse, error) {
+		sends++
+		if sends == 1 {
+			// The first copy reaches the network but the answer is lost.
+			return protocol.SendTransactionResponse{}, errors.New("timeout")
+		}
+		r := xdr.TransactionResult{Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxBadSeq}}
+		b, _ := xdr.MarshalBase64(r)
+		return protocol.SendTransactionResponse{Status: "ERROR", ErrorResultXDR: b}, nil
+	}
+	h.fake.Get = func(protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
+		return success(10, 5, 0), nil
+	}
+	res, err := h.engine.Do(context.Background(), h.account, func() (txnbuild.Operation, error) { return invoke(), nil }, 3)
+	if err != nil || res.Outcome != Success {
+		t.Fatalf("applied transaction reported as %+v %v", res, err)
+	}
+	if sends != 2 || h.fake.CallCount("simulateTransaction") != 1 {
+		t.Fatalf("%d sends, %d simulations", sends, h.fake.CallCount("simulateTransaction"))
+	}
+
+	// When the hash never lands before the time bound, the attempt is an expiry.
+	h2 := newHarness(t)
+	h2.fake.Send = func(protocol.SendTransactionRequest) (protocol.SendTransactionResponse, error) {
+		return protocol.SendTransactionResponse{}, errors.New("timeout")
+	}
+	p, err := h2.engine.Prepare(context.Background(), h2.account, invoke())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2.fake.Get = func(protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
+		return protocol.GetTransactionResponse{LatestLedgerCloseTime: p.MaxTime + 1, TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusNotFound}}, nil
+	}
+	h2.clock = h2.clock.Add(2 * time.Minute)
+	if _, err := h2.engine.Send(context.Background(), p); !errors.Is(err, ErrExpired) {
+		t.Fatalf("unanswered and never applied: %v", err)
+	}
+}
+
+func TestAResourceFeeAboveTheCapIsRefused(t *testing.T) {
+	h := newHarness(t)
+	h.engine.MaxResourceFee = 49_999
+	if _, err := h.engine.Prepare(context.Background(), h.account, invoke()); !errors.Is(err, ErrSimulation) {
+		t.Fatalf("resource fee above the cap: %v", err)
+	}
+}

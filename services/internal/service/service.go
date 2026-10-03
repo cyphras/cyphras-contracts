@@ -11,8 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/stellar/go-stellar-sdk/clients/rpcclient"
-
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
@@ -28,7 +26,7 @@ type Base struct {
 	Alerts     *alert.Alerter
 	Deployment config.Deployment
 	Vault      config.DeployedVault
-	RPC        *rpcclient.Client
+	RPC        rpc.Client
 	NetworkID  [32]byte
 }
 
@@ -61,8 +59,8 @@ func Alerter(name string, log *slog.Logger) (*alert.Alerter, error) {
 	return a, nil
 }
 
-// Start loads the deployment and the vault named by VAULT, connects to RPC_URL and refuses an RPC
-// that serves another network.
+// Start loads the deployment and the vault named by VAULT, connects to RPC_URL (or the file named
+// by RPC_URL_FILE) and refuses an RPC that serves another network.
 func Start(ctx context.Context, name string) (*Base, error) {
 	log := Logger(name)
 	alerts, err := Alerter(name, log)
@@ -81,7 +79,7 @@ func Start(ctx context.Context, name string) (*Base, error) {
 	if err != nil {
 		return nil, err
 	}
-	url, err := config.Required("RPC_URL")
+	url, err := config.Value("RPC_URL")
 	if err != nil {
 		return nil, err
 	}
