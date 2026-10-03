@@ -79,6 +79,10 @@ type Config struct {
 	RaceFailures int
 	RaceWindow   time.Duration
 	GuardedFor   time.Duration
+	// FreshRoots is how many of the vault's newest roots a proof may be made against, checked when
+	// a request is accepted and again before it is sent, so its root still has insertions to spare
+	// when the transaction lands; 200 of the 256 the vault keeps when unset.
+	FreshRoots uint32
 }
 
 func (c *Config) defaults() {
@@ -108,6 +112,9 @@ func (c *Config) defaults() {
 	}
 	if c.LedgerSeconds == 0 {
 		c.LedgerSeconds = 5
+	}
+	if c.FreshRoots == 0 {
+		c.FreshRoots = 200
 	}
 }
 
@@ -161,9 +168,10 @@ type Relayer struct {
 	heldBy    map[string]*heldRequest
 	heldOrder []string
 
-	chainMu     sync.RWMutex
-	inst        *vault.Instance
-	roots       map[fr.Element]bool
+	chainMu sync.RWMutex
+	inst    *vault.Instance
+	// roots holds the age of each root the vault keeps, 0 for the newest.
+	roots       map[fr.Element]uint32
 	latest      uint32
 	latestClose int64
 }
@@ -329,10 +337,10 @@ func (r *Relayer) readRoots(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	roots := make(map[fr.Element]bool, len(ring.Roots))
-	for _, root := range ring.Roots {
+	roots := make(map[fr.Element]uint32, len(ring.Roots))
+	for i, root := range ring.Roots {
 		if !root.IsZero() {
-			roots[root] = true
+			roots[root] = (ring.Newest + vault.RootHistory - uint32(i)) % vault.RootHistory
 		}
 	}
 	r.chainMu.Lock()
@@ -341,18 +349,24 @@ func (r *Relayer) readRoots(ctx context.Context) error {
 	return nil
 }
 
-// knownRoot reports whether the vault still accepts a root, reading the root history again when
-// the root is newer than the last refresh.
-func (r *Relayer) knownRoot(ctx context.Context, root fr.Element) bool {
+// freshRoot reports whether a root is among the vault's newest FreshRoots: one older would leave a
+// transaction made against it to fail when insertions push it out of the vault's history before
+// it lands. The root history is read again first when reread is set, and when the root is newer
+// than the last read.
+func (r *Relayer) freshRoot(ctx context.Context, root fr.Element, reread bool) (bool, error) {
 	r.chainMu.RLock()
-	known := r.roots[root]
+	age, known := r.roots[root]
 	r.chainMu.RUnlock()
-	if known || r.readRoots(ctx) != nil {
-		return known
+	if known && !reread {
+		return age < r.cfg.FreshRoots, nil
+	}
+	if err := r.readRoots(ctx); err != nil {
+		return false, err
 	}
 	r.chainMu.RLock()
 	defer r.chainMu.RUnlock()
-	return r.roots[root]
+	age, known = r.roots[root]
+	return known && age < r.cfg.FreshRoots, nil
 }
 
 // spent reports whether either nullifier is already spent.
@@ -384,7 +398,14 @@ func (r *Relayer) local(ctx context.Context, req Request) *failure {
 	inputs := [groth16.PublicInputs]fr.Element{
 		p.Root, p.PublicAmount, p.ExtDataHash, inst.Config.Domain, p.Nullifiers[0], p.Nullifiers[1], p.Commitments[0], p.Commitments[1],
 	}
-	if !r.cfg.Key.Verify(p.A, p.B, p.C, inputs) || !r.knownRoot(ctx, p.Root) {
+	if !r.cfg.Key.Verify(p.A, p.B, p.C, inputs) {
+		return fail(http.StatusUnprocessableEntity, CodeRejected)
+	}
+	ok, err := r.freshRoot(ctx, p.Root, false)
+	switch {
+	case err != nil:
+		return fail(http.StatusServiceUnavailable, CodeUnavailable)
+	case !ok:
 		return fail(http.StatusUnprocessableEntity, CodeRejected)
 	}
 	return nil
@@ -941,6 +962,13 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 			return "", f
 		}
 	}
+	current, err := r.freshRoot(ctx, req.Proof.Root, true)
+	if err != nil {
+		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	if !current {
+		return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
+	}
 	signed, err := r.engine.Send(ctx, prepared)
 	if err != nil {
 		if errors.Is(err, submit.ErrRejected) {
@@ -998,7 +1026,7 @@ func (r *Relayer) finish(res submit.Result, sent Record) {
 		r.log.Warn("failed on chain", "tx", res.Hash, "result", res.Code, "cause", c.String(), "network_fee", res.FeeCharged)
 		r.coolDown(sent, c)
 		switch c {
-		case causeSpent, causeReceive:
+		case causeSpent, causeReceive, causeRace:
 			if c == causeSpent {
 				r.known.add(sentNullifiers(sent)...)
 			}
@@ -1045,15 +1073,19 @@ const (
 	causeSpent
 	// causeReceive is a destination that stopped receiving after it was checked.
 	causeReceive
+	// causeRace is the chain moving under the call between its simulation and its ledger: the root
+	// it was proved against pushed out of the vault's history.
+	causeRace
 )
 
 func (c cause) String() string {
-	return [...]string{"relayer", "vault", "notes spent first", "destination stopped receiving"}[c]
+	return [...]string{"relayer", "vault", "notes spent first", "destination stopped receiving", "the chain moved under the call"}[c]
 }
 
 // The vault's error codes a client can bring about after its request was checked. Codes below
 // 100 are the asset contract's, which reach the vault's callers unchanged.
 const (
+	vaultUnknownRoot    = 121
 	vaultNullifierSpent = 123
 	vaultCannotReceive  = 144
 	firstVaultCode      = 100
@@ -1082,6 +1114,8 @@ func (r *Relayer) classify(res submit.Result, sent Record) cause {
 		return causeVault
 	case e.Contract == r.cfg.Vault && e.Code == vaultNullifierSpent:
 		return causeSpent
+	case e.Contract == r.cfg.Vault && e.Code == vaultUnknownRoot:
+		return causeRace
 	case e.Contract == r.cfg.Vault && e.Code == vaultCannotReceive:
 		// The vault checks the fee address too; only the destination is the client's to change.
 		if ok, err := r.CanReceive(ctx, r.cfg.FeeAddress, new(big.Int)); err == nil && !ok {
@@ -1125,10 +1159,10 @@ func (r *Relayer) vaultCanPay(ctx context.Context) (bool, error) {
 }
 
 // coolDown rests what a failed relay carried, in memory and in the database, so a restart does
-// not forget it: the notes, unless the relayer was at fault, for a day; and after a receive
-// failure the destination, for longer each time it fails again.
+// not forget it: the notes, unless the relayer was at fault or the chain moved under the call, for
+// a day; and after a receive failure the destination, for longer each time it fails again.
 func (r *Relayer) coolDown(rec Record, c cause) {
-	if c == causeRelayer {
+	if c == causeRelayer || c == causeRace {
 		return
 	}
 	now := r.now()
