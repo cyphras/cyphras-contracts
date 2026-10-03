@@ -466,9 +466,15 @@ func TestACorrectionInsideTheAttestedRangeWaitsForTheFinalWindow(t *testing.T) {
 	if got := h.sent(); len(got) != 0 {
 		t.Fatalf("sent %v", got)
 	}
-	// In its final window the correction is its final check.
+	// In its final window the correction is its final check: a referral is not clear enough.
 	h.now = time.Unix(int64(h.deposits[dirty].createdAt), 0).Add(24*time.Hour - 9*time.Minute)
-	h.sources.set(map[string]Hit{}, "4", h.now)
+	h.funders[thief] = []string{funder}
+	h.sources.set(map[string]Hit{funder: {Source: "exploits", Refer: true}}, "4", h.now)
+	if err := h.s.Unflag(ctx, dirty, "reviewer", "false positive"); err == nil || !strings.Contains(err.Error(), "do not clear") {
+		t.Fatalf("a correction on a referral: %v", err)
+	}
+	delete(h.funders, thief)
+	h.sources.set(map[string]Hit{}, "5", h.now)
 	if err := h.s.Unflag(ctx, dirty, "reviewer", "false positive"); err != nil {
 		t.Fatal(err)
 	}

@@ -88,6 +88,8 @@ func TestAClaimHasRoomForExitsQueuedAheadOfIt(t *testing.T) {
 
 func TestAReleaseHasRoomForReleasesAheadOfIt(t *testing.T) {
 	h := newHarness(t)
+	// A full batch, so the exit the room names is past the batch.
+	h.k.cfg.MaxReleases = 2
 	h.limit = 1000
 	h.status.ExitHead, h.status.ExitTail = 1, 1
 	h.queueExits(300, 250, 500)
