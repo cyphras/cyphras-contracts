@@ -199,6 +199,34 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal(owedTo(world, destination), 90n * XLM);
   });
 
+  it("moves a self-relayed split along without its signer, and sends parts only with it", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const { alice } = await twoNotes(world);
+    const destination = world.signer("exchange").publicKey;
+    const account = world.signer("my account");
+    await alice.unshield({
+      to: destination,
+      amount: 90n * XLM,
+      selfRelay: account,
+      split: true,
+      confirm: confirmAll,
+    });
+    world.advance(60);
+    // The first part landed: its gap starts without the signer, and nothing more is sent.
+    let [view] = await alice.continueOperations();
+    assert.equal(view?.sent, 50n * XLM);
+    assert.ok((view?.nextAt as number) >= world.clock() + 3_600_000);
+    world.advance(7 * 3600);
+    [view] = await alice.continueOperations();
+    assert.equal(view?.plans.length, 1);
+    [view] = await alice.continueOperations(account);
+    assert.equal(view?.plans.length, 2);
+    world.advance(60);
+    [view] = await alice.continueOperations();
+    assert.equal(view?.state, "done");
+    assert.equal(owedTo(world, destination), 90n * XLM);
+  });
+
   it("goes on with a split whose part the user retried by hand once the retry lands", async () => {
     const world = await createWorld({ limits: SPLIT });
     const { alice } = await twoNotes(world);

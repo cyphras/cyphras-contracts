@@ -934,7 +934,8 @@ export class PrivateWallet {
         if (op.state !== "active") continue;
         const parts = state.plans.filter((p) => p.operationId === op.id);
         if (parts.some(isActive)) continue;
-        if (op.route.kind === "self" && signer?.publicKey !== op.route.account) continue;
+        // A self-relayed part goes only with its signer; the operation's state moves without it.
+        const sends = op.route.kind !== "self" || signer?.publicKey === op.route.account;
         const relay = op.route.kind === "self" ? signer : undefined;
         const awaiting = parts.find((p) => p.id === op.awaiting);
         if (awaiting !== undefined) {
@@ -955,7 +956,7 @@ export class PrivateWallet {
               op.blockedBy = awaiting.id;
               continue;
             }
-            await this.#nextPart(op, relay, free, awaiting);
+            if (sends) await this.#nextPart(op, relay, free, awaiting);
             continue;
           }
           op.awaiting = undefined;
@@ -965,7 +966,7 @@ export class PrivateWallet {
           op.state = "done";
           continue;
         }
-        if (this.#core.now() < op.nextAt) continue;
+        if (this.#core.now() < op.nextAt || !sends) continue;
         await this.#nextPart(op, relay, undefined, undefined);
       }
       await this.#core.save();
