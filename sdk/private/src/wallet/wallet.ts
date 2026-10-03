@@ -86,10 +86,11 @@ import {
   checkRoot,
   crossCheck,
   downloadChain,
+  eventsUpTo,
   isActive,
   recheck,
   recordEvents,
-  resetUnlanded,
+  resetEvidence,
   stageDownload,
 } from "./sync.ts";
 
@@ -534,7 +535,7 @@ export class PrivateWallet {
     const draft = structuredClone(core.state);
     if (full) {
       const { revision, plans, deposits, operations } = draft;
-      resetUnlanded(plans);
+      resetEvidence(plans);
       Object.assign(draft, emptyState(core.deployment.deployLedger), {
         revision,
         plans,
@@ -617,11 +618,14 @@ export class PrivateWallet {
       const checked = source.kind === "rpc" || crossChecked;
       newNotes = applyDownload(core.state, core.scan, data, checked);
       core.state.rootCheck = check;
+      // RPC's events count towards a plan's fate only where they matched the indexer's data.
+      if (crossChecked && events !== undefined) {
+        recordEvents(core.state.plans, eventsUpTo(events, data.horizon));
+      }
     } else {
       stageDownload(core.state, core.scan, data);
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
-    if (events !== undefined) recordEvents(core.state.plans, events);
     const rechecked = await recheck(
       core.state,
       core.scan,

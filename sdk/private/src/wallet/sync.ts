@@ -16,7 +16,6 @@ import {
   LANDED_STATES,
   type OwnedNote,
   type Plan,
-  type PlanState,
   type RootCheck,
   type Staging,
   type WalletState,
@@ -229,13 +228,15 @@ function evidenceOf(plan: Plan, txHash: string, ledger: number): Evidence {
   return e;
 }
 
-const undecided = (plans: readonly Plan[]): Plan[] =>
-  plans.filter((p) => !LANDED_STATES.includes(p.state));
+// Each of the plan's two commitments is in the vault's tree, in whatever transaction.
+const landed = (plan: Plan): boolean =>
+  [0, 1].every((slot) => plan.evidence.some((e) => e.outputs[slot] !== undefined));
 
 // Records where the plans' output commitments landed, among leaves the vault's root confirmed:
-// those positions hold the commitments whatever transaction the source names for them.
+// those positions hold the commitments whatever transaction the source names for them. Only these
+// leaves show where a plan landed; a plan already shown to land takes none again.
 function recordOutputs(plans: readonly Plan[], found: readonly FoundLeaf[]): void {
-  for (const plan of undecided(plans)) {
+  for (const plan of plans.filter((p) => !landed(p))) {
     for (const leaf of found) {
       const slot = plan.commitments.indexOf(leaf.commitment);
       if (slot >= 0) evidenceOf(plan, leaf.txHash, leaf.ledger).outputs[slot] = leaf.index;
@@ -243,9 +244,11 @@ function recordOutputs(plans: readonly Plan[], found: readonly FoundLeaf[]): voi
   }
 }
 
-// Records what the vault's own events show of each plan, transaction by transaction: which of its
-// nullifiers a transaction spent, where it added the plan's commitments, and whether it added a
-// leaf that is not the plan's.
+// Records what the vault's own events show of each plan that has not landed, transaction by
+// transaction: whether it spent one of the plan's notes, its dummy inputs aside, and whether it
+// added a leaf that is not the plan's. The caller passes only events the wallet checked: those a
+// cross-check matched with the indexer's data, up to its horizon, and those a recheck matched with
+// what the wallet kept.
 export function recordEvents(
   plans: readonly Plan[],
   events: Pick<VaultEvents, "leaves" | "nullifiers">,
@@ -261,18 +264,28 @@ export function recordEvents(
   };
   for (const leaf of events.leaves) tx(leaf.txHash, leaf.ledger).leaves.push(leaf);
   for (const n of events.nullifiers) tx(n.txHash, n.ledger).nullifiers.push(n.nullifier);
-  for (const plan of undecided(plans)) {
+  for (const plan of plans.filter((p) => !LANDED_STATES.includes(p.state))) {
+    const notes = plan.inputs.map((input) => input.nf);
     for (const [hash, t] of txs) {
-      const spends = plan.nullifiers.map((nf) => t.nullifiers.includes(nf));
-      const outputs = plan.commitments.map((cm) => t.leaves.find((l) => l.commitment === cm));
-      if (!spends.some(Boolean) && outputs.every((o) => o === undefined)) continue;
+      const spends = plan.nullifiers.map((nf) => notes.includes(nf) && t.nullifiers.includes(nf));
+      if (!spends.some(Boolean)) continue;
       const e = evidenceOf(plan, hash, t.ledger);
       e.checked = true;
       e.nullifiers = [e.nullifiers[0] || spends[0] === true, e.nullifiers[1] || spends[1] === true];
-      e.outputs = [e.outputs[0] ?? outputs[0]?.index, e.outputs[1] ?? outputs[1]?.index];
       e.foreign ||= t.leaves.some((l) => !plan.commitments.includes(l.commitment));
     }
   }
+}
+
+// The vault's events of the ledgers up to `ledger`.
+export function eventsUpTo(
+  events: Pick<VaultEvents, "leaves" | "nullifiers">,
+  ledger: number,
+): Pick<VaultEvents, "leaves" | "nullifiers"> {
+  return {
+    leaves: events.leaves.filter((l) => l.ledger <= ledger),
+    nullifiers: events.nullifiers.filter((n) => n.ledger <= ledger),
+  };
 }
 
 // The notes and outgoing outputs this wallet finds in new leaves, with the paths of notes in the
@@ -294,7 +307,7 @@ function scanDownload(
     if (state.notes.some((n) => n.pos === leaf.index)) continue;
     if (scanLeaf(found, leaf, keys, cache)) newNotes++;
   }
-  const commitments = new Set(undecided(state.plans).flatMap((p) => p.commitments));
+  const commitments = new Set(state.plans.filter((p) => !landed(p)).flatMap((p) => p.commitments));
   const planLeaves = data.leaves
     .filter((l) => commitments.has(l.commitment))
     .map((l) => ({ index: l.index, commitment: l.commitment, ledger: l.ledger, txHash: l.txHash }));
@@ -460,24 +473,25 @@ export function isActive(plan: Plan): boolean {
   return ACTIVE_STATES.includes(plan.state);
 }
 
-// Each of the plan's two commitments is in the vault's tree, in whatever transaction.
-const landed = (plan: Plan): boolean =>
-  [0, 1].every((slot) => plan.evidence.some((e) => e.outputs[slot] !== undefined));
-
-// The transaction the plan landed in: by the vault's events where they show it.
+// The transaction the plan landed in, as the source of its leaves named it.
 function landing(plan: Plan): Evidence {
-  const both = plan.evidence.filter((e) => e.outputs.every((pos) => pos !== undefined));
-  return (both.find((e) => e.checked) ??
-    both[0] ??
-    plan.evidence.find((e) => e.outputs[0] !== undefined)) as Evidence;
+  const both = plan.evidence.find((e) => e.outputs.every((pos) => pos !== undefined));
+  return both ?? (plan.evidence.find((e) => e.outputs[0] !== undefined) as Evidence);
 }
 
-// The vault's events show a transaction that spent one of the plan's notes and added outputs that
-// are not the plan's, or a plan of this wallet that spends the same notes has landed.
-function superseded(plans: readonly Plan[], plan: Plan): boolean {
+// The vault's checked events show another transaction that spent one of the plan's notes, as the
+// note's own record of its spend agrees, and added outputs that are not the plan's; or a plan of
+// this wallet that spends the same notes has landed.
+function superseded(state: WalletState, plan: Plan): boolean {
+  const spentBy = (e: Evidence): boolean =>
+    plan.inputs.some((input) => {
+      const slot = plan.nullifiers.indexOf(input.nf);
+      const note = state.notes.find((n) => n.pos === input.pos);
+      return slot >= 0 && e.nullifiers[slot] === true && note?.spent?.txHash === e.txHash;
+    });
   return (
-    plan.evidence.some((e) => e.checked && e.foreign && e.nullifiers.some(Boolean)) ||
-    plans.some(
+    plan.evidence.some((e) => e.checked && e.foreign && spentBy(e)) ||
+    state.plans.some(
       (q) =>
         q !== plan &&
         LANDED_STATES.includes(q.state) &&
@@ -486,14 +500,45 @@ function superseded(plans: readonly Plan[], plan: Plan): boolean {
   );
 }
 
-// Moves each plan that has not landed along the submission state machine. A plan landed once both
-// its commitments are in the vault's tree. It is superseded once the vault's events show another
-// transaction spending one of its notes, or another plan of this wallet that spends the same notes
-// landed. It is dead once the wallet holds the vault's whole tree, as read at `view`, without the
-// plan's commitments in it, at or past the plan's deadline or once the plan's root has left the
-// vault's history: from then on the vault refuses its proof. A dead or superseded plan whose
-// commitments turn up is confirmed all the same.
+// A plan taken for landed whose landing a rescan has not found again, where the checked spends of
+// its ledger show one of its notes not spent by its transaction: it did not land there.
+function landingRefuted(state: WalletState, plan: Plan): boolean {
+  const at = plan.ledger;
+  if (at === undefined || !checkedBetween(state, at, at)) return false;
+  return plan.inputs.some((input) => {
+    const note = state.notes.find((n) => n.pos === input.pos);
+    const spent = note?.spent;
+    return note !== undefined && (spent?.txHash !== plan.txHash || spent?.ledger !== at);
+  });
+}
+
+// Moves each plan along the submission state machine. A plan landed once both its commitments are
+// in the vault's tree. It is superseded once the vault's checked events show another transaction
+// spending one of its notes, or another plan of this wallet that spends the same notes landed. It
+// is dead once the wallet holds the vault's whole tree, as read at `view`, without the plan's
+// commitments in it, at or past the plan's deadline or once the plan's root has left the vault's
+// history: from then on the vault refuses its proof. A dead or superseded plan whose commitments
+// turn up is confirmed all the same. A landed plan whose evidence a rescan dropped takes the
+// transaction the rebuilt leaves show, or starts over once the checked spends refute its landing.
 export function advancePlans(state: WalletState, view: ChainView): void {
+  for (const plan of state.plans) {
+    if (!LANDED_STATES.includes(plan.state)) continue;
+    if (landed(plan)) {
+      const e = landing(plan);
+      if (e.txHash !== plan.txHash || e.ledger !== plan.ledger) {
+        // Its exit is followed again, from the transaction it landed in.
+        plan.txHash = e.txHash;
+        plan.ledger = e.ledger;
+        plan.exit = undefined;
+        plan.state = "confirmed";
+      }
+    } else if (landingRefuted(state, plan)) {
+      plan.state =
+        plan.txHash === undefined && plan.heldId === undefined ? "prepared" : "submitted";
+      plan.ledger = undefined;
+      plan.exit = undefined;
+    }
+  }
   const open = state.plans.filter(
     (p) => isActive(p) || p.state === "dead" || p.state === "superseded",
   );
@@ -507,7 +552,7 @@ export function advancePlans(state: WalletState, view: ChainView): void {
   const whole = view.roots.nextLeaf === state.tree.leafCount;
   for (const plan of open) {
     if (plan.state === "confirmed" || plan.state === "superseded") continue;
-    if (superseded(state.plans, plan)) {
+    if (superseded(state, plan)) {
       plan.state = "superseded";
     } else if (
       isActive(plan) &&
@@ -519,13 +564,13 @@ export function advancePlans(state: WalletState, view: ChainView): void {
   }
 }
 
-// A full rescan rebuilds the evidence of every plan the chain has not shown to land, so nothing
-// recorded from an earlier sync decides its fate.
-export function resetUnlanded(plans: readonly Plan[]): void {
-  const unlanded: readonly PlanState[] = ["prepared", "submitted", "superseded", "dead"];
+// A full rescan rebuilds the evidence of every plan, so nothing recorded from an earlier sync
+// decides its fate: a plan that has not landed starts over, and one that has keeps its state until
+// the rebuilt chain shows again where it landed, or that it did not.
+export function resetEvidence(plans: readonly Plan[]): void {
   for (const plan of plans) {
-    if (!unlanded.includes(plan.state)) continue;
     plan.evidence = [];
+    if (LANDED_STATES.includes(plan.state)) continue;
     plan.state = plan.txHash === undefined && plan.heldId === undefined ? "prepared" : "submitted";
   }
 }

@@ -11,8 +11,8 @@ export interface SpentBy {
 
 // What one transaction showed of a plan: the leaf positions at which it added the plan's two output
 // commitments, which of the plan's two nullifiers it spent, and whether it added a leaf that is not
-// the plan's. Positions come from leaves the vault's root confirmed, or from the vault's own events;
-// the spends and the other leaves only from those events, when `checked`.
+// the plan's. Positions come only from leaves the vault's root confirmed; the spends of the plan's
+// notes and the other leaves only from the vault's events the wallet checked, when `checked`.
 export interface Evidence {
   readonly txHash: string;
   readonly ledger: number;

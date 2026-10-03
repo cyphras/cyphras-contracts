@@ -3,8 +3,14 @@ import { describe, it } from "node:test";
 import { P } from "../../src/field.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
 import type { ChainView, RootHistory } from "../../src/vault/state.ts";
-import { type Evidence, type Plan, type WalletState, emptyState } from "../../src/wallet/state.ts";
-import { advancePlans, checkRoot } from "../../src/wallet/sync.ts";
+import {
+  type Evidence,
+  type OwnedNote,
+  type Plan,
+  type WalletState,
+  emptyState,
+} from "../../src/wallet/state.ts";
+import { advancePlans, checkRoot, recordEvents } from "../../src/wallet/sync.ts";
 import { testScalar } from "../helpers.ts";
 
 const leaf = (i: number): bigint => testScalar("sync/leaf", i, P);
@@ -51,13 +57,28 @@ describe("root check", () => {
 
 describe("plan fate", () => {
   // A wallet whose tree holds `count` leaves, the vault's own as of ledger 200, with one submitted
-  // plan built then, whose proof the vault accepts up to ledger 320.
+  // plan built then, whose proof the vault accepts up to ledger 320. The plan spends the note at
+  // position 0, whose nullifier is 101, and a dummy input whose nullifier is 102.
   function walletWith(
     count: number,
     root = treeOf(count).root(),
-  ): { state: WalletState; plan: Plan } {
+  ): { state: WalletState; plan: Plan; note: OwnedNote } {
     const state = emptyState(1);
     state.tree = treeOf(count).snapshot();
+    const note: OwnedNote = {
+      pos: 0,
+      cm: leaf(0),
+      value: 11n,
+      d: new Uint8Array(11),
+      rcm: 1n,
+      nf: 101n,
+      ledger: 100,
+      txHash: "00".repeat(32),
+      pagePath: undefined,
+      spent: undefined,
+      built: false,
+    };
+    state.notes.push(note);
     const plan: Plan = {
       id: "plan",
       kind: "send",
@@ -68,7 +89,7 @@ describe("plan fate", () => {
       fee: 1n,
       to: "recipient",
       createsAccount: false,
-      inputs: [],
+      inputs: [{ pos: 0, nf: 101n, value: 11n }],
       nullifiers: [101n, 102n],
       commitments: [201n, 202n],
       outputs: [],
@@ -89,7 +110,7 @@ describe("plan fate", () => {
       error: undefined,
     };
     state.plans.push(plan);
-    return { state, plan };
+    return { state, plan, note };
   }
 
   const viewAt = (ledger: number, count: number): ChainView => ({
@@ -151,29 +172,81 @@ describe("plan fate", () => {
     assert.equal(plan.txHash, "aa".repeat(32));
   });
 
-  it("takes the landing transaction the vault's events name over the indexer's", () => {
+  it("takes where a plan landed from leaves only, never from the vault's events", () => {
     const { state, plan } = walletWith(40);
-    plan.evidence = [
-      evidence({ txHash: "aa".repeat(32), outputs: [40, 41] }),
-      evidence({ txHash: "cc".repeat(32), ledger: 211, outputs: [40, 41], checked: true }),
-    ];
+    const tx = "cc".repeat(32);
+    const at = (index: number, commitment: bigint) => ({
+      index,
+      commitment,
+      ciphertext: new Uint8Array(181),
+      ledger: 211,
+      txHash: tx,
+    });
+    recordEvents(state.plans, {
+      leaves: [at(40, 201n), at(41, 202n)],
+      nullifiers: [{ nullifier: 101n, ledger: 211, txHash: tx }],
+    });
+    assert.deepEqual(plan.evidence[0]?.outputs, [undefined, undefined]);
     advancePlans(state, viewAt(250, 40));
-    assert.equal(plan.txHash, "cc".repeat(32));
-    assert.equal(plan.ledger, 211);
+    assert.equal(plan.state, "submitted");
   });
 
-  it("supersedes a plan only on the vault's events of another transaction spending its notes", () => {
-    const { state, plan } = walletWith(40);
+  it("supersedes a plan only on the vault's checked events of another transaction spending its notes", () => {
+    const { state, plan, note } = walletWith(40);
+    const tx = "ab".repeat(32);
+    const spend = (nullifier: bigint) => ({ nullifier, ledger: 210, txHash: tx });
+    const foreign = { index: 40, commitment: 7n, ciphertext: new Uint8Array(181), ledger: 210 };
+    // A spend of the dummy input says nothing of the plan's notes.
+    recordEvents(state.plans, { leaves: [{ ...foreign, txHash: tx }], nullifiers: [spend(102n)] });
+    assert.equal(plan.evidence.length, 0);
     // The indexer's word alone, or a spend whose leaves are unknown, proves nothing.
     plan.evidence = [evidence({ nullifiers: [true, false], foreign: true })];
+    note.spent = { txHash: tx, ledger: 210 };
     advancePlans(state, viewAt(250, 40));
     assert.equal(plan.state, "submitted");
     plan.evidence = [evidence({ nullifiers: [true, false], checked: true })];
     advancePlans(state, viewAt(250, 40));
     assert.equal(plan.state, "submitted");
+    // Nor does a spend the note's own record does not show.
     plan.evidence = [evidence({ nullifiers: [true, false], foreign: true, checked: true })];
+    note.spent = undefined;
+    advancePlans(state, viewAt(250, 40));
+    assert.equal(plan.state, "submitted");
+    note.spent = { txHash: tx, ledger: 210 };
     advancePlans(state, viewAt(250, 40));
     assert.equal(plan.state, "superseded");
+  });
+
+  it("takes a landed plan's transaction again from the leaves a rescan finds", () => {
+    const { state, plan } = walletWith(40);
+    Object.assign(plan, { state: "settled", txHash: "aa".repeat(32), ledger: 205 });
+    plan.exit = { id: 3, parts: [], ledger: 205, event: undefined };
+    plan.evidence = [evidence({ txHash: "bb".repeat(32), ledger: 206, outputs: [38, 39] })];
+    advancePlans(state, viewAt(250, 40));
+    assert.equal(plan.state, "confirmed");
+    assert.equal(plan.txHash, "bb".repeat(32));
+    assert.equal(plan.ledger, 206);
+    assert.equal(plan.exit, undefined);
+  });
+
+  it("starts a landed plan over once the checked spends of its ledger refute its landing", () => {
+    const { state, plan, note } = walletWith(40);
+    Object.assign(plan, { state: "settled", txHash: "aa".repeat(32), ledger: 205 });
+    // Until the spends of its ledger are checked, nothing refutes it.
+    advancePlans(state, viewAt(250, 40));
+    assert.equal(plan.state, "settled");
+    state.nullifierSince = 230;
+    state.unchecked = [{ from: 200, to: 229, lost: false }];
+    advancePlans(state, viewAt(250, 40));
+    assert.equal(plan.state, "settled");
+    state.unchecked = [];
+    note.spent = { txHash: "aa".repeat(32), ledger: 205 };
+    advancePlans(state, viewAt(250, 40));
+    assert.equal(plan.state, "settled");
+    note.spent = undefined;
+    advancePlans(state, viewAt(250, 40));
+    assert.equal(plan.state, "submitted");
+    assert.equal(plan.ledger, undefined);
   });
 
   it("supersedes a plan whose notes a landed plan of the same wallet spent", () => {

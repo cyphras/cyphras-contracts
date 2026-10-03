@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Address, TransactionBuilder, type Transaction, xdr } from "@stellar/stellar-base";
+import {
+  Address,
+  TransactionBuilder,
+  type Transaction,
+  nativeToScVal,
+  xdr,
+} from "@stellar/stellar-base";
 import { decodeAddress } from "../../src/address.ts";
 import { bytesToHex, randomBytes } from "../../src/bytes.ts";
 import { encryptOutput } from "../../src/encryption.ts";
@@ -14,6 +20,7 @@ import { PrivateWallet } from "../../src/wallet/wallet.ts";
 import { RPC, XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
 import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
 import { TrapdoorProver, trapdoorArtifacts } from "../support/trapdoor.ts";
+import { map } from "../support/vault.ts";
 import { MNEMONIC } from "../helpers.ts";
 
 // A commitment as the indexer serves it, with its lowest bit flipped.
@@ -65,6 +72,70 @@ function flakyEvents(world: World): { fetch: FetchLike; down: boolean } {
     }) as FetchLike,
   };
   return control;
+}
+
+type FakeEvent = { readonly topic: string; readonly fields: [string, xdr.ScVal][] };
+
+// A fetch whose RPC adds fabricated vault events, all of one transaction, to its next getEvents
+// reply, as a lying node could.
+function lyingEvents(world: World): {
+  fetch: FetchLike;
+  inject(ledger: number, txHash: string, events: readonly FakeEvent[]): void;
+} {
+  let pending: { ledger: number; txHash: string; events: readonly FakeEvent[] } | undefined;
+  return {
+    fetch: async (input, init) => {
+      const res = await world.fetch(input, init);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (pending === undefined || new URL(input).origin !== RPC || body?.method !== "getEvents") {
+        return res;
+      }
+      const reply = await res.json();
+      const { ledger, txHash, events } = pending;
+      pending = undefined;
+      reply.result.events.push(
+        ...events.map((e, i) => ({
+          type: "contract",
+          ledger,
+          ledgerClosedAt: "2026-10-03T00:00:00Z",
+          contractId: world.vault.address,
+          id: `${String(ledger).padStart(12, "0")}-${String(900 + i).padStart(8, "0")}`,
+          pagingToken: "fake",
+          txHash,
+          inSuccessfulContractCall: true,
+          topic: [xdr.ScVal.scvSymbol(e.topic).toXDR("base64")],
+          value: map(e.fields).toXDR("base64"),
+        })),
+      );
+      return new Response(JSON.stringify(reply), { status: 200 });
+    },
+    inject(ledger, txHash, events) {
+      pending = { ledger, txHash, events };
+    },
+  };
+}
+
+const u256 = (n: bigint): xdr.ScVal => nativeToScVal(n, { type: "u256" });
+
+const fakeLeaf = (index: number, commitment: bigint): FakeEvent => ({
+  topic: "new_commitment",
+  fields: [
+    ["index", xdr.ScVal.scvU64(new xdr.Uint64(BigInt(index)))],
+    ["commitment", u256(commitment)],
+    ["encrypted_output", xdr.ScVal.scvBytes(Buffer.alloc(181, index % 256))],
+  ],
+});
+
+const fakeSpend = (nullifier: bigint): FakeEvent => ({
+  topic: "new_nullifier",
+  fields: [["nullifier", u256(nullifier)]],
+});
+
+// The wallet's first plan, as its sealed store holds it.
+async function storedPlan(store: MemoryStore): Promise<Plan> {
+  const state = (await loadState(new SealedStore(store, storeKeyOf(0)))) as WalletState;
+  return state.plans[0] as Plan;
 }
 
 describe("wallet safety: services that lie", () => {
@@ -325,6 +396,114 @@ describe("wallet safety: cross-checks with RPC events", () => {
     // the events keep the real ciphertext; only the indexer serves the swapped one
     assert.ok(vaultEvents.length > 0);
     await assert.rejects(fresh.sync(), isError("indexer_fault"));
+  });
+});
+
+describe("wallet safety: an RPC that lies about the vault's events", () => {
+  it("never takes a payment for landed on RPC events alone", async () => {
+    const { world, store } = await funded();
+    const rpc = lyingEvents(world);
+    const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, store);
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    // The relayer saw the proof, and so knows the commitments a node could claim landed.
+    const [cm0, cm1] = (await storedPlan(store)).commitments;
+    const next = world.vault.leaves.length;
+    // An indexer one ledger behind, as is usual, leaves the newest ledger to RPC alone.
+    world.indexer.completeTo = world.vault.ledger - 1;
+    rpc.inject(world.vault.ledger, "ee".repeat(32), [fakeLeaf(next, cm0), fakeLeaf(next + 1, cm1)]);
+    await alice.sync();
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "prepared");
+    assert.equal(plan?.mustRetry, true);
+    assert.equal((await alice.balance()).locked, 100n * XLM);
+    // Within the ledgers the indexer covers, the two disagree, and the sync keeps nothing.
+    world.indexer.completeTo = undefined;
+    rpc.inject(world.vault.ledger, "ee".repeat(32), [fakeLeaf(next, cm0), fakeLeaf(next + 1, cm1)]);
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    world.advance(121 * 5);
+    world.fill(1);
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "dead");
+    assert.equal((await alice.balance()).spendable, 100n * XLM);
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 0n);
+  });
+
+  it("never takes a live payment for superseded on RPC events alone", async () => {
+    const { world, store } = await funded();
+    const rpc = lyingEvents(world);
+    const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, store);
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
+    const [input] = (await storedPlan(store)).inputs;
+    const next = world.vault.leaves.length;
+    const forged = [
+      fakeSpend(input?.nf as bigint),
+      fakeLeaf(next, 12_345n),
+      fakeLeaf(next + 1, 67_890n),
+    ];
+    world.indexer.completeTo = world.vault.ledger - 1;
+    rpc.inject(world.vault.ledger, "dd".repeat(32), forged);
+    await alice.sync();
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    assert.equal(plan?.mustRetry, true);
+    world.indexer.completeTo = undefined;
+    rpc.inject(world.vault.ledger, "dd".repeat(32), forged);
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    // The payment's note stays locked, so no second payment can be made from it.
+    await assert.rejects(
+      alice.send({
+        to: bob.generateAddress(),
+        amount: 10n * XLM,
+        maxFee: 2n * XLM,
+        confirm: confirmAll,
+      }),
+      isError("insufficient_funds"),
+    );
+    world.advance(600);
+    world.relayer.releaseHeld();
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
+  it("starts over on rescan a payment an earlier reading took for landed though its note is unspent", async () => {
+    const { world, alice, store } = await funded();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    // A state written by an earlier release that took fabricated events for the landing.
+    const sealed = new SealedStore(store, storeKeyOf(0));
+    const state = (await loadState(sealed)) as WalletState;
+    const plan = state.plans[0] as Plan;
+    const fake = { txHash: "ee".repeat(32), ledger: world.vault.ledger };
+    Object.assign(plan, { ...fake, state: "settled" });
+    plan.evidence = [
+      { ...fake, outputs: [90, 91], nullifiers: [false, false], foreign: false, checked: true },
+    ];
+    await saveState(sealed, state);
+    world.advance(121 * 5);
+    world.fill(1);
+    const reopened = await openWallet(world, 0, store);
+    await reopened.sync();
+    assert.equal((await reopened.plans())[0]?.state, "settled");
+    assert.equal((await reopened.balance()).spendable, 0n);
+    await reopened.rescan();
+    const [rebuilt] = await reopened.plans();
+    assert.equal(rebuilt?.state, "dead");
+    assert.equal(rebuilt?.mustRetry, true);
+    assert.equal((await reopened.balance()).spendable, 100n * XLM);
   });
 });
 
