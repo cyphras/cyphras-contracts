@@ -53,28 +53,60 @@ func (k *Keeper) readExits(ctx context.Context, ids []uint64, key func(string, u
 	return out, nil
 }
 
-// window reads what is left of today's outflow window, and whether the vault takes payments now.
-func (k *Keeper) window(ctx context.Context) (vault.Instance, *big.Int, bool, error) {
+// window reads what is left of today's outflow window, what the vault can pay out, and whether
+// the vault takes payments now.
+func (k *Keeper) window(ctx context.Context) (vault.Instance, *big.Int, *big.Int, bool, error) {
 	inst, _, _, err := rpc.VaultInstance(ctx, k.rpc, k.cfg.Vault)
 	if err != nil {
-		return vault.Instance{}, nil, false, err
+		return vault.Instance{}, nil, nil, false, err
 	}
 	now, _, err := k.chainTime(ctx)
 	if err != nil {
-		return vault.Instance{}, nil, false, err
+		return vault.Instance{}, nil, nil, false, err
+	}
+	funds, err := k.funds(ctx, inst.Config.Token)
+	if err != nil {
+		return vault.Instance{}, nil, nil, false, err
 	}
 	room := new(big.Int).Sub(inst.Limits.MaxDailyOutflow, inst.Status.OutflowOn(now/secondsPerDay))
-	return inst, room, !inst.Status.Halted(now), nil
+	return inst, room, funds, !inst.Status.Halted(now), nil
+}
+
+// funds is what the vault can pay out as release judges it: its balance in the asset contract,
+// and nothing while the issuer does not let it hold the asset.
+func (k *Keeper) funds(ctx context.Context, token string) (*big.Int, error) {
+	key, err := vault.BalanceKey(token, k.cfg.Vault)
+	if err != nil {
+		return nil, err
+	}
+	e, _, err := rpc.One(ctx, k.rpc, key)
+	if errors.Is(err, rpc.ErrMissing) {
+		return new(big.Int), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	v, err := rpc.ContractValue(e)
+	if err != nil {
+		return nil, err
+	}
+	amount, authorized, err := vault.DecodeBalance(v)
+	if err != nil || !authorized {
+		return new(big.Int), err
+	}
+	return amount, nil
 }
 
 // Release pays queued exits in order while today's outflow window has room. It counts from the
-// chain how many exits fit, and when none fits whole it still tries the head, which a vault that
-// pays exits in parts will part pay. A release whose simulation handles no exit is not sent, so
-// none is paid for in vain, and a batch the transaction limits refuse in simulation is halved.
+// chain how many exits fit the window and the vault's funds, and when none fits the window whole
+// it still tries the head, which the vault pays in part. A release whose simulation handles no
+// exit is not sent, so none is paid for in vain, and a batch the transaction limits refuse in
+// simulation is halved. While the vault cannot pay the next step, which the watcher reports,
+// nothing is tried.
 func (k *Keeper) Release(ctx context.Context) error {
 	batch := max(k.cfg.MaxReleases, 1)
 	for range 100 {
-		inst, room, open, err := k.window(ctx)
+		inst, room, funds, open, err := k.window(ctx)
 		if err != nil {
 			return err
 		}
@@ -93,11 +125,21 @@ func (k *Keeper) Release(ctx context.Context) error {
 		n := 0
 		for _, e := range exits {
 			outflow := new(big.Int).Add(e.Payout, e.Fee)
-			if outflow.Cmp(room) > 0 {
+			if outflow.Cmp(room) > 0 || outflow.Cmp(funds) > 0 {
 				break
 			}
 			room.Sub(room, outflow)
+			funds.Sub(funds, outflow)
 			n++
+		}
+		if n == 0 && len(exits) > 0 {
+			step := new(big.Int).Add(exits[0].Payout, exits[0].Fee)
+			if step.Cmp(room) > 0 {
+				step = room
+			}
+			if step.Cmp(funds) > 0 {
+				return nil
+			}
 		}
 		n = max(n, 1)
 		_, err = k.callWorth(ctx, fmt.Sprintf("release of %d exits", n), func() (txnbuild.Operation, error) {

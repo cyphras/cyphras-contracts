@@ -178,10 +178,7 @@ func (h *harness) publish() {
 		}
 		fake.SetContractData(mustKey(vault.NextLeafKey(vaulttest.Vault)), vault.U64(tr.Len()), h.chain.Ledger, nil)
 		fake.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), vaulttest.RootRing(tr.Root(), uint32(tr.Len()/2)%vault.RootHistory), h.chain.Ledger, nil)
-		amount, _ := vault.I128(balance)
-		fake.SetContractData(mustKey(vault.BalanceKey(vaulttest.Token, vaulttest.Vault)), vault.Struct(
-			vault.Field{Name: "amount", Value: amount}, vault.Field{Name: "authorized", Value: vault.Bool(!h.deauthorized)}, vault.Field{Name: "clawback", Value: vault.Bool(false)},
-		), h.chain.Ledger, nil)
+		fake.SetContractData(mustKey(vault.BalanceKey(vaulttest.Token, vaulttest.Vault)), vaulttest.Balance(balance, !h.deauthorized), h.chain.Ledger, nil)
 	}
 }
 

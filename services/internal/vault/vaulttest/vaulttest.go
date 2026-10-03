@@ -386,6 +386,15 @@ func ExitEntry(recipient string, payout, fee int64, queuedAt uint64) xdr.ScVal {
 	)
 }
 
+// Balance encodes a balance entry of the asset contract.
+func Balance(amount *big.Int, authorized bool) xdr.ScVal {
+	return vault.Struct(
+		vault.Field{Name: "amount", Value: i128(amount)},
+		vault.Field{Name: "authorized", Value: vault.Bool(authorized)},
+		vault.Field{Name: "clawback", Value: vault.Bool(false)},
+	)
+}
+
 // Transfer emits the asset contract's transfer of amount from the vault to an address, in the
 // current transaction, as the Stellar Asset Contract reports it.
 func (c *Chain) Transfer(to string, amount int64) {

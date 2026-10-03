@@ -47,6 +47,10 @@ type harness struct {
 	outflows map[uint64]int64
 	// partial makes the simulated vault pay the head exit in part when it does not fit whole.
 	partial bool
+	// funds is the vault's balance, unlimited when nil; deauthorized makes the issuer refuse to
+	// let the vault hold the asset.
+	funds        *big.Int
+	deauthorized bool
 }
 
 // released is what the simulated vault's release(max) returns: how many exits it handles from the
@@ -207,6 +211,11 @@ func (h *harness) setInstance() {
 	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Vault)), vaulttest.Instance(vaulttest.InstanceOptions{
 		DelaySmall: 3600, DelayLarge: 86400, Limit: h.limit, Large: 5_000_000_000, Status: h.status, WasmHash: [32]byte{9},
 	}), 10, h.live(4_000_000))
+	funds := h.funds
+	if funds == nil {
+		funds = big.NewInt(1_000_000_000_000_000)
+	}
+	h.fake.SetContractData(mustKey(vault.BalanceKey(vaulttest.Token, vaulttest.Vault)), vaulttest.Balance(funds, !h.deauthorized), 10, h.live(4_000_000))
 }
 
 func (h *harness) live(ledgers uint32) *uint32 {
@@ -410,7 +419,11 @@ func (h *harness) release(n uint64) {
 		h.status.OutflowDay, h.status.Outflow = day, new(big.Int)
 	}
 	for range n {
-		h.status.Outflow = new(big.Int).Add(h.status.Outflow, big.NewInt(h.outflows[h.status.ExitHead]))
+		paid := big.NewInt(h.outflows[h.status.ExitHead])
+		h.status.Outflow = new(big.Int).Add(h.status.Outflow, paid)
+		if h.funds != nil {
+			h.funds = new(big.Int).Sub(h.funds, paid)
+		}
 		h.status.ExitHead++
 	}
 	h.setInstance()
@@ -466,6 +479,56 @@ func TestReleasePaysWhatFitsTheWindowAndWaitsForMidnight(t *testing.T) {
 	}
 	if d := untilRelease(time.Date(2026, 10, 3, 23, 59, 50, 0, time.UTC), 30*time.Second); d != 20*time.Second {
 		t.Fatalf("sleeps %s before midnight", d)
+	}
+}
+
+func TestReleaseWaitsWhileTheVaultCannotPay(t *testing.T) {
+	h := newHarness(t)
+	h.limit = 1000
+	h.status.ExitHead, h.status.ExitTail = 1, 1
+	h.queueExits(300, 250)
+	h.sentHook = func(d string) {
+		var n uint64
+		if _, err := fmt.Sscanf(d, "release %d", &n); err == nil {
+			h.release(n)
+		}
+	}
+	h.deauthorized = true
+	h.sync()
+	if err := h.k.Release(context.Background()); err != nil || len(h.take()) != 0 || h.fake.CallCount("simulateTransaction") != 0 {
+		t.Fatalf("released from a vault the issuer does not let hold the asset: %v", err)
+	}
+	// Authorized again, the vault holds enough for the first exit only.
+	h.deauthorized, h.funds = false, big.NewInt(400)
+	h.setInstance()
+	if err := h.k.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.take(); !equal(got, []string{"release 1"}) {
+		t.Fatalf("releases %v", got)
+	}
+
+	// Nor is the head tried in part when the vault cannot pay what the window allows of it.
+	h2 := newHarness(t)
+	h2.limit, h2.partial = 1000, true
+	h2.status.ExitHead, h2.status.ExitTail = 1, 1
+	h2.queueExits(2000)
+	h2.sentHook = func(string) {
+		h2.status.OutflowDay, h2.status.Outflow = uint64(h2.now.Unix())/secondsPerDay, big.NewInt(1000)
+		h2.setInstance()
+	}
+	h2.funds = big.NewInt(999)
+	h2.sync()
+	if err := h2.k.Release(context.Background()); err != nil || len(h2.take()) != 0 {
+		t.Fatalf("released in part beyond the vault's funds: %v", err)
+	}
+	h2.funds = big.NewInt(1000)
+	h2.setInstance()
+	if err := h2.k.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h2.take(); !equal(got, []string{"release 1"}) {
+		t.Fatalf("part payment %v", got)
 	}
 }
 
