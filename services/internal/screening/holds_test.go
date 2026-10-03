@@ -15,6 +15,7 @@ import (
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 )
@@ -309,5 +310,54 @@ func TestALiftedHoldIsNotLiftedAgainBeforeTheChainShowsIt(t *testing.T) {
 	}
 	if got := h.sent(); len(got) != 0 {
 		t.Fatalf("a lifted hold was lifted again: %v", got)
+	}
+}
+
+// gapped reads one account's history only in part, as a flood of tiny payments makes Horizon.
+type gapped struct {
+	inner   Inflows
+	account string
+}
+
+func (g gapped) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, Gap, error) {
+	out, gap, err := g.inner.Inflows(ctx, account, since)
+	if account == g.account {
+		gap |= GapVolume
+	}
+	return out, gap, err
+}
+
+func TestTheReviewQueueIsMeasuredAndPagedPastItsTime(t *testing.T) {
+	h := newHarness(t)
+	h.s.cfg.ReviewSLA = 2 * time.Hour
+	victim := keypair.MustRandom().Address()
+	h.s.check.Inflows = gapped{inner: h.s.check.Inflows, account: victim}
+	big := h.shield(victim, 6_000_000_000)
+	h.tick()
+	if hl := h.s.Health(); hl.ReviewQueue != 1 || hl.OldestReview != 0 {
+		t.Fatalf("after the first check: %+v", hl)
+	}
+	h.now = h.now.Add(time.Hour)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+	h.tick()
+	if hl := h.s.Health(); hl.OldestReview != 3600 || h.paged("review_overdue") {
+		t.Fatalf("an hour in: %+v", hl)
+	}
+	h.now = h.now.Add(61 * time.Minute)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "3", h.now)
+	h.tick()
+	var overdue bool
+	for _, p := range h.pages {
+		overdue = overdue || (p.Code == "review_overdue" && p.Severity == alert.Critical)
+	}
+	if !overdue {
+		t.Fatalf("pages %+v", h.pages)
+	}
+	if err := h.s.DecideReview(context.Background(), big, "reviewer", true); err != nil {
+		t.Fatal(err)
+	}
+	h.tick()
+	if hl := h.s.Health(); hl.ReviewQueue != 0 || !h.paged("review_overdue_resolved") {
+		t.Fatalf("after the review: %+v", hl)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -207,5 +208,41 @@ func TestAPageThatCannotBeReadIsAGapNotAnError(t *testing.T) {
 		if err != nil || gap != GapVolume {
 			t.Fatalf("%s: gap %d, %v", name, gap, err)
 		}
+	}
+}
+
+func TestPagesOfDustDoNotCountTowardThePagesRead(t *testing.T) {
+	now := time.Now().UTC()
+	reads := 0
+	// Two pages of tiny payments, then one payment that matters.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/payments") {
+			_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": []any{}}})
+			return
+		}
+		reads++
+		records := make([]map[string]any, pageSize)
+		for i := range records {
+			records[i] = map[string]any{"type": "payment", "created_at": now, "from": thief, "to": clean, "amount": "0.0000001", "asset_type": "native"}
+		}
+		if reads == 3 {
+			records = []map[string]any{{"type": "payment", "created_at": now, "from": funder, "to": clean, "amount": "100", "asset_type": "native"}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"_links":    map[string]any{"next": map[string]string{"href": "http://" + r.Host + r.URL.Path + "?cursor=next"}},
+			"_embedded": map[string]any{"records": records},
+		})
+	}))
+	defer srv.Close()
+	h := Client{URL: srv.URL, HTTP: srv.Client(), MaxPages: 2, Floors: map[string]*big.Int{"native": big.NewInt(100_000_000)}}
+	got, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour))
+	if err != nil || gap != 0 || len(got) != 2*pageSize+1 {
+		t.Fatalf("%d inflows, gap %d, %v", len(got), gap, err)
+	}
+	// Without a floor every payment is value, and the history is longer than the pages read.
+	reads = 0
+	h.Floors = nil
+	if _, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour)); err != nil || gap != GapVolume {
+		t.Fatalf("gap %d, %v", gap, err)
 	}
 }

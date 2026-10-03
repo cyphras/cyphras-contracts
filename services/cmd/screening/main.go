@@ -157,11 +157,15 @@ func build(ctx context.Context, base *service.Base) (*built, error) {
 	if err != nil {
 		return nil, err
 	}
+	reviewSLA, err := config.Duration("REVIEW_SLA", 2*time.Hour)
+	if err != nil {
+		return nil, err
+	}
 	s, err := screening.New(ctx, screening.Config{
 		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, NetworkID: base.NetworkID, Network: base.Deployment.Network,
 		PolicyVersion: config.Env("POLICY_VERSION", "1"),
 		RecheckWindow: 10 * time.Minute, Cutoff: 8 * time.Minute, FirstCheckWithin: 10 * time.Minute, RequestLookups: int(lookups),
-		Workers: int(workers), TickChecks: int(tickChecks), TickBudget: tickBudget,
+		Workers: int(workers), TickChecks: int(tickChecks), TickBudget: tickBudget, ReviewSLA: reviewSLA,
 	}, base.RPC, &chainstate.Store{Pool: pool}, check, engine, submit.NewAccount(inst.Config.ASP, hot), base.Alerts, base.Log)
 	if err != nil {
 		return nil, err
@@ -210,7 +214,7 @@ func checker(sources []screening.Source) (*screening.Checker, error) {
 	return &screening.Checker{
 		Sources: sources,
 		Inflows: &screening.CachedInflows{
-			Inner: horizon.Client{URL: horizonURL, HTTP: &http.Client{Timeout: 20 * time.Second}, MaxPages: int(maxPages)},
+			Inner: horizon.Client{URL: horizonURL, HTTP: &http.Client{Timeout: 20 * time.Second}, MaxPages: int(maxPages), Floors: floors},
 			TTL:   10 * time.Minute, Now: time.Now,
 		},
 		MaxFunders: int(maxFunders),

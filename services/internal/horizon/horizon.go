@@ -22,6 +22,9 @@ type Client struct {
 	HTTP *http.Client
 	// MaxPages bounds how far back a funder lookup reads.
 	MaxPages int
+	// Floors are, by asset, the amount below which an inflow is dust, in the asset's smallest
+	// unit; a page of dust alone does not count toward MaxPages.
+	Floors map[string]*big.Int
 }
 
 const pageSize = 200
@@ -174,15 +177,22 @@ const (
 // read: payments, path payments, account creations and merges and contract transfers from its
 // payments, and the claimable balances it claimed, the trades that paid it and its withdrawals
 // from liquidity pools from its effects. Only value counts: a transfer of nothing is left out,
-// and only pages that hold value for the account count toward MaxPages, so an account's own
-// activity does not cut its history short. A page that cannot be read is a gap, as a longer
-// history is. A missing account received nothing.
+// and only pages that hold value above dust for the account count toward MaxPages, so neither an
+// account's own activity nor a flood of tiny payments to it cuts its history short. A page that
+// cannot be read is a gap, as a longer history is. A missing account received nothing.
 func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, Gap, error) {
 	var out []Inflow
 	var gap Gap
+	// valuable is set when a page holds an inflow of value: one of unknown amount, of an asset
+	// without a floor, or at its floor or above.
+	valuable := false
 	add := func(in Inflow) {
-		if in.Amount == nil || in.Amount.Sign() != 0 {
-			out = append(out, in)
+		if in.Amount != nil && in.Amount.Sign() == 0 {
+			return
+		}
+		out = append(out, in)
+		if floor := c.Floors[in.Asset]; in.Amount == nil || floor == nil || in.Amount.Cmp(floor) >= 0 {
+			valuable = true
 		}
 	}
 	next := c.accountURL(account, "payments", fmt.Sprintf("order=desc&limit=%d", pageSize))
@@ -204,7 +214,7 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 			return nil, 0, nil
 		}
 		next = ""
-		before := len(out)
+		valuable = false
 		for _, r := range p.Embedded.Records {
 			if r.CreatedAt.Before(since) {
 				break
@@ -230,7 +240,7 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 				}
 			}
 		}
-		if len(out) > before {
+		if valuable {
 			valued++
 		}
 		if n := len(p.Embedded.Records); n == pageSize && !p.Embedded.Records[n-1].CreatedAt.Before(since) {
@@ -257,7 +267,7 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 			break
 		}
 		next = ""
-		before := len(out)
+		valuable = false
 		for _, r := range p.Embedded.Records {
 			if r.CreatedAt.Before(since) {
 				break
@@ -291,7 +301,7 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 				}
 			}
 		}
-		if len(out) > before {
+		if valuable {
 			valued++
 		}
 		if n := len(p.Embedded.Records); n == pageSize && !p.Embedded.Records[n-1].CreatedAt.Before(since) {
