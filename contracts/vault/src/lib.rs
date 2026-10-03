@@ -358,8 +358,10 @@ impl Vault {
     /// that does not fit, it pays what does, payout first, and the rest stays at the head for the
     /// next day, so no window goes unused. When the asset contract refuses a transfer, everything
     /// the exit still owes is set aside as a stranded exit for `claim`, so that a recipient who
-    /// cannot receive never holds up the exits behind it. Refused while halted; works while
-    /// paused.
+    /// cannot receive never holds up the exits behind it. While the issuer keeps the vault itself
+    /// from holding the asset, or the vault holds less than the next payment, it stops with the
+    /// queue as it is, and fails with `VaultCannotPay` if it paid nothing. Refused while halted;
+    /// works while paused.
     pub fn release(env: Env, max: u32) -> Result<u32, Error> {
         let mut status = storage::status(&env);
         let now = env.ledger().timestamp();
@@ -369,8 +371,11 @@ impl Vault {
         let max_daily_outflow = storage::limits(&env).max_daily_outflow;
         let day = now / DAY;
         let mut today = outflow_today(&status, day);
-        let token = TokenClient::new(&env, &storage::config(&env).token);
+        let config = storage::config(&env);
+        let token = TokenClient::new(&env, &config.token);
         let vault = env.current_contract_address();
+        // Read once, before the first payment, and spent down as the exits are paid.
+        let mut funds: Option<i128> = None;
         let mut count = 0;
         while count < max && status.exit_head < status.exit_tail {
             let room = max_daily_outflow
@@ -381,14 +386,27 @@ impl Vault {
             }
             let id = status.exit_head;
             let exit = storage::exit(&env, id).unwrap();
-            count += 1;
 
             // Payout first, then the fee, as far as the window reaches.
             let payout = exit.payout.min(room);
             let fee = exit.fee.min(room - payout);
+            // Transfers the issuer would refuse to the vault itself must not strand the exit, so
+            // a vault that cannot pay stops instead, with the queue as it is.
+            let available = match funds {
+                Some(funds) => funds,
+                None => vault_funds(&env, &config.token, &vault)?,
+            };
+            if payout + fee > available {
+                if count == 0 {
+                    return Err(Error::VaultCannotPay);
+                }
+                break;
+            }
+            count += 1;
             let payout_paid = try_pay(&token, &vault, &exit.recipient, payout);
             let fee_paid = try_pay(&token, &vault, &MuxedAddress::from(&exit.relayer), fee);
             let paid = payout_paid + fee_paid;
+            funds = Some(available - paid);
             today = today.checked_add(paid).ok_or(Error::Overflow)?;
             status.tvl = status.tvl.checked_sub(paid).ok_or(Error::Overflow)?;
             status.queued_total = status
@@ -881,6 +899,18 @@ fn can_receive(env: &Env, asset: &StellarAssetClient, to: &Address) -> bool {
 /// the ScAddress tag, which is 0 for an account.
 fn is_account(env: &Env, address: &Address) -> bool {
     address.clone().to_xdr(env).get(7) == Some(0)
+}
+
+/// What the vault can pay out: its balance of the asset, or `VaultCannotPay` while the issuer keeps
+/// it from holding the asset.
+fn vault_funds(env: &Env, token: &Address, vault: &Address) -> Result<i128, Error> {
+    if !matches!(
+        StellarAssetClient::new(env, token).try_authorized(vault),
+        Ok(Ok(true))
+    ) {
+        return Err(Error::VaultCannotPay);
+    }
+    Ok(TokenClient::new(env, token).balance(vault))
 }
 
 /// Pays `amount` from the vault without failing the call, and returns what was paid: all of it, or

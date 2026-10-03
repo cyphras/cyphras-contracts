@@ -422,3 +422,82 @@ fn a_payment_that_would_leave_its_account_below_the_reserve_strands() {
     assert_eq!(s.balance(&poor), XLM + XLM / 2);
     assert_eq!(s.vault.status().queued_total, 0);
 }
+
+#[test]
+fn a_vault_the_issuer_deauthorizes_neither_strands_nor_reorders_the_queue() {
+    let c = classic();
+    let s = &c.s;
+    let filler = c.holder("filler", 0);
+    let a = c.holder("a", 0);
+    let b = c.holder("b", 0);
+    fill_window(s, &filler);
+    let first = queue(s, 10 * XLM, 0, &a, &a);
+    let second = queue(s, 20 * XLM, 0, &b, &b);
+    // The issuer revokes the vault's own right to hold the asset.
+    c.asset.set_authorized(&s.vault.address, &false);
+    to_midnight(s);
+    let status = s.vault.status();
+
+    assert_eq!(
+        outcome(s.vault.try_release(&10)),
+        Err(Error::VaultCannotPay)
+    );
+    assert_eq!(s.vault.status(), status);
+    assert!(s.vault.exit(&first).is_some() && s.vault.exit(&second).is_some());
+    assert!(s.vault.stranded(&first).is_none() && s.vault.stranded(&second).is_none());
+
+    // Once it is authorized again, the queue is paid in its order.
+    c.asset.set_authorized(&s.vault.address, &true);
+    assert_eq!(s.vault.release(&1), 1);
+    assert_eq!((s.balance(&a), s.balance(&b)), (10 * XLM, 0));
+    assert_eq!(s.vault.release(&1), 1);
+    assert_eq!(s.balance(&b), 20 * XLM);
+    assert_eq!(s.vault.status().queued_total, 0);
+}
+
+#[test]
+fn a_vault_short_of_funds_pays_what_it_can_in_order_and_keeps_the_rest_queued() {
+    let c = classic();
+    let s = &c.s;
+    let filler = c.holder("filler", 0);
+    let a = c.holder("a", 0);
+    let b = c.holder("b", 0);
+    fill_window(s, &filler);
+    let first = queue(s, 10 * XLM, 0, &a, &a);
+    let second = queue(s, 20 * XLM, 0, &b, &b);
+    // The issuer claws back all but 15 units of what the vault holds.
+    let held = s.balance(&s.vault.address);
+    c.asset.clawback(&s.vault.address, &(held - 15 * XLM));
+    to_midnight(s);
+
+    // The first exit is paid; the second waits at the head instead of stranding.
+    assert_eq!(s.vault.release(&10), 1);
+    assert_eq!(s.balance(&a), 10 * XLM);
+    assert_eq!(s.vault.status().exit_head, second);
+    assert!(s.vault.exit(&first).is_none() && s.vault.stranded(&second).is_none());
+    assert_eq!(
+        outcome(s.vault.try_release(&10)),
+        Err(Error::VaultCannotPay)
+    );
+
+    // Once the vault holds enough again, the second exit is paid.
+    c.asset.mint(&s.vault.address, &(15 * XLM));
+    assert_eq!(s.vault.release(&10), 1);
+    assert_eq!(s.balance(&b), 20 * XLM);
+}
+
+#[test]
+fn release_needs_nothing_from_the_vault_when_there_is_nothing_to_pay() {
+    let c = classic();
+    let s = &c.s;
+    let filler = c.holder("filler", 0);
+    let a = c.holder("a", 0);
+    c.asset.set_authorized(&s.vault.address, &false);
+    // An empty queue, and a queue behind a full window, release nothing and fail nothing.
+    assert_eq!(s.vault.release(&10), 0);
+    c.asset.set_authorized(&s.vault.address, &true);
+    fill_window(s, &filler);
+    queue(s, 10 * XLM, 0, &a, &a);
+    c.asset.set_authorized(&s.vault.address, &false);
+    assert_eq!(s.vault.release(&10), 0);
+}

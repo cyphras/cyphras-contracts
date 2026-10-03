@@ -51,4 +51,5 @@ pub enum Error {
     NotStranded = 142,
     NothingClaimable = 143,
     CannotReceive = 144,
+    VaultCannotPay = 145,
 }

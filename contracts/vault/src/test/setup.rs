@@ -356,8 +356,8 @@ impl Setup {
     }
 }
 
-/// A vault of a classic asset whose issuer can revoke authorization, with the asset's admin
-/// client.
+/// A vault of a classic asset whose issuer can revoke authorization and claw balances back, with
+/// the asset's admin client.
 pub struct Classic {
     pub s: Setup,
     pub asset: StellarAssetClient<'static>,
@@ -368,6 +368,7 @@ impl Classic {
         let env = env(TESTNET);
         let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
         sac.issuer().set_flag(IssuerFlags::RevocableFlag);
+        sac.issuer().set_flag(IssuerFlags::ClawbackEnabledFlag);
         Classic {
             asset: StellarAssetClient::new(&env, &sac.address()),
             s: Setup::with_token(env, sac.address(), limits),
