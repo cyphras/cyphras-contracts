@@ -19,7 +19,7 @@ import {
   show,
   step,
 } from "./common.mjs";
-import { fetchRound, parseRound } from "./drand.mjs";
+import { fetchRound, parseRound, roundTime, verifyRound } from "./drand.mjs";
 import { checkVerificationKey, exportVerificationKey } from "./vk.mjs";
 
 const USAGE = `Checks the Cyphras v2 phase-2 ceremony from its public files. Every value is
@@ -27,18 +27,20 @@ recomputed here rather than read from a published hash, and any mismatch exits n
 
 Usage:
   node verify.mjs <transaction.r1cs> <${PTAU_NAME}> <transaction_final.zkey>
-      --contributions <file> --vk <verification_key.json> (--drand-round <n> | --beacon <hex>)
-      [--vk-sha256 <hex>] [--zkey-sha256 <hex>]
+      --contributions <file> --vk <verification_key.json> --drand-round <n>
+      [--drand-signature <hex>] [--beacon <hex>] [--vk-sha256 <hex>] [--zkey-sha256 <hex>]
 
   --contributions <file>  one line per signed attestation, in contribution order: the contribution
                           hash, a space and the contributor's name exactly as attested; blank
                           lines and lines starting with # are skipped
   --vk <file>             the published verification_key.json, compared byte for byte with the
                           key exported here from the final zkey
-  --drand-round <n>       the announced beacon round, fetched from the drand relays and checked
-                          against the quicknet public key
-  --beacon <hex>          the beacon randomness, to check offline; it must match --drand-round
-                          when both are given
+  --drand-round <n>       the announced beacon round; without --drand-signature it is fetched
+                          from the drand relays, and either way its signature is checked against
+                          the quicknet public key
+  --drand-signature <hex> the round's signature from the transcript, to check the beacon
+                          offline; its SHA-256 is the round's randomness
+  --beacon <hex>          the beacon randomness from the transcript, which must equal it
   --vk-sha256 <hex>       the SHA-256 the vault build pins (MAINNET_SHA256 in the verifier's
                           build/check.rs), compared with the one recomputed here
   --zkey-sha256 <hex>     the SHA-256 of the final zkey in the transcript, compared with the one
@@ -87,20 +89,22 @@ run(USAGE, async (argv) => {
       contributions: { type: "string" },
       vk: { type: "string" },
       "drand-round": { type: "string" },
+      "drand-signature": { type: "string" },
       beacon: { type: "string" },
       "vk-sha256": { type: "string" },
       "zkey-sha256": { type: "string" },
     },
   });
-  const beaconGiven = values.beacon !== undefined || values["drand-round"] !== undefined;
-  if (positionals.length !== 3 || !values.contributions || !values.vk || !beaconGiven) {
+  const required = [values.contributions, values.vk, values["drand-round"]];
+  if (positionals.length !== 3 || required.includes(undefined)) {
     throw new Error("missing arguments; run with --help");
   }
   const [r1csPath, ptauPath, zkeyPath] = positionals;
   const [r1cs, ptau, zkey] = positionals.map((path) => readFileSync(path));
   const published = readFileSync(values.vk);
   const attested = readAttested(values.contributions);
-  let beacon = values.beacon && parseHex(values.beacon, 32, "--beacon");
+  const round = parseRound(values["drand-round"]);
+  const beacon = values.beacon && parseHex(values.beacon, 32, "--beacon");
   const pin = values["vk-sha256"] && parseHex(values["vk-sha256"], 32, "--vk-sha256");
   const zkeyPin = values["zkey-sha256"] && parseHex(values["zkey-sha256"], 32, "--zkey-sha256");
 
@@ -125,16 +129,21 @@ run(USAGE, async (argv) => {
     console.log("  equal to the transcript's value");
   }
 
-  if (values["drand-round"] !== undefined) {
-    const round = parseRound(values["drand-round"]);
+  let randomness;
+  console.log(`drand quicknet round ${round}, produced at ${roundTime(round).toISOString()}`);
+  if (values["drand-signature"] !== undefined) {
+    const signature = parseHex(values["drand-signature"], 48, "--drand-signature");
+    randomness = digest(Buffer.from(signature, "hex"));
+    verifyRound(round, signature, randomness);
+    console.log(`  randomness ${randomness}\n  signature verified offline`);
+  } else {
     const drand = await fetchRound(round);
-    if (beacon && beacon !== drand.randomness) {
-      throw new Error(`--beacon ${beacon} is not the randomness of drand round ${round}`);
-    }
-    beacon = drand.randomness;
-    console.log(`drand quicknet round ${round}, produced at ${drand.time}`);
-    console.log(`  randomness ${beacon}`);
+    randomness = drand.randomness;
+    console.log(`  randomness ${randomness}`);
     console.log(`  signature verified, the same from ${drand.relays.join(", ")}`);
+  }
+  if (beacon && beacon !== randomness) {
+    throw new Error(`--beacon ${beacon} is not the randomness of drand round ${round}`);
   }
 
   const { contributions } = readZkey(zkey, zkeyPath);
@@ -165,8 +174,8 @@ run(USAGE, async (argv) => {
     );
   }
   const last = contributions.at(-1);
-  if (last.type !== 1 || last.beaconHash !== beacon) {
-    throw new Error(`the zkey must end with the beacon ${beacon}, but it does not`);
+  if (last.type !== 1 || last.beaconHash !== randomness) {
+    throw new Error(`the zkey must end with the beacon ${randomness}, but it does not`);
   }
   if (last.iterationsExp !== BEACON_ITERATIONS_EXP) {
     throw new Error(`the beacon must use numIterationsExp ${BEACON_ITERATIONS_EXP}`);

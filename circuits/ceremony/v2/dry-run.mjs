@@ -249,11 +249,12 @@ async function dryRun(root, r1cs, ptau, round) {
     VK,
     ...extra,
   ];
-  const online = (zkey) => verify(zkey, "--drand-round", String(round));
+  const { randomness, signature } = await fetchRound(round);
+  const online = (zkey, ...extra) => verify(zkey, "--drand-round", `${round}`, ...extra);
+  const offline = (zkey, ...extra) => online(zkey, "--drand-signature", signature, ...extra);
   const pin = sha256(join(verifier, VK));
-  pass("verify (online)", verifier, verify(FINAL, "--drand-round", `${round}`, "--vk-sha256", pin));
-  const { randomness } = await fetchRound(round);
-  pass("verify (offline)", verifier, verify(FINAL, "--beacon", randomness));
+  pass("verify (online)", verifier, online(FINAL, "--vk-sha256", pin));
+  pass("verify (offline)", verifier, offline(FINAL, "--beacon", randomness));
 
   const bin = join(verifier, "node_modules", ".bin", "snarkjs");
   spawnSync(bin, ["zkey", "export", "verificationkey", FINAL, "cli.json"], { cwd: verifier });
@@ -320,7 +321,7 @@ async function dryRun(root, r1cs, ptau, round) {
   refuse(
     "verify: honest final zkey against altered randomness",
     verifier,
-    verify(FINAL, "--beacon", altered),
+    online(FINAL, "--beacon", altered),
   );
 
   const vk = readFileSync(join(verifier, VK), "utf8");
@@ -333,11 +334,7 @@ async function dryRun(root, r1cs, ptau, round) {
   writeFileSync(join(verifier, VK), `${vk}\n`);
   refuse(`verify: ${VK} with one byte appended`, verifier, online(FINAL));
   writeFileSync(join(verifier, VK), vk);
-  refuse(
-    "verify: wrong vk pin",
-    verifier,
-    verify(FINAL, "--beacon", randomness, "--vk-sha256", "0".repeat(64)),
-  );
+  refuse("verify: wrong vk pin", verifier, offline(FINAL, "--vk-sha256", "0".repeat(64)));
 
   const [a, b, c] = attestations;
   const lists = {
@@ -348,11 +345,7 @@ async function dryRun(root, r1cs, ptau, round) {
   };
   for (const [label, lines] of Object.entries(lists)) {
     writeFileSync(list, `${lines.join("\n")}\n`);
-    refuse(
-      `verify: attestation list with ${label}`,
-      verifier,
-      verify(FINAL, "--beacon", randomness),
-    );
+    refuse(`verify: attestation list with ${label}`, verifier, offline(FINAL));
   }
 
   refuseBadKeys(vk);
