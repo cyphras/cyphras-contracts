@@ -29,7 +29,7 @@ func main() {
 	defer stop()
 	base, err := service.Start(ctx, "relayer")
 	if err != nil {
-		service.Fatal(nil, "start", err)
+		service.Fatal(service.Logger("relayer"), "start", err)
 	}
 	log := base.Log
 	r, err := build(ctx, base)

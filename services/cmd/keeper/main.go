@@ -20,7 +20,7 @@ func main() {
 	defer stop()
 	base, err := service.Start(ctx, "keeper")
 	if err != nil {
-		service.Fatal(nil, "start", err)
+		service.Fatal(service.Logger("keeper"), "start", err)
 	}
 	log := base.Log
 	key, err := config.Key("KEEPER_KEY")

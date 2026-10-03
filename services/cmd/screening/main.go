@@ -34,7 +34,7 @@ func main() {
 	defer stop()
 	base, err := service.Start(ctx, "screening")
 	if err != nil {
-		service.Fatal(nil, "start", err)
+		service.Fatal(service.Logger("screening"), "start", err)
 	}
 	log := base.Log
 	s, err := build(ctx, base)

@@ -26,7 +26,7 @@ func main() {
 	defer stop()
 	base, err := service.Start(ctx, "watcher")
 	if err != nil {
-		service.Fatal(nil, "start", err)
+		service.Fatal(service.Logger("watcher"), "start", err)
 	}
 	log := base.Log
 	if len(base.Alerts.Channels) < 2 {

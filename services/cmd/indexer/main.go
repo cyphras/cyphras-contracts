@@ -18,7 +18,7 @@ func main() {
 	defer stop()
 	base, err := service.Start(ctx, "indexer")
 	if err != nil {
-		service.Fatal(nil, "start", err)
+		service.Fatal(service.Logger("indexer"), "start", err)
 	}
 	log := base.Log
 	dbURL, err := service.DatabaseURL()
