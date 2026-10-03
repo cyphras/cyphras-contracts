@@ -12,6 +12,8 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
+const proofFixtures = "../../../contracts/vault/fixtures/proofs.json"
+
 type fixtureStep struct {
 	Name   string `json:"name"`
 	Call   string `json:"call"`
@@ -50,7 +52,7 @@ func amount(t *testing.T, s string) *big.Int {
 
 func fixtureSteps(t *testing.T) []fixtureStep {
 	t.Helper()
-	raw, err := os.ReadFile("../vault/testdata/proofs.json")
+	raw, err := os.ReadFile(proofFixtures)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -11,6 +11,8 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 )
 
+const proofFixtures = "../../../contracts/vault/fixtures/proofs.json"
+
 // The real proofs the vault's own tests run, from circuits/scripts/contract-fixtures.mjs.
 type fixtureFile struct {
 	NetworkID string `json:"network_id"`
@@ -48,7 +50,7 @@ type fixtureFile struct {
 
 func loadFixtures(t *testing.T) fixtureFile {
 	t.Helper()
-	raw, err := os.ReadFile("testdata/proofs.json")
+	raw, err := os.ReadFile(proofFixtures)
 	if err != nil {
 		t.Fatal(err)
 	}

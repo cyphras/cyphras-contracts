@@ -1,6 +1,7 @@
 # The services of one vault on one network, as the VPS runs them behind nginx:
 #
-#   NETWORK=testnet ASSET=xlm INDEXER_PORT=18080 RELAYER_PORT=18081 SCREENING_PORT=18090 \
+#   NETWORK=testnet ASSET=xlm VERIFYING_KEY=testnet-forgeable \
+#   INDEXER_PORT=18080 RELAYER_PORT=18081 SCREENING_PORT=18090 \
 #   INDEXER_IMAGE=ghcr.io/cyphras/cyphras-contracts/indexer@sha256:... \
 #   RELAYER_IMAGE=... KEEPER_IMAGE=... SCREENING_IMAGE=... WATCHER_IMAGE=... \
 #   docker compose -p cyphras-testnet-xlm -f compose.yaml up -d
@@ -73,8 +74,9 @@ services:
       VERIFICATION_KEY_FILE: /etc/cyphras/verification_key.json
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
-      # The key the vault's verifier was built with, for checking proofs before relaying them.
-      - ./keys/${NETWORK}.json:/etc/cyphras/verification_key.json:ro
+      # The key the vault's verifier is built with, from the same checkout, for checking proofs
+      # before relaying them.
+      - ../../contracts/verifier/keys/${VERIFYING_KEY:?set VERIFYING_KEY to the verifier's key directory}/verification_key.json:/etc/cyphras/verification_key.json:ro
     secrets: [relayer_database_url, relayer_alert_webhooks, relayer_channel_keys, relayer_screen_token]
     ports: ["127.0.0.1:${RELAYER_PORT:?}:8081"]
     networks: [egress, relayer_db, services]

@@ -34,6 +34,12 @@ import (
 )
 
 const (
+	proofFixtures = "../../../contracts/vault/fixtures/proofs.json"
+	// The fixtures are proved against the testnet verifier's key.
+	verifyingKey = "../../../contracts/verifier/keys/testnet-forgeable/verification_key.json"
+)
+
+const (
 	passphrase = "Test SDF Network ; September 2015"
 	feeAddress = "GBA3WCGVHQ5U5HNWIJXBSLCBLB5JWZH4HVWBZMU3ZLF6U4NH7OIZH3XH"
 )
@@ -54,7 +60,7 @@ func (h *harness) fund(address string) {
 // fixtureRecipients lists the recipients the fixture proofs pay.
 func fixtureRecipients(t *testing.T) []string {
 	t.Helper()
-	raw, err := os.ReadFile("../vault/testdata/proofs.json")
+	raw, err := os.ReadFile(proofFixtures)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +87,7 @@ func fixtureRecipients(t *testing.T) []string {
 // against, which the test vault then knows.
 func fixtureChain(t *testing.T) (fr.Element, []fr.Element) {
 	t.Helper()
-	raw, err := os.ReadFile("../vault/testdata/proofs.json")
+	raw, err := os.ReadFile(proofFixtures)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +124,7 @@ func fixtureChain(t *testing.T) (fr.Element, []fr.Element) {
 // the vault refuses.
 func fixture(t *testing.T, name string) map[string]any {
 	t.Helper()
-	raw, err := os.ReadFile("../vault/testdata/proofs.json")
+	raw, err := os.ReadFile(proofFixtures)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +249,7 @@ func newHarness(t *testing.T, status vault.Status) *harness {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, Validity: time.Minute, Poll: time.Millisecond, Now: h.clock}
-	rawKey, err := os.ReadFile("../groth16/testdata/testnet-forgeable.json")
+	rawKey, err := os.ReadFile(verifyingKey)
 	if err != nil {
 		t.Fatal(err)
 	}

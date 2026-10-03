@@ -10,6 +10,12 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 )
 
+const (
+	proofFixtures = "../../../contracts/vault/fixtures/proofs.json"
+	// The fixtures are proved against the testnet verifier's key.
+	verifyingKey = "../../../contracts/verifier/keys/testnet-forgeable/verification_key.json"
+)
+
 type fixtureProof struct {
 	A            string   `json:"a"`
 	B            string   `json:"b"`
@@ -24,7 +30,7 @@ type fixtureProof struct {
 
 func load(t *testing.T) (*Key, []fixtureProof) {
 	t.Helper()
-	raw, err := os.ReadFile("testdata/testnet-forgeable.json")
+	raw, err := os.ReadFile(verifyingKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +38,7 @@ func load(t *testing.T) (*Key, []fixtureProof) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err = os.ReadFile("../vault/testdata/proofs.json")
+	raw, err = os.ReadFile(proofFixtures)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +135,7 @@ func TestAProofForOtherInputsOrPointsIsRefused(t *testing.T) {
 }
 
 func TestOnlyATransactionCircuitKeyParses(t *testing.T) {
-	raw, err := os.ReadFile("testdata/testnet-forgeable.json")
+	raw, err := os.ReadFile(verifyingKey)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,9 +3,19 @@ name: services
 on:
   push:
     branches: [main, dev]
-    paths: ["services/**", "circuits/test/vectors/**", ".github/workflows/services.yml"]
+    paths:
+      - "services/**"
+      - "circuits/test/vectors/**"
+      - "contracts/vault/fixtures/**"
+      - "contracts/verifier/keys/**"
+      - ".github/workflows/services.yml"
   pull_request:
-    paths: ["services/**", "circuits/test/vectors/**", ".github/workflows/services.yml"]
+    paths:
+      - "services/**"
+      - "circuits/test/vectors/**"
+      - "contracts/vault/fixtures/**"
+      - "contracts/verifier/keys/**"
+      - ".github/workflows/services.yml"
 
 permissions:
   contents: read
