@@ -47,4 +47,10 @@ func TestTransfersAndBalancesDecode(t *testing.T) {
 	if _, err := TrustlineKey(testRelayer, "native"); err == nil {
 		t.Fatal("a trustline for the native asset")
 	}
+	// The issuer holds its own asset without a trustline.
+	for asset, want := range map[string]int{"native": 1, "USDC:" + testDepositor: 2, "USDC:" + testRelayer: 1} {
+		if keys, err := ReceiveKeys(asset, testRelayer); err != nil || len(keys) != want {
+			t.Fatalf("receive keys for %s: %d, %v", asset, len(keys), err)
+		}
+	}
 }

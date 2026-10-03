@@ -246,31 +246,22 @@ func (r *Relayer) verified(ctx context.Context, req Request) *failure {
 }
 
 // CanReceive mirrors the vault's check of an account that is to be paid: it must exist and, for an
-// issued asset, hold a trustline the issuer has authorized. A contract address is left to the
-// simulation, which runs the vault's own check.
+// issued asset it does not issue, hold a trustline the issuer has authorized. A contract address
+// is left to the simulation, which runs the vault's own check.
 func (r *Relayer) CanReceive(ctx context.Context, address string) (bool, error) {
 	account, err := vault.AccountOf(address)
 	if err != nil || account[0] != 'G' {
 		return err == nil, err
 	}
-	keys := []xdr.LedgerKey{}
-	accountKey, err := vault.AccountKey(account)
+	keys, err := vault.ReceiveKeys(r.cfg.Asset, account)
 	if err != nil {
 		return false, err
-	}
-	keys = append(keys, accountKey)
-	if r.cfg.Asset != "native" {
-		k, err := vault.TrustlineKey(account, r.cfg.Asset)
-		if err != nil {
-			return false, err
-		}
-		keys = append(keys, k)
 	}
 	entries, _, err := rpc.Entries(ctx, r.rpc, keys)
 	if err != nil {
 		return false, err
 	}
-	if _, ok := entries[mustKeyString(accountKey)]; !ok {
+	if _, ok := entries[mustKeyString(keys[0])]; !ok {
 		return false, nil
 	}
 	if len(keys) == 1 {

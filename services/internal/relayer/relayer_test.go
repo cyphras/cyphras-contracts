@@ -655,3 +655,32 @@ func TestAnUnshieldToAnAccountThatCannotReceiveIsRefusedFirst(t *testing.T) {
 		t.Fatal("an unpayable unshield reached screening or simulation")
 	}
 }
+
+func TestAnIssuedAssetNeedsAnAuthorizedTrustlineExceptForItsIssuer(t *testing.T) {
+	fake := rpctest.New(passphrase, 1000)
+	issuer, holder := keypair.MustRandom().Address(), keypair.MustRandom().Address()
+	r := &Relayer{cfg: Config{Asset: "USDC:" + issuer}, rpc: fake}
+	for _, a := range []string{issuer, holder} {
+		key := mustKey(vault.AccountKey(a))
+		fake.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{AccountId: key.MustAccount().AccountId}}, 1, nil)
+	}
+	check := func(address string, want bool) {
+		t.Helper()
+		if got, err := r.CanReceive(context.Background(), address); err != nil || got != want {
+			t.Fatalf("can receive %t, %v; want %t", got, err, want)
+		}
+	}
+	check(holder, false)
+	check(issuer, true)
+	key := mustKey(vault.TrustlineKey(holder, r.cfg.Asset))
+	asset, err := xdr.NewCreditAsset("USDC", issuer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for flags, want := range map[xdr.TrustLineFlags]bool{0: false, xdr.TrustLineFlagsAuthorizedToMaintainLiabilitiesFlag: false, xdr.TrustLineFlagsAuthorizedFlag: true} {
+		fake.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeTrustline, TrustLine: &xdr.TrustLineEntry{
+			AccountId: key.MustTrustLine().AccountId, Asset: asset.ToTrustLineAsset(), Limit: 1_000_000, Flags: xdr.Uint32(flags),
+		}}, 1, nil)
+		check(holder, want)
+	}
+}

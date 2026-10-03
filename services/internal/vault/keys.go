@@ -131,6 +131,25 @@ func TrustlineKey(account, asset string) (xdr.LedgerKey, error) {
 	return k, nil
 }
 
+// ReceiveKeys are the entries that decide whether a G account can receive the asset, named as its
+// asset contract names it: the account and, unless the asset is native or the account issues it,
+// its trustline.
+func ReceiveKeys(asset, account string) ([]xdr.LedgerKey, error) {
+	k, err := AccountKey(account)
+	if err != nil {
+		return nil, err
+	}
+	keys := []xdr.LedgerKey{k}
+	if asset == "native" || strings.HasSuffix(asset, ":"+account) {
+		return keys, nil
+	}
+	t, err := TrustlineKey(account, asset)
+	if err != nil {
+		return nil, err
+	}
+	return append(keys, t), nil
+}
+
 // ConfigSettingKey is the entry of a network configuration setting.
 func ConfigSettingKey(id xdr.ConfigSettingId) xdr.LedgerKey {
 	var k xdr.LedgerKey
