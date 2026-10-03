@@ -38,7 +38,6 @@ const (
 	feeAddress = "GBA3WCGVHQ5U5HNWIJXBSLCBLB5JWZH4HVWBZMU3ZLF6U4NH7OIZH3XH"
 )
 
-// fixture returns the request body of one of the vault's real-proof fixture steps.
 // fund creates the account behind an address, so the vault would pay it.
 func (h *harness) fund(address string) {
 	account, err := vault.AccountOf(address)
@@ -115,23 +114,27 @@ func fixtureChain(t *testing.T) (fr.Element, []fr.Element) {
 	return domain, roots
 }
 
+// fixture returns the request body of one of the vault's real-proof fixtures: a step, or a proof
+// the vault refuses.
 func fixture(t *testing.T, name string) map[string]any {
 	t.Helper()
 	raw, err := os.ReadFile("../vault/testdata/proofs.json")
 	if err != nil {
 		t.Fatal(err)
 	}
+	type step struct {
+		Name  string         `json:"name"`
+		Ext   map[string]any `json:"ext"`
+		Proof map[string]any `json:"proof"`
+	}
 	var f struct {
-		Steps []struct {
-			Name  string         `json:"name"`
-			Ext   map[string]any `json:"ext"`
-			Proof map[string]any `json:"proof"`
-		} `json:"steps"`
+		Steps   []step `json:"steps"`
+		Refused []step `json:"refused"`
 	}
 	if err := json.Unmarshal(raw, &f); err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range f.Steps {
+	for _, s := range append(f.Steps, f.Refused...) {
 		if s.Name != name {
 			continue
 		}
@@ -637,6 +640,31 @@ func TestForgedOrSpentProofsAreRefusedBeforeAnything(t *testing.T) {
 	}
 	if len(h.screen.asked) != 0 || h.fake.CallCount("simulateTransaction") != 0 {
 		t.Fatal("a refused proof reached screening or simulation")
+	}
+	// A valid proof that spends a nullifier already spent, in either input slot, passes every
+	// other check and is refused for that alone.
+	for slot, name := range []string{"double_spend_slot0", "double_spend_slot1"} {
+		body := fixture(t, name)
+		var sb SubmitBody
+		raw, _ := json.Marshal(body)
+		if err := json.Unmarshal(raw, &sb); err != nil {
+			t.Fatal(err)
+		}
+		req, err := sb.Parse()
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.fund(req.Ext.Recipient)
+		for _, nf := range req.Proof.Nullifiers {
+			h.fake.DeleteEntry(mustKey(vault.NullifierKey(vaulttest.Vault, nf.Bytes())))
+		}
+		if f := h.r.verified(context.Background(), req); f != nil {
+			t.Fatalf("%s refused while unspent: %s", name, f.code)
+		}
+		h.fake.SetContractData(mustKey(vault.NullifierKey(vaulttest.Vault, req.Proof.Nullifiers[slot].Bytes())), xdr.ScVal{Type: xdr.ScValTypeScvVoid}, 10, nil)
+		if f := h.r.verified(context.Background(), req); f == nil || f.code != CodeRejected {
+			t.Fatalf("%s accepted with a spent nullifier", name)
+		}
 	}
 }
 
