@@ -11,14 +11,19 @@ import {
   timesCofactor,
 } from "../reference/babyjub.mjs";
 import {
+  UNPROVABLE_SCALARS,
   addressAt,
   bip39Seed,
+  decodeAddress,
+  decodeFullViewingKey,
+  decodeIncomingViewingKey,
   defaultAddress,
   deriveKeys,
   diversifier,
   diversifyHash,
   fullViewingKey,
   incomingViewingKey,
+  usableScalar,
 } from "../reference/keys.mjs";
 import { MNEMONIC } from "../reference/vectors.mjs";
 
@@ -39,13 +44,26 @@ describe("keys", () => {
   });
 
   // With L = 64, HKDF-Expand is a single HMAC block, so the info string can be checked directly.
-  it("derives ask from HKDF-SHA512 with the network and account in the info string", () => {
+  const okm = (info) => {
     const prk = createHmac("sha512", "cyphras/v2/shielded").update(seed).digest();
-    const okm = createHmac("sha512", prk)
-      .update("testnet/1/ask")
+    return createHmac("sha512", prk)
+      .update(info)
       .update(Buffer.from([1]))
       .digest();
-    assert.equal(deriveKeys(seed, "testnet", 1).ask, BigInt("0x" + okm.toString("hex")) % L);
+  };
+
+  it("derives ask from HKDF-SHA512 with the network and account in the info string", () => {
+    const expected = BigInt("0x" + okm("testnet/1/ask").toString("hex")) % L;
+    assert.equal(deriveKeys(seed, "testnet", 1).ask, expected);
+  });
+
+  it("derives the store key from the label store", () => {
+    assert.deepEqual(deriveKeys(seed, "mainnet", 1).sk, okm("mainnet/1/store").subarray(0, 32));
+  });
+
+  it("skips zero and the three scalars whose fixed-base product cannot be proven", () => {
+    for (const s of [0n, ...UNPROVABLE_SCALARS]) assert.equal(usableScalar(s), false);
+    for (const s of [1n, L - 1n, UNPROVABLE_SCALARS[0] + 1n]) assert.equal(usableScalar(s), true);
   });
 
   it("gives unrelated keys per network and account", () => {
@@ -96,6 +114,27 @@ describe("keys", () => {
         assert.equal(defaultAddress(keys).index, 0);
       });
     }
+
+    it("decodes every address and viewing key it encodes", () => {
+      const bytes = (b) => Buffer.from(b);
+      for (const network of ["mainnet", "testnet"]) {
+        for (const account of [0, 1]) {
+          const keys = deriveKeys(seed, network, account);
+          for (const i of [0, 1, 2]) {
+            const a = addressAt(keys, i);
+            for (const encoding of [a.address, a.address.toUpperCase()]) {
+              const { d, gd, pkd } = decodeAddress(network, encoding);
+              assert.deepEqual([bytes(d), gd, pkd], [a.d, a.gd, a.pkd]);
+            }
+          }
+          const ivk = decodeIncomingViewingKey(network, incomingViewingKey(keys));
+          assert.deepEqual([bytes(ivk.dk), ivk.ivk], [keys.dk, keys.ivk]);
+          const fvk = decodeFullViewingKey(network, fullViewingKey(keys));
+          assert.deepEqual([fvk.ak, fvk.nk], [keys.ak, keys.nk]);
+          assert.deepEqual([bytes(fvk.ovk), bytes(fvk.dk)], [keys.ovk, keys.dk]);
+        }
+      }
+    });
 
     it("encodes both viewing keys", () => {
       const keys = deriveKeys(seed, "testnet", 0);

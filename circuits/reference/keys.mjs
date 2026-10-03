@@ -1,6 +1,18 @@
 import { createHmac, hkdfSync, pbkdf2Sync } from "node:crypto";
 import { bech32m } from "@scure/base";
-import { A, BASE8, D, F, L, isIdentity, mul, packPoint, timesCofactor } from "./babyjub.mjs";
+import {
+  A,
+  BASE8,
+  D,
+  F,
+  L,
+  P,
+  inPrimeSubgroup,
+  isIdentity,
+  mul,
+  packPoint,
+  timesCofactor,
+} from "./babyjub.mjs";
 import { hash } from "./poseidon2.mjs";
 
 export const TAG = {
@@ -15,18 +27,26 @@ export const TAG = {
   diversify: 0x12,
 };
 
-const VERSION = 0x02;
-const HRP = {
+export const VERSION = 0x02;
+export const HRP = {
   mainnet: { address: "cy", ivk: "cyivk", fvk: "cyfvk" },
   testnet: { address: "cyt", ivk: "cytivk", fvk: "cytfvk" },
 };
+
+// The scalars below L whose fixed-base product BabyPbk cannot prove: the last window adder of its
+// low segment then adds opposite points. Derivation skips them as it skips zero.
+export const UNPROVABLE_SCALARS = [
+  0x01c3653c1301a1bc1277bf923de70679621a5b6f148ea4e5d5297349effc94a8n,
+  0x03c3653c1301a1bc1277bf923de70679621a5b6f148ea4e5d5297349effc94a8n,
+  0x05c3653c1301a1bc1277bf923de70679621a5b6f148ea4e5d5297349effc94a8n,
+];
 
 export const fold = (p, tag) => hash([p[0], p[1]], tag);
 
 const os2ip = (bytes) => BigInt("0x" + Buffer.from(bytes).toString("hex"));
 const fromLE = (bytes) => os2ip(Buffer.from(bytes).reverse());
 
-function toLE32(x) {
+export function toLE32(x) {
   const out = Buffer.alloc(32);
   out.write(x.toString(16).padStart(64, "0"), "hex");
   return out.reverse();
@@ -42,10 +62,12 @@ function okm(seed, network, account, label) {
   return Buffer.from(hkdfSync("sha512", seed, "cyphras/v2/shielded", info, 64));
 }
 
+export const usableScalar = (s) => s !== 0n && !UNPROVABLE_SCALARS.includes(s);
+
 function scalar(seed, network, account, label) {
   for (let retry = 0; ; retry++) {
     const s = os2ip(okm(seed, network, account, retry ? `${label}/${retry}` : label)) % L;
-    if (s !== 0n) return s;
+    if (usableScalar(s)) return s;
   }
 }
 
@@ -63,6 +85,7 @@ export function deriveKeys(seed, network, account) {
     nsk,
     ovk: okm(seed, network, account, "ovk").subarray(0, 32),
     dk: okm(seed, network, account, "dk").subarray(0, 32),
+    sk: okm(seed, network, account, "store").subarray(0, 32),
     ak,
     nk,
     akFold,
@@ -131,4 +154,63 @@ export function fullViewingKey(keys) {
     ...keys.dk,
   ]);
   return bech32m.encode(HRP[keys.network].fvk, bech32m.toWords(payload), false);
+}
+
+// The point packPoint encodes as these bytes, or null. Only the canonical encoding is accepted:
+// y below p, and no sign bit when x = 0. Otherwise one point would have several encodings.
+export function unpackPoint(bytes) {
+  const sign = (bytes[31] & 0x80) !== 0;
+  const y = fromLE(Uint8Array.from(bytes, (b, i) => (i === 31 ? b & 0x7f : b)));
+  if (y >= P) return null;
+  const y2 = F.square(y);
+  const den = F.sub(A, F.mul(D, y2));
+  if (den === 0n) return null;
+  const x = F.sqrt(F.div(F.sub(1n, y2), den));
+  if (x === null || (x === 0n && sign)) return null;
+  const high = x > (P - 1n) / 2n;
+  return [high === sign ? x : F.neg(x), y];
+}
+
+function decodePayload(hrp, encoded, limit) {
+  const { prefix, words } = bech32m.decode(encoded, limit);
+  if (prefix !== hrp) throw new Error(`HRP is ${prefix}, expected ${hrp}`);
+  const payload = bech32m.fromWords(words);
+  if (payload[0] !== VERSION) throw new Error(`unknown version ${payload[0]}`);
+  return payload;
+}
+
+function primeOrderPoint(bytes, name) {
+  const p = unpackPoint(bytes);
+  if (p === null) throw new Error(`${name} is not a canonical curve point`);
+  if (isIdentity(p)) throw new Error(`${name} is the identity`);
+  if (!inPrimeSubgroup(p)) throw new Error(`${name} is outside the prime-order subgroup`);
+  return p;
+}
+
+export function decodeAddress(network, address) {
+  const payload = decodePayload(HRP[network].address, address, 90);
+  if (payload.length !== 44) throw new Error(`payload is ${payload.length} bytes, not 44`);
+  const d = payload.subarray(1, 12);
+  const point = diversifyHash(d);
+  if (point === null) throw new Error("DiversifyHash fails for d");
+  return { d, ...point, pkd: primeOrderPoint(payload.subarray(12), "pk_d") };
+}
+
+export function decodeIncomingViewingKey(network, encoded) {
+  const payload = decodePayload(HRP[network].ivk, encoded, false);
+  if (payload.length !== 65) throw new Error(`payload is ${payload.length} bytes, not 65`);
+  const ivk = fromLE(payload.subarray(33));
+  if (ivk >= L) throw new Error("ivk is not reduced mod L");
+  return { dk: payload.subarray(1, 33), ivk };
+}
+
+export function decodeFullViewingKey(network, encoded) {
+  const payload = decodePayload(HRP[network].fvk, encoded, false);
+  if (payload.length !== 129) throw new Error(`payload is ${payload.length} bytes, not 129`);
+  return {
+    ak: primeOrderPoint(payload.subarray(1, 33), "ak"),
+    nk: primeOrderPoint(payload.subarray(33, 65), "nk"),
+    ovk: payload.subarray(65, 97),
+    dk: payload.subarray(97, 129),
+  };
 }

@@ -13,7 +13,7 @@ import {
   onCurve,
   timesCofactor,
 } from "../reference/babyjub.mjs";
-import { addressAt } from "../reference/keys.mjs";
+import { UNPROVABLE_SCALARS, addressAt } from "../reference/keys.mjs";
 import { LEVELS, MerkleTree, noteCommitment } from "../reference/notes.mjs";
 import { alice, bob, MAX_POS, MAX_VALUE } from "./fixtures.mjs";
 import { ASSERT_FAILED, harness, randomField } from "./helpers.mjs";
@@ -221,6 +221,36 @@ describe("gadgets", () => {
         }
       });
     }
+  });
+
+  describe("BabyPbk", () => {
+    let circuit;
+    before(async () => {
+      circuit = await harness("babypbk", "circomlib/circuits/babyjub.circom", "BabyPbk()");
+    });
+
+    it("matches s * Base8 for edge scalars and scalars up to 2^253", async () => {
+      const scalars = [0n, 1n, L - 1n, L, L + 1n, 2n * L, (1n << 249n) - 1n, 1n << 249n];
+      scalars.push((1n << 252n) - 1n, (1n << 253n) - 1n, randomScalar(), randomField() >> 1n);
+      for (const s of scalars) {
+        const w = await accepts(circuit, { in: s });
+        const out = [circuit.read(w, "main.Ax"), circuit.read(w, "main.Ay")];
+        assert.deepEqual(out, mul(BASE8, s % L), `s = ${s}`);
+      }
+    });
+
+    // The last window adder of the low 249-bit segment adds opposite points when the low bits are
+    // L - 2^250 - (8^83 - 1) / 7, whatever the top 4 bits; no witness exists for those scalars.
+    it("cannot prove exactly the scalars below L that the key derivation skips", async () => {
+      const low = L - (1n << 250n) - (8n ** 83n - 1n) / 7n;
+      const unprovable = Array.from({ length: 16 }, (_, top) => low + (BigInt(top) << 249n));
+      assert.deepEqual(
+        unprovable.filter((s) => s < L),
+        UNPROVABLE_SCALARS,
+      );
+      for (const s of unprovable) await assert.rejects(circuit.witness({ in: s }), ASSERT_FAILED);
+      for (const s of [low - 1n, low + 1n]) await accepts(circuit, { in: s });
+    });
   });
 
   describe("NoteCommitment", () => {
