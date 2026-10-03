@@ -380,16 +380,25 @@ func (w *Watcher) CheckIndexer(ctx context.Context) error {
 	return nil
 }
 
-// CheckHealth pages when a health endpoint fails twice in a row.
+// CheckHealth pages when a health endpoint fails twice in a row, and when one shows every alert
+// channel of its service stalled, so the service's own pages reach no one.
 func (w *Watcher) CheckHealth(ctx context.Context) error {
 	for i, u := range w.cfg.HealthURLs {
 		code := fmt.Sprintf("health_failing_%d", i)
 		ok := false
+		var health struct {
+			Lanes []alert.LaneState `json:"alert_lanes"`
+		}
+		read := false
 		if req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil); err == nil {
 			if resp, err := w.http.Do(req); err == nil {
 				ok = resp.StatusCode == http.StatusOK
+				read = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&health) == nil
 				resp.Body.Close()
 			}
+		}
+		if read {
+			w.judgeLanes(ctx, i, u, health.Lanes)
 		}
 		w.mu.Lock()
 		if ok {
@@ -407,6 +416,22 @@ func (w *Watcher) CheckHealth(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// judgeLanes pages when every alert channel a service's health names is stalled.
+func (w *Watcher) judgeLanes(ctx context.Context, i int, u string, lanes []alert.LaneState) {
+	code := fmt.Sprintf("alerts_stalled_%d", i)
+	stalled := len(lanes) > 0
+	var names []string
+	for _, l := range lanes {
+		stalled = stalled && l.Stalled
+		names = append(names, l.Channel)
+	}
+	if stalled {
+		w.alerts.Raise(ctx, alert.Critical, code, "%s shows every alert channel stalled (%s): that service's pages reach no one", u, strings.Join(names, ", "))
+		return
+	}
+	w.alerts.Clear(ctx, code, "%s has an alert channel that takes alerts again", u)
 }
 
 // CheckGovernanceAccounts pages, also publicly, when the signers or thresholds of the guardian or

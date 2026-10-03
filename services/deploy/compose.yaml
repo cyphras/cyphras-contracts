@@ -106,6 +106,8 @@ services:
       KEEPER_KEY_FILE: /run/secrets/keeper_key
       SCREEN_TOKEN_FILE: /run/secrets/keeper_screen_token
       SCREENING_URL: http://screening-internal:8091/internal/v1/unflags
+      # Its health, for the watcher only, is not published.
+      LISTEN_ADDR: 0.0.0.0:8082
       ARCHIVE_DIR: /var/lib/cyphras/archive
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
@@ -113,7 +115,7 @@ services:
       # no public ledger archive exists, as on testnet.
       - ./data/${NETWORK}/${ASSET}/archive:/var/lib/cyphras/archive:ro
     secrets: [keeper_database_url, keeper_alert_webhooks, keeper_key, keeper_screen_token]
-    networks: [egress, keeper_db, screen]
+    networks: [egress, keeper_db, services, screen]
     depends_on: [keeper_db, screening]
 
   screening:
@@ -154,7 +156,7 @@ services:
       PUBLIC_WEBHOOKS_FILE: /run/secrets/watcher_public_webhooks
       HEARTBEAT_URL_FILE: /run/secrets/watcher_heartbeat_url
       INDEXER_URL: http://indexer:8080
-      HEALTH_URLS: http://indexer:8080/v1/health,http://relayer:8081/v1/health,http://screening:8090/v1/health
+      HEALTH_URLS: http://indexer:8080/v1/health,http://relayer:8081/v1/health,http://screening:8090/v1/health,http://keeper:8082/v1/health
       HOT_ACCOUNTS_FILE: /etc/cyphras/hot-accounts
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro

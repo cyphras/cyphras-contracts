@@ -344,7 +344,7 @@ func TestTheReviewQueueIsMeasuredAndPagedPastItsTime(t *testing.T) {
 	h.s.check.Inflows = gapped{inner: h.s.check.Inflows, account: victim}
 	big := h.shield(victim, 6_000_000_000)
 	h.tick()
-	if hl := h.s.Health(); hl.ReviewQueue != 1 || hl.OldestReview != 0 {
+	if hl := h.s.Health(); hl.ReviewQueue != 1 || hl.OldestReview != 0 || hl.AlertLanes == nil {
 		t.Fatalf("after the first check: %+v", hl)
 	}
 	h.now = h.now.Add(time.Hour)

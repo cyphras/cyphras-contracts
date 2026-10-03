@@ -735,8 +735,6 @@ const (
 	// staleAfter is how long ago the primary RPC's newest ledger may have closed: ledgers close
 	// every few seconds, so an older one means the watcher sees nothing new.
 	staleAfter = 2 * time.Minute
-	// stalledAfter is how long an alert channel may refuse every send before the heartbeat stops.
-	stalledAfter = 10 * time.Minute
 )
 
 // reconcileAndBeat reconciles, and pings the heartbeat when that succeeded with ingest healthy,
@@ -756,7 +754,7 @@ func (w *Watcher) reconcileAndBeat(ctx context.Context) error {
 		return nil
 	}
 	w.alerts.Clear(ctx, "rpc_stale", "the primary RPC serves new ledgers again")
-	if q := w.alerts.Queue; q != nil && q.Stalled(now, stalledAfter) {
+	if q := w.alerts.Queue; q != nil && q.Stalled(now, alert.StalledAfter) {
 		w.log.Warn("heartbeat withheld: an alert channel refuses every send")
 		return nil
 	}

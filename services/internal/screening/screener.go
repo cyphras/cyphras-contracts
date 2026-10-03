@@ -914,6 +914,8 @@ type Health struct {
 	// first of them has waited.
 	ReviewQueue  int   `json:"review_queue"`
 	OldestReview int64 `json:"oldest_review_seconds"`
+	// AlertLanes are the service's alert channels, by name, and whether each takes alerts.
+	AlertLanes []alert.LaneState `json:"alert_lanes"`
 }
 
 // Not-ready codes of the health endpoint.
@@ -932,7 +934,7 @@ func (s *Screener) Health() Health {
 	h := Health{
 		Vault: s.cfg.Vault, NetworkID: fmt.Sprintf("%x", s.cfg.NetworkID), PolicyVersion: s.cfg.PolicyVersion,
 		LatestLedger: s.latest, IngestedLedger: s.cursor, AttestedUpTo: s.state.AttestedUpTo,
-		ReviewQueue: s.reviews, OldestReview: int64(s.oldestReview.Seconds()),
+		ReviewQueue: s.reviews, OldestReview: int64(s.oldestReview.Seconds()), AlertLanes: s.alerts.Lanes(s.now()),
 	}
 	switch {
 	case s.fault:

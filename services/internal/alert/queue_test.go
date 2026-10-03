@@ -738,3 +738,29 @@ func TestAStoredRerouteIsKeptBeforeTheRefusedCopyGoes(t *testing.T) {
 		t.Fatalf("a reroute outlived its failed drop: %v", got)
 	}
 }
+
+func TestTheLanesShowTheirChannelsByNameAndWhetherTheyTakeAlerts(t *testing.T) {
+	ctx := context.Background()
+	refusing := &hook{status: http.StatusNotFound, refusals: -1}
+	srv := httptest.NewServer(refusing)
+	defer srv.Close()
+	now := time.Unix(1_728_000_000, 0)
+	web := Webhook{Format: "discord", URL: srv.URL + "/api/webhooks/1/TOKEN", HTTP: srv.Client()}
+	q := &Queue{Name: "operator", Now: func() time.Time { return now }, Channels: []Channel{web, named{&recorder{}, "spare"}}}
+	if got := q.Lanes(now); len(got) != 2 || got[0] != (LaneState{Channel: web.Name()}) || got[1] != (LaneState{Channel: "spare"}) {
+		t.Fatalf("lanes %+v", got)
+	}
+	q.Put(Alert{Severity: Warning, Code: "hot_balance_low", Time: now})
+	q.Flush(ctx)
+	later := now.Add(StalledAfter + time.Second)
+	got := q.Lanes(later)
+	if got[0] != (LaneState{Channel: web.Name(), Failing: now.Unix(), Refusing: true, Stalled: true}) || got[1] != (LaneState{Channel: "spare"}) {
+		t.Fatalf("lanes %+v", got)
+	}
+	if body, _ := json.Marshal(got); strings.Contains(string(body), "TOKEN") {
+		t.Fatalf("a lane shows its URL: %s", body)
+	}
+	if (&Alerter{}).Lanes(now) == nil {
+		t.Fatal("an alerter without a queue shows no list")
+	}
+}

@@ -1,6 +1,7 @@
 // Command keeper keeps one vault's entries alive, admits eligible deposits, refunds deposits that
 // stayed flagged, pays the exit queue and queues stranded exits again, from its own funded
-// account. It serves no API, and asks the screening service which refunds wait for an operator.
+// account. It serves only its health, and asks the screening service which refunds wait for an
+// operator.
 package main
 
 import (
@@ -12,6 +13,7 @@ import (
 
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
+	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/keeper"
 	"github.com/cyphras/cyphras-contracts/services/internal/service"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
@@ -85,6 +87,12 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
+	go func() {
+		addr := config.Env("LISTEN_ADDR", "127.0.0.1:8082")
+		if err := httpapi.Serve(ctx, addr, k.Handler()); err != nil && ctx.Err() == nil {
+			service.Fatal(log, "serve", err)
+		}
+	}()
 	log.Info("running", "vault", base.Vault.Vault, "account", key.Address())
 	k.Run(ctx, f, time.Second)
 }

@@ -33,7 +33,7 @@ func (h *harness) ready() {
 	h.publish()
 	h.drain()
 	h.ix.Probe(context.Background())
-	if hl := h.ix.Health(); !hl.Ready {
+	if hl := h.ix.Health(); !hl.Ready || hl.AlertLanes == nil {
 		h.t.Fatalf("not ready: %+v", hl)
 	}
 }

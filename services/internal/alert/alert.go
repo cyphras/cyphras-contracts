@@ -303,6 +303,14 @@ func (a *Alerter) Clear(ctx context.Context, code, format string, args ...any) {
 	}
 }
 
+// Lanes reports the state of the alerter's lanes, none without a queue.
+func (a *Alerter) Lanes(now time.Time) []LaneState {
+	if a.Queue == nil {
+		return []LaneState{}
+	}
+	return a.Queue.Lanes(now)
+}
+
 // Open reports whether an alert with the code is open.
 func (a *Alerter) Open(code string) bool {
 	a.mu.Lock()

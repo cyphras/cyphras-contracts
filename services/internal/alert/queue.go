@@ -493,6 +493,35 @@ func digest(ds []delivery, now time.Time) Alert {
 	return Alert{Service: ds[0].alert.Service, Severity: Info, Code: "digest", Message: fmt.Sprintf("%d notices: %s", len(ds), strings.Join(parts, "; ")), Time: now.UTC()}
 }
 
+// StalledAfter is how long a channel may refuse every send before it counts as stalled.
+const StalledAfter = 10 * time.Minute
+
+// LaneState is what a service's health shows of one of its alert lanes: its channel's name, never
+// its URL; since when the channel has refused every send; whether it refused an alert and has not
+// taken one since; and whether it has refused every send for StalledAfter.
+type LaneState struct {
+	Channel  string `json:"channel"`
+	Failing  int64  `json:"failing_since,omitempty"`
+	Refusing bool   `json:"refusing"`
+	Stalled  bool   `json:"stalled"`
+}
+
+// Lanes reports the state of every lane.
+func (q *Queue) Lanes(now time.Time) []LaneState {
+	out := make([]LaneState, len(q.Channels))
+	for i := range q.Channels {
+		l := q.lane(i)
+		q.mu.Lock()
+		s := LaneState{Channel: q.channelName(i), Refusing: l.refusing}
+		if !l.failing.IsZero() {
+			s.Failing, s.Stalled = l.failing.Unix(), now.Sub(l.failing) > StalledAfter
+		}
+		q.mu.Unlock()
+		out[i] = s
+	}
+	return out
+}
+
 // Stalled reports a channel that has refused every send for longer than after, so a heartbeat
 // can stop while alerts do not get through.
 func (q *Queue) Stalled(now time.Time, after time.Duration) bool {
