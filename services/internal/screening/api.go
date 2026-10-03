@@ -41,6 +41,14 @@ func VerifySEP53(address, message string, signature []byte) error {
 // records anything about a request.
 func (s *Screener) Public(reports, checks *httpapi.Limiter) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
+		h := s.Health()
+		status := http.StatusOK
+		if !h.Ready {
+			status = http.StatusServiceUnavailable
+		}
+		httpapi.JSON(w, status, h)
+	})
 	mux.HandleFunc("GET /v1/policy", func(w http.ResponseWriter, r *http.Request) {
 		httpapi.JSON(w, http.StatusOK, map[string]any{
 			"policy_version": s.cfg.PolicyVersion, "vault": s.cfg.Vault, "network": s.cfg.Network, "sources": s.check.Statuses(),

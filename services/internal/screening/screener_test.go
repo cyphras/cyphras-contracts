@@ -415,3 +415,24 @@ func TestTheCandidateNeverVouchesForAnUnflaggedRefusal(t *testing.T) {
 		t.Fatal("attested deposits do not block")
 	}
 }
+
+func TestHealthIsReadyOnlyWithFreshSourcesAndARecentRound(t *testing.T) {
+	h := newHarness(t)
+	if got := h.s.Health(); got.Ready || got.Code != CodeStalled {
+		t.Fatalf("before any round: %+v", got)
+	}
+	h.shield(clean, 10_000_000)
+	h.tick()
+	got := h.s.Health()
+	if !got.Ready || got.Vault != vaulttest.Vault || got.IngestedLedger == 0 {
+		t.Fatalf("after a round: %+v", got)
+	}
+	h.now = h.now.Add(3 * time.Minute)
+	if got := h.s.Health(); got.Ready || got.Code != CodeStalled {
+		t.Fatalf("after a stalled round: %+v", got)
+	}
+	h.now = h.now.Add(365 * 24 * time.Hour)
+	if got := h.s.Health(); got.Ready || got.Code != CodeSourcesStale {
+		t.Fatalf("with stale sources: %+v", got)
+	}
+}

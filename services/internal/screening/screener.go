@@ -24,6 +24,7 @@ import (
 type Config struct {
 	Vault        string
 	DeployLedger uint32
+	NetworkID    [32]byte
 	// Network is "mainnet" or "testnet", as the self-report message names it.
 	Network       string
 	PolicyVersion string
@@ -50,9 +51,12 @@ type Screener struct {
 	log     *slog.Logger
 	now     func() time.Time
 
-	mu     sync.RWMutex
-	state  *chainstate.State
-	cursor uint32
+	mu       sync.RWMutex
+	state    *chainstate.State
+	cursor   uint32
+	latest   uint32
+	fault    bool
+	tickedAt time.Time
 }
 
 // New loads the stored chain state. The checker's sources must not include a report source; the
@@ -99,6 +103,7 @@ func (s *Screener) Apply(ctx context.Context, b follow.Batch) error {
 	}
 	s.mu.Lock()
 	s.state, s.cursor = next, b.To
+	s.latest, s.fault = max(s.latest, b.Latest), false
 	s.mu.Unlock()
 	for _, n := range delta.Notices {
 		if n.Name == "attested" {
@@ -201,7 +206,13 @@ func (s *Screener) Tick(ctx context.Context) error {
 			s.log.Warn("deposit undecided", "deposit", rows[i].id, "error", err.Error())
 		}
 	}
-	return s.attest(ctx, view, rows)
+	if err := s.attest(ctx, view, rows); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.tickedAt = s.now()
+	s.mu.Unlock()
+	return nil
 }
 
 // loadDelays reads the delay snapshot of deposits that do not have one yet.
@@ -416,6 +427,9 @@ func (s *Screener) attest(ctx context.Context, v vaultView, rows []row) error {
 func (s *Screener) Run(ctx context.Context, f *follow.Follower, poll, tick, refresh time.Duration) {
 	go f.Run(ctx, poll, func(err error) {
 		if errors.Is(err, follow.ErrFault) {
+			s.mu.Lock()
+			s.fault = true
+			s.mu.Unlock()
 			s.alerts.Raise(ctx, alert.Critical, "ingest_fault", "screening ingest stopped: %v", err)
 		} else {
 			s.log.Warn("ingest retry", "error", err.Error())
@@ -442,4 +456,50 @@ func sleep(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 	case <-t.C:
 	}
+}
+
+// Health is the identity and readiness of the screening service. It is ready when every source is
+// fresh, ingest is near the chain tip without a fault, and a screening round completed in the last
+// two minutes; otherwise deposits wait, as the policy has them.
+type Health struct {
+	Ready          bool   `json:"ready"`
+	Code           string `json:"code,omitempty"`
+	Vault          string `json:"vault"`
+	NetworkID      string `json:"network_id"`
+	PolicyVersion  string `json:"policy_version"`
+	LatestLedger   uint32 `json:"latest_ledger"`
+	IngestedLedger uint32 `json:"ingested_ledger"`
+	AttestedUpTo   uint64 `json:"attested_up_to"`
+}
+
+// Not-ready codes of the health endpoint.
+const (
+	CodeSourcesStale = "sources_stale"
+	CodeLagging      = "lagging"
+	CodeFault        = "fault"
+	CodeStalled      = "stalled"
+)
+
+// Health reports readiness.
+func (s *Screener) Health() Health {
+	stale := s.check.Fresh() != nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	h := Health{
+		Vault: s.cfg.Vault, NetworkID: fmt.Sprintf("%x", s.cfg.NetworkID), PolicyVersion: s.cfg.PolicyVersion,
+		LatestLedger: s.latest, IngestedLedger: s.cursor, AttestedUpTo: s.state.AttestedUpTo,
+	}
+	switch {
+	case s.fault:
+		h.Code = CodeFault
+	case stale:
+		h.Code = CodeSourcesStale
+	case s.latest > s.cursor+12:
+		h.Code = CodeLagging
+	case s.tickedAt.IsZero() || s.now().Sub(s.tickedAt) > 2*time.Minute:
+		h.Code = CodeStalled
+	default:
+		h.Ready = true
+	}
+	return h
 }

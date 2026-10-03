@@ -116,7 +116,7 @@ func build(ctx context.Context, base *service.Base) (*screening.Screener, error)
 		MaxFunders: int(maxFunders),
 	}
 	return screening.New(ctx, screening.Config{
-		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, Network: base.Deployment.Network,
+		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, NetworkID: base.NetworkID, Network: base.Deployment.Network,
 		PolicyVersion: config.Env("POLICY_VERSION", "1"),
 		RecheckWindow: 10 * time.Minute, Cutoff: 2 * time.Minute, FirstCheckWithin: 10 * time.Minute,
 	}, base.RPC, &chainstate.Store{Pool: pool}, check, engine, submit.NewAccount(inst.Config.ASP, hot), base.Alerts, base.Log)
