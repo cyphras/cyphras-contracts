@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["types", "poseidon2"]
+members = ["types", "poseidon2", "verifier"]
 
 [workspace.package]
 version = "0.1.0"

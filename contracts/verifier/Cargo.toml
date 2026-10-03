@@ -1,0 +1,35 @@
+[package]
+name = "verifier"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+build = "build.rs"
+
+[lib]
+crate-type = ["lib"]
+doctest = false
+
+[features]
+# Embeds the ceremony key from keys/mainnet instead of the testnet-forgeable dev key.
+mainnet = []
+
+[dependencies]
+soroban-sdk = { workspace = true }
+types = { path = "../types" }
+
+[build-dependencies]
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+num-bigint = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+ark-bn254 = "0.5"
+ark-ec = "0.5"
+ark-ff = "0.5"
+num-bigint = "0.4"
+serde_json = "1"
+sha2 = "0.10"
