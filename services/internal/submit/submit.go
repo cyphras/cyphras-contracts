@@ -132,6 +132,10 @@ type extendOp struct{ *txnbuild.ExtendFootprintTtl }
 
 func (o extendOp) setExt(ext xdr.TransactionExt) { o.Ext = ext }
 
+type restoreOp struct{ *txnbuild.RestoreFootprint }
+
+func (o restoreOp) setExt(ext xdr.TransactionExt) { o.Ext = ext }
+
 // Prepare simulates op from the account and returns the assembled transaction. The account must
 // be locked by the caller.
 func (e *Engine) Prepare(ctx context.Context, a *Account, op txnbuild.Operation) (*Prepared, error) {
@@ -142,8 +146,10 @@ func (e *Engine) Prepare(ctx context.Context, a *Account, op txnbuild.Operation)
 		o.Auth, o.Ext = nil, xdr.TransactionExt{}
 		sop = invokeOp{o}
 	case *txnbuild.ExtendFootprintTtl:
-		// The caller sets the footprint of the entries to extend.
+		// The caller sets the footprint of the entries to extend or restore.
 		sop = extendOp{o}
+	case *txnbuild.RestoreFootprint:
+		sop = restoreOp{o}
 	default:
 		return nil, fmt.Errorf("submit: %T is not a Soroban operation", op)
 	}
