@@ -215,27 +215,11 @@ func (s store) stats(ctx context.Context, upTo uint32) (Stats, error) {
 	return Stats{AdmittedDeposits: uint64(admitted), DistinctDepositors: uint64(distinct), PendingDeposits: uint64(pending)}, nil
 }
 
-// ResolvedExit is an exit paid in full in the last week: by release, its last step, or by claim.
-type ResolvedExit struct {
-	ID            uint64 `json:"id"`
-	Payout        string `json:"payout"`
-	Fee           string `json:"fee"`
-	Recipient     string `json:"recipient"`
-	Relayer       string `json:"relayer"`
-	QueuedAt      uint64 `json:"queued_at"`
-	TxHash        string `json:"tx_hash"`
-	Outcome       string `json:"outcome"`
-	SettledLedger uint32 `json:"settled_ledger"`
-	SettledAt     uint64 `json:"settled_at"`
-	SettledTx     string `json:"settled_tx"`
-}
-
-// resolvedExits lists the exits paid in full since a time, up to a ledger. Payout and fee are
-// what the exit owed when it was queued.
-func (s store) resolvedExits(ctx context.Context, since int64, upTo uint32) ([]ResolvedExit, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, payout::text, fee::text, recipient, relayer, queued_at, tx_hash,
-		CASE WHEN claimed_ledger IS NULL THEN 'released' ELSE 'claimed' END,
-		coalesce(claimed_ledger, released_ledger), coalesce(claimed_at, released_at), coalesce(claimed_tx, released_tx)
+// settledExits lists the exits paid in full since a time, up to a ledger: by release, which may
+// have paid parts before, or by claim after a release stranded them.
+func (s store) settledExits(ctx context.Context, since int64, upTo uint32) ([]Exit, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, payout::text, fee::text, recipient, relayer, queued_at, ledger, tx_hash,
+		released_ledger, released_at, released_tx, unpaid_payout IS NOT NULL, claimed_ledger, claimed_at, claimed_tx
 		FROM exits
 		WHERE (unpaid_payout IS NULL AND released_ledger <= $2 AND released_at >= $1)
 		   OR (claimed_ledger <= $2 AND claimed_at >= $1)
@@ -244,14 +228,25 @@ func (s store) resolvedExits(ctx context.Context, since int64, upTo uint32) ([]R
 		return nil, err
 	}
 	defer rows.Close()
-	out := []ResolvedExit{}
+	var out []Exit
 	for rows.Next() {
-		var e ResolvedExit
-		var id, queuedAt, ledger, at int64
-		if err := rows.Scan(&id, &e.Payout, &e.Fee, &e.Recipient, &e.Relayer, &queuedAt, &e.TxHash, &e.Outcome, &ledger, &at, &e.SettledTx); err != nil {
+		e := Exit{State: ExitSettled, PayoutLeft: "0", FeeLeft: "0"}
+		var id, queuedAt, ledger, releasedLedger, releasedAt int64
+		var releasedTx string
+		var stranded bool
+		var claimedLedger, claimedAt *int64
+		var claimedTx *string
+		if err := rows.Scan(&id, &e.Payout, &e.Fee, &e.Recipient, &e.Relayer, &queuedAt, &ledger, &e.TxHash,
+			&releasedLedger, &releasedAt, &releasedTx, &stranded, &claimedLedger, &claimedAt, &claimedTx); err != nil {
 			return nil, err
 		}
-		e.ID, e.QueuedAt, e.SettledLedger, e.SettledAt = uint64(id), uint64(queuedAt), uint32(ledger), uint64(at)
+		e.ID, e.QueuedAt, e.QueuedLedger = uint64(id), uint64(queuedAt), uint32(ledger)
+		e.PayoutPaid, e.FeePaid = e.Payout, e.Fee
+		e.SettledLedger, e.SettledAt, e.SettledTx = ptr(uint32(releasedLedger)), ptr(uint64(releasedAt)), ptr(releasedTx)
+		if stranded {
+			e.StrandedLedger, e.StrandedAt, e.StrandedTx = e.SettledLedger, e.SettledAt, e.SettledTx
+			e.SettledLedger, e.SettledAt, e.SettledTx = ptr(uint32(*claimedLedger)), ptr(uint64(*claimedAt)), claimedTx
+		}
 		out = append(out, e)
 	}
 	return out, rows.Err()

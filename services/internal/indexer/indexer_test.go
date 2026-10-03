@@ -9,7 +9,6 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -399,20 +398,24 @@ func TestTheStreamWakesSubscribers(t *testing.T) {
 	}
 }
 
-func TestPaymentTimesFollowTheDailyWindow(t *testing.T) {
+func TestExitsArePaidByTheBoundTheWindowSets(t *testing.T) {
 	const day = 20_000 * secondsPerDay
 	n := func(v int64) *big.Int { return big.NewInt(v) }
-	got := paidBy([]*big.Int{n(300), n(500), n(1000), n(1)}, day+100, 0, n(600), n(1000))
-	// 300 fits today's 400 left; the next 500 completes tomorrow, and the 1000 after it, with the 1
-	// behind, the day after, each day's window used in full.
-	want := []uint64{day + 100, day + secondsPerDay, day + 2*secondsPerDay, day + 2*secondsPerDay}
-	if !slices.Equal(got, want) {
-		t.Fatalf("schedule %v, want %v", got, want)
+	endOf := func(d uint64) uint64 { return day + (d+1)*secondsPerDay - 1 }
+	got := paidBy([]*big.Int{n(300), n(500), n(1000), n(1)}, day+100, 0, n(1000))
+	// 300 and the 500 behind it need one more window, the 1000 and the 1 two.
+	want := []uint64{endOf(1), endOf(1), endOf(2), endOf(2)}
+	for i := range want {
+		if got[i] == nil || *got[i] != want[i] {
+			t.Fatalf("exit %d paid by %v, want %d", i, got[i], want[i])
+		}
 	}
-	// A halt that ends tomorrow starts the schedule there, with tomorrow's whole window.
-	got = paidBy([]*big.Int{n(900)}, day+100, day+secondsPerDay+50, n(600), n(1000))
-	if got[0] != day+secondsPerDay+50 {
-		t.Fatalf("after a halt %v", got)
+	// A halt that ends tomorrow counts the windows from there.
+	if got = paidBy([]*big.Int{n(900)}, day+100, day+secondsPerDay+50, n(1000)); *got[0] != endOf(2) {
+		t.Fatalf("after a halt %d", *got[0])
+	}
+	if got = paidBy([]*big.Int{n(1)}, day, 0, n(0)); got[0] != nil {
+		t.Fatal("a bound without a window")
 	}
 }
 
@@ -426,10 +429,11 @@ func TestTheExitQueueIsServedWithReleaseTimes(t *testing.T) {
 	c.NextLedger(5)
 	first := c.QueueExit(1, -2_000_000_000, 1_000, vaulttest.Depositor)
 	second := c.QueueExit(2, -1_000_000_000, 0, vaulttest.Relayer)
-	c.QueueExit(3, -500_000_000, 0, vaulttest.Relayer)
+	third := c.QueueExit(3, -500_000_000, 0, vaulttest.Relayer)
 	c.NextLedger(5)
 	c.Strand(first, 2_000_000_000, 0)
 	c.Release(second)
+	c.PayPart(third, 100_000_000, 0, 400_000_000, 0)
 	c.NextLedger(5)
 	h.publish()
 	h.drain()
@@ -442,25 +446,26 @@ func TestTheExitQueueIsServedWithReleaseTimes(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("exits %d %v", code, body)
 	}
-	queued := body["queued"].([]any)
-	stranded := body["stranded"].([]any)
-	if body["head"].(float64) != 3 || body["tail"].(float64) != 4 || len(queued) != 1 || len(stranded) != 1 {
+	if body["head"].(float64) != 3 || body["tail"].(float64) != 4 || body["queued_total"] != "2400000000" || body["window"].(map[string]any)["used"] != "1100001000" {
 		t.Fatalf("exits %v", body)
 	}
-	q := queued[0].(map[string]any)
-	if q["id"].(float64) != 3 || q["position"].(float64) != 0 || q["payout"] != "500000000" || q["earliest_paid_at"].(float64) != float64(c.ClosedAt) {
+	exits := body["exits"].([]any)
+	if len(exits) != 3 {
+		t.Fatalf("exits %v", exits)
+	}
+	q := exits[0].(map[string]any)
+	if q["id"].(float64) != 3 || q["state"] != ExitPaidInPart || q["position"].(float64) != 0 || q["payout"] != "500000000" || q["payout_paid"] != "100000000" ||
+		q["payout_left"] != "400000000" || q["paid_by"] == nil || q["tx_hash"] == "" {
 		t.Fatalf("queued exit %v", q)
 	}
-	s := stranded[0].(map[string]any)
-	if s["id"].(float64) != 1 || s["payout"] != "2000000000" || s["fee"] != "0" || s["recipient"] != vaulttest.Depositor || s["stranded_tx"] == "" || s["stranded_tx"] == s["tx_hash"] {
-		t.Fatalf("stranded exit %v", s)
+	st := exits[1].(map[string]any)
+	if st["id"].(float64) != 1 || st["state"] != ExitStranded || st["payout_left"] != "2000000000" || st["fee_paid"] != "1000" || st["fee_left"] != "0" ||
+		st["recipient"] != vaulttest.Depositor || st["stranded_tx"] == nil || st["stranded_tx"] == st["tx_hash"] || st["position"] != nil {
+		t.Fatalf("stranded exit %v", st)
 	}
-	resolved := body["resolved"].([]any)
-	if len(resolved) != 1 || resolved[0].(map[string]any)["id"].(float64) != 2 || resolved[0].(map[string]any)["outcome"] != "released" || resolved[0].(map[string]any)["settled_tx"] == "" {
-		t.Fatalf("resolved exits %v", resolved)
-	}
-	if body["queued_total"] != "2500000000" || body["window"].(map[string]any)["used"] != "1000001000" {
-		t.Fatalf("totals %v", body)
+	done := exits[2].(map[string]any)
+	if done["id"].(float64) != 2 || done["state"] != ExitSettled || done["settled_tx"] == nil || done["payout_paid"] != "1000000000" || done["payout_left"] != "0" {
+		t.Fatalf("settled exit %v", done)
 	}
 }
 

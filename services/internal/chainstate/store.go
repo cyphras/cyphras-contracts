@@ -318,8 +318,8 @@ func (st *Store) Load(ctx context.Context, vaultID string, deployLedger uint32) 
 }
 
 func (st *Store) loadExits(ctx context.Context, s *State) error {
-	rows, err := st.Pool.Query(ctx, `SELECT id, coalesce(payout_left, payout)::text, coalesce(fee_left, fee)::text, recipient, relayer,
-		queued_at, ledger, tx_hash, released_ledger IS NOT NULL, coalesce(unpaid_payout, 0)::text, coalesce(unpaid_fee, 0)::text,
+	rows, err := st.Pool.Query(ctx, `SELECT id, coalesce(payout_left, payout)::text, coalesce(fee_left, fee)::text, payout::text, fee::text,
+		recipient, relayer, queued_at, ledger, tx_hash, released_ledger IS NOT NULL, coalesce(unpaid_payout, 0)::text, coalesce(unpaid_fee, 0)::text,
 		coalesce(released_ledger, 0), coalesce(released_at, 0), coalesce(released_tx, '')
 		FROM exits WHERE released_ledger IS NULL OR (unpaid_payout IS NOT NULL AND claimed_ledger IS NULL) ORDER BY id`)
 	if err != nil {
@@ -329,10 +329,10 @@ func (st *Store) loadExits(ctx context.Context, s *State) error {
 	for rows.Next() {
 		var e Exit
 		var id, queuedAt, ledger, strandedLedger int64
-		var payout, fee, unpaidPayout, unpaidFee string
+		var payout, fee, queuedPayout, queuedFee, unpaidPayout, unpaidFee string
 		var released bool
-		if err := rows.Scan(&id, &payout, &fee, &e.Recipient, &e.Relayer, &queuedAt, &ledger, &e.TxHash, &released, &unpaidPayout, &unpaidFee,
-			&strandedLedger, &e.StrandedAt, &e.StrandedTx); err != nil {
+		if err := rows.Scan(&id, &payout, &fee, &queuedPayout, &queuedFee, &e.Recipient, &e.Relayer, &queuedAt, &ledger, &e.TxHash, &released,
+			&unpaidPayout, &unpaidFee, &strandedLedger, &e.StrandedAt, &e.StrandedTx); err != nil {
 			return err
 		}
 		e.ID, e.QueuedAt, e.Ledger = uint64(id), uint64(queuedAt), uint32(ledger)
@@ -340,12 +340,16 @@ func (st *Store) loadExits(ctx context.Context, s *State) error {
 			payout, fee = unpaidPayout, unpaidFee
 			e.StrandedLedger = uint32(strandedLedger)
 		}
-		var ok1, ok2 bool
-		e.Payout, ok1 = new(big.Int).SetString(payout, 10)
-		e.Fee, ok2 = new(big.Int).SetString(fee, 10)
-		if !ok1 || !ok2 {
-			return errors.New("stored exit amounts")
+		amounts := []*string{&payout, &fee, &queuedPayout, &queuedFee}
+		parsed := make([]*big.Int, len(amounts))
+		for i, a := range amounts {
+			n, ok := new(big.Int).SetString(*a, 10)
+			if !ok {
+				return errors.New("stored exit amounts")
+			}
+			parsed[i] = n
 		}
+		e.Payout, e.Fee, e.QueuedPayout, e.QueuedFee = parsed[0], parsed[1], parsed[2], parsed[3]
 		if released {
 			s.Stranded[e.ID] = &e
 		} else {

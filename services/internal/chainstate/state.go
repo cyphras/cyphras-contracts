@@ -54,14 +54,18 @@ func (d *Deposit) clone() *Deposit {
 // the parts a release could not pay. Payout and Fee are what is still owed, less any part
 // payment.
 type Exit struct {
-	ID        uint64
-	Payout    *big.Int
-	Fee       *big.Int
-	Recipient string
-	Relayer   string
-	QueuedAt  uint64
-	Ledger    uint32
-	TxHash    string
+	ID     uint64
+	Payout *big.Int
+	Fee    *big.Int
+	// QueuedPayout and QueuedFee are what the exit owed when it was queued; the difference to
+	// Payout and Fee has been paid.
+	QueuedPayout *big.Int
+	QueuedFee    *big.Int
+	Recipient    string
+	Relayer      string
+	QueuedAt     uint64
+	Ledger       uint32
+	TxHash       string
 	// StrandedLedger, StrandedAt and StrandedTx are set on a stranded exit: the release that
 	// stranded it.
 	StrandedLedger uint32
@@ -115,7 +119,13 @@ func New() *State {
 func (e *Exit) clone() *Exit {
 	c := *e
 	c.Payout, c.Fee = new(big.Int).Set(e.Payout), new(big.Int).Set(e.Fee)
+	c.QueuedPayout, c.QueuedFee = new(big.Int).Set(e.QueuedPayout), new(big.Int).Set(e.QueuedFee)
 	return &c
+}
+
+// Paid is what the exit has been paid so far.
+func (e Exit) Paid() (payout, fee *big.Int) {
+	return new(big.Int).Sub(e.QueuedPayout, e.Payout), new(big.Int).Sub(e.QueuedFee, e.Fee)
 }
 
 // Clone returns a deep copy, so a window can be applied and discarded on failure.
@@ -473,7 +483,10 @@ func (s *State) transact(tx vault.Tx, c vault.Transact, d *Delta, spent map[fr.E
 		if fits && s.Limits != nil {
 			return inconsistent("exit %d queued while it could be paid at once", q.ID)
 		}
-		e := &Exit{ID: q.ID, Payout: new(big.Int).Neg(q.ExtAmount), Fee: new(big.Int).Set(q.Fee), Recipient: q.Recipient, Relayer: q.Relayer, QueuedAt: now, Ledger: tx.Ledger, TxHash: tx.Hash}
+		e := &Exit{
+			ID: q.ID, Payout: new(big.Int).Neg(q.ExtAmount), Fee: new(big.Int).Set(q.Fee), QueuedPayout: new(big.Int).Neg(q.ExtAmount),
+			QueuedFee: new(big.Int).Set(q.Fee), Recipient: q.Recipient, Relayer: q.Relayer, QueuedAt: now, Ledger: tx.Ledger, TxHash: tx.Hash,
+		}
 		s.Exits[q.ID] = e
 		s.ExitTail++
 		s.QueuedTotal.Add(s.QueuedTotal, outflow)
