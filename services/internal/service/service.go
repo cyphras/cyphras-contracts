@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
+	"github.com/cyphras/cyphras-contracts/services/internal/archive"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
+	"github.com/cyphras/cyphras-contracts/services/internal/follow"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 )
 
@@ -120,4 +122,34 @@ func Fatal(log *slog.Logger, msg string, err error) {
 	}
 	log.Error(msg, "error", err.Error())
 	os.Exit(1)
+}
+
+// History returns the sources of ledgers older than the RPC keeps: the event archive in
+// ARCHIVE_DIR, then the ledger metadata archive at LEDGER_META_ARCHIVE_URL.
+func (b *Base) History() []follow.Source {
+	var out []follow.Source
+	if dir := config.Env("ARCHIVE_DIR", ""); dir != "" {
+		out = append(out, archive.Reader{Dir: dir, Vault: b.Vault.Vault})
+	}
+	if url := config.Env("LEDGER_META_ARCHIVE_URL", ""); url != "" {
+		out = append(out, &follow.LedgerArchive{
+			BaseURL: url, Passphrase: b.Deployment.NetworkPassphrase, Vault: b.Vault.Vault, Workers: 16,
+		})
+	}
+	return out
+}
+
+// Follower follows the vault into sink from the RPC, with History for older ledgers.
+func (b *Base) Follower(sink follow.Sink) (*follow.Follower, error) {
+	window, err := config.Int("WINDOW_LEDGERS", 500)
+	if err != nil {
+		return nil, err
+	}
+	if window < 1 || window > 10_000 {
+		return nil, fmt.Errorf("WINDOW_LEDGERS %d is outside 1 to 10000", window)
+	}
+	return &follow.Follower{
+		RPC: b.RPC, Live: follow.RPCSource{Client: b.RPC, Vault: b.Vault.Vault, PageLimit: 1000},
+		History: b.History(), Window: uint32(window), Sink: sink,
+	}, nil
 }

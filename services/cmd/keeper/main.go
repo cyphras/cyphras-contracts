@@ -10,7 +10,6 @@ import (
 
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
-	"github.com/cyphras/cyphras-contracts/services/internal/follow"
 	"github.com/cyphras/cyphras-contracts/services/internal/keeper"
 	"github.com/cyphras/cyphras-contracts/services/internal/service"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
@@ -70,7 +69,10 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "load", err)
 	}
-	f := &follow.Follower{RPC: base.RPC, Live: follow.RPCSource{Client: base.RPC, Vault: base.Vault.Vault, PageLimit: 1000}, Window: 500, Sink: k}
+	f, err := base.Follower(k)
+	if err != nil {
+		service.Fatal(log, "config", err)
+	}
 	log.Info("running", "vault", base.Vault.Vault, "account", key.Address())
 	k.Run(ctx, f, time.Second)
 }

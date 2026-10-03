@@ -21,7 +21,6 @@ import (
 
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
-	"github.com/cyphras/cyphras-contracts/services/internal/follow"
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/screening"
@@ -56,7 +55,10 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
-	f := &follow.Follower{RPC: base.RPC, Live: follow.RPCSource{Client: base.RPC, Vault: base.Vault.Vault, PageLimit: 1000}, Window: 500, Sink: s}
+	f, err := base.Follower(s)
+	if err != nil {
+		service.Fatal(log, "config", err)
+	}
 	go s.Run(ctx, f, poll, 20*time.Second, 5*time.Minute)
 	go func() {
 		addr := config.Env("INTERNAL_ADDR", "127.0.0.1:8091")
