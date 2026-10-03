@@ -36,6 +36,10 @@ var ErrRange = errors.New("archive: a range that ends before it starts")
 // a write a crash cut short. It is malformed data, as an ingest fault is.
 var ErrDamaged = fmt.Errorf("archive: damaged file: %w", vault.ErrMalformed)
 
+// ErrTooLarge reports a write refused for an event larger than a line of the archive may be,
+// which no vault emits.
+var ErrTooLarge = fmt.Errorf("archive: an event too large for a line: %w", vault.ErrMalformed)
+
 // line is one record of a file. Write groups the records of one Append, and the covered record
 // closes it with the number of event lines the write put in the file and their SHA-256, newlines
 // included.
@@ -58,8 +62,8 @@ func path(dir string, start uint32) string {
 // Writer appends to the archive in dir.
 type Writer struct {
 	Dir string
-	// TooLarge, when set, is told of each event left out of a write for being larger than a line
-	// of the archive may be.
+	// TooLarge, when set, is told of the event that made a write refused for being larger than a
+	// line of the archive may be.
 	TooLarge func(vault.RawEvent)
 }
 
@@ -72,7 +76,9 @@ const maxRead = 4 << 20
 
 // Append records the events of ledgers [from, to] and that the range is complete. It returns
 // only once the data is on disk. A later write of the same ledgers replaces an earlier one. A
-// write that fails is cut off the file again, so a failure leaves no torn line behind.
+// write that fails is cut off the file again, so a failure leaves no torn line behind. A write
+// with an event too large for a line is refused whole, so its range stays uncovered and a rebuild
+// reads it from another source.
 func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 	if from > to {
 		return fmt.Errorf("%w: ledgers %d to %d", ErrRange, from, to)
@@ -128,11 +134,7 @@ func appendWrite(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint3
 }
 
 func writeLines(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint32, tooLarge func(vault.RawEvent)) error {
-	buf := bufio.NewWriter(f)
-	if err := terminateTornLine(f, buf); err != nil {
-		return err
-	}
-	sum, count := sha256.New(), 0
+	var lines [][]byte
 	for i := range events {
 		if events[i].Ledger >= lo && events[i].Ledger <= hi {
 			b, err := json.Marshal(line{Write: write, Event: &events[i]})
@@ -143,14 +145,21 @@ func writeLines(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint32
 				if tooLarge != nil {
 					tooLarge(events[i])
 				}
-				continue
+				return fmt.Errorf("%w: ledger %d", ErrTooLarge, events[i].Ledger)
 			}
-			b = append(b, '\n')
-			sum.Write(b)
-			count++
-			if _, err := buf.Write(b); err != nil {
-				return err
-			}
+			lines = append(lines, append(b, '\n'))
+		}
+	}
+	buf := bufio.NewWriter(f)
+	if err := terminateTornLine(f, buf); err != nil {
+		return err
+	}
+	sum, count := sha256.New(), 0
+	for _, b := range lines {
+		sum.Write(b)
+		count++
+		if _, err := buf.Write(b); err != nil {
+			return err
 		}
 	}
 	closing, err := json.Marshal(line{Write: write, Covered: &[2]uint32{lo, hi}, Count: &count, SHA256: hex.EncodeToString(sum.Sum(nil))})

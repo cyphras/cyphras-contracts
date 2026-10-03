@@ -72,6 +72,9 @@ func (f *Follower) Step(ctx context.Context) (bool, error) {
 	}
 	events := make([]vault.Event, 0, len(raw))
 	for _, r := range raw {
+		if err := r.Valid(); err != nil {
+			return false, fmt.Errorf("%w: ledger %d: %w", ErrFault, r.Ledger, err)
+		}
 		e, err := vault.Decode(r)
 		if err != nil {
 			return false, fmt.Errorf("%w: ledger %d: %w", ErrFault, r.Ledger, err)

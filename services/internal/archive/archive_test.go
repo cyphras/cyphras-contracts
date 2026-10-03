@@ -189,7 +189,7 @@ func TestARangeThatEndsBeforeItStartsIsRefused(t *testing.T) {
 	}
 }
 
-func TestAnEventTooLargeToReadIsLeftOutOfTheWrite(t *testing.T) {
+func TestAWriteWithAnEventTooLargeForALineIsRefusedWhole(t *testing.T) {
 	dir := t.TempDir()
 	const v = "CVAULT"
 	var tooLarge []uint32
@@ -197,13 +197,20 @@ func TestAnEventTooLargeToReadIsLeftOutOfTheWrite(t *testing.T) {
 	if err := w.Append([]vault.RawEvent{{Ledger: 100, Tx: 1, Contract: v, TxHash: "a", Topics: []string{"t"}, Value: "x"}}, 100, 100); err != nil {
 		t.Fatal(err)
 	}
-	big := vault.RawEvent{Ledger: 101, Tx: 1, Contract: v, TxHash: "b", Topics: []string{"t"}, Value: strings.Repeat("A", 5<<20)}
+	big := vault.RawEvent{Ledger: 101, Tx: 1, Contract: v, TxHash: "b", Topics: []string{"t"}, Value: strings.Repeat("A", 2<<20)}
 	fits := vault.RawEvent{Ledger: 101, Tx: 2, Contract: v, TxHash: "c", Topics: []string{"t"}, Value: "y"}
-	if err := w.Append([]vault.RawEvent{big, fits}, 101, 101); err != nil {
-		t.Fatal(err)
+	if err := w.Append([]vault.RawEvent{big, fits}, 101, 101); !errors.Is(err, ErrTooLarge) || len(tooLarge) != 1 || tooLarge[0] != 101 {
+		t.Fatalf("an oversized event's write: %v, told of %v", err, tooLarge)
 	}
-	if len(tooLarge) != 1 || tooLarge[0] != 101 {
-		t.Fatalf("left out %v", tooLarge)
+	// Its ledger stays uncovered, so a rebuild reads it elsewhere rather than missing an event.
+	if _, err := (Reader{Dir: dir, Vault: v}).Events(context.Background(), 100, 101); !errors.Is(err, ErrNotCovered) {
+		t.Fatalf("read across the refused ledger: %v", err)
+	}
+	if last, err := LastCovered(dir); err != nil || last != 100 {
+		t.Fatalf("covered to %d, %v", last, err)
+	}
+	if err := w.Append([]vault.RawEvent{fits}, 101, 101); err != nil {
+		t.Fatal(err)
 	}
 	got, err := (Reader{Dir: dir, Vault: v}).Events(context.Background(), 100, 101)
 	if err != nil || len(got) != 2 || got[1].TxHash != "c" {

@@ -557,19 +557,46 @@ func (oversized) Events(_ context.Context, from, _ uint32) ([]vault.RawEvent, er
 	return []vault.RawEvent{{Ledger: from, Contract: vaulttest.Vault, TxHash: strings.Repeat("ab", 32), Topics: []string{"t"}, Value: strings.Repeat("A", 2<<20)}}, nil
 }
 
-func TestAnEventTooLargeForTheArchivePages(t *testing.T) {
+func TestAnEventTooLargeForTheArchivePagesAndCoversNothing(t *testing.T) {
 	h := newHarness(t)
 	h.activity()
 	h.ready()
 	h.fake.SetLatest(h.chain.Ledger + 5)
 	first := h.ix.archivedTo + 1
-	if _, err := h.ix.ArchiveStep(context.Background(), oversized{}); err != nil {
-		t.Fatal(err)
+	if _, err := h.ix.ArchiveStep(context.Background(), oversized{}); !errors.Is(err, archive.ErrTooLarge) {
+		t.Fatalf("an oversized window archived: %v", err)
 	}
 	if !h.pagedAs(fmt.Sprintf("archive_event_too_large_%d", first), alert.Critical) {
 		t.Fatalf("pages %+v", h.pages.alerts)
 	}
+	if h.ix.archivedTo != first-1 {
+		t.Fatalf("archived to %d past the refused window", h.ix.archivedTo)
+	}
 	if _, err := (archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}).Events(context.Background(), 10, h.ix.archivedTo); err != nil {
 		t.Fatalf("the archive cannot be read: %v", err)
+	}
+}
+
+func TestAnEventNoChainHoldsIsAnIngestFault(t *testing.T) {
+	for name, spoil := range map[string]func(*vault.RawEvent){
+		"a padded transaction hash": func(e *vault.RawEvent) { e.TxHash += strings.Repeat("ab", 600_000) },
+		"an upper-case hash":        func(e *vault.RawEvent) { e.TxHash = strings.Repeat("AB", 32) },
+		"no close time":             func(e *vault.RawEvent) { e.ClosedAt = 0 },
+		"oversized data":            func(e *vault.RawEvent) { e.Value += strings.Repeat("A", 40<<10) },
+	} {
+		h := newHarness(t)
+		h.activity()
+		h.ready()
+		before := h.ix.archivedTo
+		h.chain.NextLedger(5)
+		h.chain.Shield(vaulttest.Depositor, 10_000_000)
+		spoil(&h.chain.Events[len(h.chain.Events)-1])
+		h.publish()
+		if _, err := h.f.Step(context.Background()); !errors.Is(err, follow.ErrFault) {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if h.ix.archivedTo != before || h.ix.Cursor() >= h.chain.Ledger {
+			t.Fatalf("%s: archived to %d, ingested to %d", name, h.ix.archivedTo, h.ix.Cursor())
+		}
 	}
 }
