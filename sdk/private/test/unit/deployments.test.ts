@@ -7,6 +7,8 @@ import {
   checkDeployment,
   resolveDeployment,
 } from "../../src/deployments.ts";
+import { computeDomain } from "../../src/domain.ts";
+import { NETWORK_PASSPHRASES } from "../../src/keys.ts";
 import { createWorld } from "../support/network.ts";
 
 const isCode = (code: string) => (err: unknown) => err instanceof CyphrasError && err.code === code;
@@ -76,5 +78,25 @@ describe("pinned deployments", () => {
       ],
     };
     assert.doesNotThrow(() => checkDeployment(tls, true));
+  });
+
+  it("requires a pinned mainnet deployment to recommend a second RPC provider", async () => {
+    const { deployment } = await createWorld();
+    const mainnet: Deployment = {
+      ...deployment,
+      network: "mainnet",
+      networkPassphrase: NETWORK_PASSPHRASES.mainnet,
+      domain: computeDomain("mainnet", deployment.asset.name),
+      indexers: ["https://indexer.example"],
+      relayers: [
+        {
+          url: "https://relayer.example",
+          feeAddress: deployment.relayers[0]?.feeAddress as string,
+        },
+      ],
+    };
+    assert.throws(() => checkDeployment(mainnet, true), isCode("invalid_argument"));
+    assert.doesNotThrow(() => checkDeployment({ ...mainnet, recommendSecondRpc: true }, true));
+    assert.doesNotThrow(() => checkDeployment(mainnet, false));
   });
 });

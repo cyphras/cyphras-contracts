@@ -6,6 +6,7 @@ export type {
   PlanView,
   RetryRequest,
   SendRequest,
+  StateReset,
   SyncSummary,
   UnshieldRequest,
   ViewOnlyOptions,

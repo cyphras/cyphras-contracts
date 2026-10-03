@@ -34,6 +34,10 @@ export interface Deployment {
   readonly relayers: readonly RelayerEndpoint[];
   // Relayer fees are multiples of this, in the asset's smallest unit.
   readonly feeTier: bigint;
+  // Wallets of this deployment are advised to set a second RPC provider, which must agree with the
+  // first before a payment is declared dead or a tree it contradicts is taken. Every pinned
+  // mainnet deployment sets it.
+  readonly recommendSecondRpc?: boolean;
 }
 
 /** The deployments an SDK release can pin. */
@@ -89,6 +93,9 @@ export function checkDeployment(d: Deployment, pinned: boolean): void {
   for (const r of d.relayers)
     if (!isAccountId(r.feeAddress) && !isContractId(r.feeAddress)) bad("relayer");
   if (d.feeTier <= 0n) bad("fee tier");
+  if (pinned && d.network === "mainnet" && d.recommendSecondRpc !== true) {
+    bad("second RPC recommendation");
+  }
 }
 
 // The pinned deployment of that name. A Deployment object instead of a name is accepted only

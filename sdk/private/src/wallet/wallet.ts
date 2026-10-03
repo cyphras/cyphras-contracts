@@ -53,6 +53,7 @@ import {
 } from "./disclosure.ts";
 import { type ExitPosition, applyExits, exitPosition, payoutLeft } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
+import { updatePace } from "./pace.ts";
 import { type Verification, createServices, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
@@ -64,6 +65,7 @@ import {
 import {
   type ConfirmSpend,
   type Submission,
+  cancelHeld,
   checkIssuer,
   followHeld,
   spend,
@@ -86,10 +88,11 @@ import {
   checkRoot,
   crossCheck,
   downloadChain,
+  eventsUpTo,
   isActive,
   recheck,
   recordEvents,
-  resetUnlanded,
+  resetEvidence,
   stageDownload,
 } from "./sync.ts";
 
@@ -100,6 +103,9 @@ export interface ConnectionOptions {
   readonly allowUnpinnedDeployment?: boolean;
   readonly storage: KeyValueStore;
   readonly rpcUrl: string;
+  // A second RPC provider, read on every sync: a payment is declared dead only when both show it,
+  // and a tree it contradicts is not taken. Recommended on mainnet.
+  readonly secondRpcUrl?: string;
   // Every request goes through it, so the caller can route private-payment traffic via a proxy.
   readonly fetch?: FetchLike;
   // Service URLs other than the pinned ones; each must report the pinned vault and network.
@@ -112,8 +118,12 @@ export interface ConnectionOptions {
   readonly syncLimits?: Partial<SyncLimits>;
   // Starts from a fresh state when the stored one cannot be read, instead of refusing to open. The
   // first sync then rebuilds notes and history from the chain; local records of submissions and
-  // deposits that were only in the lost state are gone.
+  // deposits that were only in the lost state are gone, as stateReset() warns.
   readonly resetUnreadableState?: boolean;
+  // Starts from a fresh state, in the same way, when the stored one is older than the last one
+  // saved or missing while its record remains, as a restore from an old backup or a lost write
+  // leaves it, instead of refusing to open with state_conflict.
+  readonly resetRolledBackState?: boolean;
   // The caller's guarantee that no other wallet instance uses this store, needed where the
   // platform has no Web Locks API. Instances that share a store, such as an extension's popup and
   // its service worker, rely on Web Locks to run one operation at a time; without it two of them
@@ -146,9 +156,10 @@ export interface SyncSummary {
   readonly rootVerified: boolean;
   // The indexer's new data matched the vault's RPC events for the same ledgers.
   readonly crossChecked: boolean;
-  // Ledgers whose spends came from the indexer alone: later syncs check them against the vault's
-  // events while RPC still holds them.
+  // Ledgers whose spends, and leaves whose contents, came from the indexer alone: later syncs check
+  // them against the vault's events while RPC still holds them.
   readonly uncheckedLedgers: number;
+  readonly uncheckedLeaves: number;
 }
 
 /** A shielded payment through a relayer. */
@@ -195,6 +206,7 @@ export interface OperationView {
   readonly parts: number;
   readonly state: Operation["state"];
   // The part that blocks a blocked operation: it did not land, and its notes were spent elsewhere.
+  // resumeOperation goes on without it, and abandonOperation stops the operation.
   readonly blockedBy: string | undefined;
   // Milliseconds since the epoch from which the next part may go.
   readonly nextAt: number;
@@ -224,6 +236,19 @@ export interface PlanView extends Submission {
   readonly needsUserDecision: boolean;
 }
 
+/** Why the wallet opened on a fresh state in place of the stored one, and what was lost with it. */
+export interface StateReset {
+  readonly reason: "unreadable" | "rolled_back";
+  readonly warning: string;
+}
+
+const STATE_RESET_WARNING =
+  "The stored state was replaced by a fresh one, which the next sync rebuilds from the chain. " +
+  "Records that only the lost state held are gone: a payment or split unshield in flight is no " +
+  "longer followed and may still land, its notes look spendable until the chain shows them " +
+  "spent, and a deposit being submitted is no longer tracked. Before paying again, wait until " +
+  "any such payment has landed or its deadline has passed.";
+
 const VIEWING_KEY_WARNING =
   "A viewing key reveals the whole history and future of this private account to whoever holds " +
   "it, and cannot be revoked. To prove a single payment, use disclosePayment instead.";
@@ -234,6 +259,35 @@ const SPLIT_GAP_MS = { min: 3_600_000, max: 21_600_000 };
 function randomGap(): number {
   const r = new DataView(randomBytes(4).buffer).getUint32(0) / 2 ** 32;
   return SPLIT_GAP_MS.min + Math.floor(r * (SPLIT_GAP_MS.max - SPLIT_GAP_MS.min));
+}
+
+// What became of the part an operation awaits. It landed, itself or as a retry by the same notes;
+// it is dead with all its notes free, to go again with them; one of its notes was spent by a
+// landed payment of this wallet that is no part of the operation, so it can never land and never
+// paid; or it did not land and its notes were spent elsewhere, which only the caller can judge.
+function partFate(
+  state: WalletState,
+  parts: readonly Plan[],
+  part: Plan,
+): "landed" | "again" | "unpaid" | "blocked" {
+  const landed = (p: Plan): boolean => LANDED_STATES.includes(p.state);
+  if (
+    landed(part) ||
+    parts.some((p) => landed(p) && p.nullifiers.some((nf) => part.nullifiers.includes(nf)))
+  ) {
+    return "landed";
+  }
+  const free = part.inputs.every((i) =>
+    state.notes.some((n) => n.pos === i.pos && n.spent === undefined),
+  );
+  if (part.state === "dead" && free) return "again";
+  const ours = state.plans.some(
+    (q) =>
+      !parts.includes(q) &&
+      landed(q) &&
+      q.inputs.some((i) => part.inputs.some((input) => input.nf === i.nf)),
+  );
+  return ours ? "unpaid" : "blocked";
 }
 
 // A view-only wallet has no seed, so its store key comes from the viewing key: its state is as
@@ -266,6 +320,7 @@ export class PrivateWallet {
   readonly #lock: AccountLock;
   readonly #limits: SyncLimits;
   #verification: Verification;
+  readonly #reset: StateReset | undefined;
   #queue: Promise<unknown> = Promise.resolve();
   // The last sync found data that contradicts the chain; nothing of it was kept.
   #fault = false;
@@ -277,6 +332,7 @@ export class PrivateWallet {
     lock: AccountLock,
     limits: SyncLimits,
     verification: Verification,
+    reset: StateReset | undefined,
   ) {
     this.#core = core;
     this.#fetch = fetchFn;
@@ -284,6 +340,7 @@ export class PrivateWallet {
     this.#lock = lock;
     this.#limits = limits;
     this.#verification = verification;
+    this.#reset = reset;
   }
 
   /** Derives the keys, checks the pinned deployment and loads the local state. */
@@ -357,22 +414,26 @@ export class PrivateWallet {
       fetchFn,
       options.indexers,
       options.relayers,
+      options.secondRpcUrl,
     );
     const store = new SealedStore(options.storage, storeKey);
     const states = new StateStore(store);
     let state: WalletState;
+    let reset: StateReset | undefined;
     try {
       state = (await states.load()) ?? emptyState(deployment.deployLedger);
     } catch (err) {
-      if (
-        !(err instanceof CyphrasError) ||
-        err.code !== "storage_unreadable" ||
-        options.resetUnreadableState !== true
-      ) {
-        throw err;
-      }
+      const code = err instanceof CyphrasError ? err.code : undefined;
+      const reason =
+        code === "storage_unreadable" && options.resetUnreadableState === true
+          ? "unreadable"
+          : code === "state_conflict" && options.resetRolledBackState === true
+            ? "rolled_back"
+            : undefined;
+      if (reason === undefined) throw err;
       await states.discard();
       state = emptyState(deployment.deployLedger);
+      reset = { reason, warning: STATE_RESET_WARNING };
     }
     const now = options.clock ?? (() => Date.now());
     const sleep =
@@ -402,7 +463,7 @@ export class PrivateWallet {
     };
     const { verification } = await verify(services);
     const limits = { ...DEFAULT_SYNC_LIMITS, ...options.syncLimits };
-    return new PrivateWallet(core, fetchFn, states, lock, limits, verification);
+    return new PrivateWallet(core, fetchFn, states, lock, limits, verification, reset);
   }
 
   /**
@@ -427,6 +488,7 @@ export class PrivateWallet {
       options.fetch ?? defaultFetch,
       options.indexers,
       [],
+      undefined,
     );
     return verifyDisclosure(
       doc,
@@ -469,6 +531,11 @@ export class PrivateWallet {
   /** What the checks of the pinned deployment found; shields and spends need "verified". */
   verification(): Verification {
     return this.#verification;
+  }
+
+  /** Set when opening replaced the stored state with a fresh one, with a warning to show the user. */
+  stateReset(): StateReset | undefined {
+    return this.#reset;
   }
 
   /** The local tree's size and whether its root was last found in the vault's history. */
@@ -534,7 +601,7 @@ export class PrivateWallet {
     const draft = structuredClone(core.state);
     if (full) {
       const { revision, plans, deposits, operations } = draft;
-      resetUnlanded(plans);
+      resetEvidence(plans);
       Object.assign(draft, emptyState(core.deployment.deployLedger), {
         revision,
         plans,
@@ -589,6 +656,11 @@ export class PrivateWallet {
       download = await downloadChain(core.state, source, core.services.vault, limits.leafPages);
     }
     const { view, data } = download;
+    // The second provider's view, when one is set; a provider that cannot answer lets no plan die.
+    const second = await core.services.second?.vault.view().catch((err: unknown) => {
+      if (err instanceof CyphrasError) return undefined;
+      throw err;
+    });
     let crossChecked = false;
     // The vault's own events, from RPC, for the ledgers of this sync, when RPC held them.
     let events: VaultEvents | undefined;
@@ -605,7 +677,10 @@ export class PrivateWallet {
       events = await source.events();
     }
     const check = checkRoot(data.tree, view.roots);
-    if (check.state === "mismatch") {
+    if (
+      check.state === "mismatch" ||
+      (second !== undefined && checkRoot(data.tree, second.roots).state === "mismatch")
+    ) {
       fail(
         "tree_unverified",
         "the synced tree contradicts the vault; nothing of this sync was kept",
@@ -617,11 +692,14 @@ export class PrivateWallet {
       const checked = source.kind === "rpc" || crossChecked;
       newNotes = applyDownload(core.state, core.scan, data, checked);
       core.state.rootCheck = check;
+      // RPC's events count towards a plan's fate only where they matched the indexer's data.
+      if (crossChecked && events !== undefined) {
+        recordEvents(core.state.plans, eventsUpTo(events, data.horizon));
+      }
     } else {
-      stageDownload(core.state, core.scan, data);
+      stageDownload(core.state, core.scan, data, source.kind === "rpc" || crossChecked);
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
-    if (events !== undefined) recordEvents(core.state.plans, events);
     const rechecked = await recheck(
       core.state,
       core.scan,
@@ -630,10 +708,15 @@ export class PrivateWallet {
       limits.eventPages,
     );
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
-    if (check.state === "verified") advancePlans(core.state, view);
+    if (check.state === "verified") {
+      const views =
+        core.services.second === undefined ? [view] : second === undefined ? [] : [view, second];
+      advancePlans(core.state, views);
+    }
     const live = source.kind === "indexer" ? indexer : undefined;
+    const pace = updatePace(core.state, events?.times ?? []);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
-    onReads({ view, stats: await live?.stats().catch(() => undefined) });
+    onReads({ view, stats: await live?.stats().catch(() => undefined), pace });
     await trackDeposits(core, await live?.deposits().catch(() => undefined), [
       ...(events?.deposits ?? []),
       ...(rechecked?.deposits ?? []),
@@ -646,7 +729,7 @@ export class PrivateWallet {
       await live?.exits().catch(() => undefined),
       view.ledger,
     );
-    await this.#pollRelayers(core, view.ledger);
+    await this.#pollRelayers(core, view.ledger, pace);
     return {
       leafCount: core.state.tree.leafCount,
       staged:
@@ -656,13 +739,20 @@ export class PrivateWallet {
       source: source.kind,
       rootVerified: core.state.rootCheck.state === "verified",
       crossChecked,
-      uncheckedLedgers: core.state.unchecked.reduce((n, r) => n + r.to - r.from + 1, 0),
+      uncheckedLedgers: core.state.unchecked.reduce(
+        (n, r) => n + Math.max(0, r.to - r.from + 1),
+        0,
+      ),
+      uncheckedLeaves: core.state.unchecked.reduce(
+        (n, r) => n + (r.leaves === undefined ? 0 : r.leaves.end - r.leaves.first),
+        0,
+      ),
     };
   }
 
   // Asks only the relayer that took each pending plan about it: by its transaction's hash, or by
   // the ID of a request the relayer holds until its not_before.
-  async #pollRelayers(core: Core, latest: number): Promise<void> {
+  async #pollRelayers(core: Core, latest: number, pace: number): Promise<void> {
     for (const plan of core.state.plans) {
       const route = plan.route;
       if (plan.state !== "submitted" || route.kind !== "relayer") continue;
@@ -674,7 +764,7 @@ export class PrivateWallet {
           () => "unknown",
         );
       } else if (heldId !== undefined) {
-        await followHeld(core, plan, heldId, client, latest).catch(() => {
+        await followHeld(core, plan, heldId, client, latest, pace).catch(() => {
           plan.relayerStatus = "unknown";
         });
       }
@@ -780,6 +870,7 @@ export class PrivateWallet {
         operationId: undefined,
         parts: 1,
         burnToIssuer: false,
+        onPlan: undefined,
       });
     });
   }
@@ -814,6 +905,7 @@ export class PrivateWallet {
         operationId: undefined,
         parts: 1,
         burnToIssuer,
+        onPlan: undefined,
       });
     });
   }
@@ -875,36 +967,28 @@ export class PrivateWallet {
     confirm?: ConfirmSpend,
   ): Promise<void> {
     const remaining = op.total - this.#sent(op);
-    let submission: Submission;
-    try {
-      submission = await spend(this.#core, {
-        kind: "unshield",
-        to: op.to,
-        amount: again?.amount ?? (remaining < op.partSize ? remaining : op.partSize),
-        maxFee: op.maxFee,
-        relayers: op.route.kind === "relayers" ? this.#relayerClients(op.route.urls) : [],
-        selfRelay: signer,
-        // Later parts were confirmed with the whole operation; their warnings cannot stop them.
-        confirm: confirm ?? (() => true),
-        notBefore: undefined,
-        inputs,
-        retryOf: again?.id,
-        operationId: op.id,
-        parts: Number((op.total + op.partSize - 1n) / op.partSize),
-        // The operation was agreed to as a whole, its destination included.
-        burnToIssuer: true,
-      });
-    } catch (err) {
-      // A part refused once it was saved is still the one whose fate the operation follows.
-      const planId = err instanceof CyphrasError ? err.details["planId"] : undefined;
-      if (typeof planId === "string") {
-        op.awaiting = planId;
-        await this.#core.save();
-      }
-      throw err;
-    }
-    op.awaiting = submission.planId;
-    await this.#core.save();
+    await spend(this.#core, {
+      kind: "unshield",
+      to: op.to,
+      amount: again?.amount ?? (remaining < op.partSize ? remaining : op.partSize),
+      maxFee: op.maxFee,
+      relayers: op.route.kind === "relayers" ? this.#relayerClients(op.route.urls) : [],
+      selfRelay: signer,
+      // Later parts were confirmed with the whole operation; their warnings cannot stop them.
+      confirm: confirm ?? (() => true),
+      notBefore: undefined,
+      inputs,
+      retryOf: again?.id,
+      operationId: op.id,
+      parts: Number((op.total + op.partSize - 1n) / op.partSize),
+      // The operation was agreed to as a whole, its destination included.
+      burnToIssuer: true,
+      // The operation follows the part from the moment it is saved, whatever then becomes of its
+      // submission, and sends nothing more until its fate is known.
+      onPlan: (plan) => {
+        op.awaiting = plan.id;
+      },
+    });
   }
 
   #operationView(op: Operation): OperationView {
@@ -920,57 +1004,100 @@ export class PrivateWallet {
     };
   }
 
+  // One step of an operation: follows the part it awaits, then sends the next one once it is due.
+  // With `resume`, a part that blocks the operation is taken, on the caller's word, for one that
+  // never paid.
+  async #advance(
+    op: Operation,
+    signer: TransactionSigner | undefined,
+    resume: boolean,
+  ): Promise<void> {
+    if (op.state === "done" || op.state === "abandoned") return;
+    const { state } = this.#core;
+    const parts = state.plans.filter((p) => p.operationId === op.id);
+    if (parts.some(isActive)) return;
+    // A self-relayed part goes only with its signer; the operation's state moves without it.
+    const sends = op.route.kind !== "self" || signer?.publicKey === op.route.account;
+    const relay = op.route.kind === "self" ? signer : undefined;
+    const awaiting = parts.find((p) => p.id === op.awaiting);
+    if (awaiting !== undefined) {
+      const fate = partFate(state, parts, awaiting);
+      if (fate === "blocked" && !resume) {
+        op.state = "blocked";
+        op.blockedBy = awaiting.id;
+        return;
+      }
+      op.state = "active";
+      op.blockedBy = undefined;
+      if (fate === "again") {
+        const notes = awaiting.inputs.map(
+          (i) => state.notes.find((n) => n.pos === i.pos) as OwnedNote,
+        );
+        if (sends) await this.#nextPart(op, relay, notes, awaiting);
+        return;
+      }
+      op.awaiting = undefined;
+      // A part that never paid takes no gap: the next one goes in its place.
+      if (fate === "landed") op.nextAt = this.#core.now() + randomGap();
+    }
+    if (this.#sent(op) >= op.total) {
+      op.state = "done";
+      return;
+    }
+    if (this.#core.now() < op.nextAt || !sends) return;
+    await this.#nextPart(op, relay, undefined, undefined);
+  }
+
+  #operation(operationId: string): Operation {
+    const op = this.#core.state.operations.find((o) => o.id === operationId);
+    if (op === undefined) fail("not_found", "no operation has that ID");
+    return op;
+  }
+
   /**
    * Sends the next part of each split unshield whose previous part has landed and whose random
-   * gap has passed. A part that is dead goes again with its own notes, as retry sends it; one that
-   * did not land and whose notes were spent elsewhere blocks the operation for the caller to
-   * decide. A self-relayed operation needs its signer again.
+   * gap has passed. A part that is dead goes again with its own notes, as retry sends it. A part
+   * whose notes a landed payment of this wallet spent never paid, and the next part takes its
+   * place. One that did not land and whose notes were spent elsewhere blocks the operation until
+   * it lands after all, or the caller resumes or abandons the operation. A self-relayed operation
+   * needs its signer again.
    */
   continueOperations(signer?: TransactionSigner): Promise<OperationView[]> {
     return this.#run(async () => {
       await this.#sync(false);
-      const { state } = this.#core;
-      for (const op of state.operations) {
-        if (op.state !== "active") continue;
-        const parts = state.plans.filter((p) => p.operationId === op.id);
-        if (parts.some(isActive)) continue;
-        // A self-relayed part goes only with its signer; the operation's state moves without it.
-        const sends = op.route.kind !== "self" || signer?.publicKey === op.route.account;
-        const relay = op.route.kind === "self" ? signer : undefined;
-        const awaiting = parts.find((p) => p.id === op.awaiting);
-        if (awaiting !== undefined) {
-          // A retry of the part, by the same notes, that landed stands for it.
-          const landed =
-            LANDED_STATES.includes(awaiting.state) ||
-            parts.some(
-              (p) =>
-                LANDED_STATES.includes(p.state) &&
-                p.nullifiers.some((nf) => awaiting.nullifiers.includes(nf)),
-            );
-          if (!landed) {
-            const free = awaiting.inputs
-              .map((i) => state.notes.find((n) => n.pos === i.pos))
-              .filter((n): n is OwnedNote => n !== undefined && n.spent === undefined);
-            if (awaiting.state !== "dead" || free.length !== awaiting.inputs.length) {
-              op.state = "blocked";
-              op.blockedBy = awaiting.id;
-              continue;
-            }
-            if (sends) await this.#nextPart(op, relay, free, awaiting);
-            continue;
-          }
-          op.awaiting = undefined;
-          op.nextAt = this.#core.now() + randomGap();
-        }
-        if (this.#sent(op) >= op.total) {
-          op.state = "done";
-          continue;
-        }
-        if (this.#core.now() < op.nextAt || !sends) continue;
-        await this.#nextPart(op, relay, undefined, undefined);
-      }
+      for (const op of this.#core.state.operations) await this.#advance(op, signer, false);
       await this.#core.save();
-      return state.operations.map((op) => this.#operationView(op));
+      return this.#core.state.operations.map((op) => this.#operationView(op));
+    });
+  }
+
+  /**
+   * Goes on with a blocked split unshield on the caller's word that the part blocking it never
+   * paid, as when its notes were spent elsewhere: the next part goes in its place, with other
+   * notes. Should the part have landed after all, the operation simply goes on from it.
+   */
+  resumeOperation(operationId: string, signer?: TransactionSigner): Promise<OperationView> {
+    return this.#run(async () => {
+      await this.#sync(false);
+      const op = this.#operation(operationId);
+      if (op.state !== "blocked") fail("invalid_argument", "only a blocked operation resumes");
+      await this.#advance(op, signer, true);
+      await this.#core.save();
+      return this.#operationView(op);
+    });
+  }
+
+  /**
+   * Stops a split unshield that is not done: nothing more of it is sent. Parts already sent are
+   * followed as before, and count as sent once they land.
+   */
+  abandonOperation(operationId: string): Promise<OperationView> {
+    return this.#run(async () => {
+      const op = this.#operation(operationId);
+      if (op.state === "done") fail("invalid_argument", "the operation is done");
+      op.state = "abandoned";
+      await this.#core.save();
+      return this.#operationView(op);
     });
   }
 
@@ -1009,7 +1136,32 @@ export class PrivateWallet {
         parts: 1,
         // The plan's destination was agreed to when it was made.
         burnToIssuer: true,
+        onPlan: undefined,
       });
+    });
+  }
+
+  /**
+   * Asks the relayer that holds a payment until its notBefore not to send it. True once the
+   * relayer confirms it will not, false when it no longer holds the payment, as when it has sent
+   * it already; either way the wallet does not send it again. The payment keeps its notes until
+   * the chain shows that it cannot land, since the relayer has seen its proof.
+   */
+  cancelHeld(planId: string): Promise<boolean> {
+    return this.#run(async () => {
+      const plan = this.#core.state.plans.find((p) => p.id === planId);
+      if (plan === undefined) fail("not_found", "no plan has that ID");
+      const { heldId, route } = plan;
+      if (plan.state !== "submitted" || heldId === undefined || route.kind !== "relayer") {
+        fail("invalid_argument", "only a payment a relayer holds can be cancelled");
+      }
+      const cancelled = await cancelHeld(
+        plan,
+        heldId,
+        this.#relayerClients(route.url)[0] as RelayerClient,
+      );
+      await this.#core.save();
+      return cancelled;
     });
   }
 

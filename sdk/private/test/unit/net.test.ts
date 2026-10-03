@@ -8,7 +8,8 @@ import { Fields, type FetchLike, MAX_REPLY_BYTES } from "../../src/net/http.ts";
 import { IndexerClient } from "../../src/net/indexer.ts";
 import { RelayerClient } from "../../src/net/relayer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
-import { IndexerSource } from "../../src/wallet/sources.ts";
+import { StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
+import { IndexerSource, RpcEventSource } from "../../src/wallet/sources.ts";
 import { vaultErrorName } from "../../src/vault/errors.ts";
 import { parseVaultErrors } from "../../scripts/vault-errors.ts";
 import { SDK_ROOT } from "../helpers.ts";
@@ -553,6 +554,42 @@ describe("relayer client", () => {
   });
 });
 
+describe("relayer client: cancels and pauses", () => {
+  const HELD_ID = "0f".repeat(16);
+
+  it("cancels a held request by its ID with DELETE, and tells when the relayer holds none", async () => {
+    const methods: string[] = [];
+    const answer =
+      (status: number, body: unknown): FetchLike =>
+      async (input, init) => {
+        methods.push(`${init?.method} ${new URL(input).pathname}`);
+        return new Response(JSON.stringify(body), { status });
+      };
+    const cancel = (status: number, body: unknown) =>
+      new RelayerClient("http://r", answer(status, body)).cancelHeld(HELD_ID);
+    assert.equal(await cancel(200, { status: "cancelled" }), true);
+    assert.deepEqual(methods, [`DELETE /v1/held/${HELD_ID}`]);
+    assert.equal(await cancel(404, { error: "not_found" }), false);
+    await assert.rejects(cancel(200, { status: "held" }), isCode("service_rejected"));
+    await assert.rejects(cancel(503, { error: "unavailable" }), isCode("service_unavailable"));
+  });
+
+  it("reads whether relaying is paused from the relayer's health", async () => {
+    const health = {
+      ready: false,
+      vault: StrKey.encodeContract(Buffer.alloc(32, 1)),
+      network_id: "00".repeat(32),
+      fee_address: StrKey.encodeEd25519PublicKey(Buffer.alloc(32, 2)),
+      paused: true,
+    };
+    const paused = await new RelayerClient("http://r", reply(503, health)).health();
+    assert.equal(paused.paused, true);
+    assert.equal(paused.ready, false);
+    const { paused: _, ...plain } = health;
+    assert.equal((await new RelayerClient("http://r", reply(200, plain)).health()).paused, false);
+  });
+});
+
 describe("RPC client", () => {
   it("reports JSON-RPC errors by method and code only", async () => {
     const rpc = new SorobanRpc(
@@ -565,6 +602,104 @@ describe("RPC client", () => {
       assert.ok(!(err as Error).message.includes("secret detail"));
       return true;
     });
+  });
+
+  it("refuses a ledger entry modified after the ledger the reply is of", async () => {
+    const key = xdr.LedgerKey.account(
+      new xdr.LedgerKeyAccount({
+        accountId: xdr.PublicKey.publicKeyTypeEd25519(Buffer.alloc(32, 1)),
+      }),
+    );
+    const data = xdr.LedgerEntryData.contractData(
+      new xdr.ContractDataEntry({
+        ext: new xdr.ExtensionPoint(0),
+        contract: xdr.ScAddress.scAddressTypeContract(Buffer.alloc(32, 2) as never),
+        key: xdr.ScVal.scvU32(1),
+        durability: xdr.ContractDataDurability.persistent(),
+        val: xdr.ScVal.scvU32(2),
+      }),
+    );
+    const entries = (modified: number) =>
+      reply(200, {
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          entries: [
+            {
+              key: key.toXDR("base64"),
+              xdr: data.toXDR("base64"),
+              lastModifiedLedgerSeq: modified,
+            },
+          ],
+          latestLedger: 100,
+        },
+      });
+    const read = await new SorobanRpc("http://rpc", entries(100)).getLedgerEntries([key]);
+    assert.equal(read.entries.size, 1);
+    await assert.rejects(
+      new SorobanRpc("http://rpc", entries(101)).getLedgerEntries([key]),
+      isCode("rpc_error"),
+    );
+  });
+
+  it("reads the close times of the events' ledgers and of the range RPC holds", async () => {
+    const rpc = new SorobanRpc(
+      "http://rpc",
+      reply(200, {
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          events: [],
+          latestLedger: 2_000,
+          oldestLedger: 1_000,
+          latestLedgerCloseTime: "1700005000",
+          oldestLedgerCloseTime: "1700000000",
+        },
+      }),
+    );
+    const page = await rpc.getEvents({ contractId: "C", startLedger: 1_500 });
+    assert.equal(page.latestCloseTime, 1_700_005_000);
+    assert.equal(page.oldestCloseTime, 1_700_000_000);
+  });
+
+  it("gives the close times of the oldest ledger RPC holds, of the first event's and of the latest", async () => {
+    const vault = StrKey.encodeContract(Buffer.alloc(32, 9));
+    const spend = {
+      type: "contract",
+      ledger: 1_500,
+      ledgerClosedAt: new Date(1_700_002_500_000).toISOString(),
+      contractId: vault,
+      id: "000000001500-00000000",
+      txHash: "ab".repeat(32),
+      inSuccessfulContractCall: true,
+      topic: [xdr.ScVal.scvSymbol("new_nullifier").toXDR("base64")],
+      value: xdr.ScVal.scvMap([
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol("nullifier"),
+          val: nativeToScVal(7n, { type: "u256" }),
+        }),
+      ]).toXDR("base64"),
+    };
+    const rpc = new SorobanRpc(
+      "http://rpc",
+      reply(200, {
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          events: [spend],
+          latestLedger: 2_000,
+          oldestLedger: 1_000,
+          latestLedgerCloseTime: "1700005000",
+          oldestLedgerCloseTime: "1700000000",
+        },
+      }),
+    );
+    const events = await new RpcEventSource(rpc, vault, 1_200, 1).events();
+    assert.deepEqual(events.times, [
+      { ledger: 1_000, at: 1_700_000_000 },
+      { ledger: 1_500, at: 1_700_002_500 },
+      { ledger: 2_000, at: 1_700_005_000 },
+    ]);
   });
 
   it("reads the vault error of a failed simulation", async () => {

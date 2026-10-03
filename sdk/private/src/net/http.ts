@@ -47,7 +47,7 @@ export async function requestJson(
   fetchFn: FetchLike,
   service: string,
   url: string,
-  init: { method?: "GET" | "POST"; body?: unknown; timeoutMs?: number } = {},
+  init: { method?: "GET" | "POST" | "DELETE"; body?: unknown; timeoutMs?: number } = {},
 ): Promise<JsonResponse> {
   const headers: Record<string, string> = { accept: "application/json" };
   if (init.body !== undefined) headers["content-type"] = "application/json";

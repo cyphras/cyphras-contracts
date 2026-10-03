@@ -6,7 +6,13 @@ import type { ExitEntry, ExitQueue } from "../../src/net/indexer.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
 import { applyExits } from "../../src/wallet/exits.ts";
 import type { ExitEvent } from "../../src/wallet/sources.ts";
-import { type Plan, type WalletState, emptyState, loadState } from "../../src/wallet/state.ts";
+import {
+  type Plan,
+  type WalletState,
+  emptyState,
+  loadState,
+  saveState,
+} from "../../src/wallet/state.ts";
 import type { OperationView, PrivateWallet } from "../../src/wallet/wallet.ts";
 import { XLM, createWorld } from "../support/network.ts";
 import { keypairFor } from "../support/rpc.ts";
@@ -82,12 +88,18 @@ describe("exits above the single-exit cap", () => {
 describe("split unshields whose parts do not plainly land", () => {
   const SPLIT = { maxDailyOutflow: 50n * XLM, maxDeposit: 500n * XLM, tvlCap: 350n * XLM };
 
-  // A wallet with two notes, of 60 and 70 XLM, so a part sent again could use the other one.
-  async function twoNotes(world: Awaited<ReturnType<typeof createWorld>>, fetch?: FetchLike) {
+  // A wallet with notes of these values, by default two, of 60 and 70 XLM, so a part sent again
+  // could use the other one.
+  async function withNotes(
+    world: Awaited<ReturnType<typeof createWorld>>,
+    fetch?: FetchLike,
+    values = [60n * XLM, 70n * XLM],
+  ) {
     const store = new MemoryStore();
     const alice = await openWallet(fetch === undefined ? world : { ...world, fetch }, 0, store);
-    await alice.shield({ amount: 60n * XLM, signer: world.signer("alice depositor") });
-    await alice.shield({ amount: 70n * XLM, signer: world.signer("alice depositor") });
+    for (const amount of values) {
+      await alice.shield({ amount, signer: world.signer("alice depositor") });
+    }
     world.advance(3_601);
     world.admitAll();
     await alice.sync();
@@ -113,7 +125,7 @@ describe("split unshields whose parts do not plainly land", () => {
 
   it("pays a split unshield once when a part's leaves arrive in a batch held aside", async () => {
     const world = await createWorld({ limits: SPLIT });
-    const { alice, store } = await twoNotes(world);
+    const { alice, store } = await withNotes(world);
     const destination = world.signer("exchange").publicKey;
     await alice.unshield({
       to: destination,
@@ -147,7 +159,7 @@ describe("split unshields whose parts do not plainly land", () => {
       }
       return world.fetch(input, init);
     };
-    const { alice } = await twoNotes(world, flaky);
+    const { alice } = await withNotes(world, flaky);
     const destination = world.signer("exchange").publicKey;
     await alice.unshield({
       to: destination,
@@ -167,7 +179,7 @@ describe("split unshields whose parts do not plainly land", () => {
 
   it("sends a dead part again with its own notes", async () => {
     const world = await createWorld({ limits: SPLIT });
-    const { alice, store } = await twoNotes(world);
+    const { alice, store } = await withNotes(world);
     const destination = world.signer("exchange").publicKey;
     world.relayer.failures.push({ error: "unavailable" });
     await assert.rejects(
@@ -199,9 +211,53 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal(owedTo(world, destination), 90n * XLM);
   });
 
+  it("follows a part whose submission reply was lost, and waits its gap before the next", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    let cut = false;
+    const cutting: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (cut && url.origin === "http://relayer.test" && url.pathname === "/v1/submit") {
+        cut = false;
+        // The relayer takes the part, but its reply never arrives.
+        await world.fetch(input, init);
+        throw new TypeError("the connection was lost");
+      }
+      return world.fetch(input, init);
+    };
+    const { alice } = await withNotes(world, cutting);
+    const destination = world.signer("exchange").publicKey;
+    cut = true;
+    let named: unknown;
+    await assert.rejects(
+      alice.unshield({
+        to: destination,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+      (err: unknown) => {
+        named = err instanceof CyphrasError ? err.details["planId"] : undefined;
+        return isError("service_unavailable")(err);
+      },
+    );
+    const [part] = await alice.plans();
+    assert.equal(named, part?.planId);
+    let [view] = await alice.continueOperations();
+    assert.equal(view?.plans.length, 1);
+    assert.equal(view?.sent, 48n * XLM);
+    assert.ok((view?.nextAt as number) >= world.clock() + 3_600_000);
+    [view] = await alice.continueOperations();
+    assert.equal(view?.plans.length, 1);
+    view = await finish(world, alice);
+    assert.equal(view?.state, "done");
+    assert.equal(owedTo(world, destination), 90n * XLM);
+    assert.equal(world.relayer.submissions.length, 2);
+  });
+
   it("moves a self-relayed split along without its signer, and sends parts only with it", async () => {
     const world = await createWorld({ limits: SPLIT });
-    const { alice } = await twoNotes(world);
+    const { alice } = await withNotes(world);
     const destination = world.signer("exchange").publicKey;
     const account = world.signer("my account");
     await alice.unshield({
@@ -229,7 +285,7 @@ describe("split unshields whose parts do not plainly land", () => {
 
   it("goes on with a split whose part the user retried by hand once the retry lands", async () => {
     const world = await createWorld({ limits: SPLIT });
-    const { alice } = await twoNotes(world);
+    const { alice } = await withNotes(world);
     const destination = world.signer("exchange").publicKey;
     world.relayer.failures.push({ error: "unavailable" });
     await assert.rejects(
@@ -250,9 +306,9 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal(owedTo(world, destination), 90n * XLM);
   });
 
-  it("blocks a split whose part did not land when its notes were spent elsewhere", async () => {
+  it("blocks a split whose part did not land when its notes were spent elsewhere, until abandoned", async () => {
     const world = await createWorld({ limits: SPLIT });
-    const { alice } = await twoNotes(world);
+    const { alice } = await withNotes(world);
     const destination = world.signer("exchange").publicKey;
     world.relayer.failures.push({ error: "unavailable" });
     await assert.rejects(
@@ -271,7 +327,7 @@ describe("split unshields whose parts do not plainly land", () => {
     const bob = await openWallet(world, 1);
     await other.send({ to: bob.generateAddress(), amount: 100n * XLM, maxFee: 2n * XLM });
     world.advance(7 * 3600);
-    const [view] = await alice.continueOperations();
+    let [view] = await alice.continueOperations();
     assert.equal((await alice.plans())[0]?.state, "superseded");
     assert.equal(view?.state, "blocked");
     assert.equal(view?.blockedBy, part?.planId);
@@ -280,6 +336,122 @@ describe("split unshields whose parts do not plainly land", () => {
     world.advance(7 * 3600);
     assert.equal((await alice.continueOperations())[0]?.state, "blocked");
     assert.equal((await alice.plans()).length, 1);
+    const id = view?.operationId as string;
+    await assert.rejects(alice.abandonOperation("00".repeat(16)), isError("not_found"));
+    view = await alice.abandonOperation(id);
+    assert.equal(view.state, "abandoned");
+    world.advance(7 * 3600);
+    assert.equal((await alice.continueOperations())[0]?.state, "abandoned");
+    await assert.rejects(alice.resumeOperation(id), isError("invalid_argument"));
+    assert.equal((await alice.plans()).length, 1);
+    assert.equal(world.relayer.submissions.length, 1);
+  });
+
+  it("resumes a blocked split on the caller's word that its part never paid, with other notes", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const { alice } = await withNotes(world, undefined, [50n * XLM, 60n * XLM, 70n * XLM]);
+    const destination = world.signer("exchange").publicKey;
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: destination,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+    );
+    const [part] = await alice.plans();
+    const other = await openWallet(world, 0, new MemoryStore());
+    await other.sync();
+    const bob = await openWallet(world, 1);
+    await other.send({ to: bob.generateAddress(), amount: 30n * XLM, maxFee: 2n * XLM });
+    let [view] = await alice.continueOperations();
+    assert.equal(view?.state, "blocked");
+    assert.equal(view?.blockedBy, part?.planId);
+    const id = view?.operationId as string;
+    view = await alice.resumeOperation(id);
+    assert.equal(view.state, "active");
+    assert.equal(view.blockedBy, undefined);
+    assert.equal(view.plans.length, 2);
+    await assert.rejects(alice.resumeOperation(id), isError("invalid_argument"));
+    view = await finish(world, alice);
+    assert.equal(view?.state, "done");
+    assert.equal(owedTo(world, destination), 90n * XLM);
+  });
+
+  it("goes on with a split once a payment of the wallet spent a dead part's note", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const { alice } = await withNotes(world, undefined, [50n * XLM, 60n * XLM, 70n * XLM]);
+    const destination = world.signer("exchange").publicKey;
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: destination,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+      isError("service_rejected"),
+    );
+    world.advance(3600);
+    world.fill(1);
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "dead");
+    // Meanwhile the user pays someone else, and the wallet picks the dead part's free note.
+    const bob = await openWallet(world, 1);
+    await alice.send({
+      to: bob.generateAddress(),
+      amount: 30n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    // The payment's leaves are in, though the indexer does not list its spend yet.
+    world.indexer.completeTo = world.vault.ledger - 1;
+    let [view] = await alice.continueOperations();
+    assert.equal((await alice.plans())[0]?.state, "superseded");
+    assert.equal(view?.state, "active");
+    assert.equal(view?.plans.length, 2);
+    world.indexer.completeTo = undefined;
+    view = await finish(world, alice);
+    assert.equal(view?.state, "done");
+    assert.equal(owedTo(world, destination), 90n * XLM);
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 30n * XLM);
+  });
+
+  it("goes on with a blocked split once its part turns out to have landed", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const { alice, store } = await withNotes(world);
+    const destination = world.signer("exchange").publicKey;
+    await alice.unshield({
+      to: destination,
+      amount: 90n * XLM,
+      maxFee: 2n * XLM,
+      split: true,
+      confirm: confirmAll,
+    });
+    await alice.sync();
+    // An earlier reading took the part, which landed, for superseded, and so blocked the split.
+    const sealed = new SealedStore(store, storeKeyOf(0));
+    const state = (await loadState(sealed)) as WalletState;
+    const part = state.plans[0] as Plan;
+    Object.assign(part, { state: "superseded", evidence: [] });
+    Object.assign(state.operations[0] as object, { state: "blocked", blockedBy: part.id });
+    await saveState(sealed, state);
+    const reopened = await openWallet(world, 0, store);
+    let [view] = await reopened.continueOperations();
+    assert.equal(view?.state, "blocked");
+    await reopened.rescan();
+    [view] = await reopened.continueOperations();
+    assert.equal(view?.state, "active");
+    assert.equal(view?.sent, 48n * XLM);
+    assert.equal(view?.plans.length, 1);
+    assert.ok((view?.nextAt as number) >= world.clock() + 3_600_000);
+    view = await finish(world, reopened);
+    assert.equal(view?.state, "done");
+    assert.equal(owedTo(world, destination), 90n * XLM);
   });
 });
 
@@ -671,6 +843,116 @@ describe("the exit queue: sources", () => {
     [view] = await alice.continueOperations();
     assert.equal(view?.state, "done");
     assert.equal(view?.sent, 90n * XLM);
+  });
+});
+
+describe("an indexer that renames the transaction a payment landed in", () => {
+  // A fetch whose indexer names another transaction for the newest one in the replies of `paths`
+  // while `renaming` is set, and whose RPC answers getEvents with an error while `eventsDown` is
+  // set.
+  function renamingFetch(
+    world: Awaited<ReturnType<typeof createWorld>>,
+    paths = ["/v1/leaves", "/v1/nullifiers"],
+  ) {
+    const control = {
+      renaming: false,
+      eventsDown: false,
+      fetch: (async (input, init) => {
+        const url = new URL(input);
+        const body =
+          init?.body === undefined || init.body === null
+            ? undefined
+            : JSON.parse(String(init.body));
+        if (control.eventsDown && body?.method === "getEvents") {
+          const error = { code: -32603, message: "busy" };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+        }
+        const res = await world.fetch(input, init);
+        if (
+          !control.renaming ||
+          url.origin !== "http://indexer.test" ||
+          !paths.includes(url.pathname)
+        ) {
+          return res;
+        }
+        const reply = await res.json();
+        const landing = world.vault.leaves.at(-1)?.txHash;
+        const rename = (x: { tx_hash: string }) =>
+          x.tx_hash === landing ? { ...x, tx_hash: "ab".repeat(32) } : x;
+        if (reply.leaves !== undefined) reply.leaves = reply.leaves.map(rename);
+        if (reply.nullifiers !== undefined) reply.nullifiers = reply.nullifiers.map(rename);
+        return new Response(JSON.stringify(reply), { status: 200 });
+      }) as FetchLike,
+    };
+    return control;
+  }
+
+  async function fundedThrough(world: Awaited<ReturnType<typeof createWorld>>, fetch: FetchLike) {
+    const alice = await openWallet({ ...world, fetch }, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    return alice;
+  }
+
+  it("follows a queued payout's exit once a rescan takes its landing transaction again", async () => {
+    const world = await createWorld({ limits: SMALL });
+    const control = renamingFetch(world);
+    const alice = await fundedThrough(world, control.fetch);
+    // Today's window is nearly used up, so the payout waits in the exit queue.
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 45n * XLM;
+    const destination = world.signer("exchange").publicKey;
+    await alice.unshield({
+      to: destination,
+      amount: 20n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    const exit = [...world.vault.exits.values()][0];
+    // The sync that takes the landing cannot be cross-checked.
+    control.renaming = true;
+    control.eventsDown = true;
+    await alice.sync();
+    control.renaming = false;
+    control.eventsDown = false;
+    world.fill(1);
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    await alice.rescan();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.txHash, exit?.txHash);
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.exitId, exit?.id);
+    assert.equal(plan?.payoutLeft, 20n * XLM);
+  });
+
+  it("catches the renamed landing of a payment that left no change", async () => {
+    const world = await createWorld();
+    // Only the leaves are renamed: no note of the wallet, nor a spend of one, shows the lie.
+    const control = renamingFetch(world, ["/v1/leaves"]);
+    const alice = await fundedThrough(world, control.fetch);
+    // The payout and the fee take the whole note, so no note of the wallet is at its leaves.
+    const destination = world.signer("exchange").publicKey;
+    await alice.unshield({
+      to: destination,
+      amount: 99n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    const landing = world.vault.leaves.at(-1)?.txHash;
+    control.renaming = true;
+    control.eventsDown = true;
+    await alice.sync();
+    control.renaming = false;
+    control.eventsDown = false;
+    assert.equal((await alice.plans())[0]?.state, "confirmed");
+    world.fill(1);
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    await alice.rescan();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    assert.equal(plan?.txHash, landing);
   });
 });
 

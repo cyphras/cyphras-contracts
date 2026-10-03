@@ -19,6 +19,8 @@ import type { OwnedNote, WalletState } from "./state.ts";
 export interface ChainReads {
   readonly view: ChainView;
   readonly stats: PoolStats | undefined;
+  // Seconds per ledger, as recent close times give it.
+  readonly pace: number;
 }
 
 // Everything the wallet's operations share. Spend keys are absent from a view-only wallet.

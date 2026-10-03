@@ -4,7 +4,7 @@ import { Account, MuxedAccount, StrKey } from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
 import { MemoryStore } from "../../src/storage.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
-import { INDEXER, RPC, XLM, createWorld } from "../support/network.ts";
+import { INDEXER, RELAYER, RPC, XLM, createWorld } from "../support/network.ts";
 import { keypairFor } from "../support/rpc.ts";
 import { confirmAll, isError, openWallet } from "../support/wallets.ts";
 
@@ -282,6 +282,24 @@ describe("wallet: spends", () => {
     );
   });
 
+  it("covers a long hold at the pace at which ledgers close", async () => {
+    const world = await createWorld();
+    // Ledgers close every four seconds, so the relayer predicts more of them for the hold.
+    world.rpc.secondsPerLedger = 4;
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 3_600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    const [submission] = world.relayer.submissions;
+    // an hour and the relayer's 10-minute window in four-second ledgers, and the usual 120
+    assert.ok((submission?.ext.deadline as number) >= world.vault.ledger + 1_050 + 120);
+    assert.equal((await alice.plans())[0]?.state, "submitted");
+  });
+
   it("follows a held payment by its ID, sends it again to a relayer that restarted, and takes its hash", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
@@ -329,15 +347,19 @@ describe("wallet: spends", () => {
     const notBefore = Number(world.vault.timestamp) + 600;
     await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
     world.relayer.restart();
-    // Past the deadline the vault refuses the proof, so it goes nowhere again. The indexer has not
-    // served the latest leaves, so the plan stays open, and a sync still asks about it.
-    world.vault.ledger = (world.relayer.submissions[0]?.ext.deadline as number) + 1;
+    // Past the deadline the vault refuses the proof, so it goes nowhere again. The indexer has
+    // served neither the latest leaves nor the spends up to the deadline, so the plan stays open,
+    // and a sync still asks about it.
+    const deadline = world.relayer.submissions[0]?.ext.deadline as number;
+    world.vault.ledger = deadline + 1;
     world.indexer.leafLimit = world.vault.leaves.length;
-    world.indexer.completeTo = world.vault.ledger;
+    world.indexer.completeTo = deadline - 1;
     world.fill(1);
+    const submits = () => world.requests.filter((r) => r === `${RELAYER}/v1/submit`).length;
+    const before = submits();
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "submitted");
-    assert.equal(world.relayer.submissions.length, 1);
+    assert.equal(submits(), before);
   });
 
   it("asks the relayer about a held payment while the indexer is down", async () => {
@@ -406,6 +428,29 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 2);
   });
 
+  it("leaves a forgotten held payment alone once its deadline cannot cover a new window at the pace of ledgers", async () => {
+    const world = await createWorld();
+    world.rpc.secondsPerLedger = 4;
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    const deadline = world.relayer.submissions[0]?.ext.deadline as number;
+    world.relayer.restart();
+    // 140 ledgers before the deadline and its margin: at four seconds a ledger, too few for the
+    // relayer's 10-minute window, though five-second ledgers would leave room.
+    world.advance(5 * (deadline - world.vault.ledger - 160));
+    const submits = () => world.requests.filter((r) => r === `${RELAYER}/v1/submit`).length;
+    const before = submits();
+    await alice.sync();
+    assert.equal(submits(), before);
+    assert.equal((await alice.plans())[0]?.state, "submitted");
+  });
+
   it("never pays twice when a held payment is sent again, its ID forgotten and then retried", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
@@ -470,6 +515,147 @@ describe("wallet: spends", () => {
     [plan] = await alice.plans();
     assert.equal(plan?.relayerStatus, "failed");
     assert.equal(world.relayer.submissions.length, 1);
+  });
+
+  it("cancels a held payment, which no one sends then, and keeps its notes until its deadline", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    const sub = await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      notBefore,
+    });
+    assert.equal(await alice.cancelHeld(sub.planId), true);
+    let [plan] = await alice.plans();
+    assert.equal(plan?.relayerStatus, "cancelled");
+    assert.equal(plan?.mustRetry, true);
+    // Neither the relayer, once due, nor the wallet, after a restart of the relayer, sends it.
+    world.advance(700);
+    world.relayer.releaseHeld();
+    world.relayer.restart();
+    await alice.sync();
+    assert.equal(world.relayer.submissions.length, 1);
+    assert.equal((await alice.balance()).locked, 100n * XLM);
+    world.advance(86_400);
+    world.fill(1);
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "dead");
+    assert.equal((await alice.balance()).spendable, 100n * XLM);
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 0n);
+    await assert.rejects(alice.cancelHeld(sub.planId), isError("invalid_argument"));
+    await assert.rejects(alice.cancelHeld("00".repeat(16)), isError("not_found"));
+  });
+
+  it("reports a held payment the relayer has sent already as not cancelled", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    const sub = await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      notBefore,
+    });
+    world.advance(700);
+    world.relayer.releaseHeld();
+    assert.equal(await alice.cancelHeld(sub.planId), false);
+    const [plan] = await alice.plans();
+    assert.equal(plan?.relayerStatus, "success");
+    assert.match(plan?.txHash ?? "", /^[0-9a-f]{64}$/);
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+  });
+
+  it("never sends again a held payment the relayer lost once asked to cancel it", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    const sub = await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      notBefore,
+    });
+    // A relayer that restarted no longer knows the request, so it cannot confirm the cancel.
+    world.relayer.restart();
+    assert.equal(await alice.cancelHeld(sub.planId), false);
+    assert.equal((await alice.plans())[0]?.relayerStatus, "unknown");
+    const submits = () => world.requests.filter((r) => r === `${RELAYER}/v1/submit`).length;
+    const before = submits();
+    await alice.sync();
+    assert.equal(submits(), before);
+    assert.equal((await alice.plans())[0]?.state, "submitted");
+  });
+
+  it("passes over a relayer that has paused relaying, for another one or for self-relay", async () => {
+    const { world, alice } = await funded();
+    const destination = keypairFor("payee").publicKey();
+    world.rpc.account(keypairFor("payee"));
+    world.relayer.paused = true;
+    await assert.rejects(
+      alice.unshield({ to: destination, amount: 5n * XLM, maxFee: 2n * XLM, confirm: confirmAll }),
+      (err: unknown) =>
+        isError("service_unavailable")(err) && (err as CyphrasError).details["paused"] === true,
+    );
+    // Another relayer takes the payment.
+    const second = "http://relayer2.test";
+    const both = await openWallet(
+      {
+        ...world,
+        fetch: async (input, init) => {
+          const url = new URL(input);
+          if (url.origin !== second) return world.fetch(input, init);
+          world.relayer.paused = false;
+          try {
+            return await world.fetch(`${RELAYER}${url.pathname}${url.search}`, init);
+          } finally {
+            world.relayer.paused = true;
+          }
+        },
+      },
+      0,
+      new MemoryStore(),
+      undefined,
+      { relayers: [RELAYER, second] },
+    );
+    await both.sync();
+    const relayed = await both.unshield({
+      to: destination,
+      amount: 5n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    assert.ok("planId" in relayed);
+    // A self-relayed unshield needs no relayer.
+    await alice.sync();
+    const own = await alice.unshield({
+      to: destination,
+      amount: 5n * XLM,
+      selfRelay: world.signer("my account"),
+      confirm: confirmAll,
+    });
+    assert.ok("planId" in own);
+    await alice.sync();
+    assert.deepEqual(
+      world.vault.transfers.filter((t) => t.to === destination).map((t) => t.amount),
+      [5n * XLM, 5n * XLM],
+    );
+  });
+
+  it("unshields less than 1 XLM to an account that exists", async () => {
+    const { world, alice } = await funded();
+    const payee = world.signer("small payee").publicKey;
+    await alice.unshield({ to: payee, amount: XLM / 2n, maxFee: 2n * XLM, confirm: confirmAll });
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+    assert.deepEqual(
+      world.vault.transfers.filter((t) => t.to === payee).map((t) => t.amount),
+      [XLM / 2n],
+    );
   });
 
   it("refuses a destination that does not exist unless the payout can create it, and the vault itself", async () => {

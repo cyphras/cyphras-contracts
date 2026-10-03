@@ -8,6 +8,8 @@ import { type ServiceIdentity, readIdentity } from "./indexer.ts";
 export interface RelayerHealth extends ServiceIdentity {
   readonly feeAddress: string;
   readonly maxFee: bigint | undefined;
+  // Relaying is paused for a while after transactions failed on chain.
+  readonly paused: boolean;
 }
 
 export interface Quote {
@@ -99,6 +101,7 @@ export class RelayerClient {
       ...readIdentity(f),
       feeAddress: feeAddress(f),
       maxFee: f.has("max_fee") ? f.amount("max_fee") : undefined,
+      paused: f.has("paused") && f.boolean("paused"),
     };
   }
 
@@ -172,6 +175,26 @@ export class RelayerClient {
       code: f.has("code") ? errorCode(f.string("code")) : undefined,
       exitId: f.has("exit_id") ? f.integer("exit_id", 1) : undefined,
     };
+  }
+
+  // Asks the relayer not to send a request it holds. False when it holds no such request to
+  // cancel: it sent, refused or cancelled it, or, after a restart, does not know it.
+  async cancelHeld(id: string): Promise<boolean> {
+    const { status, body } = await requestJson(
+      this.#fetch,
+      "relayer",
+      joinUrl(this.url, `/v1/held/${id}`),
+      { method: "DELETE" },
+    );
+    if (status === 404) return false;
+    if (status !== 200) {
+      throw new CyphrasError("service_unavailable", "the relayer gave no answer", {
+        service: "relayer",
+      });
+    }
+    const f = Fields.of(body, "service_rejected", "cancelled request");
+    oneOf(f, "status", ["cancelled"] as const);
+    return true;
   }
 
   // Asks the relayer about a request it holds, by the ID its reply gave. The relayer keeps held

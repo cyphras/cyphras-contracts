@@ -47,6 +47,8 @@ export interface TransactionStatus {
 export interface ContractEvent {
   readonly id: string;
   readonly ledger: number;
+  // Unix seconds at which its ledger closed, when RPC says.
+  readonly closedAt: number | undefined;
   readonly txHash: string;
   readonly contractId: string;
   readonly topic: readonly xdr.ScVal[];
@@ -59,7 +61,14 @@ export interface EventPage {
   readonly cursor: string | undefined;
   readonly latestLedger: number;
   readonly oldestLedger: number;
+  // Unix seconds at which those two ledgers closed, when RPC says.
+  readonly latestCloseTime: number | undefined;
+  readonly oldestCloseTime: number | undefined;
 }
+
+// A close time, which RPC sends as a decimal string of Unix seconds.
+const closeTime = (f: Fields, key: string): number | undefined =>
+  f.has(key) ? Number(f.amount(key)) : undefined;
 
 export const keyId = (key: xdr.LedgerKey): string => key.toXDR("base64");
 
@@ -97,9 +106,11 @@ export class SorobanRpc {
     return (await this.call("getLatestLedger")).integer("sequence", 1);
   }
 
+  // An entry modified after the ledger the reply claims to be of contradicts the reply.
   async getLedgerEntries(keys: readonly xdr.LedgerKey[]): Promise<LedgerEntries> {
     const wanted = new Map(keys.map((k) => [keyId(k), k]));
     const result = await this.call("getLedgerEntries", { keys: [...wanted.keys()] });
+    const latestLedger = result.integer("latestLedger", 1);
     const entries = new Map<string, LedgerEntry>();
     const list = result.has("entries") ? result.array("entries") : [];
     list.forEach((raw, i) => {
@@ -113,14 +124,17 @@ export class SorobanRpc {
       } catch {
         return e.fault("an entry is not LedgerEntryData XDR");
       }
+      const lastModifiedLedger = e.integer("lastModifiedLedgerSeq");
+      if (lastModifiedLedger > latestLedger)
+        e.fault("an entry was modified after the reply's ledger");
       entries.set(id, {
         key,
         data,
-        lastModifiedLedger: e.integer("lastModifiedLedgerSeq"),
+        lastModifiedLedger,
         liveUntilLedger: e.has("liveUntilLedgerSeq") ? e.integer("liveUntilLedgerSeq") : undefined,
       });
     });
-    return { latestLedger: result.integer("latestLedger", 1), entries };
+    return { latestLedger, entries };
   }
 
   async simulateTransaction(envelope: string): Promise<Simulation> {
@@ -201,9 +215,11 @@ export class SorobanRpc {
     const r = await this.call("getEvents", params);
     const events = r.array("events").map((raw, i): ContractEvent => {
       const e = r.item(raw, i, "events");
+      const closed = e.has("ledgerClosedAt") ? Date.parse(e.string("ledgerClosedAt")) : NaN;
       return {
         id: e.string("id"),
         ledger: e.integer("ledger", 1),
+        closedAt: Number.isNaN(closed) ? undefined : closed / 1000,
         txHash: e.hash("txHash"),
         contractId: e.string("contractId"),
         topic: e.array("topic").map((t) => xdr.ScVal.fromXDR(String(t), "base64")),
@@ -218,6 +234,8 @@ export class SorobanRpc {
       cursor: r.has("cursor") ? r.string("cursor") : undefined,
       latestLedger: r.integer("latestLedger", 1),
       oldestLedger: r.has("oldestLedger") ? r.integer("oldestLedger") : 1,
+      latestCloseTime: closeTime(r, "latestLedgerCloseTime"),
+      oldestCloseTime: closeTime(r, "oldestLedgerCloseTime"),
     };
   }
 

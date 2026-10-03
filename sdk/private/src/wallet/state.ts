@@ -11,8 +11,8 @@ export interface SpentBy {
 
 // What one transaction showed of a plan: the leaf positions at which it added the plan's two output
 // commitments, which of the plan's two nullifiers it spent, and whether it added a leaf that is not
-// the plan's. Positions come from leaves the vault's root confirmed, or from the vault's own events;
-// the spends and the other leaves only from those events, when `checked`.
+// the plan's. Positions come only from leaves the vault's root confirmed; the spends of the plan's
+// notes and the other leaves only from the vault's events the wallet checked, when `checked`.
 export interface Evidence {
   readonly txHash: string;
   readonly ledger: number;
@@ -176,9 +176,10 @@ export interface Operation {
   // The part whose landing starts the gap before the next one.
   awaiting: string | undefined;
   nextAt: number;
-  // Blocked by a part that did not land whose notes are gone: sending it again with other notes
-  // could pay twice, so the caller decides.
-  state: "active" | "done" | "blocked";
+  // Blocked by a part that did not land whose notes were spent elsewhere: sending it again with
+  // other notes could pay twice, so the caller decides, unless the part lands after all. Abandoned
+  // by the caller, it sends nothing more.
+  state: "active" | "done" | "blocked" | "abandoned";
   blockedBy: string | undefined;
 }
 
@@ -194,6 +195,8 @@ export interface Staging {
   readonly paths: { readonly pos: number; readonly pagePath: bigint[] }[];
   // The staged leaves that hold a plan's output commitment.
   readonly found: readonly FoundLeaf[];
+  // The first staged leaf a sync took while RPC could not confirm it, and the ledger it was added at.
+  readonly unchecked: { readonly first: number; readonly ledger: number } | undefined;
 }
 
 export interface FoundLeaf {
@@ -203,12 +206,23 @@ export interface FoundLeaf {
   readonly txHash: string;
 }
 
-// Ledgers whose spends a sync took from the indexer while RPC could not confirm them; `lost` once
-// RPC no longer holds them, so that nothing can check them any more.
-export interface LedgerRange {
+// What syncs took from the indexer while RPC could not confirm it: the spends of the ledgers from
+// `from` to `to`, none when `from` is past `to`, and the leaves at positions from `first` up to
+// `end`, the first of them added at `ledger`. `lost` once RPC no longer holds them, so that nothing
+// can check them any more.
+export interface UncheckedRange {
   readonly from: number;
   readonly to: number;
+  readonly leaves:
+    | { readonly first: number; readonly end: number; readonly ledger: number }
+    | undefined;
   readonly lost: boolean;
+}
+
+// A ledger and the Unix second it closed at.
+export interface LedgerTime {
+  readonly ledger: number;
+  readonly at: number;
 }
 
 export interface RootCheck {
@@ -226,8 +240,9 @@ export interface WalletState {
   lastLeafLedger: number;
   staging: Staging | undefined;
   nullifierSince: number;
-  // Every other ledger before nullifierSince, since the wallet started, was cross-checked.
-  unchecked: LedgerRange[];
+  // Every other ledger before nullifierSince, since the wallet started, was cross-checked, and so
+  // was every other leaf of the tree.
+  unchecked: UncheckedRange[];
   nullifierBuffer: { readonly nf: bigint; readonly ledger: number; readonly txHash: string }[];
   notes: OwnedNote[];
   sent: SentNote[];
@@ -235,6 +250,8 @@ export interface WalletState {
   deposits: Deposit[];
   operations: Operation[];
   rootCheck: RootCheck | undefined;
+  // Close times of the last hour that RPC reported, from which the pace of ledgers is taken.
+  ledgerTimes: LedgerTime[];
 }
 
 export function emptyState(deployLedger: number): WalletState {
@@ -253,6 +270,7 @@ export function emptyState(deployLedger: number): WalletState {
     deposits: [],
     operations: [],
     rootCheck: undefined,
+    ledgerTimes: [],
   };
 }
 
@@ -294,6 +312,8 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   if (bytes === undefined) return undefined;
   const state = JSON.parse(new TextDecoder().decode(bytes), reviver) as WalletState;
   if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
+  // A state need not hold close times yet; its next sync records them.
+  state.ledgerTimes ??= [];
   return state;
 }
 
