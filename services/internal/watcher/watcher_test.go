@@ -573,3 +573,24 @@ func TestAStatusReadAheadOfTheReplayWaitsForIt(t *testing.T) {
 		t.Fatalf("pages %v", h.pages.codes())
 	}
 }
+
+func TestARebuildDoesNotReportOldGovernanceAgain(t *testing.T) {
+	h := newHarness(t)
+	h.chain.Governance("paused", vault.Field{Name: "deposits", Value: vault.Bool(false)}, vault.Field{Name: "transfers", Value: vault.Bool(true)})
+	// Two days of quiet ledgers follow, so the event is old when the watcher first reads it.
+	h.chain.NextLedger(2 * 86_400)
+	h.chain.Shield(vaulttest.Depositor, 10_000_000)
+	h.chain.NextLedger(5)
+	h.f.Window = 1
+	h.publish()
+	h.primary.CloseTime = h.chain.ClosedAt
+	for range 100 {
+		progressed, err := h.f.Step(context.Background())
+		if err != nil || !progressed {
+			break
+		}
+	}
+	if h.pages.has("governance_paused") || h.public.has("governance_paused") {
+		t.Fatalf("an old governance event was reported again: %v %v", h.pages.codes(), h.public.codes())
+	}
+}

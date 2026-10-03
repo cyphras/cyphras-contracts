@@ -75,10 +75,7 @@ func (f *Follower) Step(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("%w: %w", ErrFault, err)
 	}
-	b := Batch{From: next, To: to, Raw: raw, Txs: txs, Latest: health.LatestLedger}
-	if to == health.LatestLedger {
-		b.LatestCloseTime = health.LatestLedgerCloseTime
-	}
+	b := Batch{From: next, To: to, Raw: raw, Txs: txs, Latest: health.LatestLedger, LatestCloseTime: health.LatestLedgerCloseTime}
 	if err := f.Sink.Apply(ctx, b); err != nil {
 		return false, err
 	}
