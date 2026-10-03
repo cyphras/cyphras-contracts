@@ -64,9 +64,10 @@ type Config struct {
 	// request is accepted, and again when a held one is sent; 20 when unset, and twice that in the
 	// guarded mode.
 	DeadlineMargin uint32
-	// Cooldown is how long the nullifiers of a relay that failed on chain for a reason the request
-	// carries are refused; 24 hours when unset. A destination that stopped receiving rests ten
-	// minutes after its first failure, doubling with each one in a row up to a day.
+	// Cooldown is how long a request that failed on chain is refused, and its nullifiers with it
+	// when the failure was of the request's making; 24 hours when unset. A destination that stopped
+	// receiving, or that a failure without diagnostics named, rests ten minutes after its first
+	// failure, doubling with each one in a row up to a day.
 	Cooldown time.Duration
 	// BreakerFailures failures on chain within BreakerWindow that point at the relayer itself
 	// pause relaying for BreakerPause; 3, an hour and 30 minutes when unset.

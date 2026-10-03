@@ -35,8 +35,8 @@ type Config struct {
 	PolicyVersion string
 	// RecheckWindow is how long before eligibility the final check runs.
 	RecheckWindow time.Duration
-	// Cutoff is how long before eligibility an attested deposit without a passed re-check is
-	// refused rather than risk its admission unchecked.
+	// Cutoff is how long before eligibility a deposit whose checks keep failing, without a passed
+	// re-check, is held rather than risk its admission unchecked.
 	Cutoff time.Duration
 	// FirstCheckWithin is the time the policy allows for a deposit's first check.
 	FirstCheckWithin time.Duration
