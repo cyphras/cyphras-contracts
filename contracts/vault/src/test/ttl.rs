@@ -77,7 +77,8 @@ fn bump_ttl_extends_the_instance_the_tree_and_the_listed_deposits_to_the_maximum
     s.shield(&depositor, XLM).unwrap();
     s.advance(DELAY_SMALL);
 
-    s.vault.bump_ttl(&Vec::from_slice(&s.env, &[1, 7]));
+    s.vault
+        .bump_ttl(&Vec::from_slice(&s.env, &[1, 7]), &Vec::new(&s.env));
     assert!(authorizers(&s).is_empty());
     let max = max_ttl(&s);
     assert_eq!(instance_ttl(&s), max);
@@ -91,6 +92,38 @@ fn bump_ttl_extends_the_instance_the_tree_and_the_listed_deposits_to_the_maximum
     // A later write does not shorten an entry the keeper extended.
     s.vault.flag(&1, &1);
     assert_eq!(persistent_ttl(&s, &DataKey::Pending(1)), max);
+}
+
+#[test]
+fn bump_ttl_extends_the_listed_queued_and_stranded_exits_to_the_maximum() {
+    let s = Setup::with_limits(Limits {
+        max_daily_outflow: 10 * XLM,
+        tvl_cap: 70 * XLM,
+        ..limits()
+    });
+    s.fund_pool("funder", 50 * XLM);
+    let user = s.account("user", 0);
+    let missing = account_address(&s.env, "missing");
+    s.transact(&user, &s.ext(-10 * XLM, 0, &user, &user))
+        .unwrap();
+    s.transact(&user, &s.ext(-XLM / 2, 0, &missing, &user))
+        .unwrap();
+    for _ in 0..2 {
+        s.transact(&user, &s.ext(-XLM, 0, &user, &user)).unwrap();
+    }
+    s.advance(DAY);
+    // Too small to create the missing account, the first exit strands.
+    s.env.ledger().with_mut(|l| l.base_reserve = 5_000_000);
+    assert_eq!(s.vault.release(&1), 1);
+
+    s.vault
+        .bump_ttl(&Vec::new(&s.env), &Vec::from_slice(&s.env, &[1, 2, 9]));
+    assert!(authorizers(&s).is_empty());
+    let max = max_ttl(&s);
+    assert_eq!(persistent_ttl(&s, &DataKey::Stranded(1)), max);
+    assert_eq!(persistent_ttl(&s, &DataKey::Exit(2)), max);
+    // Unlisted exits keep their TTL.
+    assert!(persistent_ttl(&s, &DataKey::Exit(3)) < max);
 }
 
 #[test]

@@ -250,16 +250,20 @@ pub fn set_day_total(env: &Env, depositor: &Address, day: u64, total: i128) {
 }
 
 /// Extends the instance and the tree entries to the network's maximum TTL, and every listed
-/// pending deposit that still exists.
-pub fn bump(env: &Env, pending_ids: &Vec<u64>) {
+/// pending deposit and queued or stranded exit that still exists.
+pub fn bump(env: &Env, pending_ids: &Vec<u64>, exit_ids: &Vec<u64>) {
     let max = env.storage().max_ttl();
     env.storage().instance().extend_ttl(max, max);
     let storage = env.storage().persistent();
     for key in [DataKey::Roots, DataKey::Frontier, DataKey::NextLeaf] {
         storage.extend_ttl(&key, max, max);
     }
-    for id in pending_ids.iter() {
-        let key = DataKey::Pending(id);
+    let listed = pending_ids.iter().map(DataKey::Pending).chain(
+        exit_ids
+            .iter()
+            .flat_map(|id| [DataKey::Exit(id), DataKey::Stranded(id)]),
+    );
+    for key in listed {
         if storage.has(&key) {
             storage.extend_ttl(&key, max, max);
         }

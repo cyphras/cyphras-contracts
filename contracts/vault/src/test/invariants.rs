@@ -611,12 +611,10 @@ impl Run {
             Op::CancelLimits => outcome(v.try_cancel_limits()).map(|_| Done::Unit),
             Op::Release(max) => outcome(v.try_release(max)).map(Done::Count),
             Op::BumpTtl => {
-                v.bump_ttl(&ids(&self
-                    .model
-                    .pending
-                    .keys()
-                    .copied()
-                    .collect::<std::vec::Vec<_>>()));
+                let m = &self.model;
+                let pending: std::vec::Vec<u64> = m.pending.keys().copied().collect();
+                let exits: std::vec::Vec<u64> = (m.status.exit_head..m.status.exit_tail).collect();
+                v.bump_ttl(&ids(&pending), &ids(&exits));
                 Ok(Done::Unit)
             }
             Op::Advance(seconds) => {

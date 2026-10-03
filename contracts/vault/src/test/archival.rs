@@ -12,9 +12,9 @@ use soroban_sdk::{
 use super::{
     e2e::Flow,
     fixtures,
-    setup::{outcome, Setup, DAY, XLM},
+    setup::{account_address, limits, outcome, Setup, DAY, XLM},
 };
-use crate::{DataKey, Error};
+use crate::{DataKey, Error, Limits};
 
 fn ledger_key(env: &Env, contract: &soroban_sdk::Address, key: &DataKey) -> Rc<xdr::LedgerKey> {
     let ScAddress::Contract(contract) = ScAddress::from(contract) else {
@@ -92,4 +92,34 @@ fn an_archived_pending_deposit_can_still_be_cancelled_or_refunded() {
     s.vault.refund(&2);
     assert_eq!(s.balance(&depositor), 100 * XLM);
     assert_eq!(outcome(s.vault.try_cancel(&1)), Err(Error::UnknownDeposit));
+}
+
+#[test]
+fn an_archived_queued_or_stranded_exit_is_still_paid() {
+    let s = Setup::with_limits(Limits {
+        max_daily_outflow: 10 * XLM,
+        tvl_cap: 70 * XLM,
+        ..limits()
+    });
+    s.fund_pool("funder", 50 * XLM);
+    let user = s.account("user", 0);
+    let missing = account_address(&s.env, "missing");
+    s.transact(&user, &s.ext(-10 * XLM, 0, &user, &user))
+        .unwrap();
+    s.transact(&user, &s.ext(-XLM / 2, 0, &missing, &user))
+        .unwrap();
+    s.transact(&user, &s.ext(-XLM, 0, &user, &user)).unwrap();
+    // Both exits were written in the same ledger, so they are archived together.
+    archive(&s.env, &s.vault.address, &DataKey::Exit(1));
+    s.advance(DAY);
+
+    // Too small to create the missing account, the first exit strands; the second is paid.
+    s.env.ledger().with_mut(|l| l.base_reserve = 5_000_000);
+    assert_eq!(s.vault.release(&2), 2);
+    assert_eq!(s.balance(&user), 11 * XLM);
+    archive(&s.env, &s.vault.address, &DataKey::Stranded(1));
+    s.account("missing", XLM);
+    s.vault.claim(&1);
+    assert_eq!(s.balance(&missing), XLM + XLM / 2);
+    assert_eq!(s.vault.status().queued_total, 0);
 }

@@ -718,10 +718,11 @@ impl Vault {
         Ok(())
     }
 
-    /// Anyone extends the instance, the tree entries and the listed pending deposits to the
-    /// network's maximum TTL. IDs that are no longer pending are skipped.
-    pub fn bump_ttl(env: Env, pending_ids: Vec<u64>) {
-        storage::bump(&env, &pending_ids);
+    /// Anyone extends the instance, the tree entries, the listed pending deposits and the listed
+    /// queued or stranded exits to the network's maximum TTL. IDs that are no longer pending,
+    /// queued or stranded are skipped.
+    pub fn bump_ttl(env: Env, pending_ids: Vec<u64>, exit_ids: Vec<u64>) {
+        storage::bump(&env, &pending_ids, &exit_ids);
     }
 
     pub fn config(env: Env) -> Config {

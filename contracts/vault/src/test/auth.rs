@@ -56,7 +56,8 @@ fn every_privileged_entry_point_refuses_a_call_without_authorization() {
     assert!(s.vault.queued_limits().is_some());
 
     // The permissionless entry points need nobody.
-    s.vault.bump_ttl(&Vec::from_slice(&s.env, &[1, 2]));
+    s.vault
+        .bump_ttl(&Vec::from_slice(&s.env, &[1, 2]), &Vec::new(&s.env));
     assert_eq!(
         outcome(s.vault.try_apply_limits()),
         Err(Error::LimitsNotReady)
