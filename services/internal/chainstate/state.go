@@ -217,6 +217,13 @@ type Claimed struct {
 	TxHash   string
 }
 
+// RootAt is the tree's root once it holds LeafCount leaves. The vault keeps the same roots in its
+// root ring, so a root read from the chain is compared with the one at the same leaf count.
+type RootAt struct {
+	LeafCount uint64
+	Root      fr.Element
+}
+
 // Notice is a governance, queue or exit event, kept for the services that report them.
 type Notice struct {
 	Name     string
@@ -229,6 +236,7 @@ type Notice struct {
 // Delta is what one window of transactions changed.
 type Delta struct {
 	Leaves      []Leaf
+	Roots       []RootAt
 	Nullifiers  []Nullifier
 	Created     []Deposit
 	Updated     []Deposit
@@ -610,6 +618,7 @@ func (s *State) insert(tx vault.Tx, outputs [2]vault.NewCommitment, d *Delta) er
 	if _, err := s.Tree.AppendPair(outputs[0].Commitment, outputs[1].Commitment); err != nil {
 		return inconsistent("insertion: %v", err)
 	}
+	d.Roots = append(d.Roots, RootAt{LeafCount: s.Tree.Len(), Root: s.Tree.Root()})
 	for _, o := range outputs {
 		d.Leaves = append(d.Leaves, Leaf{Index: o.Index, Commitment: o.Commitment, Ciphertext: o.Ciphertext, Ledger: tx.Ledger, TxHash: tx.Hash})
 	}

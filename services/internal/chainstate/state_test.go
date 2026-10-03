@@ -144,6 +144,9 @@ func TestTheVaultFixtureFlowReplaysToTheVaultRoots(t *testing.T) {
 		if tx.Hash == "admit" && (len(d.Resolved) != 2 || len(d.Leaves) != 4 || d.Resolved[1].LeafIndex0 != 2) {
 			t.Fatalf("admission delta %+v", d)
 		}
+		if len(d.Roots) != len(d.Leaves)/2 || (len(d.Roots) > 0 && (d.Roots[len(d.Roots)-1].Root != s.Tree.Root() || d.Roots[len(d.Roots)-1].LeafCount != s.Tree.Len())) {
+			t.Fatalf("%s: roots %+v", tx.Hash, d.Roots)
+		}
 	}
 	if s.Tree.Len() != 12 || s.NullifierCount != 12 || len(s.Pending) != 0 {
 		t.Fatalf("leaves %d, nullifiers %d, pending %d", s.Tree.Len(), s.NullifierCount, len(s.Pending))

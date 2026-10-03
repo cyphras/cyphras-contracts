@@ -16,6 +16,7 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/follow"
+	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
@@ -65,6 +66,24 @@ type Indexer struct {
 	fault      bool
 	instance   *vault.Instance
 	delays     map[uint64]uint64
+	// roots holds the tree's recent roots by leaf count, as the vault's root ring does.
+	roots     map[uint64]fr.Element
+	rootOrder []uint64
+}
+
+// rootHistory is how many recent roots the indexer keeps to compare with the vault's.
+const rootHistory = 1024
+
+func (ix *Indexer) keepRoot(r chainstate.RootAt) {
+	if _, ok := ix.roots[r.LeafCount]; ok {
+		return
+	}
+	ix.roots[r.LeafCount] = r.Root
+	ix.rootOrder = append(ix.rootOrder, r.LeafCount)
+	if len(ix.rootOrder) > rootHistory {
+		delete(ix.roots, ix.rootOrder[0])
+		ix.rootOrder = ix.rootOrder[1:]
+	}
 }
 
 // New loads the stored state. The database must already hold the chain-state and indexer tables.
@@ -78,6 +97,8 @@ func New(ctx context.Context, cfg Config, client rpc.Client, chain *chainstate.S
 		return nil, err
 	}
 	ix.state, ix.cursor = state, cursor
+	ix.roots = map[uint64]fr.Element{}
+	ix.keepRoot(chainstate.RootAt{LeafCount: state.Tree.Len(), Root: state.Tree.Root()})
 	if ix.mismatch, err = ix.db.mismatch(ctx); err != nil {
 		return nil, err
 	}
@@ -129,6 +150,9 @@ func (ix *Indexer) Apply(ctx context.Context, b follow.Batch) error {
 	ix.mu.Lock()
 	ix.state, ix.cursor = next, b.To
 	ix.latest = max(ix.latest, b.Latest)
+	for _, r := range delta.Roots {
+		ix.keepRoot(r)
+	}
 	if ix.fault {
 		ix.fault = false
 		ix.alerts.Clear(ctx, "ingest_fault", "ingest moved past ledger %d", b.To)
@@ -161,8 +185,9 @@ func (ix *Indexer) Fault(ctx context.Context, err error) {
 	ix.log.Warn("ingest retry", "error", err.Error())
 }
 
-// Reconcile compares the vault's next leaf index and current root with the indexer's, once the
-// indexer has ingested every ledger that modified them.
+// Reconcile compares the vault's current root with the indexer's root at the vault's next leaf
+// index. Roots are kept by leaf count, so the comparison holds even when the vault moves on between
+// the read and the ingest.
 func (ix *Indexer) Reconcile(ctx context.Context) error {
 	nextKey, err := vault.NextLeafKey(ix.cfg.Vault)
 	if err != nil {
@@ -177,16 +202,12 @@ func (ix *Indexer) Reconcile(ctx context.Context) error {
 		return err
 	}
 	ix.mu.RLock()
-	cursor, state := ix.cursor, ix.state
+	cursor := ix.cursor
 	ix.mu.RUnlock()
 	nextEntry, ok1 := entries[mustKeyString(nextKey)]
 	rootsEntry, ok2 := entries[mustKeyString(rootsKey)]
 	if !ok1 || !ok2 {
 		return ix.mismatchAt(ctx, cursor, "the vault's tree entries are missing or archived")
-	}
-	if max(nextEntry.LastModified, rootsEntry.LastModified) > cursor {
-		// The chain moved on; compare after ingesting that far.
-		return nil
 	}
 	nextVal, err := rpc.ContractValue(nextEntry)
 	if err != nil {
@@ -204,9 +225,18 @@ func (ix *Indexer) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return ix.mismatchAt(ctx, cursor, "the root ring does not decode")
 	}
-	if uint64(nextLeaf) != state.Tree.Len() || ring.Current() != state.Tree.Root() {
-		return ix.mismatchAt(ctx, cursor, fmt.Sprintf("chain has %d leaves and root %s, indexer %d and %s",
-			uint64(nextLeaf), ring.Current().Hex(), state.Tree.Len(), state.Tree.Root().Hex()))
+	n := uint64(nextLeaf)
+	ix.mu.RLock()
+	ours, known := ix.roots[n]
+	have := ix.state.Tree.Len()
+	ix.mu.RUnlock()
+	if n > have || !known {
+		// The chain is ahead of the indexer, or the read is older than the roots kept; compare on
+		// the next round.
+		return nil
+	}
+	if ring.Current() != ours {
+		return ix.mismatchAt(ctx, cursor, fmt.Sprintf("at %d leaves the chain has root %s, the indexer %s", n, ring.Current().Hex(), ours.Hex()))
 	}
 	ix.mu.Lock()
 	ix.reconciled, ix.matched = cursor, true
@@ -302,6 +332,9 @@ func (ix *Indexer) Run(ctx context.Context, f *follow.Follower, poll time.Durati
 			ix.Probe(ctx)
 			if err := ix.RefreshPending(ctx); err != nil {
 				ix.log.Warn("pending refresh failed", "error", err.Error())
+			}
+			if err := ix.Reconcile(ctx); err != nil {
+				ix.log.Warn("reconciliation incomplete", "error", err.Error())
 			}
 			select {
 			case <-ctx.Done():
