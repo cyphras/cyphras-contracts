@@ -1,0 +1,7 @@
+The .circom files in this directory are taken, with whitespace-only changes, from
+NethermindEth/stellar-private-payments (circuits/src/poseidon2, commit
+00a9c54445b14228de9760280de3c9c83586061a), licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
+
+Their round constants come from the Horizen Labs Poseidon2 reference script:
+https://github.com/HorizenLabs/poseidon2
