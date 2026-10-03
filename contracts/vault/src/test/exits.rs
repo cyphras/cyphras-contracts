@@ -1,15 +1,22 @@
 //! The exit queue: an exit that does not fit today's outflow window waits in ID order, and anyone
 //! releases the queue as the window allows.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, rc::Rc};
 
-use soroban_sdk::{testutils::Events as _, Address, Event, MuxedAddress};
+use soroban_sdk::{
+    testutils::{Events as _, MuxedAddress as _},
+    token::StellarAssetClient,
+    xdr, Address, Env, Event, MuxedAddress,
+};
 
 use super::{
     queue::authorizers,
-    setup::{limits, outcome, Setup, DAY, DELAY_SMALL, XLM},
+    setup::{
+        account_address, asset_contract, create_account, env, limits, outcome, Setup, DAY,
+        DELAY_SMALL, TESTNET, XLM,
+    },
 };
-use crate::{events, Error, Exit, Status};
+use crate::{events, storage, Error, Exit, Status};
 
 const HALT: u64 = 72 * 3_600;
 
@@ -561,4 +568,134 @@ fn exits_sized_to_waste_the_window_slow_the_queue_but_never_stop_it() {
     assert_eq!(days, 6);
     assert_eq!(s.balance(&honest), 100 * XLM);
     assert_eq!(s.balance(&attacker), 6 * wasteful);
+}
+
+// The live network's per-transaction limits on instructions and on event bytes. The test
+// environment also enforces its limits on written and accessed ledger entries by default.
+const TX_INSTRUCTIONS: i64 = 400_000_000;
+const TX_EVENTS: u32 = 16_384;
+
+/// A classic asset with a twelve-letter code, the longest name its transfer events can carry.
+fn long_asset(env: &Env) -> xdr::AlphaNum12 {
+    let issuer = account_address(env, "issuer");
+    let xdr::ScAddress::Account(issuer) = xdr::ScAddress::from(&issuer) else {
+        panic!("the issuer is not an account");
+    };
+    xdr::AlphaNum12 {
+        asset_code: xdr::AssetCode12(*b"ABCDEFGHIJKL"),
+        issuer,
+    }
+}
+
+/// An account with an authorized trustline to `asset`, written straight into the ledger.
+fn trusting(env: &Env, asset: &xdr::AlphaNum12, tag: &str) -> Address {
+    let address = account_address(env, tag);
+    create_account(env, &address, 0);
+    let xdr::ScAddress::Account(account_id) = xdr::ScAddress::from(&address) else {
+        panic!("not an account address");
+    };
+    let asset = xdr::TrustLineAsset::CreditAlphanum12(asset.clone());
+    let key = Rc::new(xdr::LedgerKey::Trustline(xdr::LedgerKeyTrustLine {
+        account_id: account_id.clone(),
+        asset: asset.clone(),
+    }));
+    let entry = Rc::new(xdr::LedgerEntry {
+        data: xdr::LedgerEntryData::Trustline(xdr::TrustLineEntry {
+            account_id,
+            asset,
+            balance: 0,
+            limit: i64::MAX,
+            flags: xdr::TrustLineFlags::AuthorizedFlag as u32,
+            ext: xdr::TrustLineEntryExt::V0,
+        }),
+        last_modified_ledger_seq: 0,
+        ext: xdr::LedgerEntryExt::V0,
+    });
+    env.host().add_ledger_entry(&key, &entry, None).unwrap();
+    address
+}
+
+/// A vault of the long-named asset holding `n` exits, written into its storage as `transact`
+/// queues them. Each pays 100 units to a muxed address of an account of its own and a fee of one
+/// unit to its relayer, which is the same account for every exit when `shared_relayer` is set.
+fn queued_exits(n: u64, shared_relayer: bool) -> Setup {
+    let env = env(TESTNET);
+    let asset = long_asset(&env);
+    create_account(&env, &account_address(&env, "issuer"), XLM);
+    let token = asset_contract(&env, xdr::Asset::CreditAlphanum12(asset.clone()));
+    let s = Setup::with_token(
+        env,
+        token.clone(),
+        crate::Limits {
+            max_daily_outflow: 1_000_000 * XLM,
+            tvl_cap: 7_000_000 * XLM,
+            ..limits()
+        },
+    );
+    let total = 101 * XLM * n as i128;
+    StellarAssetClient::new(&s.env, &token).mint(&s.vault.address, &total);
+    let shared = trusting(&s.env, &asset, "relayer");
+    let exits: std::vec::Vec<Exit> = (0..n)
+        .map(|i| Exit {
+            recipient: MuxedAddress::new(
+                trusting(&s.env, &asset, &std::format!("recipient {i}")),
+                u64::MAX - i,
+            ),
+            payout: 100 * XLM,
+            relayer: if shared_relayer {
+                shared.clone()
+            } else {
+                trusting(&s.env, &asset, &std::format!("relayer {i}"))
+            },
+            fee: XLM,
+            queued_at: s.now(),
+        })
+        .collect();
+    s.env.as_contract(&s.vault.address, || {
+        let mut status = storage::status(&s.env);
+        for exit in &exits {
+            storage::set_exit(&s.env, status.exit_tail, exit);
+            status.exit_tail += 1;
+        }
+        status.tvl = total;
+        status.queued_total = total;
+        storage::set_status(&s.env, &status);
+    });
+    s
+}
+
+#[test]
+fn fifteen_releases_fit_every_limit_of_one_transaction() {
+    // Each exit has a recipient and a relayer of its own, so it writes three entries and emits a
+    // settled event and two transfers naming the long asset. The budget is lifted so that only
+    // the network's limits, checked here and by the test environment, apply.
+    let s = queued_exits(15, false);
+    s.env.cost_estimate().budget().reset_unlimited();
+    assert_eq!(s.vault.release(&15), 15);
+    let resources = s.env.cost_estimate().resources();
+    std::println!(
+        "release of 15: cpu {} mem {} writes {} entries {} events {}",
+        resources.instructions,
+        resources.mem_bytes,
+        resources.write_entries,
+        resources.disk_read_entries + resources.memory_read_entries + resources.write_entries,
+        resources.contract_events_size_bytes,
+    );
+    assert!(resources.instructions <= TX_INSTRUCTIONS);
+    assert!(resources.contract_events_size_bytes <= TX_EVENTS);
+    assert_eq!(resources.write_entries, 3 * 15 + 2);
+    assert_eq!(s.vault.status().queued_total, 0);
+}
+
+#[test]
+fn the_event_limit_caps_a_release_at_eighteen_exits() {
+    let s = queued_exits(19, true);
+    s.env.cost_estimate().budget().reset_unlimited();
+    assert_eq!(s.vault.release(&1), 1);
+    let one = s.env.cost_estimate().resources().contract_events_size_bytes;
+    s.env.cost_estimate().budget().reset_unlimited();
+    assert_eq!(s.vault.release(&18), 18);
+    let eighteen = s.env.cost_estimate().resources().contract_events_size_bytes;
+    assert_eq!(eighteen, 18 * one);
+    assert!(eighteen <= TX_EVENTS && 19 * one > TX_EVENTS);
 }
