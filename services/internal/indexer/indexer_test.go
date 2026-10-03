@@ -527,3 +527,42 @@ func TestBulkResponsesAreServedFromMemoryForAFewSeconds(t *testing.T) {
 		t.Fatalf("a stale copy was served: %v", body)
 	}
 }
+
+func TestOnlyAFullAndRecentReconciliationMakesTheIndexerReady(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.publish()
+	leaves := h.leafValues()
+	// The chain reads as if only the first pair had been inserted: a prefix the indexer agrees
+	// with, which says nothing about the leaves after it.
+	var tr tree.Tree
+	if _, err := tr.AppendPair(leaves[0], leaves[1]); err != nil {
+		t.Fatal(err)
+	}
+	h.fake.SetContractData(mustKey(vault.NextLeafKey(vaulttest.Vault)), vault.U64(tr.Len()), 10, nil)
+	h.fake.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), vaulttest.RootRing(tr.Root(), 1), 10, nil)
+	for range 50 {
+		if progressed, err := h.f.Step(context.Background()); err != nil || !progressed {
+			break
+		}
+	}
+	h.ix.Probe(context.Background())
+	if err := h.ix.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.ix.Health(); got.Ready {
+		t.Fatalf("ready on a prefix: %+v", got)
+	}
+	h.publish()
+	if err := h.ix.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.ix.Health(); !got.Ready {
+		t.Fatalf("not ready after a full match: %+v", got)
+	}
+	h.now = h.now.Add(reconcileMaxAge + time.Second)
+	h.ix.Probe(context.Background())
+	if got := h.ix.Health(); got.Ready || got.Code != CodeLagging {
+		t.Fatalf("still ready without reconciling: %+v", got)
+	}
+}

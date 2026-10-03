@@ -66,6 +66,8 @@ type Indexer struct {
 	fault      bool
 	instance   *vault.Instance
 	delays     map[uint64]uint64
+	// reconciledAt is when the chain last vouched for every leaf served.
+	reconciledAt time.Time
 	// roots holds the tree's recent roots by leaf count, as the vault's root ring does.
 	roots     map[uint64]fr.Element
 	rootOrder []uint64
@@ -76,6 +78,9 @@ type Indexer struct {
 
 // rootHistory is how many recent roots the indexer keeps to compare with the vault's.
 const rootHistory = 1024
+
+// reconcileMaxAge is how long the indexer stays ready without the chain vouching for all it serves.
+const reconcileMaxAge = 10 * time.Minute
 
 func (ix *Indexer) keepRoot(r chainstate.RootAt) {
 	if _, ok := ix.roots[r.LeafCount]; ok {
@@ -241,8 +246,12 @@ func (ix *Indexer) Reconcile(ctx context.Context) error {
 	if ring.Current() != ours {
 		return ix.mismatchAt(ctx, cursor, fmt.Sprintf("at %d leaves the chain has root %s, the indexer %s", n, ring.Current().Hex(), ours.Hex()))
 	}
+	if n < have {
+		// The read vouches only for the leaves up to n; the ones after it wait for a later round.
+		return nil
+	}
 	ix.mu.Lock()
-	ix.reconciled, ix.matched = cursor, true
+	ix.reconciled, ix.matched, ix.reconciledAt = cursor, true, ix.now()
 	ix.latest = max(ix.latest, latest)
 	ix.mu.Unlock()
 	return nil
@@ -382,7 +391,7 @@ func (ix *Indexer) Health() Health {
 		h.Code = CodeFault
 	case ix.probedAt.IsZero() || ix.now().Sub(ix.probedAt) > ix.cfg.ProbeMaxAge:
 		h.Code = CodeProbeFailed
-	case ix.latest > ix.cursor+ix.cfg.MaxLag || !ix.matched:
+	case ix.latest > ix.cursor+ix.cfg.MaxLag || !ix.matched || ix.now().Sub(ix.reconciledAt) > reconcileMaxAge:
 		h.Code = CodeLagging
 	default:
 		h.Ready = true
