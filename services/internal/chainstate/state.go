@@ -272,6 +272,44 @@ type Delta struct {
 	Released    []Released
 	Claimed     []Claimed
 	Notices     []Notice
+	// exitOrder is the order the exit changes above happened in, which the store follows: one
+	// window can queue an exit, strand it and pay part of it by claim, each change building on
+	// the one before.
+	exitOrder []exitChange
+}
+
+type exitChangeKind int
+
+const (
+	queuedChange exitChangeKind = iota
+	partPaidChange
+	releasedChange
+	claimedChange
+)
+
+type exitChange struct {
+	kind  exitChangeKind
+	index int
+}
+
+func (d *Delta) queued(e Exit) {
+	d.exitOrder = append(d.exitOrder, exitChange{queuedChange, len(d.Queued)})
+	d.Queued = append(d.Queued, e)
+}
+
+func (d *Delta) partPaid(p PartPaid) {
+	d.exitOrder = append(d.exitOrder, exitChange{partPaidChange, len(d.PartPaid)})
+	d.PartPaid = append(d.PartPaid, p)
+}
+
+func (d *Delta) released(r Released) {
+	d.exitOrder = append(d.exitOrder, exitChange{releasedChange, len(d.Released)})
+	d.Released = append(d.Released, r)
+}
+
+func (d *Delta) claimed(c Claimed) {
+	d.exitOrder = append(d.exitOrder, exitChange{claimedChange, len(d.Claimed)})
+	d.Claimed = append(d.Claimed, c)
 }
 
 // Apply applies the transactions in chain order and returns what changed. On error the state is
@@ -490,7 +528,7 @@ func (s *State) transact(tx vault.Tx, c vault.Transact, d *Delta, spent map[fr.E
 		s.Exits[q.ID] = e
 		s.ExitTail++
 		s.QueuedTotal.Add(s.QueuedTotal, outflow)
-		d.Queued = append(d.Queued, *e)
+		d.queued(*e)
 		s.notice(tx, "exit_queued", *q, d)
 		return nil
 	}
@@ -531,7 +569,7 @@ func (s *State) release(tx vault.Tx, settled vault.Settled, d *Delta) error {
 	if err := s.takeOff(now, id, e.Outflow()); err != nil {
 		return err
 	}
-	d.Released = append(d.Released, Released{Exit: *e, UnpaidPayout: new(big.Int), UnpaidFee: new(big.Int), PaidLedger: tx.Ledger, PaidAt: tx.ClosedAt, PaidTx: tx.Hash})
+	d.released(Released{Exit: *e, UnpaidPayout: new(big.Int), UnpaidFee: new(big.Int), PaidLedger: tx.Ledger, PaidAt: tx.ClosedAt, PaidTx: tx.Hash})
 	d.Settlements = append(d.Settlements, Settlement{Settled: settled, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
 	s.notice(tx, "exit_released", settled, d)
 	return nil
@@ -560,7 +598,7 @@ func (s *State) payPart(tx vault.Tx, c vault.ExitPaid, d *Delta) error {
 	}
 	id := c.ID
 	part := vault.Settled{ExtAmount: new(big.Int).Neg(c.PayoutPaid), Fee: new(big.Int).Set(c.FeePaid), Recipient: e.Recipient, Relayer: e.Relayer, ExitID: &id}
-	d.PartPaid = append(d.PartPaid, PartPaid{ID: c.ID, PayoutLeft: e.Payout, FeeLeft: e.Fee})
+	d.partPaid(PartPaid{ID: c.ID, PayoutLeft: e.Payout, FeeLeft: e.Fee})
 	d.Settlements = append(d.Settlements, Settlement{Settled: part, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
 	s.notice(tx, "exit_paid", c, d)
 	return nil
@@ -591,7 +629,7 @@ func (s *State) claimPart(tx vault.Tx, c vault.ExitPaid, d *Delta) error {
 	}
 	id := c.ID
 	part := vault.Settled{ExtAmount: new(big.Int).Neg(c.PayoutPaid), Fee: new(big.Int).Set(c.FeePaid), Recipient: e.Recipient, Relayer: e.Relayer, ExitID: &id}
-	d.PartPaid = append(d.PartPaid, PartPaid{ID: c.ID, Stranded: true, PayoutLeft: e.Payout, FeeLeft: e.Fee})
+	d.partPaid(PartPaid{ID: c.ID, Stranded: true, PayoutLeft: e.Payout, FeeLeft: e.Fee})
 	d.Settlements = append(d.Settlements, Settlement{Settled: part, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
 	s.notice(tx, "exit_paid", c, d)
 	return nil
@@ -628,7 +666,7 @@ func (s *State) strand(tx vault.Tx, c vault.ExitStranded, d *Delta) error {
 	left.Payout, left.Fee = new(big.Int).Set(c.Payout), new(big.Int).Set(c.Fee)
 	left.StrandedLedger, left.StrandedAt, left.StrandedTx = tx.Ledger, tx.ClosedAt, tx.Hash
 	s.Stranded[c.ID] = left
-	d.Released = append(d.Released, Released{Exit: *e, UnpaidPayout: left.Payout, UnpaidFee: left.Fee, PaidLedger: tx.Ledger, PaidAt: tx.ClosedAt, PaidTx: tx.Hash})
+	d.released(Released{Exit: *e, UnpaidPayout: left.Payout, UnpaidFee: left.Fee, PaidLedger: tx.Ledger, PaidAt: tx.ClosedAt, PaidTx: tx.Hash})
 	if paid.Sign() > 0 {
 		id := c.ID
 		part := vault.Settled{ExtAmount: new(big.Int).Neg(paidPayout), Fee: paidFee, Recipient: e.Recipient, Relayer: e.Relayer, ExitID: &id}
@@ -671,7 +709,7 @@ func (s *State) claim(tx vault.Tx, settled vault.Settled, d *Delta) error {
 	if s.Tvl.Sign() < 0 || s.QueuedTotal.Sign() < 0 {
 		return inconsistent("stranded exit %d pays more than the vault holds", id)
 	}
-	d.Claimed = append(d.Claimed, Claimed{ID: id, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
+	d.claimed(Claimed{ID: id, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
 	d.Settlements = append(d.Settlements, Settlement{Settled: settled, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
 	s.notice(tx, "exit_claimed", settled, d)
 	return nil

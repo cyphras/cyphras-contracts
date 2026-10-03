@@ -455,52 +455,9 @@ func (st *Store) Commit(ctx context.Context, from, to uint32, s *State, d Delta,
 			return err
 		}
 	}
-	for _, e := range d.Queued {
-		if _, err := tx.Exec(ctx, `INSERT INTO exits (id, payout, fee, recipient, relayer, queued_at, ledger, tx_hash)
-			VALUES ($1, $2::numeric, $3::numeric, $4, $5, $6, $7, $8)`,
-			int64(e.ID), e.Payout.String(), e.Fee.String(), e.Recipient, e.Relayer, int64(e.QueuedAt), int64(e.Ledger), e.TxHash); err != nil {
+	for _, c := range d.exitOrder {
+		if err := commitExit(ctx, tx, d, c); err != nil {
 			return err
-		}
-	}
-	for _, p := range d.PartPaid {
-		query := `UPDATE exits SET payout_left = $2::numeric, fee_left = $3::numeric WHERE id = $1 AND released_ledger IS NULL`
-		if p.Stranded {
-			query = `UPDATE exits SET unpaid_payout = $2::numeric, unpaid_fee = $3::numeric
-				WHERE id = $1 AND unpaid_payout IS NOT NULL AND claimed_ledger IS NULL`
-		}
-		tag, err := tx.Exec(ctx, query, int64(p.ID), p.PayoutLeft.String(), p.FeeLeft.String())
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
-			return inconsistent("exit %d part paid while neither queued nor stranded", p.ID)
-		}
-	}
-	for _, e := range d.Released {
-		var unpaidPayout, unpaidFee *string
-		if e.UnpaidPayout.Sign() > 0 || e.UnpaidFee.Sign() > 0 {
-			p, f := e.UnpaidPayout.String(), e.UnpaidFee.String()
-			unpaidPayout, unpaidFee = &p, &f
-		}
-		tag, err := tx.Exec(ctx, `UPDATE exits SET released_ledger = $2, released_at = $3, released_tx = $4,
-			unpaid_payout = $5::numeric, unpaid_fee = $6::numeric WHERE id = $1 AND released_ledger IS NULL`,
-			int64(e.ID), int64(e.PaidLedger), e.PaidAt, e.PaidTx, unpaidPayout, unpaidFee)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
-			return inconsistent("exit %d released twice", e.ID)
-		}
-	}
-	for _, c := range d.Claimed {
-		tag, err := tx.Exec(ctx, `UPDATE exits SET claimed_ledger = $2, claimed_at = $3, claimed_tx = $4
-			WHERE id = $1 AND unpaid_payout IS NOT NULL AND claimed_ledger IS NULL`,
-			int64(c.ID), int64(c.Ledger), c.ClosedAt, c.TxHash)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() != 1 {
-			return inconsistent("stranded exit %d claimed twice", c.ID)
 		}
 	}
 	if hook != nil {
@@ -515,4 +472,59 @@ func (st *Store) Commit(ctx context.Context, from, to uint32, s *State, d Delta,
 func (st *Store) Reset(ctx context.Context) error {
 	_, err := st.Pool.Exec(ctx, `TRUNCATE chain_meta, leaves, nullifiers, deposits, settlements, exits`)
 	return err
+}
+
+// commitExit writes one exit change. Changes are written in the order they happened, since each
+// builds on the row the one before left.
+func commitExit(ctx context.Context, tx pgx.Tx, d Delta, c exitChange) error {
+	switch c.kind {
+	case queuedChange:
+		e := d.Queued[c.index]
+		_, err := tx.Exec(ctx, `INSERT INTO exits (id, payout, fee, recipient, relayer, queued_at, ledger, tx_hash)
+			VALUES ($1, $2::numeric, $3::numeric, $4, $5, $6, $7, $8)`,
+			int64(e.ID), e.Payout.String(), e.Fee.String(), e.Recipient, e.Relayer, int64(e.QueuedAt), int64(e.Ledger), e.TxHash)
+		return err
+	case partPaidChange:
+		p := d.PartPaid[c.index]
+		query := `UPDATE exits SET payout_left = $2::numeric, fee_left = $3::numeric WHERE id = $1 AND released_ledger IS NULL`
+		if p.Stranded {
+			query = `UPDATE exits SET unpaid_payout = $2::numeric, unpaid_fee = $3::numeric
+				WHERE id = $1 AND unpaid_payout IS NOT NULL AND claimed_ledger IS NULL`
+		}
+		tag, err := tx.Exec(ctx, query, int64(p.ID), p.PayoutLeft.String(), p.FeeLeft.String())
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return inconsistent("exit %d part paid while neither queued nor stranded", p.ID)
+		}
+	case releasedChange:
+		e := d.Released[c.index]
+		var unpaidPayout, unpaidFee *string
+		if e.UnpaidPayout.Sign() > 0 || e.UnpaidFee.Sign() > 0 {
+			p, f := e.UnpaidPayout.String(), e.UnpaidFee.String()
+			unpaidPayout, unpaidFee = &p, &f
+		}
+		tag, err := tx.Exec(ctx, `UPDATE exits SET released_ledger = $2, released_at = $3, released_tx = $4,
+			unpaid_payout = $5::numeric, unpaid_fee = $6::numeric WHERE id = $1 AND released_ledger IS NULL`,
+			int64(e.ID), int64(e.PaidLedger), e.PaidAt, e.PaidTx, unpaidPayout, unpaidFee)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return inconsistent("exit %d released twice", e.ID)
+		}
+	case claimedChange:
+		cl := d.Claimed[c.index]
+		tag, err := tx.Exec(ctx, `UPDATE exits SET claimed_ledger = $2, claimed_at = $3, claimed_tx = $4
+			WHERE id = $1 AND unpaid_payout IS NOT NULL AND claimed_ledger IS NULL`,
+			int64(cl.ID), int64(cl.Ledger), cl.ClosedAt, cl.TxHash)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return inconsistent("stranded exit %d claimed twice", cl.ID)
+		}
+	}
+	return nil
 }

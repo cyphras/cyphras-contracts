@@ -224,3 +224,28 @@ func TestPendingDepositsAndFlagsReload(t *testing.T) {
 		t.Fatalf("after reset: cursor %d, %v", cursor, err)
 	}
 }
+
+func TestOneWindowCanQueueStrandAndPartClaimAnExit(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	s, _, err := st.Load(ctx, testVault, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Queued, stranded with both parts refused, then the fee paid by a claim: all in one window.
+	d, err := s.Apply([]vault.Tx{
+		{Ledger: 10, ClosedAt: 1_728_000_000, Hash: "a", Calls: []any{shield(1, 1, 1000), vault.Attested{UpTo: 1}, admission(1, 0), queued(10, 2, 1, -300, 5)}},
+		{Ledger: 11, ClosedAt: 1_728_000_005, Hash: "b", Calls: []any{vault.ExitStranded{ID: 1, Payout: big.NewInt(300), Fee: big.NewInt(5)}}},
+		{Ledger: 12, ClosedAt: 1_728_000_010, Hash: "c", Calls: []any{vault.ExitPaid{ID: 1, PayoutPaid: new(big.Int), FeePaid: big.NewInt(5), PayoutLeft: big.NewInt(300), FeeLeft: new(big.Int)}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Commit(ctx, 10, 12, s, d, nil); err != nil {
+		t.Fatalf("a window that strands and part claims an exit: %v", err)
+	}
+	got, _, err := st.Load(ctx, testVault, 10)
+	if err != nil || got.Stranded[1] == nil || got.Stranded[1].Payout.Int64() != 300 || got.Stranded[1].Fee.Sign() != 0 || got.QueuedTotal.Int64() != 300 {
+		t.Fatalf("reloaded as %+v, %v", got.Stranded, err)
+	}
+}
