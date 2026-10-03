@@ -1,0 +1,5 @@
+# The maintainers who may sign a services release tag, one line each in ssh-keygen allowed_signers
+# form: an email address, then the public key of the SSH key that signs. verify-images.sh checks
+# release tags against this file, and the file must hold the same lines as the repository's
+# SERVICES_RELEASE_SIGNERS variable, which the release workflow checks with. With no line, nothing
+# is deployed.

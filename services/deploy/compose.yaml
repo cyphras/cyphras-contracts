@@ -8,7 +8,8 @@
 #
 # The image references come from deployments/<network>.json and always carry a digest. Before
 # docker compose pull or up, verify-images.sh checks with the same variables, and the tag and commit
-# the deployment file names, that the release workflow built and attested each image. Each
+# the deployment file names, that a maintainer signed the tag and that the release workflow built
+# and attested each image. Each
 # service runs as its own user with a read-only root filesystem and no capabilities, publishes its
 # public port on loopback only, for nginx, and reaches only its own database. Settings that are
 # not secret are in env/<service>.env; secrets are files in secrets/<network>/<asset>/, each mode
