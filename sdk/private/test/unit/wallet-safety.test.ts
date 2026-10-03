@@ -77,23 +77,31 @@ function flakyEvents(world: World): { fetch: FetchLike; down: boolean } {
 
 type FakeEvent = { readonly topic: string; readonly fields: [string, xdr.ScVal][] };
 
+type Fabricated = { ledger: number; txHash: string; events: readonly FakeEvent[] };
+
 // A fetch whose RPC adds fabricated vault events, all of one transaction, to its next getEvents
-// reply, as a lying node could.
+// reply, or, once forged, to every reply from their ledger or an earlier one, as a lying node
+// could.
 function lyingEvents(world: World): {
   fetch: FetchLike;
   inject(ledger: number, txHash: string, events: readonly FakeEvent[]): void;
+  forge(ledger: number, txHash: string, events: readonly FakeEvent[]): void;
 } {
-  let pending: { ledger: number; txHash: string; events: readonly FakeEvent[] } | undefined;
+  let pending: Fabricated | undefined;
+  let forged: Fabricated | undefined;
   return {
     fetch: async (input, init) => {
       const res = await world.fetch(input, init);
       const body =
         init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
-      if (pending === undefined || new URL(input).origin !== RPC || body?.method !== "getEvents") {
-        return res;
-      }
+      if (new URL(input).origin !== RPC || body?.method !== "getEvents") return res;
+      const from = body.params.startLedger as number | undefined;
+      const added =
+        pending ??
+        (forged !== undefined && from !== undefined && from <= forged.ledger ? forged : undefined);
+      if (added === undefined) return res;
       const reply = await res.json();
-      const { ledger, txHash, events } = pending;
+      const { ledger, txHash, events } = added;
       pending = undefined;
       reply.result.events.push(
         ...events.map((e, i) => ({
@@ -113,6 +121,9 @@ function lyingEvents(world: World): {
     },
     inject(ledger, txHash, events) {
       pending = { ledger, txHash, events };
+    },
+    forge(ledger, txHash, events) {
+      forged = { ledger, txHash, events };
     },
   };
 }
@@ -865,6 +876,60 @@ describe("wallet safety: a second RPC provider", () => {
     assert.equal(plan?.state, "settled");
     await bob.sync();
     assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
+  it("never takes a live payment for superseded on events past the ledgers every provider checked", async () => {
+    const { world, store } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    const plain = await openWallet(world, 0, store);
+    await plain.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
+    const nf = (await storedPlan(store)).inputs[0]?.nf as bigint;
+    const forged = "dd".repeat(32);
+    // The indexer and the first provider lie together: the first shows a transaction that spends
+    // the held payment's note past the ledger the indexer is complete to, and the indexer serves
+    // that spend later, while the second provider's events are out of reach.
+    const first = lyingEvents(world);
+    let spend: Record<string, unknown> | undefined;
+    const indexer = rewritingFetch(
+      { ...world, fetch: first.fetch },
+      {
+        "/v1/nullifiers": (body) =>
+          spend === undefined
+            ? body
+            : { ...body, nullifiers: [...(body["nullifiers"] as unknown[]), spend] },
+      },
+    );
+    let busy = false;
+    const fetch: FetchLike = async (input, init) => {
+      if (new URL(input).origin !== SECOND) return indexer(input, init);
+      const body = JSON.parse(String(init?.body));
+      if (busy && body.method === "getEvents") {
+        const error = { code: -32603, message: "busy" };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+      }
+      return world.fetch(RPC, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, store, undefined, {
+      secondRpcUrl: SECOND,
+    });
+    const next = world.vault.leaves.length;
+    const at = world.vault.ledger;
+    world.indexer.completeTo = at - 1;
+    first.inject(at, forged, [fakeSpend(nf), fakeLeaf(next, 12_345n), fakeLeaf(next + 1, 67_890n)]);
+    assert.equal((await alice.sync()).crossChecked, true);
+    world.indexer.completeTo = undefined;
+    spend = { nullifier: nf.toString(16).padStart(64, "0"), ledger: at, tx_hash: forged };
+    first.forge(at, forged, [fakeSpend(nf)]);
+    busy = true;
+    assert.equal((await alice.sync()).crossChecked, false);
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    // Once the second provider's events are in reach, a recheck against them finds the forged
+    // spend, which the first still shows.
+    busy = false;
+    spend = undefined;
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
   });
 
   it("refuses a tree a second RPC provider contradicts", async () => {

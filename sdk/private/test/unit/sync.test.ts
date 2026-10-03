@@ -459,10 +459,12 @@ describe("unchecked ranges", () => {
     );
   });
 
-  it("refuses leaves RPC shows with a gap after the range's first", async () => {
-    await assert.rejects(
-      recheck(walletAfter(four), [showing(four.slice(2))], VAULT, 1),
-      (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
-    );
+  it("refuses leaves RPC shows with a gap after the range's first, in full runs or not", async () => {
+    for (const shown of [four.slice(2), four.slice(1, 2)]) {
+      await assert.rejects(
+        recheck(walletAfter(four), [showing(shown)], VAULT, 1),
+        (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
+      );
+    }
   });
 });
