@@ -1,0 +1,190 @@
+{
+  "description": "Encodings a decoder MUST reject, with the rule each one breaks.",
+  "rules": {
+    "hrp": "an HRP other than the given network's",
+    "version": "a version byte other than 0x02",
+    "length": "a payload of the wrong length (44, 65 or 129 bytes)",
+    "bech32m": "a string that is not valid bech32m",
+    "point": "bytes that are not the canonical packPoint encoding of a curve point",
+    "identity": "the identity point",
+    "subgroup": "a point outside the prime-order subgroup",
+    "ivk_range": "an incoming viewing key not reduced mod L"
+  },
+  "untestable": [
+    "a d for which DiversifyHash fails: none is known, as one occurs with probability about 2^-256"
+  ],
+  "address": [
+    {
+      "network": "mainnet",
+      "encoding": "cyt1qg0fpmtj6qu7aym2w0nf40j5w05herq0qhluq8vm79qz8wmty528ud3t2fzpjd6lx5mycrcvfcj38",
+      "rule": "hrp",
+      "reason": "a testnet address"
+    },
+    {
+      "network": "testnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hyc6mcshhr4z40de25ljmvm20w7y2k483efya693pzf68tf4ee5fqxe2mmp",
+      "rule": "hrp",
+      "reason": "a mainnet address"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qpxxk7y9acag4tmw248ukmx6nmh3z44fuw2f8w3vggjw366dwwdzg4xw2s8",
+      "rule": "version",
+      "reason": "version 0x00 with 33 bytes"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qyh7a9c5unuxw025w4hyc6mcshhr4z40de25ljmvm20w7y2k483efya693pzf68tf4ee5fq0645g4",
+      "rule": "version",
+      "reason": "version 0x01"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qvh7a9c5unuxw025w4hyc6mcshhr4z40de25ljmvm20w7y2k483efya693pzf68tf4ee5fqpcc7dd",
+      "rule": "version",
+      "reason": "version 0x03"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hyc6mcshhr4z40de25ljmvm20w7y2k483efya693pzf68tf4ee5yuxz69",
+      "rule": "length",
+      "reason": "43 bytes"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hyc6mcshhr4z40de25ljmvm20w7y2k483efya693pzf68tf4ee5fqqt56uu0",
+      "rule": "length",
+      "reason": "45 bytes"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hyc6mcshhr4z40de25ljmvm20w7y2k483efya693pzf68tf4ee5fqn96h7r",
+      "rule": "bech32m",
+      "reason": "a bech32 checksum instead of bech32m"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5UNUXW025W4HYC6MCSHHR4Z40DE25LJMVM20W7Y2K483EFYA693PZF68TF4EE5FQXE2MMP",
+      "rule": "bech32m",
+      "reason": "mixed case"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hqyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq65dcsu",
+      "rule": "point",
+      "reason": "pk_d with no point at that y"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hy66mcwkprqm8nllzss3d4ctfpwmaw9fj5hkg2u44ugxwdcrqlu4q8326df",
+      "rule": "point",
+      "reason": "pk_d encoded with y + p"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hqzqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpqqanuj7q",
+      "rule": "point",
+      "reason": "pk_d = (0, 1) with the sign bit set"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hqzqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqql3498c",
+      "rule": "identity",
+      "reason": "pk_d = (0, 1)"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hqqqqq7zfltc2rj9ctj72gaqejsh2csxqmv32shq56qv0pwf8xgvq2tmy0q",
+      "rule": "subgroup",
+      "reason": "pk_d of order 2"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4h804ks47q3aldt5z6nfqndckgmwty55e9h6ykpvv2dxus3yxm6kzsenaa6g",
+      "rule": "subgroup",
+      "reason": "pk_d of order 8"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cy1qgh7a9c5unuxw025w4hqclptgwsavmfdcdpxg370mrsk5wnvwjs5wzlldasr5tels903mpgxdaeq3",
+      "rule": "subgroup",
+      "reason": "pk_d of order 8L"
+    }
+  ],
+  "incoming_viewing_key": [
+    {
+      "network": "mainnet",
+      "encoding": "cytivk1qfhwy6mprahz0tuumvcttmj8uutmjdrl30aq7pkl70u9mxt8z0zzkvvfx2wug2vsgyk0ds38hsq72smly5gqxwcfgqgdjv7v750syegqjk4dr9",
+      "rule": "hrp",
+      "reason": "a testnet key"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyivk1qy78wvt5exdh4czdlrlug3mz8ktf5fxfjtyrhum4ugw0r56hg92l58utf6zstgnzt0fe89qdjwg5ka5qy4km7rp2w7dk0503w9hqhrcqt256xs",
+      "rule": "version",
+      "reason": "version 0x01"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyivk1qg78wvt5exdh4czdlrlug3mz8ktf5fxfjtyrhum4ugw0r56hg92l58utf6zstgnzt0fe89qdjwg5ka5qy4km7rp2w7dk0503w9hqhrcl8ktg6",
+      "rule": "length",
+      "reason": "64 bytes"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyivk1qg78wvt5exdh4czdlrlug3mz8ktf5fxfjtyrhum4ugw0r56hg92l58utf6zstgnzt0fe89qdjwg5ka5qy4km7rp2w7dk0503w9hqhrcqqqw0kyk6",
+      "rule": "length",
+      "reason": "66 bytes"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyivk1qg78wvt5exdh4czdlrlug3mz8ktf5fxfjtyrhum4ugw0r56hg92l5y9jd7lwzww4ctwcrd2xfdlc5gvv2zwclsejs8fxcpgcec7ftxcxau8h64",
+      "rule": "ivk_range",
+      "reason": "ivk + L"
+    }
+  ],
+  "full_viewing_key": [
+    {
+      "network": "mainnet",
+      "encoding": "cytfvk1qfq88u55lpj9p8nqgyka02ppfh36c45t9hvc729a3pysnq8dd69pvwqcwt3t7hadh60melup7s8pky3v8kdv3ezpj2pnqts7u45axa55pa84w2yexs7msp9f2nfnsuud6t4h5k3f3uuusfen5tju88ywu3nxacntvy0kufa0nndnpd0wgln30wf5079l5rcxmlelshvevufug2c849dhr",
+      "rule": "hrp",
+      "reason": "a testnet key"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyfvk1q9pmata5sc3x4a4nhm6mkjrdkh0wrtg4g80df97fullc094vwqqej0f9ydft9qutaq8nj203d2m7t74sj6wp30jd6c7veu0qreqqn95q8eunlne0z5hxpj4xjw2n5x3aj094dy3yvf2jwe6cznt20pj6003ncae3wnyek7hqfhu0l3z8vg7edx3yexfvswlnwh3peuwn2aq4t7sfeggqs",
+      "rule": "version",
+      "reason": "version 0x01"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyfvk1qfpmata5sc3x4a4nhm6mkjrdkh0wrtg4g80df97fullc094vwqqej0f9ydft9qutaq8nj203d2m7t74sj6wp30jd6c7veu0qreqqn95q8eunlne0z5hxpj4xjw2n5x3aj094dy3yvf2jwe6cznt20pj6003ncae3wnyek7hqfhu0l3z8vg7edx3yexfvswlnwh3peuwn2aq42ammrkf",
+      "rule": "length",
+      "reason": "128 bytes"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyfvk1qgpqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq0f9ydft9qutaq8nj203d2m7t74sj6wp30jd6c7veu0qreqqn95q8eunlne0z5hxpj4xjw2n5x3aj094dy3yvf2jwe6cznt20pj6003ncae3wnyek7hqfhu0l3z8vg7edx3yexfvswlnwh3peuwn2aq4t7s9z4227",
+      "rule": "point",
+      "reason": "ak with no point at that y"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyfvk1qfztatayrgvycwj997hnty24ayrr7p5hc22p46ypzxstjaclhajuj0f9ydft9qutaq8nj203d2m7t74sj6wp30jd6c7veu0qreqqn95q8eunlne0z5hxpj4xjw2n5x3aj094dy3yvf2jwe6cznt20pj6003ncae3wnyek7hqfhu0l3z8vg7edx3yexfvswlnwh3peuwn2aq4t7su2p4f8",
+      "rule": "point",
+      "reason": "ak encoded with y + p"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyfvk1qfpmata5sc3x4a4nhm6mkjrdkh0wrtg4g80df97fullc094vwqqejqgqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq8eunlne0z5hxpj4xjw2n5x3aj094dy3yvf2jwe6cznt20pj6003ncae3wnyek7hqfhu0l3z8vg7edx3yexfvswlnwh3peuwn2aq4t7sec2t95",
+      "rule": "identity",
+      "reason": "nk = (0, 1)"
+    },
+    {
+      "network": "mainnet",
+      "encoding": "cyfvk1qg85khtlkwy262mevu2fyanrar6423u7lr8fru3g4kvqleqwxqees0f9ydft9qutaq8nj203d2m7t74sj6wp30jd6c7veu0qreqqn95q8eunlne0z5hxpj4xjw2n5x3aj094dy3yvf2jwe6cznt20pj6003ncae3wnyek7hqfhu0l3z8vg7edx3yexfvswlnwh3peuwn2aq4t7s6px3k4",
+      "rule": "subgroup",
+      "reason": "ak of order 8L"
+    }
+  ]
+}
