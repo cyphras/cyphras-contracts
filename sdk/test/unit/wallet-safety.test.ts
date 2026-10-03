@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Address, TransactionBuilder, type Transaction, xdr } from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
-import { MemoryStore } from "../../src/storage.ts";
-import { XLM, createWorld, type World } from "../support/network.ts";
-import { confirmAll, isError, openWallet } from "../support/wallets.ts";
+import { MemoryStore, SealedStore } from "../../src/storage.ts";
+import { type Plan, type WalletState, loadState, saveState } from "../../src/wallet/state.ts";
+import { XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
+import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
 import { TrapdoorProver } from "../support/trapdoor.ts";
 import { MNEMONIC } from "../helpers.ts";
 
@@ -213,6 +214,77 @@ describe("wallet safety: cross-checks with RPC events", () => {
     // the events keep the real ciphertext; only the indexer serves the swapped one
     assert.ok(vaultEvents.length > 0);
     await assert.rejects(fresh.sync(), isError("indexer_fault"));
+  });
+});
+
+describe("wallet safety: syncs that fail", () => {
+  it("keeps nothing of a sync whose nullifiers carry a forged transaction", async () => {
+    const world = await createWorld();
+    const store = new MemoryStore();
+    const alice = await openWallet(world, 0, store);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    const lying = rewritingFetch(world, {
+      "/v1/nullifiers": (body) => {
+        const list = body["nullifiers"] as Record<string, unknown>[];
+        return {
+          ...body,
+          nullifiers: list.map((n, i) =>
+            i === list.length - 1 ? { ...n, tx_hash: "ab".repeat(32) } : n,
+          ),
+        };
+      },
+    });
+    const session = await openWallet({ ...world, fetch: lying }, 0, store);
+    await assert.rejects(session.sync(), isError("indexer_fault"));
+    const next = await openWallet(world, 0, store);
+    assert.deepEqual(
+      (await next.plans()).map((p) => p.state),
+      ["submitted"],
+    );
+    await next.rescan();
+    assert.deepEqual(
+      (await next.plans()).map((p) => p.state),
+      ["settled"],
+    );
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
+  it("rebuilds on rescan the fate of every plan the chain has not shown to land", async () => {
+    const world = await createWorld();
+    const backend = new MemoryStore();
+    const alice = await openWallet(world, 0, backend);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    // A state written by an older release that took a forged spend for another plan's.
+    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const state = (await loadState(sealed)) as WalletState;
+    const plan = state.plans[0] as Plan;
+    plan.state = "superseded";
+    plan.evidence = [
+      {
+        txHash: "ab".repeat(32),
+        ledger: 1,
+        nullifiers: [true, false],
+        outputs: [undefined, undefined],
+      },
+    ];
+    await saveState(sealed, state);
+    const reopened = await openWallet(world, 0, backend);
+    await reopened.rescan();
+    assert.deepEqual(
+      (await reopened.plans()).map((p) => p.state),
+      ["settled"],
+    );
   });
 });
 

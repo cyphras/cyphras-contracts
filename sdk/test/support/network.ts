@@ -523,3 +523,18 @@ export async function createWorld(options: { limits?: Partial<Limits> } = {}): P
   };
   return world;
 }
+
+/** Rewrites the JSON replies of indexer endpoints, to play an indexer that lies. */
+export function rewritingFetch(
+  world: World,
+  rewrite: Readonly<Record<string, (body: Record<string, unknown>) => unknown>>,
+): FetchLike {
+  return async (input, init) => {
+    const res = await world.fetch(input, init);
+    const url = new URL(input);
+    const fn = url.origin === INDEXER ? rewrite[url.pathname] : undefined;
+    if (fn === undefined || res.status !== 200) return res;
+    const body = fn((await res.json()) as Record<string, unknown>);
+    return new Response(JSON.stringify(body), { status: 200 });
+  };
+}

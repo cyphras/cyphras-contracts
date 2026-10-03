@@ -1,4 +1,6 @@
+import { mnemonicToSeedSync } from "@scure/bip39";
 import { CyphrasError } from "../../src/errors.ts";
+import { deriveStoreKey } from "../../src/keys.ts";
 import { keySource } from "../../src/keysource.ts";
 import { type KeyValueStore, MemoryStore } from "../../src/storage.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
@@ -30,4 +32,9 @@ export const confirmAll = (): true => true;
 
 export function isError(code: string): (err: unknown) => boolean {
   return (err: unknown) => err instanceof CyphrasError && err.code === code;
+}
+
+/** The store key of a test account, to read and change its sealed state as an attacker could not. */
+export function storeKeyOf(account: number): Uint8Array {
+  return deriveStoreKey(mnemonicToSeedSync(MNEMONIC), "testnet", account);
 }

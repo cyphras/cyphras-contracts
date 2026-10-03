@@ -245,8 +245,7 @@ function planOf(
     retryOf: intent.retryOf,
     txHash: undefined,
     ledger: undefined,
-    spentBy: [undefined, undefined],
-    landed: undefined,
+    evidence: [],
     relayerStatus: undefined,
     exit: undefined,
     error: undefined,
@@ -282,7 +281,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
     if (intent.selfRelay !== undefined) fail("invalid_argument", "notBefore needs a relayer");
   }
   const check = core.state.rootCheck;
-  if (core.state.treeFault || check?.state !== "verified") {
+  if (check?.state !== "verified") {
     fail("tree_unverified", "the local tree is not verified against the vault; sync first");
   }
 

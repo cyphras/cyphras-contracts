@@ -11,10 +11,11 @@ import type { RootHistory } from "../vault/state.ts";
 import { type ChainSource, type ExitEvent, RpcEventSource } from "./sources.ts";
 import {
   ACTIVE_STATES,
+  type Evidence,
   type OwnedNote,
   type Plan,
+  type PlanState,
   type RootCheck,
-  type SpentBy,
   type WalletState,
 } from "./state.ts";
 
@@ -80,13 +81,30 @@ function scanLeaf(state: WalletState, leaf: Leaf, keys: ScanKeys, cache: Address
   return false;
 }
 
-function trackPlanOutputs(plans: Plan[], leaf: Leaf): void {
+function evidenceOf(plan: Plan, txHash: string, ledger: number): Evidence {
+  let e = plan.evidence.find((x) => x.txHash === txHash);
+  if (e === undefined) {
+    e = { txHash, ledger, nullifiers: [false, false], outputs: [undefined, undefined] };
+    plan.evidence.push(e);
+  }
+  return e;
+}
+
+// Records, per transaction, which of a plan's commitments the new leaves add and which of its
+// nullifiers the new nullifiers spend.
+export function recordEvidence(
+  plans: readonly Plan[],
+  leaves: readonly Leaf[],
+  nullifiers: readonly { readonly nf: bigint; readonly ledger: number; readonly txHash: string }[],
+): void {
   for (const plan of plans) {
-    if (!plan.commitments.includes(leaf.commitment)) continue;
-    if (plan.landed === undefined) {
-      plan.landed = { txHash: leaf.txHash, ledger: leaf.ledger, positions: [leaf.index] };
-    } else if (plan.landed.txHash === leaf.txHash && !plan.landed.positions.includes(leaf.index)) {
-      plan.landed.positions.push(leaf.index);
+    for (const leaf of leaves) {
+      const slot = plan.commitments.indexOf(leaf.commitment);
+      if (slot >= 0) evidenceOf(plan, leaf.txHash, leaf.ledger).outputs[slot] = leaf.index;
+    }
+    for (const n of nullifiers) {
+      const slot = plan.nullifiers.indexOf(n.nf);
+      if (slot >= 0) evidenceOf(plan, n.txHash, n.ledger).nullifiers[slot] = true;
     }
   }
 }
@@ -98,7 +116,6 @@ export async function syncChain(
   state: WalletState,
   keys: ScanKeys,
   source: ChainSource,
-  save: () => Promise<void>,
 ): Promise<ChainUpdate> {
   const tree = CommitmentTree.fromSnapshot(state.tree);
   const firstIndex = tree.leafCount;
@@ -114,7 +131,6 @@ export async function syncChain(
     }
     for (const leaf of leaves) {
       if (scanLeaf(state, leaf, keys, cache)) newNotes++;
-      trackPlanOutputs(state.plans, leaf);
     }
     for (const page of tree.append(leaves.map((l) => l.commitment))) {
       const start = page.page * PAGE_SIZE;
@@ -129,8 +145,6 @@ export async function syncChain(
     state.tree = tree.snapshot();
     fetched.push(...leaves);
     if (done) break;
-    // A long first sync keeps its progress if it is interrupted.
-    await save();
   }
 
   const buffer = [
@@ -143,14 +157,7 @@ export async function syncChain(
     const hit = spent.get(note.nf);
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
-  for (const plan of state.plans) {
-    plan.nullifiers.forEach((nf, i) => {
-      const hit = spent.get(nf);
-      if (hit !== undefined && plan.spentBy[i] === undefined) {
-        plan.spentBy[i] = { txHash: hit.txHash, ledger: hit.ledger };
-      }
-    });
-  }
+  recordEvidence(state.plans, fetched, buffer);
   state.nullifierSince = completeToLedger + 1;
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
   state.nullifierBuffer = buffer.filter((n) => n.ledger >= state.lastLeafLedger);
@@ -187,25 +194,20 @@ export function advancePlans(
 ): void {
   for (const plan of state.plans) {
     if (!isActive(plan)) continue;
-    const landed = plan.landed;
-    const spentBy = plan.spentBy.filter((s): s is SpentBy => s !== undefined);
-    if (
-      landed !== undefined &&
-      landed.positions.length === 2 &&
-      plan.spentBy.length === 2 &&
-      plan.spentBy.every((s) => s?.txHash === landed.txHash)
-    ) {
+    const landed = plan.evidence.find(
+      (e) => e.nullifiers.every(Boolean) && e.outputs.every((pos) => pos !== undefined),
+    );
+    if (landed !== undefined) {
       plan.state = "confirmed";
       plan.txHash = landed.txHash;
       plan.ledger = landed.ledger;
       continue;
     }
-    // Spent by a transaction that did not add this plan's outputs: another plan won.
-    if (spentBy.some((s) => s.txHash !== landed?.txHash)) {
+    // A nullifier spent by a transaction that did not add this plan's outputs: another plan won.
+    if (plan.evidence.some((e) => e.nullifiers.some(Boolean))) {
       plan.state = "superseded";
       continue;
     }
-    if (spentBy.length > 0) continue;
     if (completeToLedger >= plan.deadline) {
       plan.state = "dead";
       continue;
@@ -217,6 +219,17 @@ export function advancePlans(
     ) {
       plan.state = "dead";
     }
+  }
+}
+
+// A full rescan rebuilds the evidence of every plan the chain has not shown to land, so nothing
+// recorded from an earlier sync decides its fate.
+export function resetUnlanded(plans: readonly Plan[]): void {
+  const unlanded: readonly PlanState[] = ["prepared", "submitted", "superseded", "dead"];
+  for (const plan of plans) {
+    if (!unlanded.includes(plan.state)) continue;
+    plan.evidence = [];
+    plan.state = plan.txHash === undefined ? "prepared" : "submitted";
   }
 }
 

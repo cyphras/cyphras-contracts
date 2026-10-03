@@ -9,6 +9,15 @@ export interface SpentBy {
   readonly ledger: number;
 }
 
+// What one transaction showed of a plan: which of the plan's two nullifiers it spent, and the leaf
+// positions at which it added the plan's two output commitments.
+export interface Evidence {
+  readonly txHash: string;
+  readonly ledger: number;
+  readonly nullifiers: [boolean, boolean];
+  readonly outputs: [number | undefined, number | undefined];
+}
+
 // A note of this wallet that is in the tree.
 export interface OwnedNote {
   readonly pos: number;
@@ -95,10 +104,9 @@ export interface Plan {
   readonly retryOf: string | undefined;
   txHash: string | undefined;
   ledger: number | undefined;
-  spentBy: (SpentBy | undefined)[];
-  landed:
-    | { readonly txHash: string; readonly ledger: number; readonly positions: number[] }
-    | undefined;
+  // Keyed by transaction: the plan is confirmed only when one transaction carries both its
+  // nullifiers and both its commitments.
+  evidence: Evidence[];
   relayerStatus: string | undefined;
   exit: PlanExit | undefined;
   error: string | undefined;
@@ -164,11 +172,6 @@ export interface WalletState {
   deposits: Deposit[];
   operations: Operation[];
   rootCheck: RootCheck | undefined;
-  // Set when the chain contradicts the synced tree; only a rescan clears it.
-  treeFault: boolean;
-  crossCheckedLedger: number;
-  // The last ledger whose exit queue data was applied.
-  exitsLedger: number;
 }
 
 export function emptyState(deployLedger: number): WalletState {
@@ -184,9 +187,6 @@ export function emptyState(deployLedger: number): WalletState {
     deposits: [],
     operations: [],
     rootCheck: undefined,
-    treeFault: false,
-    crossCheckedLedger: 0,
-    exitsLedger: 0,
   };
 }
 

@@ -50,7 +50,15 @@ import { type Verification, createServices, verify } from "./services.ts";
 import { type ExitEvent, IndexerSource, RpcEventSource } from "./sources.ts";
 import { type ConfirmSpend, type Submission, spend, submissionOf } from "./spend.ts";
 import { type Operation, type Plan, emptyState, loadState, saveState } from "./state.ts";
-import { type ScanKeys, advancePlans, checkRoot, crossCheck, isActive, syncChain } from "./sync.ts";
+import {
+  type ScanKeys,
+  advancePlans,
+  checkRoot,
+  crossCheck,
+  isActive,
+  resetUnlanded,
+  syncChain,
+} from "./sync.ts";
 
 /** Options shared by full and view-only wallets. */
 export interface ConnectionOptions {
@@ -191,6 +199,8 @@ export class PrivateWallet {
   readonly #fetch: FetchLike;
   #verification: Verification;
   #queue: Promise<unknown> = Promise.resolve();
+  // The last sync found data that contradicts the chain; nothing of it was kept.
+  #fault = false;
 
   private constructor(core: Core, fetchFn: FetchLike, verification: Verification) {
     this.#core = core;
@@ -351,7 +361,7 @@ export class PrivateWallet {
     return {
       leafCount: state.tree.leafCount,
       verified: state.rootCheck?.state === "verified",
-      fault: state.treeFault,
+      fault: this.#fault,
     };
   }
 
@@ -384,8 +394,8 @@ export class PrivateWallet {
     return this.#core.services.indexers.find((i) => i.url === ready?.url);
   }
 
-  #rpcSource(): RpcEventSource {
-    const { state, deployment, services } = this.#core;
+  #rpcSource(core: Core): RpcEventSource {
+    const { state, deployment, services } = core;
     const from = Math.min(state.nullifierSince, state.lastLeafLedger || state.nullifierSince);
     return new RpcEventSource(
       services.rpc,
@@ -394,23 +404,43 @@ export class PrivateWallet {
     );
   }
 
+  // A sync works on a copy of the state and keeps it only when every check passed, so data that
+  // contradicts the chain never reaches the store, nor survives into a later sync.
   async #sync(full: boolean): Promise<SyncSummary> {
     await this.#ensureVerified();
     const core = this.#core;
+    const draft = structuredClone(core.state);
     if (full) {
-      const { plans, deposits, operations } = core.state;
-      Object.assign(core.state, emptyState(core.deployment.deployLedger), {
+      const { plans, deposits, operations } = draft;
+      resetUnlanded(plans);
+      Object.assign(draft, emptyState(core.deployment.deployLedger), {
         plans,
         deposits,
         operations,
       });
     }
+    let summary: SyncSummary;
+    try {
+      summary = await this.#syncInto({ ...core, state: draft, save: async () => {} });
+    } catch (err) {
+      this.#fault =
+        err instanceof CyphrasError &&
+        (err.code === "indexer_fault" || err.code === "tree_unverified");
+      throw err;
+    }
+    this.#fault = false;
+    Object.assign(core.state, draft);
+    await core.save();
+    return summary;
+  }
+
+  async #syncInto(core: Core): Promise<SyncSummary> {
     const indexer = this.#indexer();
     let source: IndexerSource | RpcEventSource =
-      indexer === undefined ? this.#rpcSource() : new IndexerSource(indexer);
+      indexer === undefined ? this.#rpcSource(core) : new IndexerSource(indexer);
     let update;
     try {
-      update = await syncChain(core.state, core.scan, source, core.save);
+      update = await syncChain(core.state, core.scan, source);
     } catch (err) {
       // An indexer that becomes unreachable is passed over for the vault's RPC events; one that
       // served inconsistent data is a fault the caller must see.
@@ -421,43 +451,35 @@ export class PrivateWallet {
       ) {
         throw err;
       }
-      source = this.#rpcSource();
-      update = await syncChain(core.state, core.scan, source, core.save);
+      source = this.#rpcSource(core);
+      update = await syncChain(core.state, core.scan, source);
     }
     let crossChecked = false;
     let exitEvents: readonly ExitEvent[];
     if (source.kind === "indexer") {
-      try {
-        const check = await crossCheck(core.services.rpc, core.deployment.vault, update);
-        crossChecked = check.verified;
-        exitEvents = check.exits;
-      } catch (err) {
-        core.state.treeFault = true;
-        await core.save();
-        throw err;
-      }
+      const check = await crossCheck(core.services.rpc, core.deployment.vault, update);
+      crossChecked = check.verified;
+      exitEvents = check.exits;
     } else {
       exitEvents = (await source.events()).exits;
     }
     // F-27: the root history is read on every sync, so reading it does not signal a spend.
     const history = await core.services.vault.rootHistory();
     const check = checkRoot(core.state, history);
+    if (check.state === "mismatch") {
+      fail(
+        "tree_unverified",
+        "the synced tree contradicts the vault; nothing of this sync was kept",
+      );
+    }
     core.state.rootCheck = check;
-    if (check.state === "mismatch") core.state.treeFault = true;
     advancePlans(core.state, update.completeToLedger, history);
     // Read on every sync, like the root history, so that a spend's read of it stands out less.
     await core.services.vault.instance();
     const live = source.kind === "indexer" ? indexer : undefined;
     await trackDeposits(core, await live?.deposits().catch(() => undefined));
     applyExits(core.state, exitEvents, await live?.exits().catch(() => undefined));
-    if (live !== undefined) await this.#pollRelayers();
-    await core.save();
-    if (core.state.treeFault) {
-      fail(
-        "tree_unverified",
-        "the synced tree contradicts the vault; rescan, ideally from another indexer",
-      );
-    }
+    if (live !== undefined) await this.#pollRelayers(core);
     return {
       leafCount: core.state.tree.leafCount,
       newNotes: update.newNotes,
@@ -468,8 +490,8 @@ export class PrivateWallet {
   }
 
   // Asks only the relayer that submitted each pending plan about its own transaction.
-  async #pollRelayers(): Promise<void> {
-    for (const plan of this.#core.state.plans) {
+  async #pollRelayers(core: Core): Promise<void> {
+    for (const plan of core.state.plans) {
       const route = plan.route;
       if (plan.state !== "submitted" || route.kind !== "relayer" || plan.txHash === undefined) {
         continue;
