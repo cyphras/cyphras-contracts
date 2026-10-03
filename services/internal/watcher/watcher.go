@@ -217,7 +217,8 @@ func (w *Watcher) Apply(ctx context.Context, b follow.Batch) error {
 		// stays in the database, so neither a failed read nor a restart loses it.
 		for _, n := range delta.Notices {
 			if n.Name == "attested" && n.ClosedAt+secondsPerDay >= b.LatestCloseTime {
-				if err := w.db.addAttestCheck(ctx, tx, n.Body.(vault.Attested).UpTo, n.Ledger, n.ClosedAt); err != nil {
+				a := n.Body.(chainstate.Attestation)
+				if err := w.db.addAttestCheck(ctx, tx, attestCheck{upTo: a.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: a.Covered}); err != nil {
 					return err
 				}
 			}
@@ -350,7 +351,8 @@ func (w *Watcher) notices(ctx context.Context, notices []chainstate.Notice, late
 			r := n.Body.(vault.ExitRequeued)
 			w.alerts.Raise(ctx, alert.Info, fmt.Sprintf("exit_requeued_%d", r.NewID), "%v of the payout and %v of the fee of stranded exit %d were queued again as exit %d", r.Payout, r.Fee, r.ID, r.NewID)
 		case n.Name == "attested":
-			if err := w.judgeAttestation(ctx, attestCheck{upTo: n.Body.(vault.Attested).UpTo, ledger: n.Ledger, closedAt: n.ClosedAt}); err != nil {
+			a := n.Body.(chainstate.Attestation)
+			if err := w.judgeAttestation(ctx, attestCheck{upTo: a.UpTo, ledger: n.Ledger, closedAt: n.ClosedAt, covered: a.Covered}); err != nil {
 				w.log.Warn("attestation check deferred", "ledger", n.Ledger, "error", err.Error())
 			}
 		}
@@ -392,6 +394,8 @@ type attestCheck struct {
 	upTo     uint64
 	ledger   uint32
 	closedAt int64
+	// covered are the deposits the attestation vouches for.
+	covered []uint64
 }
 
 // errNotYet reports a check that cannot run before the vault's instance has been read.
@@ -399,8 +403,9 @@ var errNotYet = errors.New("the vault's instance is not read yet")
 
 // judgeAttestation pages when an attestation covers a deposit more than ten minutes before that
 // deposit can be admitted: the screening service attests only after the final check, which runs
-// in the last ten minutes, so an earlier one can mean a stolen asp key. Once judged, the check is
-// forgotten; one that cannot be judged now stays for RetryAttestations.
+// in the last ten minutes, so an earlier one can mean a stolen asp key. Every deposit it vouches
+// for is judged, not only the last. Once judged, the check is forgotten; one that cannot be judged
+// now stays for RetryAttestations.
 func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 	w.mu.RLock()
 	inst := w.inst
@@ -408,12 +413,15 @@ func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 	if inst == nil {
 		return errNotYet
 	}
-	amount, createdAt, found, err := w.db.deposit(ctx, c.upTo)
-	if err != nil {
-		return err
-	}
-	if found {
-		delay, ok, err := w.delayOf(ctx, c.upTo)
+	for _, id := range c.covered {
+		amount, createdAt, found, err := w.db.deposit(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		delay, ok, err := w.delayOf(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -422,9 +430,9 @@ func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 		}
 		eligible := vault.PendingDeposit{Amount: amount, CreatedAt: createdAt, Delay: delay}.EligibleAt(inst.Config, inst.Limits)
 		if uint64(c.closedAt)+600+attestSlack < eligible {
-			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("early_attestation_%d", c.upTo),
-				"attestation up to deposit %d at ledger %d came %d seconds before its final-check window; the asp key may be stolen",
-				c.upTo, c.ledger, eligible-600-uint64(c.closedAt))
+			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("early_attestation_%d", id),
+				"attestation up to deposit %d at ledger %d covered deposit %d %d seconds before its final-check window; the asp key may be stolen",
+				c.upTo, c.ledger, id, eligible-600-uint64(c.closedAt))
 		}
 	}
 	return w.db.dropAttestCheck(ctx, c.upTo, c.ledger)

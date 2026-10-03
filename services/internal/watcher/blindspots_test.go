@@ -344,3 +344,29 @@ func TestAPaymentToTheAssetsIssuerIsNoMismatch(t *testing.T) {
 		t.Fatalf("pages %v", h.pages.codes())
 	}
 }
+
+func TestAnAttestationIsJudgedForEveryDepositItCovers(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		h := newHarness(t)
+		c := h.chain
+		large := c.Shield(vaulttest.Depositor, 6_000_000_000)
+		small := c.Shield(vaulttest.Depositor, 10_000_000)
+		c.NextLedger(5)
+		h.sync()
+		created := uint64(c.ClosedAt - 5)
+		h.primary.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, large)), vaulttest.Pending(large, vaulttest.Depositor, 6_000_000_000, created, 86400, nil, 0), c.Ledger, nil)
+		h.primary.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, small)), vaulttest.Pending(small, vaulttest.Depositor, 10_000_000, created, 3600, nil, 0), c.Ledger, nil)
+		// Inside the small deposit's final ten minutes, 23 hours before the large one's: the
+		// attestation vouches for the large one too, unless it is held.
+		c.NextLedger(3600 - 5*60)
+		if held {
+			c.Flag(large, 6)
+		}
+		c.Attest(small)
+		c.NextLedger(5)
+		h.sync()
+		if got := h.pages.has("early_attestation_1"); got == held || h.pages.has("early_attestation_2") {
+			t.Fatalf("held %v: pages %v", held, h.pages.codes())
+		}
+	}
+}

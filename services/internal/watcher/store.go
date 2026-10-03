@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS watch_attest_checks (
 	closed_at bigint NOT NULL,
 	PRIMARY KEY (up_to, ledger)
 );
+ALTER TABLE watch_attest_checks ADD COLUMN IF NOT EXISTS covered bigint[];
 `
 
 type store struct {
@@ -169,9 +170,13 @@ func (s store) payoutsSince(ctx context.Context, since int64) ([]flow, error) {
 	return scanFlows(rows)
 }
 
-func (s store) addAttestCheck(ctx context.Context, tx pgx.Tx, upTo uint64, ledger uint32, closedAt int64) error {
-	_, err := tx.Exec(ctx, `INSERT INTO watch_attest_checks (up_to, ledger, closed_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-		int64(upTo), int64(ledger), closedAt)
+func (s store) addAttestCheck(ctx context.Context, tx pgx.Tx, c attestCheck) error {
+	covered := make([]int64, len(c.covered))
+	for i, id := range c.covered {
+		covered[i] = int64(id)
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO watch_attest_checks (up_to, ledger, closed_at, covered) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+		int64(c.upTo), int64(c.ledger), c.closedAt, covered)
 	return err
 }
 
@@ -181,7 +186,7 @@ func (s store) dropAttestCheck(ctx context.Context, upTo uint64, ledger uint32) 
 }
 
 func (s store) attestChecks(ctx context.Context) ([]attestCheck, error) {
-	rows, err := s.pool.Query(ctx, `SELECT up_to, ledger, closed_at FROM watch_attest_checks ORDER BY ledger, up_to`)
+	rows, err := s.pool.Query(ctx, `SELECT up_to, ledger, closed_at, covered FROM watch_attest_checks ORDER BY ledger, up_to`)
 	if err != nil {
 		return nil, err
 	}
@@ -190,10 +195,18 @@ func (s store) attestChecks(ctx context.Context) ([]attestCheck, error) {
 	for rows.Next() {
 		var c attestCheck
 		var upTo, ledger int64
-		if err := rows.Scan(&upTo, &ledger, &c.closedAt); err != nil {
+		var covered []int64
+		if err := rows.Scan(&upTo, &ledger, &c.closedAt, &covered); err != nil {
 			return nil, err
 		}
 		c.upTo, c.ledger = uint64(upTo), uint32(ledger)
+		// A check stored before the deposits were named judges the last one only.
+		if covered == nil {
+			covered = []int64{upTo}
+		}
+		for _, id := range covered {
+			c.covered = append(c.covered, uint64(id))
+		}
 		out = append(out, c)
 	}
 	return out, rows.Err()

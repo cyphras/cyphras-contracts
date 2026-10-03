@@ -160,7 +160,7 @@ func (s *Screener) Apply(ctx context.Context, b follow.Batch) error {
 	s.mu.Unlock()
 	for _, n := range delta.Notices {
 		if n.Name == "attested" {
-			s.log.Info("attestation on chain", "up_to", n.Body.(vault.Attested).UpTo, "ledger", n.Ledger)
+			s.log.Info("attestation on chain", "up_to", n.Body.(chainstate.Attestation).UpTo, "ledger", n.Ledger)
 		}
 	}
 	return nil

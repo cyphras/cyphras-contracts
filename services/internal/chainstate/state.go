@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"math/big"
+	"slices"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 	"github.com/cyphras/cyphras-contracts/services/internal/tree"
@@ -296,6 +297,13 @@ type RootAt struct {
 	Root      fr.Element
 }
 
+// Attestation is the body of an attested notice: the attestation and the deposits it vouches for,
+// those pending and unflagged in its range when it landed.
+type Attestation struct {
+	vault.Attested
+	Covered []uint64
+}
+
 // Notice is a governance, queue or exit event, kept for the services that report them.
 type Notice struct {
 	Name     string
@@ -469,8 +477,15 @@ func (s *State) apply(tx vault.Tx, call any, d *Delta, spent map[fr.Element]bool
 		if c.UpTo <= s.AttestedUpTo || c.UpTo >= s.NextDepositID {
 			return inconsistent("attestation up to %d after %d with %d next", c.UpTo, s.AttestedUpTo, s.NextDepositID)
 		}
+		var covered []uint64
+		for id, dep := range s.Pending {
+			if id > s.AttestedUpTo && id <= c.UpTo && dep.Flag == nil {
+				covered = append(covered, id)
+			}
+		}
+		slices.Sort(covered)
 		s.AttestedUpTo = c.UpTo
-		s.notice(tx, "attested", c, d)
+		s.notice(tx, "attested", Attestation{Attested: c, Covered: covered}, d)
 	case vault.DepositRefunded:
 		dep, ok := s.Pending[c.ID]
 		if !ok {
