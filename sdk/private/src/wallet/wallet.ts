@@ -929,7 +929,8 @@ export class PrivateWallet {
 
   /**
    * Pays queued exits in FIFO order, up to `max`, as far as today's outflow window reaches; anyone
-   * may call it.
+   * may call it. While the vault cannot pay out, it stops with the queue as it is, and fails with
+   * the vault error VaultCannotPay when it could pay nothing.
    */
   releaseExits(signer: TransactionSigner, max = 10): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
