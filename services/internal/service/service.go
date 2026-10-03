@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stellar/go-stellar-sdk/network"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
@@ -46,8 +48,8 @@ func Logger(name string) *slog.Logger {
 
 // Alerter pages through the webhooks in ALERT_WEBHOOKS_FILE, which must list at least two, so a
 // page reaches the operator when one channel refuses it. ALERT_DEV=1 lets a development setup run
-// with one; none is never enough.
-func Alerter(name string, log *slog.Logger) (*alert.Alerter, error) {
+// with one, never on the public network; none is never enough.
+func Alerter(name string, log *slog.Logger, passphrase string) (*alert.Alerter, error) {
 	a := &alert.Alerter{Service: name, Log: log, Cooldown: 15 * time.Minute}
 	data, err := config.Secret("ALERT_WEBHOOKS")
 	if err != nil {
@@ -59,6 +61,9 @@ func Alerter(name string, log *slog.Logger) (*alert.Alerter, error) {
 	}
 	least := 2
 	if os.Getenv("ALERT_DEV") == "1" {
+		if passphrase == network.PublicNetworkPassphrase {
+			return nil, errors.New("ALERT_DEV is for development, not the public network")
+		}
 		least = 1
 	}
 	if len(channels) < least {
@@ -96,10 +101,6 @@ func StartQueue(ctx context.Context, a *alert.Alerter, name string, pool *pgxpoo
 // by RPC_URL_FILE) and refuses an RPC that serves another network.
 func Start(ctx context.Context, name string) (*Base, error) {
 	log := Logger(name)
-	alerts, err := Alerter(name, log)
-	if err != nil {
-		return nil, err
-	}
 	path, err := config.Required("DEPLOYMENT_FILE")
 	if err != nil {
 		return nil, err
@@ -109,6 +110,10 @@ func Start(ctx context.Context, name string) (*Base, error) {
 		return nil, err
 	}
 	deployment, v, err := config.LoadDeployment(path, vaultID)
+	if err != nil {
+		return nil, err
+	}
+	alerts, err := Alerter(name, log, deployment.NetworkPassphrase)
 	if err != nil {
 		return nil, err
 	}
