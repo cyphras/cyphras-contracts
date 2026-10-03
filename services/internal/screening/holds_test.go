@@ -361,3 +361,46 @@ func TestTheReviewQueueIsMeasuredAndPagedPastItsTime(t *testing.T) {
 		t.Fatalf("after the review: %+v", hl)
 	}
 }
+
+func TestAnOperatorLiftsAHoldOnlyAsItsFinalCheckWould(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	big := h.shield(clean, 6_000_000_000)
+	h.tick()
+	h.shield(keypair.MustRandom().Address(), 10_000_000)
+	h.tick()
+	h.now = h.now.Add(55 * time.Minute)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 6", "attest 2"}) {
+		t.Fatalf("sent %v", got)
+	}
+	h.tick()
+	// A day before its final window, the hold stays whatever the checks say.
+	if err := h.s.Unflag(ctx, big, "reviewer", "looked fine"); err == nil || !strings.Contains(err.Error(), "final window") {
+		t.Fatalf("an early unflag: %v", err)
+	}
+	// In its final window a referral is not clear enough.
+	h.now = time.Unix(int64(h.deposits[big].createdAt), 0).Add(24*time.Hour - 9*time.Minute)
+	h.funders[clean] = []string{funder}
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}, funder: {Source: "exploits", Refer: true}}, "2", h.now)
+	if err := h.s.Unflag(ctx, big, "reviewer", "looked fine"); err == nil || !strings.Contains(err.Error(), "do not clear") {
+		t.Fatalf("an unflag on a referral: %v", err)
+	}
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("sent %v", got)
+	}
+	// A clear check then counts as the final check: the deposit is not checked again before it is
+	// admitted, and the lifted flag is not lifted twice.
+	delete(h.funders, clean)
+	if err := h.s.Unflag(ctx, big, "reviewer", "looked fine"); err != nil {
+		t.Fatal(err)
+	}
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"unflag 1"}) {
+		t.Fatalf("sent %v", got)
+	}
+	rows, err := h.s.db.pending(ctx)
+	if err != nil || rows[0].recheck != "pass" || rows[0].recheckAt == nil || *rows[0].recheckAt != uint64(h.now.Unix()) {
+		t.Fatalf("rows %+v %v", rows, err)
+	}
+}
