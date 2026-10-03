@@ -1,7 +1,9 @@
 name: services release
 
-# Images are built only from a signed services-vX.Y.Z tag and published by digest; the host pulls
-# them by digest from deployments/<network>.json, so the running code always traces to a tag.
+# Images are built only from a signed services-vX.Y.Z tag, published by digest and attested with
+# their build provenance; the host verifies the attestations and pulls the images by digest from
+# deployments/<network>.json, so the running code always traces to a tag. The tag name reaches a
+# shell only through an environment variable, and only once it has that form.
 on:
   push:
     tags: ["services-v*"]
@@ -13,6 +15,10 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
+      - name: Check the tag name
+        env:
+          TAG: ${{ github.ref_name }}
+        run: '[[ "$TAG" =~ ^services-v[0-9]+\.[0-9]+\.[0-9]+$ ]]'
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
@@ -37,9 +43,14 @@ jobs:
   images:
     needs: verify
     runs-on: ubuntu-latest
+    # The environment holds the job until a maintainer approves the release.
+    environment: services-release
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       matrix:
         service: [indexer, relayer, keeper, screening, watcher]
@@ -62,6 +73,11 @@ jobs:
             VERSION=${{ github.ref_name }}
           push: true
           tags: ghcr.io/${{ github.repository }}/${{ matrix.service }}:${{ github.ref_name }}
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}/${{ matrix.service }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
       - name: Record the digest
         env:
           SERVICE: ${{ matrix.service }}

@@ -11,6 +11,8 @@ COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 COPY . .
 RUN test -n "$SERVICE" && test -d "cmd/$SERVICE"
+# The version reaches the linker flags only in the form of a release tag, or as dev.
+RUN printf '%s\n' "$VERSION" | grep -Eqx 'services-v[0-9]+\.[0-9]+\.[0-9]+|dev'
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
   -ldflags "-s -w -X github.com/cyphras/cyphras-contracts/services/internal/service.Version=${VERSION}" \
   -o /out/service "./cmd/${SERVICE}"
