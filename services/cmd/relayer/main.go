@@ -138,8 +138,8 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 		return nil, err
 	}
 	// Every relayed fee goes to the fee address, so the vault would refuse every relay if it could
-	// not receive the asset.
-	ok, err := r.CanReceive(ctx, feeAddress)
+	// not receive the asset. A fee is too small to create the account.
+	ok, err := r.CanReceive(ctx, feeAddress, new(big.Int))
 	if err != nil {
 		return nil, err
 	}

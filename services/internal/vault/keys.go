@@ -150,6 +150,10 @@ func ReceiveKeys(asset, account string) ([]xdr.LedgerKey, error) {
 	return append(keys, t), nil
 }
 
+// MinNewAccountPayout is the least payout of the native asset, in stroops, that the vault makes to
+// an account that does not exist yet; the asset contract creates the account with it.
+const MinNewAccountPayout = 10_000_000
+
 // ConfigSettingKey is the entry of a network configuration setting.
 func ConfigSettingKey(id xdr.ConfigSettingId) xdr.LedgerKey {
 	var k xdr.LedgerKey

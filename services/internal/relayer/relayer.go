@@ -234,7 +234,7 @@ func (r *Relayer) verified(ctx context.Context, req Request) *failure {
 	// The vault refuses an exit to a party that cannot receive; refusing it here first spares the
 	// screening and the simulation.
 	if req.Ext.ExtAmount.Sign() < 0 {
-		ok, err := r.CanReceive(ctx, req.Ext.Recipient)
+		ok, err := r.CanReceive(ctx, req.Ext.Recipient, new(big.Int).Neg(req.Ext.ExtAmount))
 		if err != nil {
 			return fail(http.StatusServiceUnavailable, CodeUnavailable)
 		}
@@ -246,9 +246,10 @@ func (r *Relayer) verified(ctx context.Context, req Request) *failure {
 }
 
 // CanReceive mirrors the vault's check of an account that is to be paid: it must exist and, for an
-// issued asset it does not issue, hold a trustline the issuer has authorized. A contract address
-// is left to the simulation, which runs the vault's own check.
-func (r *Relayer) CanReceive(ctx context.Context, address string) (bool, error) {
+// issued asset it does not issue, hold a trustline the issuer has authorized. An account that does
+// not exist yet can still be paid the native asset when the payout is enough to create it. A
+// contract address is left to the simulation, which runs the vault's own check.
+func (r *Relayer) CanReceive(ctx context.Context, address string, payout *big.Int) (bool, error) {
 	account, err := vault.AccountOf(address)
 	if err != nil || account[0] != 'G' {
 		return err == nil, err
@@ -262,7 +263,7 @@ func (r *Relayer) CanReceive(ctx context.Context, address string) (bool, error) 
 		return false, err
 	}
 	if _, ok := entries[mustKeyString(keys[0])]; !ok {
-		return false, nil
+		return r.cfg.Asset == "native" && payout.Cmp(big.NewInt(vault.MinNewAccountPayout)) >= 0, nil
 	}
 	if len(keys) == 1 {
 		return true, nil

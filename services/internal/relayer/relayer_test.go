@@ -202,7 +202,7 @@ func success(resource int64) protocol.GetTransactionResponse {
 	return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusSuccess, ResultXDR: r, ResultMetaXDR: meta, Ledger: 1001}}
 }
 
-func newHarness(t *testing.T, status vault.Status) *harness {
+func newHarness(t *testing.T, status vault.Status, mutate ...func(*Config)) *harness {
 	t.Helper()
 	h := &harness{t: t, fake: rpctest.New(passphrase, 1000), screen: &screenStub{allow: true}, now: time.Unix(1_728_000_000, 0), status: success(900_000)}
 	h.fake.CloseTime = h.now.Unix()
@@ -257,10 +257,14 @@ func newHarness(t *testing.T, status vault.Status) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := New(ctx, Config{
+	cfg := Config{
 		Vault: vaulttest.Vault, NetworkID: rpc.NetworkID(passphrase), Asset: "native", FeeAddress: feeAddress,
 		Pricing: Pricing{Native: true, MarginBps: 500, Tier: big.NewInt(100_000)}, LedgerSeconds: 5, MaxHeld: 10, Key: key,
-	}, h.fake, engine, channels, h.screen, NewStore(pool), 1_000_000, &alert.Alerter{Service: "relayer"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}
+	for _, m := range mutate {
+		m(&cfg)
+	}
+	r, err := New(ctx, cfg, h.fake, engine, channels, h.screen, NewStore(pool), 1_000_000, &alert.Alerter{Service: "relayer"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -675,18 +679,41 @@ func TestForgedOrSpentProofsAreRefusedBeforeAnything(t *testing.T) {
 }
 
 func TestAnUnshieldToAnAccountThatCannotReceiveIsRefusedFirst(t *testing.T) {
-	h := newHarness(t, vault.Status{})
+	// The fixture pays 70 XLM, enough to create a missing account, so here the vault holds an issued
+	// asset the recipient has no trustline for.
+	issuer := keypair.MustRandom().Address()
+	h := newHarness(t, vault.Status{}, func(c *Config) { c.Asset = "USDC:" + issuer })
+	if code, out := h.post(fixture(t, "unshield_muxed")); code != http.StatusUnprocessableEntity || out["error"] != CodeRejected {
+		t.Fatalf("unshield to an account without a trustline: %d %v", code, out)
+	}
+	if len(h.screen.asked) != 0 || h.fake.CallCount("simulateTransaction") != 0 {
+		t.Fatal("an unpayable unshield reached screening or simulation")
+	}
+	// Of the native asset, the same payout creates the account, so it goes on.
+	h = newHarness(t, vault.Status{})
 	body := fixture(t, "unshield_muxed")
 	recipient, err := vault.AccountOf(body["ext"].(map[string]any)["recipient"].(string))
 	if err != nil {
 		t.Fatal(err)
 	}
 	h.fake.DeleteEntry(mustKey(vault.AccountKey(recipient)))
-	if code, out := h.post(body); code != http.StatusUnprocessableEntity || out["error"] != CodeRejected {
-		t.Fatalf("unshield to a missing account: %d %v", code, out)
+	if code, out := h.post(body); code != http.StatusAccepted {
+		t.Fatalf("unshield that creates its account: %d %v", code, out)
 	}
-	if len(h.screen.asked) != 0 || h.fake.CallCount("simulateTransaction") != 0 {
-		t.Fatal("an unpayable unshield reached screening or simulation")
+}
+
+func TestAMissingAccountIsPaidOnlyTheNativeAssetAndEnoughToCreateIt(t *testing.T) {
+	fake := rpctest.New(passphrase, 1000)
+	r := &Relayer{cfg: Config{Asset: "native"}, rpc: fake}
+	missing := keypair.MustRandom().Address()
+	for payout, want := range map[int64]bool{0: false, vault.MinNewAccountPayout - 1: false, vault.MinNewAccountPayout: true} {
+		if got, err := r.CanReceive(context.Background(), missing, big.NewInt(payout)); err != nil || got != want {
+			t.Fatalf("a payout of %d: %t, %v", payout, got, err)
+		}
+	}
+	r.cfg.Asset = "USDC:" + keypair.MustRandom().Address()
+	if got, err := r.CanReceive(context.Background(), missing, big.NewInt(vault.MinNewAccountPayout)); err != nil || got {
+		t.Fatalf("an issued asset to a missing account: %t, %v", got, err)
 	}
 }
 
@@ -700,7 +727,7 @@ func TestAnIssuedAssetNeedsAnAuthorizedTrustlineExceptForItsIssuer(t *testing.T)
 	}
 	check := func(address string, want bool) {
 		t.Helper()
-		if got, err := r.CanReceive(context.Background(), address); err != nil || got != want {
+		if got, err := r.CanReceive(context.Background(), address, big.NewInt(vault.MinNewAccountPayout)); err != nil || got != want {
 			t.Fatalf("can receive %t, %v; want %t", got, err, want)
 		}
 	}
