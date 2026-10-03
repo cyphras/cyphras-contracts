@@ -38,4 +38,25 @@ describe("state compare-and-swap", () => {
     await backend.set(key as string, old);
     await assert.rejects(states.load(), isCode("state_conflict"));
   });
+
+  it("refuses a state older than the last revision saved, after a reopen too", async () => {
+    const backend = new MemoryStore();
+    const store = new SealedStore(backend, testBytes("lock/store", 2, 32));
+    const states = new StateStore(store);
+    const state = emptyState(10);
+    await states.save(state);
+    // The state record is written first, the record of its revision after it.
+    const [key] = backend.keys();
+    const old = (await backend.get(key as string)) as Uint8Array;
+    await states.save(state);
+    await backend.set(key as string, old);
+    await assert.rejects(new StateStore(store).load(), isCode("state_conflict"));
+    // Nor may the state vanish while its revision stays.
+    await backend.delete(key as string);
+    await assert.rejects(new StateStore(store).load(), isCode("state_conflict"));
+    // A state that could not be read and is discarded starts afresh.
+    const fresh = new StateStore(store);
+    await fresh.discard();
+    assert.equal(await fresh.load(), undefined);
+  });
 });

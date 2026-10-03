@@ -286,6 +286,8 @@ function reviver(_key: string, value: unknown): unknown {
 }
 
 const STATE_RECORD = "state";
+// The last revision saved, written after the state itself.
+const REVISION_RECORD = "revision";
 
 export async function loadState(store: SealedStore): Promise<WalletState | undefined> {
   const bytes = await store.read(STATE_RECORD);
@@ -311,16 +313,19 @@ export class StateStore {
     this.#store = store;
   }
 
-  // The stored state, refused when it is older than one this instance already saw: the store was
-  // rolled back.
+  // The stored state, refused when it is older than one this instance already saw, or than the
+  // last revision any instance recorded: the store was rolled back. A rollback of the whole store
+  // goes unnoticed across a reopen.
   async load(): Promise<WalletState | undefined> {
     const state = await loadState(this.#store);
-    if (state === undefined) return undefined;
-    if (state.revision < this.#seen) {
+    const recorded = await this.#store.read(REVISION_RECORD);
+    const last = recorded === undefined ? 0 : Number(new TextDecoder().decode(recorded));
+    if ((state?.revision ?? 0) < Math.max(this.#seen, last)) {
       fail("state_conflict", "the stored state is older than one this wallet saw", {
         conflict: "older",
       });
     }
+    if (state === undefined) return undefined;
     this.#seen = state.revision;
     return state;
   }
@@ -328,6 +333,7 @@ export class StateStore {
   // Drops a stored state that cannot be read, so that a fresh one can be saved in its place.
   async discard(): Promise<void> {
     await this.#store.remove(STATE_RECORD);
+    await this.#store.remove(REVISION_RECORD);
     this.#seen = 0;
   }
 
@@ -342,5 +348,6 @@ export class StateStore {
     await saveState(this.#store, { ...state, revision: state.revision + 1 });
     state.revision += 1;
     this.#seen = state.revision;
+    await this.#store.write(REVISION_RECORD, new TextEncoder().encode(String(state.revision)));
   }
 }
