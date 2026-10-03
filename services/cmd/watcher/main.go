@@ -4,7 +4,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -32,9 +31,6 @@ func main() {
 		service.Fatal(service.Logger("watcher"), "start", err)
 	}
 	log := base.Log
-	if len(base.Alerts.Channels) < 2 {
-		service.Fatal(log, "config", errors.New("the watcher pages through two independent channels; ALERT_WEBHOOKS_FILE must list at least two"))
-	}
 	public := &alert.Alerter{Service: "watcher", Log: log, Cooldown: time.Hour}
 	if os.Getenv("PUBLIC_WEBHOOKS_FILE") != "" {
 		data, err := config.Secret("PUBLIC_WEBHOOKS")
@@ -78,7 +74,7 @@ func main() {
 	if err := base.StartAlerts(ctx, pool); err != nil {
 		service.Fatal(log, "alerts", err)
 	}
-	if err := service.StartQueue(ctx, public, "public", pool, log); err != nil {
+	if err := service.StartQueue(ctx, public, "public", pool, log, 0); err != nil {
 		service.Fatal(log, "alerts", err)
 	}
 	w, err := watcher.New(ctx, cfg, base.RPC, second, &chainstate.Store{Pool: pool}, hz, base.Alerts, public, log)

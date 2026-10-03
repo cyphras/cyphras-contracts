@@ -19,18 +19,23 @@ import (
 // that is slow, down or rate limited holds up only itself. A lane sends Critical alerts before
 // Warnings, each on its own, and gathers Info alerts into one digest at most every DigestEvery.
 // A copy a channel fails to take is retried with backoff until the channel takes it, and one it
-// refuses with a 4xx answer other than 408 or 429 is dropped, as it would be refused again; a
-// lane whose channel keeps failing rests, as long as a 429 answer asks or at a backoff. With a
-// Store, the copies not yet delivered survive a restart, kept under each channel's name.
+// refuses with a 4xx answer other than 408 or 429 is dropped, as it would be refused again: a
+// dropped Critical goes to the other channels, saying so. A lane whose channel keeps failing
+// rests, as long as a 429 answer asks or at a backoff. With a Store, the copies not yet delivered
+// survive a restart, kept under each channel's name.
 type Queue struct {
 	// Name tells apart the queues that share a store, such as an operator and a public one.
 	Name     string
+	Service  string
 	Channels []Channel
 	Store    *Store
 	Log      *slog.Logger
 	Now      func() time.Time
 	// DigestEvery is how often a lane sends its digest of Info alerts; 5 minutes unless set.
 	DigestEvery time.Duration
+	// TestEvery, when set, is how often a lane that has nothing to send while its channel counts as
+	// failing sends the channel a test, which clears the failing once the channel takes it.
+	TestEvery time.Duration
 
 	mu      sync.Mutex
 	pending []delivery
@@ -54,9 +59,11 @@ type lane struct {
 	// failures counts the sends the channel refused in a row, from the time failing.
 	failures int
 	failing  time.Time
-	// rest is when the lane may send again, and digestAt when its next digest may go.
+	// rest is when the lane may send again, digestAt when its next digest may go, and tried when
+	// it last sent the channel anything.
 	rest     time.Time
 	digestAt time.Time
+	tried    time.Time
 }
 
 // Named is a channel that names itself the same way across restarts, as its configuration does.
@@ -143,10 +150,23 @@ func (q *Queue) lane(i int) *lane {
 
 // Put takes an alert for every channel and returns at once.
 func (q *Queue) Put(a Alert) {
+	all := make([]int, len(q.Channels))
+	for i := range all {
+		all[i] = i
+	}
+	q.putTo(a, all)
+}
+
+// putTo takes an alert for the given channels.
+func (q *Queue) putTo(a Alert, channels []int) {
 	defer q.wakeAll()
 	if q.Store != nil {
+		names := make([]string, len(channels))
+		for i, ch := range channels {
+			names[i] = q.channelName(ch)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := q.Store.add(ctx, q.Name, a, q.channelNames(), q.now())
+		err := q.Store.add(ctx, q.Name, a, names, q.now())
 		cancel()
 		if err == nil {
 			return
@@ -155,9 +175,9 @@ func (q *Queue) Put(a Alert) {
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for i := range q.Channels {
+	for _, ch := range channels {
 		q.nextID--
-		q.pending = append(q.pending, delivery{id: q.nextID, channel: i, alert: a, next: q.now()})
+		q.pending = append(q.pending, delivery{id: q.nextID, channel: ch, alert: a, next: q.now()})
 	}
 	// A full queue drops its oldest copies of the lowest severity first, Info before Warning
 	// before Critical.
@@ -289,7 +309,33 @@ func (q *Queue) flushLane(ctx context.Context, ch int) time.Duration {
 		l.digestAt = now.Add(q.digestEvery())
 		q.mu.Unlock()
 	}
+	q.test(ctx, l, ch, now)
 	return max(q.restLeft(l, now), 50*time.Millisecond)
+}
+
+// test sends a lane's channel a test when the channel counts as failing and the lane has sent it
+// nothing for TestEvery. A channel that refused one copy, and would take the next, then stops
+// counting as failing although no other alert comes; one that keeps refusing keeps failing, and
+// stalls the heartbeat.
+func (q *Queue) test(ctx context.Context, l *lane, ch int, now time.Time) {
+	q.mu.Lock()
+	due := q.TestEvery > 0 && !l.failing.IsZero() && !now.Before(l.rest) && now.Sub(l.tried) >= q.TestEvery
+	since := l.failing
+	q.mu.Unlock()
+	if !due {
+		return
+	}
+	a := Alert{Service: q.Service, Severity: Info, Code: "channel_test",
+		Message: fmt.Sprintf("a test of this channel, which has refused alerts since %s", since.UTC().Format(time.RFC3339)), Time: now.UTC()}
+	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
+	err := q.Channels[ch].Send(sendCtx, a)
+	cancel()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	l.tried = now
+	if err == nil {
+		l.failures, l.failing = 0, time.Time{}
+	}
 }
 
 // attempt sends one message standing for the copies given, and reports whether the lane may go
@@ -299,6 +345,9 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
 	err := q.Channels[ch].Send(sendCtx, a)
 	cancel()
+	q.mu.Lock()
+	l.tried = now
+	q.mu.Unlock()
 	if err == nil {
 		for _, d := range ds {
 			q.done(ctx, d)
@@ -313,6 +362,9 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 		q.logError("alert refused by its channel and dropped", a.Code, err)
 		for _, d := range ds {
 			q.done(ctx, d)
+		}
+		if a.Severity == Critical && !strings.HasSuffix(a.Code, rerouted) {
+			q.reroute(a, ch, refused)
 		}
 		// The lane goes on without a rest, but until a send succeeds it counts as failing, so a
 		// channel that refuses every copy, such as a deleted webhook, still stalls the heartbeat.
@@ -346,6 +398,27 @@ func (q *Queue) attempt(ctx context.Context, l *lane, ch int, now time.Time, ds 
 		return false
 	}
 	return true
+}
+
+// rerouted ends the code of a Critical a channel refused, as the other channels get it.
+const rerouted = "_rerouted"
+
+// reroute puts a Critical one channel refused to the other channels, saying so, so whoever
+// watches only them learns of the alert and of the channel that refused it. A rerouted alert is
+// never rerouted again.
+func (q *Queue) reroute(a Alert, refusing int, refused Refused) {
+	var others []int
+	for i := range q.Channels {
+		if i != refusing {
+			others = append(others, i)
+		}
+	}
+	if len(others) == 0 {
+		return
+	}
+	a.Code += rerouted
+	a.Message = fmt.Sprintf("the %s channel refused this alert, answering %d: %s", q.channelName(refusing), refused.Status, a.Message)
+	q.putTo(a, others)
 }
 
 func (q *Queue) restLeft(l *lane, now time.Time) time.Duration {

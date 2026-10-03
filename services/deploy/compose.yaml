@@ -14,7 +14,8 @@
 # public port on loopback only, for nginx, and reaches only its own database. Settings that are
 # not secret are in env/<service>.env; secrets are files in secrets/<network>/<asset>/, each mode
 # 0400 and owned by the uid of the one service that mounts it (10001 to 10005 below, 999 for the
-# databases). Testnet and mainnet run as separate projects and share nothing.
+# databases). Each service's alert webhooks file lists at least two channels, or the service does
+# not start. Testnet and mainnet run as separate projects and share nothing.
 #
 # Docker rotates each container's log by size, keeping at most 7 files of 20 MB, so the days the
 # host holds depend on how much a service logs. The retention policy, 7 days and 30 for the

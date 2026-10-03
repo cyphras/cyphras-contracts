@@ -34,7 +34,7 @@ func TestTheSubcommandIsTheFirstArgument(t *testing.T) {
 	}
 }
 
-func TestAServicePagesThroughAtLeastOneChannel(t *testing.T) {
+func TestAServicePagesThroughAtLeastTwoChannels(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	if _, err := Alerter("keeper", log); err == nil {
 		t.Fatal("started without webhooks")
@@ -49,8 +49,17 @@ func TestAServicePagesThroughAtLeastOneChannel(t *testing.T) {
 		t.Setenv("ALERT_WEBHOOKS_FILE", path)
 	}
 	hooks("# being rewritten\n")
+	t.Setenv("ALERT_DEV", "1")
 	if _, err := Alerter("keeper", log); err == nil {
 		t.Fatal("started with no channel")
+	}
+	hooks("slack https://hooks.example/a\n")
+	if a, err := Alerter("keeper", log); err != nil || len(a.Channels) != 1 {
+		t.Fatalf("one channel for development: %v", err)
+	}
+	t.Setenv("ALERT_DEV", "")
+	if _, err := Alerter("keeper", log); err == nil {
+		t.Fatal("started with one channel")
 	}
 	hooks("slack https://hooks.example/a\ntext https://ntfy.example/b\n")
 	if a, err := Alerter("keeper", log); err != nil || len(a.Channels) != 2 {
