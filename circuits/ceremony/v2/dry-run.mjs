@@ -550,6 +550,12 @@ async function dryRun(root, r1cs, ptau) {
     offline({ zkey: fixture("section.zkey", appendSection) }),
     "has an unknown section 11",
   );
+  refuse(
+    "verify: final zkey with bytes after its last section",
+    verifier,
+    offline({ zkey: fixture("trailing.zkey", (data) => Buffer.concat([data, Buffer.alloc(37)])) }),
+    "has bytes after its last section",
+  );
   const renamed = fixture("renamed.zkey", rename(0, "Dry Run X (github: dry-run-x)"));
   const alone = await timed("snarkjs zkey verify alone, on the final zkey with #1 renamed", () =>
     snarkjs.zKey.verifyFromR1cs(
