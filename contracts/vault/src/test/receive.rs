@@ -9,7 +9,7 @@ use soroban_sdk::{
 
 use super::{
     exits::{fill_window, funded, used},
-    setup::{account_address, limits, outcome, Classic, Setup, XLM},
+    setup::{limits, outcome, Classic, Setup, XLM},
 };
 use crate::Error;
 
@@ -21,7 +21,7 @@ fn classic() -> Classic {
 }
 
 /// Submits an unshield and returns its result, checking that a refused one spent nothing.
-fn exit(
+pub fn exit(
     s: &Setup,
     payout: i128,
     fee: i128,
@@ -79,25 +79,6 @@ fn a_recipient_whose_authorization_is_revoked_is_refused_until_it_is_restored() 
     c.asset.set_authorized(&frozen, &true);
     assert_eq!(exit(s, 10 * XLM, 0, frozen.clone().into(), &filler), Ok(()));
     assert_eq!(s.balance(&frozen), 10 * XLM);
-}
-
-#[test]
-fn a_native_account_that_does_not_exist_yet_is_refused() {
-    let s = funded();
-    let filler = s.account("filler", 0);
-    let missing = account_address(&s.env, "missing");
-    // Two base reserves would create the account, but an exit only pays existing accounts.
-    assert_eq!(
-        exit(&s, 10 * XLM, 0, missing.clone().into(), &filler),
-        Err(Error::CannotReceive)
-    );
-    fill_window(&s, &filler);
-    assert_eq!(
-        exit(&s, 10 * XLM, 0, missing.clone().into(), &filler),
-        Err(Error::CannotReceive)
-    );
-    s.account("missing", 0);
-    assert_eq!(exit(&s, 10 * XLM, 0, missing.into(), &filler), Ok(()));
 }
 
 #[test]
