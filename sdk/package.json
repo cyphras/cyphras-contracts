@@ -1,0 +1,33 @@
+{
+  "name": "@cyphras/sdk-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "The TypeScript packages of Cyphras private payments v2: the SDK core and its snarkjs prover",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "workspaces": [
+    "private",
+    "prover-snarkjs"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @cyphras/private --workspace @cyphras/private-prover-snarkjs",
+    "typecheck": "npm run typecheck --workspaces",
+    "test": "npm test --workspace @cyphras/private",
+    "test:proof": "npm run test:proof --workspace @cyphras/private",
+    "format": "prettier --write \"*/src/**/*.ts\" \"*/test/**/*.ts\" \"*/scripts/**/*.ts\" \"scripts/**/*.ts\"",
+    "format:check": "prettier --check \"*/src/**/*.ts\" \"*/test/**/*.ts\" \"*/scripts/**/*.ts\" \"scripts/**/*.ts\"",
+    "size": "node scripts/size.ts"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.1",
+    "esbuild": "0.28.2",
+    "prettier": "3.8.4",
+    "typescript": "5.9.3"
+  },
+  "overrides": {
+    "underscore": "1.13.8"
+  }
+}

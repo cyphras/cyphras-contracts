@@ -1,0 +1,31 @@
+{
+  "description": "Vault domain vectors.",
+  "format": "Field elements are 0x-prefixed 32-byte big-endian hex.",
+  "derivation": "domain = OS2IP(SHA-256(\"cyphras/v2/domain/\" || network || \"/\" || asset)) mod p",
+  "domains": [
+    {
+      "network": "mainnet",
+      "asset": "native",
+      "preimage": "cyphras/v2/domain/mainnet/native",
+      "domain": "0x00f58a95d4597b23c196b75fd9239ef748f320ac02e2da084d66b3d57a51a06a"
+    },
+    {
+      "network": "testnet",
+      "asset": "native",
+      "preimage": "cyphras/v2/domain/testnet/native",
+      "domain": "0x13769b40e979190b26903a0102449d200ab1c79d88e873c16c0267b586b4f205"
+    },
+    {
+      "network": "mainnet",
+      "asset": "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      "preimage": "cyphras/v2/domain/mainnet/USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      "domain": "0x0148a48119f4fafc9ac3287ab6aa849e9241a00148559c3797b3a5fb2f6d8a75"
+    },
+    {
+      "network": "testnet",
+      "asset": "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+      "preimage": "cyphras/v2/domain/testnet/USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+      "domain": "0x214e43430f55cd16840fc3a58015e2a689098bdd4b79813dd555f98b545f7296"
+    }
+  ]
+}

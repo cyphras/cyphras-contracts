@@ -1,0 +1,32 @@
+{
+  "name": "@cyphras/private-prover-snarkjs",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "description": "The default prover of @cyphras/private: snarkjs Groth16 over the pinned circuit artifacts",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "exports": {
+    ".": {
+      "cyphras-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "snarkjs": "0.7.6"
+  },
+  "peerDependencies": {
+    "@cyphras/private": "0.1.0"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "customConditions": ["cyphras-source"]
+  },
+  "include": ["src"]
+}
