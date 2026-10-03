@@ -153,7 +153,7 @@ export interface RootCheck {
 }
 
 export interface WalletState {
-  readonly version: 1;
+  readonly version: 2;
   tree: TreeSnapshot;
   lastLeafLedger: number;
   nullifierSince: number;
@@ -173,7 +173,7 @@ export interface WalletState {
 
 export function emptyState(deployLedger: number): WalletState {
   return {
-    version: 1,
+    version: 2,
     tree: { leafCount: 0, upper: [], partial: [] },
     lastLeafLedger: 0,
     nullifierSince: deployLedger,
@@ -190,12 +190,17 @@ export function emptyState(deployLedger: number): WalletState {
   };
 }
 
-// JSON with bigint and byte values tagged, so the state round-trips exactly.
+// JSON with bigint and byte values tagged, so the state round-trips exactly. A bigint is its sign
+// followed by its magnitude in hex.
 function replacer(_key: string, value: unknown): unknown {
-  if (typeof value === "bigint") return { $n: value.toString(16) };
+  if (typeof value === "bigint") {
+    return { $n: (value < 0n ? "-" : "+") + (value < 0n ? -value : value).toString(16) };
+  }
   if (value instanceof Uint8Array) return { $b: bytesToHex(value) };
   return value;
 }
+
+const BIGINT = /^([+-])([0-9a-f]+)$/;
 
 // The state never stores null, and JSON turns an undefined array element into null.
 function reviver(_key: string, value: unknown): unknown {
@@ -203,7 +208,12 @@ function reviver(_key: string, value: unknown): unknown {
   if (typeof value === "object" && !Array.isArray(value)) {
     const keys = Object.keys(value);
     const record = value as Record<string, unknown>;
-    if (keys.length === 1 && typeof record["$n"] === "string") return BigInt("0x" + record["$n"]);
+    if (keys.length === 1 && typeof record["$n"] === "string") {
+      const parts = BIGINT.exec(record["$n"]);
+      if (parts === null) fail("storage_unreadable", "the stored state holds a malformed number");
+      const magnitude = BigInt("0x" + parts[2]);
+      return parts[1] === "-" ? -magnitude : magnitude;
+    }
     if (keys.length === 1 && typeof record["$b"] === "string") return hexToBytes(record["$b"]);
   }
   return value;
@@ -215,7 +225,7 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   const bytes = await store.read(STATE_RECORD);
   if (bytes === undefined) return undefined;
   const state = JSON.parse(new TextDecoder().decode(bytes), reviver) as WalletState;
-  if (state.version !== 1) fail("storage_unreadable", "the stored state has an unknown version");
+  if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
   return state;
 }
 
