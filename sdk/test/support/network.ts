@@ -1,0 +1,393 @@
+// An indexer and a relayer that follow services.md, as this SDK reads it, over the vault model,
+// and a fetch that routes the SDK's requests to them and to the mock RPC.
+import { createHash } from "node:crypto";
+import {
+  Asset,
+  Keypair,
+  StrKey,
+  type Transaction,
+  TransactionBuilder,
+} from "@stellar/stellar-base";
+import { bytesToHex, toHex32 } from "../../src/bytes.ts";
+import type { Deployment } from "../../src/deployments.ts";
+import { computeDomain } from "../../src/domain.ts";
+import {
+  extDataFromJson,
+  txProofFromJson,
+  type ExtDataJson,
+  type TxProofJson,
+} from "../../src/extdata.ts";
+import { NETWORK_PASSPHRASES } from "../../src/keys.ts";
+import type { FetchLike } from "../../src/net/http.ts";
+import type { TransactionSigner } from "../../src/vault/invoke.ts";
+import { MockRpc, RpcFailure, keypairFor } from "./rpc.ts";
+import { trapdoorPins } from "./trapdoor.ts";
+import { type Limits, MockVault } from "./vault.ts";
+
+export const RPC = "http://rpc.test";
+export const INDEXER = "http://indexer.test";
+export const RELAYER = "http://relayer.test";
+const PASSPHRASE = NETWORK_PASSPHRASES.testnet;
+export const XLM = 10_000_000n;
+
+export const DEFAULT_LIMITS: Limits = {
+  minDeposit: 1n * XLM,
+  maxDeposit: 2_500n * XLM,
+  maxDailyPerDepositor: 5_000n * XLM,
+  tvlCap: 25_000n * XLM,
+  maxDailyOutflow: 5_000n * XLM,
+  maxFee: 5n * XLM,
+  largeDepositThreshold: 500n * XLM,
+};
+
+const json = (status: number, body: unknown): Response =>
+  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+export class MockIndexer {
+  readonly vault: MockVault;
+  readonly networkId: string;
+  ready = true;
+  nullifierPage = 4096;
+  identity: { vault: string; networkId: string } | undefined;
+  // Test hooks: change what the indexer serves.
+  tamperLeaf: ((index: number, cm: string) => string) | undefined;
+  hideNullifiers = false;
+  down = false;
+  requests: string[] = [];
+
+  constructor(vault: MockVault, networkId: string) {
+    this.vault = vault;
+    this.networkId = networkId;
+  }
+
+  handle(url: URL): Response {
+    if (this.down) throw new TypeError("connection refused");
+    this.requests.push(url.pathname + url.search);
+    const v = this.vault;
+    const identity = {
+      vault: this.identity?.vault ?? v.address,
+      network_id: this.identity?.networkId ?? this.networkId,
+    };
+    switch (url.pathname) {
+      case "/v1/health":
+        return json(this.ready ? 200 : 503, {
+          ready: this.ready,
+          ...(this.ready ? {} : { code: "lagging" }),
+          ...identity,
+          deploy_ledger: 10,
+          latest_ledger: v.ledger,
+          ingested_ledger: v.ledger,
+          reconciled_ledger: v.ledger,
+          leaf_count: v.tree.leafCount,
+          root: toHex32(v.tree.root()),
+          nullifier_count: v.nullifiers.size,
+          pending_count: v.pending.size,
+        });
+      case "/v1/leaves": {
+        const page = Number(url.searchParams.get("page"));
+        const leaves = v.leaves.slice(page * 1024, page * 1024 + 1024).map((l) => {
+          const cm = toHex32(l.cm);
+          return {
+            index: l.index,
+            commitment: this.tamperLeaf?.(l.index, cm) ?? cm,
+            ciphertext: bytesToHex(l.ciphertext),
+            ledger: l.ledger,
+            tx_hash: l.txHash,
+          };
+        });
+        return json(200, { page, leaves });
+      }
+      case "/v1/nullifiers": {
+        const since = Number(url.searchParams.get("since_ledger"));
+        const offset = Number(url.searchParams.get("cursor") ?? "0");
+        const all = [...v.nullifiers.entries()]
+          .filter(([, n]) => n.ledger >= since && !this.hideNullifiers)
+          .sort(([, a], [, b]) => a.ledger - b.ledger);
+        const slice = all.slice(offset, offset + this.nullifierPage);
+        const more = offset + slice.length < all.length;
+        return json(200, {
+          nullifiers: slice.map(([nf, n]) => ({
+            nullifier: toHex32(nf),
+            ledger: n.ledger,
+            tx_hash: n.txHash,
+          })),
+          cursor: more ? String(offset + slice.length) : null,
+          complete_to_ledger: v.ledger,
+        });
+      }
+      case "/v1/deposits":
+        return json(200, {
+          pending: [...v.pending.entries()].map(([id, d]) => ({
+            id,
+            depositor: d.depositor,
+            amount: d.amount.toString(),
+            created_at: Number(d.createdAt),
+            earliest_admission: Number(d.createdAt + d.delay),
+            attested: id <= v.attestedUpTo,
+            flag: d.flag === undefined ? null : { reason: d.flag, flagged_at: Number(d.flaggedAt) },
+          })),
+          resolved: v.resolved.map((r) => ({
+            id: r.id,
+            depositor: r.depositor,
+            amount: r.amount.toString(),
+            outcome: r.outcome,
+            reason: r.reason ?? null,
+            leaf_indices: r.leafIndices ?? null,
+          })),
+        });
+      case "/v1/stats":
+        return json(200, {
+          leaf_count: v.tree.leafCount,
+          admitted_deposits: v.resolved.filter((r) => r.outcome === "admitted").length,
+          distinct_depositors: new Set(v.resolved.map((r) => r.depositor)).size,
+          pending_deposits: v.pending.size,
+        });
+      case "/v1/exits": {
+        if (!v.exitQueue) return json(404, { error: "not_found" });
+        const entry = (e: {
+          id: number;
+          payout: bigint;
+          fee: bigint;
+          recipient: string;
+          txHash: string;
+          ledger: number;
+        }) => ({
+          id: e.id,
+          payout: e.payout.toString(),
+          fee: e.fee.toString(),
+          recipient: e.recipient,
+          tx_hash: e.txHash,
+          ledger: e.ledger,
+        });
+        return json(200, {
+          head: v.exitHead,
+          tail: v.exitTail,
+          queued: [...v.exits.values()].sort((a, b) => a.id - b.id).map(entry),
+          stranded: [...v.stranded.values()].map(entry),
+          resolved: v.resolvedExits.map((r) => ({
+            id: r.id,
+            outcome: r.outcome,
+            tx_hash: r.txHash,
+          })),
+          complete_to_ledger: v.ledger,
+        });
+      }
+      default:
+        return json(404, { error: "not_found" });
+    }
+  }
+}
+
+export class MockRelayer {
+  readonly rpc: MockRpc;
+  readonly vault: MockVault;
+  readonly networkId: string;
+  readonly feeAddress: string;
+  readonly channel: Keypair;
+  fee = 1n * XLM;
+  tier = 100_000n;
+  ready = true;
+  // Test hooks: errors to answer submissions with, in order.
+  failures: { error: string; reason?: number }[] = [];
+  inFlight = new Set<string>();
+  submissions: { proof: TxProofJson; ext: ExtDataJson; notBefore: number | undefined }[] = [];
+  status = new Map<string, string>();
+
+  constructor(rpc: MockRpc, networkId: string, feeAddress: string) {
+    this.rpc = rpc;
+    this.vault = rpc.vault;
+    this.networkId = networkId;
+    this.feeAddress = feeAddress;
+    this.channel = keypairFor("relayer channel");
+  }
+
+  handle(url: URL, body: unknown): Response {
+    const v = this.vault;
+    if (url.pathname === "/v1/health") {
+      return json(this.ready ? 200 : 503, {
+        ready: this.ready,
+        vault: v.address,
+        network_id: this.networkId,
+        fee_address: this.feeAddress,
+        max_fee: v.limits.maxFee.toString(),
+        channels: 4,
+      });
+    }
+    if (url.pathname === "/v1/quote") {
+      if (this.fee > v.limits.maxFee) return json(503, { error: "unavailable" });
+      return json(200, {
+        fee: this.fee.toString(),
+        asset: "native",
+        tier: this.tier.toString(),
+        margin_bps: 500,
+        valid_until: Number(v.timestamp) + 300,
+        fee_address: this.feeAddress,
+        vault: v.address,
+        network_id: this.networkId,
+      });
+    }
+    if (url.pathname === "/v1/submit") return this.#submit(body as Record<string, unknown>);
+    if (url.pathname.startsWith("/v1/tx/")) {
+      const status = this.status.get(url.pathname.slice("/v1/tx/".length));
+      return status === undefined ? json(404, { error: "not_found" }) : json(200, { status });
+    }
+    return json(404, { error: "not_found" });
+  }
+
+  // Strict parsing, then the vault call with a channel account as the submitter.
+  #submit(body: Record<string, unknown>): Response {
+    const failure = this.failures.shift();
+    if (failure !== undefined) return json(400, failure);
+    let proof;
+    let ext;
+    try {
+      proof = txProofFromJson(body["proof"] as TxProofJson);
+      ext = extDataFromJson(body["ext"] as ExtDataJson);
+    } catch {
+      return json(400, { error: "bad_request" });
+    }
+    if (ext.vault !== this.vault.address || bytesToHex(ext.networkId) !== this.networkId) {
+      return json(400, { error: "wrong_vault" });
+    }
+    if (ext.extAmount > 0n || ext.relayer !== this.feeAddress)
+      return json(400, { error: "bad_request" });
+    if (ext.fee < this.fee) return json(400, { error: "fee_too_low" });
+    if (ext.fee > this.vault.limits.maxFee) return json(400, { error: "fee_above_cap" });
+    const key = proof.inputNullifiers.map(String).join(":");
+    if (proof.inputNullifiers.some((nf) => this.inFlight.has(nf.toString()))) {
+      return json(409, { error: "duplicate" });
+    }
+    this.submissions.push({
+      proof: body["proof"] as TxProofJson,
+      ext: body["ext"] as ExtDataJson,
+      notBefore: body["not_before"] as number | undefined,
+    });
+    const hash = createHash("sha256")
+      .update(`relayed/${key}/${this.submissions.length}`)
+      .digest("hex");
+    try {
+      this.rpc.run(hash, () => this.vault.transact(proof, ext, this.channel.publicKey()));
+      this.status.set(hash, "success");
+    } catch {
+      this.status.set(hash, "failed");
+      return json(400, { error: "rejected" });
+    }
+    return json(202, { hash });
+  }
+}
+
+export interface World {
+  readonly vault: MockVault;
+  readonly rpc: MockRpc;
+  readonly indexer: MockIndexer;
+  readonly relayer: MockRelayer;
+  readonly deployment: Deployment;
+  readonly fetch: FetchLike;
+  readonly requests: string[];
+  readonly clock: () => number;
+  signer(label: string): TransactionSigner & { readonly keypair: Keypair };
+  advance(seconds: number): void;
+  // The keeper and the screening service: attest and admit every eligible deposit.
+  admitAll(): void;
+}
+
+export async function createWorld(options: { limits?: Partial<Limits> } = {}): Promise<World> {
+  const networkId = createHash("sha256").update(PASSPHRASE).digest();
+  const vaultAddress = StrKey.encodeContract(createHash("sha256").update("test vault").digest());
+  const token = Asset.native().contractId(PASSPHRASE);
+  const vault = new MockVault({
+    address: vaultAddress,
+    token,
+    networkId: new Uint8Array(networkId),
+    domain: computeDomain("testnet", "native"),
+    wasmHash: createHash("sha256").update("test vault wasm").digest("hex"),
+    limits: { ...DEFAULT_LIMITS, ...options.limits },
+  });
+  const rpc = new MockRpc(vault, PASSPHRASE);
+  const feeAddress = keypairFor("relayer fee").publicKey();
+  const indexer = new MockIndexer(vault, networkId.toString("hex"));
+  const relayer = new MockRelayer(rpc, networkId.toString("hex"), feeAddress);
+  const requests: string[] = [];
+  const deployment: Deployment = {
+    id: "testnet/test",
+    network: "testnet",
+    networkPassphrase: PASSPHRASE,
+    vault: vaultAddress,
+    asset: { contract: token, name: "native" },
+    domain: vault.domain,
+    deployLedger: 10,
+    vaultWasmHash: vault.wasmHash,
+    artifacts: await trapdoorPins(),
+    indexers: [INDEXER],
+    relayers: [{ url: RELAYER, feeAddress }],
+    feeTier: relayer.tier,
+  };
+  const fetchFn: FetchLike = async (input, init) => {
+    const url = new URL(input);
+    requests.push(`${url.origin}${url.pathname}`);
+    const body =
+      init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+    if (url.origin === RPC) {
+      const request = body as { id: number; method: string; params: Record<string, unknown> };
+      try {
+        return json(200, {
+          jsonrpc: "2.0",
+          id: request.id,
+          result: rpc.handle(request.method, request.params ?? {}),
+        });
+      } catch (err) {
+        if (err instanceof RpcFailure) {
+          return json(200, {
+            jsonrpc: "2.0",
+            id: request.id,
+            error: { code: err.code, message: err.message },
+          });
+        }
+        throw err;
+      }
+    }
+    if (url.origin === INDEXER) return indexer.handle(url);
+    if (url.origin === RELAYER) return relayer.handle(url, body);
+    throw new TypeError(`no route to ${url.origin}`);
+  };
+  rpc.account(relayer.channel);
+  const world: World = {
+    vault,
+    rpc,
+    indexer,
+    relayer,
+    deployment,
+    fetch: fetchFn,
+    requests,
+    clock: () => Number(vault.timestamp) * 1000,
+    signer(label: string) {
+      const keypair = keypairFor(label);
+      if (!rpc.accounts.has(keypair.publicKey())) rpc.account(keypair);
+      return {
+        keypair,
+        publicKey: keypair.publicKey(),
+        async signTransaction(envelope: string, passphrase: string): Promise<string> {
+          const tx = TransactionBuilder.fromXDR(envelope, passphrase) as Transaction;
+          tx.sign(keypair);
+          return tx.toXDR();
+        },
+      };
+    },
+    advance(seconds: number) {
+      vault.timestamp += BigInt(seconds);
+      vault.ledger += Math.ceil(seconds / 5);
+    },
+    admitAll() {
+      const ids = [...vault.pending.keys()].sort((a, b) => a - b);
+      const last = ids[ids.length - 1];
+      if (last === undefined) return;
+      rpc.run(createHash("sha256").update(`attest ${last} ${vault.ledger}`).digest("hex"), () =>
+        vault.attest(last),
+      );
+      rpc.run(createHash("sha256").update(`admit ${vault.ledger}`).digest("hex"), () =>
+        vault.admit(ids),
+      );
+    },
+  };
+  return world;
+}

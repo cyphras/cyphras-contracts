@@ -1,9 +1,9 @@
 import { compress } from "./poseidon2.ts";
 
 export const LEVELS = 32;
-export const PAGE_LEVELS = 10;
+const PAGE_LEVELS = 10;
 export const PAGE_SIZE = 1 << PAGE_LEVELS;
-export const CAPACITY = 2 ** LEVELS;
+const CAPACITY = 2 ** LEVELS;
 
 // ZEROS[i] is the root of an empty subtree of height i; the empty leaf is 0.
 export const ZEROS: readonly bigint[] = (() => {
@@ -46,7 +46,7 @@ export function pagePath(pageLeaves: readonly bigint[], offset: number): bigint[
   return siblings(subtreeLevels(pageLeaves, PAGE_LEVELS), offset, PAGE_LEVELS);
 }
 
-export function pageRoot(pageLeaves: readonly bigint[]): bigint {
+function pageRoot(pageLeaves: readonly bigint[]): bigint {
   return subtreeLevels(pageLeaves, PAGE_LEVELS)[PAGE_LEVELS]?.[0] ?? (ZEROS[PAGE_LEVELS] as bigint);
 }
 
@@ -134,6 +134,31 @@ export class CommitmentTree {
     this.#partial = [];
     this.#pushComplete(0, pageRoot(commitments));
     return commitments;
+  }
+
+  // Appends leaves after the last one, across page boundaries. Returns every page this
+  // completes, with its commitments, so paths inside it can be captured.
+  append(leaves: readonly bigint[]): { page: number; leaves: readonly bigint[] }[] {
+    const completed: { page: number; leaves: readonly bigint[] }[] = [];
+    let rest = leaves;
+    while (rest.length > 0) {
+      const page = this.currentPage;
+      const room = PAGE_SIZE - this.#partial.length;
+      const done = this.applyPage([...this.#partial, ...rest.slice(0, room)]);
+      if (done !== undefined) completed.push({ page, leaves: done });
+      rest = rest.slice(room);
+    }
+    return completed;
+  }
+
+  // The full path of the leaf at `pos`, given its siblings inside a complete page.
+  path(pos: number, pagePathOfLeaf: readonly bigint[] | undefined): bigint[] {
+    if (pos >= this.#leafCount) throw new RangeError("the leaf is not in the tree");
+    if (pos >= this.currentPage * PAGE_SIZE) return this.partialPath(pos);
+    if (pagePathOfLeaf === undefined || pagePathOfLeaf.length !== PAGE_LEVELS) {
+      throw new RangeError("the path inside a complete page is missing");
+    }
+    return [...pagePathOfLeaf, ...this.upperPath(pos)];
   }
 
   #pushComplete(k: number, node: bigint): void {
