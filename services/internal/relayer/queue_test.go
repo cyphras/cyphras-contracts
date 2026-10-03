@@ -3,6 +3,7 @@ package relayer
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
@@ -125,5 +126,42 @@ func TestARelayedExitHasRoomForTheOtherPathOfTheQueue(t *testing.T) {
 		if len(written) != len(want) || data.Resources.Instructions != 40_000_000+vault.SwitchInstructions {
 			t.Fatalf("tail %d: %d written entries, %d instructions", tail, len(written), data.Resources.Instructions)
 		}
+	}
+}
+
+func TestTheRelayerQueuesOneExitAtATime(t *testing.T) {
+	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t) })
+	h.queuedAt(9)
+	landed := make(chan struct{})
+	h.fake.Get = func(protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
+		<-landed
+		return success(900_000), nil
+	}
+	first, second := keypair.MustRandom().Address(), keypair.MustRandom().Address()
+	h.fund(first)
+	h.fund(second)
+	if _, f := h.r.Submit(context.Background(), h.forged(t, first, -20_000_000, 5_000_000)); f != nil {
+		t.Fatalf("first exit: %v", f)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, f := h.r.Submit(context.Background(), h.forged(t, second, -20_000_000, 5_000_000)); f != nil {
+			t.Errorf("second exit: %v", f)
+		}
+	}()
+	for h.fake.CallCount("simulateTransaction") < 2 {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if h.sends() != 1 {
+		t.Fatalf("%d exits queueing at once", h.sends())
+	}
+	// Once the first lands, the second is simulated again against the tail it left, and sent.
+	close(landed)
+	<-done
+	h.waitIdle()
+	if h.sends() != 2 || h.fake.CallCount("simulateTransaction") != 3 {
+		t.Fatalf("%d sent after %d simulations", h.sends(), h.fake.CallCount("simulateTransaction"))
 	}
 }

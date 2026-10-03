@@ -164,6 +164,8 @@ type Relayer struct {
 	nfNext uint32
 	// following counts the transactions being followed to their outcome.
 	following sync.WaitGroup
+	// exitSlot holds a token while none of this relayer's exits that queue is in flight.
+	exitSlot chan struct{}
 
 	mu       sync.Mutex
 	inflight map[fr.Element]bool
@@ -222,7 +224,9 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		clock: &ledgerClock{fallback: float64(cfg.LedgerSeconds)},
 		known: spentSet{max: maxKnownSpent}, told: verdicts{ttl: verdictLifetime, max: maxVerdicts},
 		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[string]*heldRequest{},
+		exitSlot: make(chan struct{}, 1),
 	}
+	r.exitSlot <- struct{}{}
 	for _, ok := range past {
 		r.results.add(ok)
 	}
@@ -978,10 +982,13 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	if !ok {
 		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
-	release := true
+	release, slot := true, false
 	defer func() {
 		if release {
 			r.channels.release(ch)
+			if slot {
+				r.exitSlot <- struct{}{}
+			}
 		}
 	}()
 	if !r.simulateLimit.Allow() {
@@ -991,9 +998,7 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	if err != nil {
 		return "", fail(http.StatusBadRequest, CodeBadRequest)
 	}
-	// The bound stops at the deadline itself: a ledger bound excludes its own ledger, so the
-	// transaction can never land where the vault would answer Expired.
-	prepared, err := r.engine.PrepareUntil(ctx, ch, op, req.Ext.Deadline, r.exitRoom(req))
+	prepared, slot, err := r.prepare(ctx, ch, op, req)
 	if err != nil {
 		if errors.Is(err, submit.ErrSimulation) {
 			return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
@@ -1030,20 +1035,56 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 		r.alerts.Raise(r.ctx, alert.Critical, "relay_record_failed", "relay record of %s not stored: %v", signed.Hash, err)
 	}
 	r.following.Add(1)
-	go r.follow(signed, ch, req.Proof.Nullifiers, rec)
+	go r.follow(signed, ch, slot, req.Proof.Nullifiers, rec)
 	return signed.Hash, nil
+}
+
+// prepare simulates a relayed transaction, with room for the other path of the exit queue, and
+// holds the exit slot for one whose simulation queued its exit: this relayer has one exit that
+// queues in flight at a time, so its own exits never compete for the queue's tail in a ledger. One
+// that has to wait for the slot is simulated again once it holds it, against the tail the exit
+// before it left. slot reports that the caller holds the slot.
+func (r *Relayer) prepare(ctx context.Context, ch *submit.Account, op txnbuild.Operation, req Request) (p *submit.Prepared, slot bool, err error) {
+	for {
+		queued := false
+		// The bound stops at the deadline itself: a ledger bound excludes its own ledger, so the
+		// transaction can never land where the vault would answer Expired.
+		p, err = r.engine.PrepareUntil(ctx, ch, op, req.Ext.Deadline, r.exitRoom(req, &queued))
+		switch {
+		case err != nil || !queued:
+			if slot {
+				r.exitSlot <- struct{}{}
+			}
+			return p, false, err
+		case slot:
+			return p, true, nil
+		}
+		select {
+		case <-r.exitSlot:
+			return p, true, nil
+		default:
+		}
+		select {
+		case <-r.exitSlot:
+			slot = true
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+	}
 }
 
 // exitRoom gives a relayed transaction that pays anything the entries of the exit queue's other
 // path, as vault.TransactRoom names them, with the resources that path may take. The queue's tail
 // is the one the simulation wrote an exit at, or the vault's tail now when it paid at once.
-func (r *Relayer) exitRoom(req Request) submit.Extend {
+// queued reports a simulation that queued the exit.
+func (r *Relayer) exitRoom(req Request, queued *bool) submit.Extend {
 	return func(ctx context.Context, fp xdr.LedgerFootprint) (submit.Extra, error) {
 		if req.Ext.ExtAmount.Sign() == 0 && req.Ext.Fee.Sign() == 0 {
 			return submit.Extra{}, nil
 		}
 		inst, _, _ := r.view()
 		tail, ok := vault.QueuedExit(r.cfg.Vault, fp)
+		*queued = ok
 		if !ok || inst == nil {
 			fresh, _, _, err := rpc.VaultInstance(ctx, r.rpc, r.cfg.Vault)
 			if err != nil {
@@ -1074,10 +1115,13 @@ func (r *Relayer) exitRoom(req Request) submit.Extend {
 	}
 }
 
-func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, nfs [2]fr.Element, rec Record) {
+func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, slot bool, nfs [2]fr.Element, rec Record) {
 	defer r.following.Done()
 	res, err := r.engine.Track(r.ctx, s)
 	r.channels.release(ch)
+	if slot {
+		r.exitSlot <- struct{}{}
+	}
 	r.unclaim(nfs)
 	if err != nil {
 		r.log.Warn("tracking stopped", "tx", s.Hash, "error", err.Error())
