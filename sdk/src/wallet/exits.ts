@@ -34,23 +34,13 @@ const exitPlans = (state: WalletState): Plan[] =>
     (p) => p.kind === "unshield" && ["confirmed", "queued", "stranded"].includes(p.state),
   );
 
-// Moves confirmed unshields to settled, queued, stranded or claimed. A vault without an exit
-// queue pays every unshield inside the transact. A transfer is settled once it is confirmed: its
-// payment is the note, and a queued fee concerns only the relayer.
-export function applyExits(
-  state: WalletState,
-  instance: VaultInstance,
-  queue: ExitQueue | undefined,
-): void {
+// Moves confirmed unshields to settled, queued, stranded or claimed. A transfer is settled once
+// it is confirmed: its payment is the note, and a queued fee concerns only the relayer.
+export function applyExits(state: WalletState, queue: ExitQueue | undefined): void {
   for (const plan of state.plans) {
     if (plan.kind === "send" && plan.state === "confirmed") plan.state = "settled";
   }
-  const hasQueue = instance.status.exitHead !== undefined;
   for (const plan of exitPlans(state)) {
-    if (!hasQueue) {
-      if (plan.state === "confirmed") plan.state = "settled";
-      continue;
-    }
     if (queue === undefined) continue;
     const byTx = (e: { txHash: string }): boolean => e.txHash === plan.txHash;
     const queued = queue.queued.find(byTx);

@@ -182,8 +182,8 @@ function vaultOpen(
   }
 }
 
-// Outflow rules for a transact: the single-exit cap, admitted value only, and the daily window
-// of a vault without an exit queue. Returns whether the payout will wait in the exit queue.
+// Outflow rules for a transact: the single-exit cap and admitted value only. Returns whether the
+// payout will wait in the exit queue.
 function checkOutflow(instance: VaultInstance, outflow: bigint, now: number): boolean {
   const { limits, status } = instance;
   if (outflow > limits.maxDailyOutflow) {
@@ -192,24 +192,16 @@ function checkOutflow(instance: VaultInstance, outflow: bigint, now: number): bo
     });
   }
   // Pending deposits stay claimable by their depositors and queued exits are owed already.
-  if (outflow > status.tvl - status.pendingTotal - (status.queuedTotal ?? 0n)) {
+  if (outflow > status.tvl - status.pendingTotal - status.queuedTotal) {
     fail("vault_unavailable", "the vault holds too little admitted value for this payout");
   }
   const day = BigInt(Math.floor(now / 86_400_000));
   const usedToday = status.outflowDay === day ? status.outflow : 0n;
-  const windowFull = usedToday + outflow > limits.maxDailyOutflow;
-  const hasQueue = status.exitHead !== undefined && status.exitTail !== undefined;
-  if (!hasQueue) {
-    if (windowFull) {
-      fail("limit_exceeded", "today's outflow window has no room for this payout", {
-        availableToday: (limits.maxDailyOutflow - usedToday).toString(),
-        resetsAt: ((day + 1n) * 86_400n).toString(),
-      });
-    }
-    return false;
-  }
-  // An exit that pays nothing never waits.
-  return outflow > 0n && (windowFull || (status.exitTail as bigint) > (status.exitHead as bigint));
+  // An exit that pays nothing never waits; any other waits behind those already queued.
+  return (
+    outflow > 0n &&
+    (usedToday + outflow > limits.maxDailyOutflow || status.exitTail > status.exitHead)
+  );
 }
 
 function planOf(

@@ -229,18 +229,8 @@ export class IndexerClient {
     return { pending, resolved };
   }
 
-  // Undefined when the indexer serves a vault without an exit queue.
-  async exits(): Promise<ExitQueue | undefined> {
-    const { status, body } = await requestJson(
-      this.#fetch,
-      "indexer",
-      joinUrl(this.url, "/v1/exits"),
-    );
-    if (status === 404) return undefined;
-    if (status !== 200) {
-      fail("service_unavailable", `the indexer answered ${status}`, { service: "indexer" });
-    }
-    const f = Fields.of(body, "indexer_fault", "indexer exits");
+  async exits(): Promise<ExitQueue> {
+    const f = await this.#get("/v1/exits");
     const entry = (list: string) =>
       f.array(list).map((raw, i): ExitEntry => {
         const e: Fields = f.item(raw, i, list);

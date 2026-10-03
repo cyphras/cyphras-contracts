@@ -61,14 +61,8 @@ describe("exits above the single-exit cap", () => {
     assert.equal(view?.sent, 48n * XLM);
     assert.equal(view?.plans.length, 1);
     assert.ok((view?.nextAt as number) >= world.clock() + 3_600_000);
-    // The vault has no exit queue and today's window is nearly used up: the next part waits for
-    // the next UTC day after its gap.
     world.advance(6 * 3_600 + 1);
     [view] = await alice.continueOperations();
-    if (view?.plans.length === 1) {
-      world.advance(86_400 + 6 * 3_600);
-      [view] = await alice.continueOperations();
-    }
     assert.equal(view?.plans.length, 2);
     [view] = await alice.continueOperations();
     assert.equal(view?.state, "done");
@@ -81,7 +75,6 @@ describe("exits above the single-exit cap", () => {
 describe("the exit queue", () => {
   it("queues a payout when the day's window is full and pays it by release", async () => {
     const { world, alice } = await funded();
-    world.vault.exitQueue = true;
     world.vault.outflowDay = world.vault.timestamp / 86_400n;
     world.vault.outflow = 45n * XLM;
     const destination = world.signer("dest").publicKey;
@@ -124,7 +117,6 @@ describe("the exit queue", () => {
 
   it("follows a stranded payout until it is claimed", async () => {
     const { world, alice } = await funded();
-    world.vault.exitQueue = true;
     world.vault.outflowDay = world.vault.timestamp / 86_400n;
     world.vault.outflow = 50n * XLM;
     const destination = world.signer("closed account").publicKey;
@@ -155,7 +147,6 @@ describe("the exit queue", () => {
 
   it("puts queued payouts in FIFO order behind the ones ahead", async () => {
     const { world, alice } = await funded({ maxDailyOutflow: 30n * XLM, tvlCap: 210n * XLM });
-    world.vault.exitQueue = true;
     world.vault.outflowDay = world.vault.timestamp / 86_400n;
     world.vault.outflow = 30n * XLM;
     const first = await alice.unshield({

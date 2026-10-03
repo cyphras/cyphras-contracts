@@ -224,7 +224,7 @@ export async function refundDeposit(
   if (pending === undefined) fail("not_found", "no pending deposit has that ID");
   if (pending.flag === undefined) fail("invalid_argument", "the deposit is not flagged");
   const now = BigInt(Math.floor(core.now() / 1000));
-  if (pending.flaggedAt !== undefined && now < pending.flaggedAt + BigInt(REFUND_DELAY_SECONDS)) {
+  if (now < pending.flaggedAt + BigInt(REFUND_DELAY_SECONDS)) {
     fail(
       "vault_unavailable",
       "a flagged deposit can be refunded a day after the flag; its depositor can cancel now",

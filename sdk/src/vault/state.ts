@@ -83,10 +83,10 @@ export interface VaultStatus {
   readonly pendingTotal: bigint;
   readonly outflowDay: bigint;
   readonly outflow: bigint;
-  // The exit queue: absent from a vault without one.
-  readonly exitHead: bigint | undefined;
-  readonly exitTail: bigint | undefined;
-  readonly queuedTotal: bigint | undefined;
+  // Queued exits hold the IDs from exitHead up to, not including, exitTail.
+  readonly exitHead: bigint;
+  readonly exitTail: bigint;
+  readonly queuedTotal: bigint;
 }
 
 export interface VaultInstance {
@@ -107,16 +107,10 @@ export interface RootHistory {
 
 export interface PendingDepositEntry {
   readonly depositor: string;
-  readonly amount: bigint;
-  readonly commitments: readonly [bigint, bigint];
-  readonly createdAt: bigint;
-  readonly delay: bigint | undefined;
   readonly flag: number | undefined;
-  readonly flaggedAt: bigint | undefined;
+  // Zero while the deposit is not flagged.
+  readonly flaggedAt: bigint;
 }
-
-const optional = <T>(s: Struct, name: string, read: (n: string) => T): T | undefined =>
-  s.has(name) ? read(name) : undefined;
 
 function parseInstance(data: xdr.LedgerEntryData): Omit<VaultInstance, "latestLedger"> {
   const val = data.contractData().val();
@@ -142,7 +136,7 @@ function parseInstance(data: xdr.LedgerEntryData): Omit<VaultInstance, "latestLe
       delayLarge: config.u64("delay_large"),
     },
     limits: {
-      minDeposit: optional(limits, "min_deposit", (n) => limits.i128(n)) ?? 1n,
+      minDeposit: limits.i128("min_deposit"),
       maxDeposit: limits.i128("max_deposit"),
       maxDailyPerDepositor: limits.i128("max_daily_per_depositor"),
       tvlCap: limits.i128("tvl_cap"),
@@ -156,12 +150,12 @@ function parseInstance(data: xdr.LedgerEntryData): Omit<VaultInstance, "latestLe
       haltedUntil: status.u64("halted_until"),
       nextDepositId: status.u64("next_deposit_id"),
       tvl: status.i128("tvl"),
-      pendingTotal: optional(status, "pending_total", (n) => status.i128(n)) ?? 0n,
+      pendingTotal: status.i128("pending_total"),
       outflowDay: status.u64("outflow_day"),
       outflow: status.i128("outflow"),
-      exitHead: optional(status, "exit_head", (n) => status.u64(n)),
-      exitTail: optional(status, "exit_tail", (n) => status.u64(n)),
-      queuedTotal: optional(status, "queued_total", (n) => status.i128(n)),
+      exitHead: status.u64("exit_head"),
+      exitTail: status.u64("exit_tail"),
+      queuedTotal: status.i128("queued_total"),
     },
   };
 }
@@ -214,12 +208,8 @@ export class VaultReader {
     const d = new Struct(entry.data.contractData().val(), "pending deposit");
     return {
       depositor: d.address("depositor"),
-      amount: d.i128("amount"),
-      commitments: [d.u256("commitment0"), d.u256("commitment1")],
-      createdAt: d.u64("created_at"),
-      delay: optional(d, "delay", (n) => d.u64(n)),
       flag: d.optionU32("flag"),
-      flaggedAt: optional(d, "flagged_at", (n) => d.u64(n)),
+      flaggedAt: d.u64("flagged_at"),
     };
   }
 

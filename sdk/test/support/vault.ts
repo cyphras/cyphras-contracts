@@ -1,6 +1,6 @@
 // A model of contracts/vault on the contracts branch: the entry points the SDK calls, their
 // checks in the vault's order, the state they change and the events they emit. Proofs are
-// verified for real against the trapdoor key. The exit queue is off unless a test turns it on.
+// verified for real against the trapdoor key.
 import { Address, MuxedAccount, StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
 import { bytesToHex, hexToBytes } from "../../src/bytes.ts";
 import {
@@ -145,9 +145,6 @@ export class MockVault {
   pendingTotal = 0n;
   outflowDay = 0n;
   outflow = 0n;
-  // The vault of c189d8a on the contracts branch has an exit queue; an older one refuses an exit
-  // that does not fit today's window instead.
-  exitQueue = false;
   exitHead = 1;
   exitTail = 1;
   queuedTotal = 0n;
@@ -353,13 +350,7 @@ export class MockVault {
     this.#binding(ext);
     const payout = -ext.extAmount;
     const outflow = payout + ext.fee;
-    const day = this.timestamp / DAY;
-    const usedToday = this.outflowDay === day ? this.outflow : 0n;
-    if (this.exitQueue) {
-      if (outflow > this.limits.maxDailyOutflow) refuse(ERROR.ExceedsDailyOutflow);
-    } else if (usedToday + outflow > this.limits.maxDailyOutflow) {
-      refuse(ERROR.OutflowLimit);
-    }
+    if (outflow > this.limits.maxDailyOutflow) refuse(ERROR.ExceedsDailyOutflow);
     if (outflow > this.tvl - this.pendingTotal - this.queuedTotal) {
       refuse(ERROR.ExceedsAdmittedValue);
     }
@@ -369,9 +360,11 @@ export class MockVault {
     if (this.dryRun) return;
     this.#spendNullifiers(proof);
     this.#insertPair(proof.outputCommitments, [ext.encryptedOutput0, ext.encryptedOutput1]);
+    const day = this.timestamp / DAY;
+    const usedToday = this.outflowDay === day ? this.outflow : 0n;
     const fits =
       this.exitHead === this.exitTail && usedToday + outflow <= this.limits.maxDailyOutflow;
-    if (this.exitQueue && outflow > 0n && !fits) {
+    if (outflow > 0n && !fits) {
       const id = this.exitTail++;
       this.queuedTotal += outflow;
       this.exits.set(id, {
@@ -577,14 +570,10 @@ export class MockVault {
       ["pending_total", i128(this.pendingTotal)],
       ["outflow_day", u64(this.outflowDay)],
       ["outflow", i128(this.outflow)],
+      ["exit_head", u64(this.exitHead)],
+      ["exit_tail", u64(this.exitTail)],
+      ["queued_total", i128(this.queuedTotal)],
     ];
-    if (this.exitQueue) {
-      status.push(
-        ["exit_head", u64(this.exitHead)],
-        ["exit_tail", u64(this.exitTail)],
-        ["queued_total", i128(this.queuedTotal)],
-      );
-    }
     return [
       new xdr.ScMapEntry({
         key: key("Config"),

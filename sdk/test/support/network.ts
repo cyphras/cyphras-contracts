@@ -222,7 +222,6 @@ export class MockIndexer {
           pending_deposits: v.pending.size,
         });
       case "/v1/exits": {
-        if (!v.exitQueue) return json(404, { error: "not_found" });
         const entry = (e: {
           id: number;
           payout: bigint;

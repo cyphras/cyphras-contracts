@@ -438,14 +438,11 @@ export class PrivateWallet {
     core.state.rootCheck = check;
     if (check.state === "mismatch") core.state.treeFault = true;
     advancePlans(core.state, update.completeToLedger, history);
-    const instance = await core.services.vault.instance();
+    // Read on every sync, like the root history, so that a spend's read of it stands out less.
+    await core.services.vault.instance();
     const live = source.kind === "indexer" ? indexer : undefined;
     await trackDeposits(core, await live?.deposits().catch(() => undefined));
-    const exits =
-      instance.status.exitHead === undefined
-        ? undefined
-        : await live?.exits().catch(() => undefined);
-    applyExits(core.state, instance, exits);
+    applyExits(core.state, await live?.exits().catch(() => undefined));
     if (live !== undefined) await this.#pollRelayers();
     await core.save();
     if (core.state.treeFault) {
@@ -714,15 +711,7 @@ export class PrivateWallet {
         }
         if (this.#core.now() < op.nextAt) continue;
         if (op.route.kind === "self" && signer?.publicKey !== op.route.account) continue;
-        try {
-          await this.#nextPart(op, op.route.kind === "self" ? signer : undefined, undefined);
-        } catch (err) {
-          // A vault without an exit queue refuses a payout once the day's outflow is used up;
-          // the part waits for the next window instead.
-          const resetsAt = err instanceof CyphrasError ? err.details["resetsAt"] : undefined;
-          if (typeof resetsAt !== "string") throw err;
-          op.nextAt = Number(resetsAt) * 1000 + randomGap();
-        }
+        await this.#nextPart(op, op.route.kind === "self" ? signer : undefined, undefined);
       }
       await this.#core.save();
       return state.operations.map((op) => this.#operationView(op));
