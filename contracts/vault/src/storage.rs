@@ -112,8 +112,8 @@ pub struct PendingDeposit {
 }
 
 /// An exit owed by the vault: what is still owed to `recipient` and `relayer`, and the time
-/// `transact` queued it. A queued exit holds what is left after any part payment; a stranded one
-/// holds the parts not yet paid.
+/// `transact` or `claim` queued it. A queued exit holds what is left after any part payment; a
+/// stranded one holds the parts not yet moved back into the queue.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Exit {

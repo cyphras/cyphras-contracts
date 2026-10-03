@@ -1,6 +1,8 @@
 //! Exits whose recipient or relayer can no longer receive the asset when they are released. A
-//! part the asset contract refuses is set aside as a stranded exit, the queue moves on, and anyone
-//! claims it once the party can receive.
+//! part the asset contract refuses is set aside as a stranded exit, the queue moves on, and once
+//! the party can receive, anyone moves the part back to the tail of the queue.
+
+use std::collections::VecDeque;
 
 use soroban_sdk::{
     testutils::{Events as _, Ledger, MuxedAddress as _},
@@ -8,11 +10,14 @@ use soroban_sdk::{
 };
 
 use super::{
-    exits::{fill_window, funded, queue, to_midnight, used},
+    exits::{
+        check_paid, fill_window, funded, queue, queue_honest, to_midnight, used, wait_bound,
+        Waiting,
+    },
     queue::authorizers,
     setup::{limits, outcome, Classic, DAY, XLM},
 };
-use crate::{events, Error, Exit, Status};
+use crate::{events, Error, Exit, Limits, Status};
 
 const HALT: u64 = 72 * 3_600;
 
@@ -87,19 +92,51 @@ fn an_exit_whose_recipient_loses_the_right_to_hold_the_asset_strands_and_the_que
     assert_eq!(s.vault.status(), released);
     assert_eq!(s.balance(&vault), released.tvl);
 
-    // While the recipient still cannot receive, a claim pays nothing, so it fails.
+    // While the recipient still cannot receive, nothing can move back into the queue.
     assert_eq!(
         outcome(s.vault.try_claim(&stuck)),
         Err(Error::NothingClaimable)
     );
     assert_eq!(s.vault.status(), released);
-    assert!(s.vault.stranded(&stuck).is_some());
 
-    // Once it can, anyone claims it.
+    // Once it can, anyone moves the payout to the tail of the queue. The value stays owed and
+    // nothing is paid yet, so no total and no window changes.
     c.asset.set_authorized(&flaky, &true);
     s.env.set_auths(&[]);
-    s.vault.claim(&stuck);
+    let requeued = s.vault.claim(&stuck);
     assert!(authorizers(s).is_empty());
+    assert_eq!(requeued, released.exit_tail);
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&vault),
+        std::vec![events::ExitRequeued {
+            id: stuck,
+            new_id: requeued,
+            payout: 10 * XLM,
+            fee: 0
+        }
+        .to_xdr(&s.env, &vault)]
+    );
+    assert_eq!(s.vault.stranded(&stuck), None);
+    assert_eq!(
+        s.vault.exit(&requeued),
+        Some(Exit {
+            recipient: flaky.clone().into(),
+            payout: 10 * XLM,
+            relayer: relayer.clone(),
+            fee: 0,
+            queued_at: s.now(),
+        })
+    );
+    assert_eq!(
+        s.vault.status(),
+        Status {
+            exit_tail: requeued + 1,
+            ..released
+        }
+    );
+
+    // release pays it in turn, under its new ID.
+    assert_eq!(s.vault.release(&10), 1);
     assert_eq!(
         s.env.events().all().filter_by_contract(&vault),
         std::vec![events::Settled {
@@ -107,17 +144,18 @@ fn an_exit_whose_recipient_loses_the_right_to_hold_the_asset_strands_and_the_que
             fee: 0,
             recipient: flaky.clone().into(),
             relayer: relayer.clone(),
-            exit_id: Some(stuck)
+            exit_id: Some(requeued)
         }
         .to_xdr(&s.env, &vault)]
     );
     assert_eq!(s.balance(&flaky), 10 * XLM);
-    assert_eq!(s.vault.stranded(&stuck), None);
     assert_eq!(
         s.vault.status(),
         Status {
             tvl: released.tvl - 10 * XLM,
             queued_total: 0,
+            exit_head: requeued + 1,
+            exit_tail: requeued + 1,
             outflow: 32 * XLM,
             ..released
         }
@@ -196,6 +234,9 @@ fn a_deauthorized_recipient_strands_and_is_paid_once_authorized_again() {
 
     c.asset.set_authorized(&frozen, &true);
     s.vault.claim(&id);
+    // A claim pays nothing; release does.
+    assert_eq!((s.balance(&frozen), used(s)), (0, 0));
+    assert_eq!(s.vault.release(&1), 1);
     assert_eq!(s.balance(&frozen), 10 * XLM);
     assert_eq!(used(s), 10 * XLM);
     assert_eq!(s.vault.status().queued_total, 0);
@@ -232,7 +273,18 @@ fn a_fee_its_relayer_cannot_receive_strands_alone() {
     assert_eq!(s.balance(&vault), status.tvl);
 
     c.asset.set_authorized(&relayer, &true);
-    s.vault.claim(&id);
+    let requeued = s.vault.claim(&id);
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&vault),
+        std::vec![events::ExitRequeued {
+            id,
+            new_id: requeued,
+            payout: 0,
+            fee: XLM
+        }
+        .to_xdr(&s.env, &vault)]
+    );
+    assert_eq!(s.vault.release(&1), 1);
     assert_eq!(
         s.env.events().all().filter_by_contract(&vault),
         std::vec![events::Settled {
@@ -240,7 +292,7 @@ fn a_fee_its_relayer_cannot_receive_strands_alone() {
             fee: XLM,
             recipient: deposit_address,
             relayer: relayer.clone(),
-            exit_id: Some(id)
+            exit_id: Some(requeued)
         }
         .to_xdr(&s.env, &vault)]
     );
@@ -250,61 +302,50 @@ fn a_fee_its_relayer_cannot_receive_strands_alone() {
 }
 
 #[test]
-fn a_claimed_part_is_paid_whole_within_what_is_left_of_todays_window() {
+fn a_requeued_exit_waits_behind_every_exit_queued_before_its_claim() {
     let c = classic();
     let s = &c.s;
-    let window = s.vault.limits().max_daily_outflow;
     let filler = c.holder("filler", 0);
-    let relayer = c.holder("relayer", 0);
     let flaky = c.holder("flaky", 0);
+    let other = c.holder("other", 0);
     fill_window(s, &filler);
-    let id = queue(s, 10 * XLM, XLM, &flaky, &relayer);
+    let stuck = queue(s, 10 * XLM, 0, &flaky, &flaky);
     c.asset.set_authorized(&flaky, &false);
-    c.asset.set_authorized(&relayer, &false);
     to_midnight(s);
     assert_eq!(s.vault.release(&1), 1);
-    c.asset.set_authorized(&flaky, &true);
-    c.asset.set_authorized(&relayer, &true);
+    assert!(s.vault.stranded(&stuck).is_some());
 
-    // With no exit queued, an exit paid at once leaves room for the fee but not the payout.
-    let ext = s.ext(-(window - 5 * XLM), 0, &filler, &filler);
-    assert_eq!(s.transact(&filler, &ext), Ok(()));
-    s.vault.claim(&id);
-    let vault = s.vault.address.clone();
-    assert_eq!(
-        s.env.events().all().filter_by_contract(&vault),
-        std::vec![events::ExitPaid {
-            id,
-            payout_paid: 0,
-            fee_paid: XLM,
-            payout_left: 10 * XLM,
-            fee_left: 0
-        }
-        .to_xdr(&s.env, &vault)]
-    );
-    assert_eq!(used(s), window - 4 * XLM);
-    assert_eq!(
-        outcome(s.vault.try_claim(&id)),
-        Err(Error::NothingClaimable)
-    );
+    // Two exits join the queue after the strand and before the claim, behind a full window.
+    fill_window(s, &filler);
+    let first = queue(s, 100 * XLM, 0, &other, &other);
+    let second = queue(s, 200 * XLM, 0, &other, &other);
+    c.asset.set_authorized(&flaky, &true);
+    // The claim needs no room in the full window, and the exit goes behind both.
+    let requeued = s.vault.claim(&stuck);
+    assert!(requeued > second && second > first);
+    assert_eq!(s.vault.release(&10), 0);
 
     to_midnight(s);
-    s.vault.claim(&id);
+    assert_eq!(s.vault.release(&10), 3);
+    let vault = s.vault.address.clone();
+    let settled = |id: u64, payout: i128, to: &soroban_sdk::Address| {
+        events::Settled {
+            ext_amount: -payout,
+            fee: 0,
+            recipient: to.clone().into(),
+            relayer: to.clone(),
+            exit_id: Some(id),
+        }
+        .to_xdr(&s.env, &vault)
+    };
     assert_eq!(
         s.env.events().all().filter_by_contract(&vault),
-        std::vec![events::Settled {
-            ext_amount: -10 * XLM,
-            fee: 0,
-            recipient: flaky.clone().into(),
-            relayer: relayer.clone(),
-            exit_id: Some(id)
-        }
-        .to_xdr(&s.env, &vault)]
+        std::vec![
+            settled(first, 100 * XLM, &other),
+            settled(second, 200 * XLM, &other),
+            settled(requeued, 10 * XLM, &flaky),
+        ]
     );
-    assert_eq!(used(s), 10 * XLM);
-    assert_eq!((s.balance(&flaky), s.balance(&relayer)), (10 * XLM, XLM));
-    assert_eq!(s.vault.status().queued_total, 0);
-    assert_eq!(outcome(s.vault.try_claim(&id)), Err(Error::NotStranded));
 }
 
 #[test]
@@ -329,22 +370,20 @@ fn a_party_that_can_never_receive_cannot_hold_up_the_others_part() {
         Err(Error::NothingClaimable)
     );
 
-    // Once the recipient can receive, its payout is claimed on its own.
+    // Once the recipient can receive, its payout moves back into the queue on its own.
     c.asset.set_authorized(&flaky, &true);
-    s.vault.claim(&id);
+    let requeued = s.vault.claim(&id);
     let vault = s.vault.address.clone();
     assert_eq!(
         s.env.events().all().filter_by_contract(&vault),
-        std::vec![events::ExitPaid {
+        std::vec![events::ExitRequeued {
             id,
-            payout_paid: 10 * XLM,
-            fee_paid: 0,
-            payout_left: 0,
-            fee_left: XLM
+            new_id: requeued,
+            payout: 10 * XLM,
+            fee: 0
         }
         .to_xdr(&s.env, &vault)]
     );
-    assert_eq!(s.balance(&flaky), 10 * XLM);
     assert_eq!(
         s.vault.stranded(&id),
         Some(Exit {
@@ -355,11 +394,14 @@ fn a_party_that_can_never_receive_cannot_hold_up_the_others_part() {
             queued_at,
         })
     );
-    assert_eq!(s.vault.status().queued_total, XLM);
     assert_eq!(
         outcome(s.vault.try_claim(&id)),
         Err(Error::NothingClaimable)
     );
+    assert_eq!(s.vault.release(&1), 1);
+    assert_eq!(s.balance(&flaky), 10 * XLM);
+    // The relayer's fee stays stranded and reserved.
+    assert_eq!(s.vault.status().queued_total, XLM);
 }
 
 #[test]
@@ -382,6 +424,7 @@ fn a_claim_is_refused_while_halted_and_works_while_paused() {
     assert_eq!(outcome(s.vault.try_claim(&second)), Err(Error::Halted));
     s.advance(HALT);
     s.vault.claim(&second);
+    assert_eq!(s.vault.release(&10), 2);
     assert_eq!(s.balance(&flaky), 2 * XLM);
 }
 
@@ -419,6 +462,7 @@ fn a_payment_that_would_leave_its_account_below_the_reserve_strands() {
 
     s.account("poor", XLM);
     s.vault.claim(&id);
+    assert_eq!(s.vault.release(&1), 1);
     assert_eq!(s.balance(&poor), XLM + XLM / 2);
     assert_eq!(s.vault.status().queued_total, 0);
 }
@@ -500,4 +544,103 @@ fn release_needs_nothing_from_the_vault_when_there_is_nothing_to_pay() {
     queue(s, 10 * XLM, 0, &a, &a);
     c.asset.set_authorized(&s.vault.address, &false);
     assert_eq!(s.vault.release(&10), 0);
+}
+
+#[test]
+fn a_requeued_exit_is_paid_in_its_share_of_full_windows_however_busy_the_queue() {
+    let c = Classic::new(Limits {
+        tvl_cap: 35_000 * XLM,
+        ..limits()
+    });
+    c.fund(14, 2_500 * XLM);
+    let s = &c.s;
+    let window = s.vault.limits().max_daily_outflow;
+    let filler = c.holder("filler", 0);
+    let honest = c.holder("honest", 0);
+    let flaky = c.holder("flaky", 0);
+    fill_window(s, &filler);
+    // A whole window strands on its recipient.
+    let stuck = queue(s, window, 0, &flaky, &flaky);
+    c.asset.set_authorized(&flaky, &false);
+    to_midnight(s);
+    assert_eq!(s.vault.release(&1), 1);
+    assert_eq!(s.vault.stranded(&stuck).map(|e| e.payout), Some(window));
+    c.asset.set_authorized(&flaky, &true);
+    fill_window(s, &filler);
+
+    // Honest demand of a whole window a day keeps the queue busy, and the first call of each day
+    // is the keeper's release. The stranded window still goes out within its bound, counted from
+    // the day it was moved back into the queue.
+    let mut waiting = VecDeque::new();
+    for day in 0..6 {
+        if day < 4 {
+            queue_honest(s, window / 2, &honest, &mut waiting);
+            queue_honest(s, window / 2, &honest, &mut waiting);
+        }
+        if day == 0 {
+            let ahead = s.vault.status().queued_total - window;
+            let id = s.vault.claim(&stuck);
+            assert_eq!(wait_bound(ahead, window, window), 2);
+            waiting.push_back(Waiting {
+                id,
+                day: s.now() / DAY,
+                ahead,
+                own: window,
+            });
+        }
+        to_midnight(s);
+        s.vault.release(&50);
+        assert!(used(s) <= window);
+        check_paid(s, &mut waiting);
+    }
+    assert!(waiting.is_empty());
+    assert_eq!(s.balance(&flaky), window);
+    assert_eq!(s.balance(&honest), 4 * window);
+}
+
+#[test]
+fn exits_ahead_that_strand_and_are_claimed_go_behind_and_never_delay_an_honest_exit() {
+    let c = Classic::new(limits());
+    c.fund(10, 2_500 * XLM);
+    let s = &c.s;
+    let filler = c.holder("filler", 0);
+    let flaky = c.holder("flaky", 0);
+    let honest = c.holder("honest", 0);
+    fill_window(s, &filler);
+
+    // Exits ahead, two of them to a party that loses its authorization before they are released,
+    // so they strand and are claimed again at day boundaries, before the keeper's release.
+    for (i, payout) in [3_000 * XLM, 2_000 * XLM, 4_000 * XLM, 1_500 * XLM]
+        .into_iter()
+        .enumerate()
+    {
+        let to = if i % 2 == 0 { &flaky } else { &filler };
+        queue(s, payout, 0, to, to);
+    }
+    let mut waiting = VecDeque::new();
+    for payout in [700 * XLM, 2_600 * XLM, 100 * XLM] {
+        queue_honest(s, payout, &honest, &mut waiting);
+    }
+    c.asset.set_authorized(&flaky, &false);
+
+    let mut stranded: std::vec::Vec<u64> = std::vec::Vec::new();
+    for day in 1..=8 {
+        to_midnight(s);
+        if day >= 2 {
+            c.asset.set_authorized(&flaky, &true);
+            stranded.retain(|id| outcome(s.vault.try_claim(id)).is_err());
+        }
+        let head = s.vault.status().exit_head;
+        s.vault.release(&50);
+        for id in head..s.vault.status().exit_head {
+            if s.vault.stranded(&id).is_some() {
+                stranded.push(id);
+            }
+        }
+        check_paid(s, &mut waiting);
+    }
+    assert!(waiting.is_empty());
+    assert!(stranded.is_empty());
+    assert_eq!(s.balance(&honest), 3_400 * XLM);
+    assert_eq!(s.balance(&flaky), 7_000 * XLM);
 }

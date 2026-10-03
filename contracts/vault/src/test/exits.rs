@@ -526,25 +526,24 @@ fn value_owed_to_queued_exits_cannot_leave_twice() {
     );
 }
 
-/// The days after the first day boundary within which an exit is paid in full, with `ahead` owed
-/// to the exits queued or stranded before it and `own` its own outflow, when every day's window is
-/// used in full until it is paid: everything in front of it and itself must pass through windows
-/// of `window` each.
-fn wait_bound(ahead: i128, own: i128, window: i128) -> u64 {
+/// The days after the first day boundary within which an exit is paid in full when every day's
+/// window is used in full until it is: `ahead`, at least what the exits queued before it still
+/// owe, and `own`, its own outflow, must pass through windows of `window` each.
+pub fn wait_bound(ahead: i128, own: i128, window: i128) -> u64 {
     ((ahead + own) as u64).div_ceil(window as u64)
 }
 
 /// An honest exit waiting in the queue.
-struct Waiting {
-    id: u64,
-    day: u64,
-    ahead: i128,
-    own: i128,
+pub struct Waiting {
+    pub id: u64,
+    pub day: u64,
+    pub ahead: i128,
+    pub own: i128,
 }
 
 /// Pops every honest exit the queue has paid in full, checking that it went in its turn and in
 /// time.
-fn check_paid(s: &Setup, waiting: &mut VecDeque<Waiting>) {
+pub fn check_paid(s: &Setup, waiting: &mut VecDeque<Waiting>) {
     let status = s.vault.status();
     let window = s.vault.limits().max_daily_outflow;
     while let Some(exit) = waiting.front() {
@@ -565,7 +564,7 @@ fn check_paid(s: &Setup, waiting: &mut VecDeque<Waiting>) {
 }
 
 /// Submits an honest exit that must wait, and records what is ahead of it.
-fn queue_honest(s: &Setup, payout: i128, honest: &Address, waiting: &mut VecDeque<Waiting>) {
+pub fn queue_honest(s: &Setup, payout: i128, honest: &Address, waiting: &mut VecDeque<Waiting>) {
     let ahead = s.vault.status().queued_total;
     let id = queue(s, payout, 0, honest, honest);
     waiting.push_back(Waiting {

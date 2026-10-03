@@ -201,9 +201,13 @@ fn the_exit_queue_writes_only_the_entries_it_changes() {
     assert_eq!(s.vault.release(&1), 1);
     assert_eq!(writes(), 4);
     assert_eq!(persistent_ttl(&s, &DataKey::Stranded(2)), WRITE_TTL);
-    // Claiming it writes the instance, the stranded exit and two balances.
+    // Claiming it moves it back into the queue: the instance, the stranded exit and the new exit.
     s.account("poor", XLM);
-    s.vault.claim(&2);
+    let requeued = s.vault.claim(&2);
+    assert_eq!(writes(), 3);
+    assert_eq!(persistent_ttl(&s, &DataKey::Exit(requeued)), WRITE_TTL);
+    // Releasing it writes the instance, the exit and two balances.
+    assert_eq!(s.vault.release(&1), 1);
     assert_eq!(writes(), 4);
 
     // Paying part of an exit rewrites it: the instance, the exit and two balances.
@@ -211,5 +215,5 @@ fn the_exit_queue_writes_only_the_entries_it_changes() {
         .unwrap();
     assert_eq!(s.vault.release(&1), 1);
     assert_eq!(writes(), 4);
-    assert!(s.vault.exit(&3).is_some());
+    assert!(s.vault.exit(&(requeued + 1)).is_some());
 }

@@ -121,6 +121,7 @@ fn an_archived_queued_or_stranded_exit_is_still_paid() {
     archive(&s.env, &s.vault.address, &DataKey::Stranded(1));
     s.account("poor", XLM);
     s.vault.claim(&1);
+    assert_eq!(s.vault.release(&1), 1);
     assert_eq!(s.balance(&poor), XLM + XLM / 2);
     assert_eq!(s.vault.status().queued_total, 0);
 }

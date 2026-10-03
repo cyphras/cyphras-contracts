@@ -459,79 +459,66 @@ impl Vault {
         Ok(count)
     }
 
-    /// Anyone pays the unpaid parts of a stranded exit, the payout to its recipient and the fee to
-    /// its relayer, each on its own: a part is paid whole when it fits what is left of today's
-    /// outflow window and the asset contract accepts it, and otherwise stays stranded. The call
-    /// fails only when it pays nothing, so a party that can never receive cannot hold up the
-    /// other's part. Refused while halted; works while paused.
-    pub fn claim(env: Env, id: u64) -> Result<(), Error> {
+    /// Anyone moves the parts of a stranded exit whose party can receive now back into the exit
+    /// queue, at its tail, as a new exit that `release` pays in turn like any other, and returns
+    /// its ID. A part whose party still cannot receive stays stranded. Fails with
+    /// `NothingClaimable` when no part can move. Refused while halted; works while paused.
+    pub fn claim(env: Env, id: u64) -> Result<u64, Error> {
         let mut status = storage::status(&env);
         let now = env.ledger().timestamp();
         if status.halted(now) {
             return Err(Error::Halted);
         }
         let exit = storage::stranded(&env, id).ok_or(Error::NotStranded)?;
-        let max_daily_outflow = storage::limits(&env).max_daily_outflow;
-        let day = now / DAY;
-        let mut today = outflow_today(&status, day);
-        let token = TokenClient::new(&env, &storage::config(&env).token);
-        let vault = env.current_contract_address();
-
-        let fits = |today: i128, part: i128| -> Result<bool, Error> {
-            Ok(today.checked_add(part).ok_or(Error::Overflow)? <= max_daily_outflow)
-        };
-        let payout_paid = if fits(today, exit.payout)? {
-            try_pay(&token, &vault, &exit.recipient, exit.payout)
+        let asset = StellarAssetClient::new(&env, &storage::config(&env).token);
+        let payout = if exit.payout > 0 && can_receive(&env, &asset, &exit.recipient.address()) {
+            exit.payout
         } else {
             0
         };
-        today = today.checked_add(payout_paid).ok_or(Error::Overflow)?;
-        let fee_paid = if fits(today, exit.fee)? {
-            try_pay(&token, &vault, &MuxedAddress::from(&exit.relayer), exit.fee)
+        let fee = if exit.fee > 0 && can_receive(&env, &asset, &exit.relayer) {
+            exit.fee
         } else {
             0
         };
-        today = today.checked_add(fee_paid).ok_or(Error::Overflow)?;
-        let paid = payout_paid + fee_paid;
-        if paid == 0 {
+        if payout == 0 && fee == 0 {
             return Err(Error::NothingClaimable);
         }
 
-        status.tvl = status.tvl.checked_sub(paid).ok_or(Error::Overflow)?;
-        status.queued_total = status
-            .queued_total
-            .checked_sub(paid)
-            .ok_or(Error::Overflow)?;
-        status.outflow_day = day;
-        status.outflow = today;
-        storage::set_status(&env, &status);
+        // The value stays owed, so queued_total and tvl do not change, and nothing is paid yet,
+        // so the window does not either. Queued at the tail, the exit waits behind every exit
+        // queued before it, which keeps the queue's wait bound for all of them.
         let left = Exit {
-            payout: exit.payout - payout_paid,
-            fee: exit.fee - fee_paid,
+            payout: exit.payout - payout,
+            fee: exit.fee - fee,
             ..exit.clone()
         };
         if left.payout == 0 && left.fee == 0 {
             storage::remove_stranded(&env, id);
-            events::Settled {
-                ext_amount: -payout_paid,
-                fee: fee_paid,
-                recipient: exit.recipient,
-                relayer: exit.relayer,
-                exit_id: Some(id),
-            }
-            .publish(&env);
         } else {
             storage::set_stranded(&env, id, &left);
-            events::ExitPaid {
-                id,
-                payout_paid,
-                fee_paid,
-                payout_left: left.payout,
-                fee_left: left.fee,
-            }
-            .publish(&env);
         }
-        Ok(())
+        let new_id = status.exit_tail;
+        status.exit_tail = new_id.checked_add(1).ok_or(Error::Overflow)?;
+        storage::set_exit(
+            &env,
+            new_id,
+            &Exit {
+                payout,
+                fee,
+                queued_at: now,
+                ..exit
+            },
+        );
+        storage::set_status(&env, &status);
+        events::ExitRequeued {
+            id,
+            new_id,
+            payout,
+            fee,
+        }
+        .publish(&env);
+        Ok(new_id)
     }
 
     /// The ASP asserts that every unflagged deposit with an ID up to `up_to` passed screening.

@@ -430,37 +430,38 @@ impl Model {
                     return Err(Error::Halted);
                 }
                 let mut owed = self.stranded.get(id).ok_or(Error::NotStranded)?.clone();
-                // Each part is paid whole if it fits the window and its party can receive.
-                let max = self.limits.max_daily_outflow;
-                let today = self.outflow_today(day);
-                let payout_paid = if today + owed.payout <= max && self.can_receive[owed.recipient]
-                {
+                // The parts whose party can receive now move to the tail of the queue; the value
+                // stays owed and nothing is paid.
+                let payout = if self.can_receive[owed.recipient] {
                     owed.payout
                 } else {
                     0
                 };
-                let fee_paid =
-                    if today + payout_paid + owed.fee <= max && self.can_receive[owed.relayer] {
-                        owed.fee
-                    } else {
-                        0
-                    };
-                let paid = payout_paid + fee_paid;
-                if paid == 0 {
+                let fee = if self.can_receive[owed.relayer] {
+                    owed.fee
+                } else {
+                    0
+                };
+                if payout + fee == 0 {
                     return Err(Error::NothingClaimable);
                 }
-                self.received[owed.recipient] += payout_paid;
-                self.received[owed.relayer] += fee_paid;
-                owed.payout -= payout_paid;
-                owed.fee -= fee_paid;
-                self.status.queued_total -= paid;
-                self.pay(day, paid);
+                let new_id = self.status.exit_tail;
+                self.exits.push_back(Owed {
+                    id: new_id,
+                    payout,
+                    fee,
+                    queued_at: now,
+                    ..owed.clone()
+                });
+                self.status.exit_tail += 1;
+                owed.payout -= payout;
+                owed.fee -= fee;
                 if owed.payout + owed.fee == 0 {
                     self.stranded.remove(id);
                 } else {
                     self.stranded.insert(*id, owed);
                 }
-                Ok(Done::Unit)
+                Ok(Done::Id(new_id))
             }
             Op::Authorize(party, authorized) => {
                 self.can_receive[*party] = *authorized;
@@ -700,10 +701,24 @@ impl Run {
                     Op::Authorize(exit.recipient, true)
                 } else if exit.fee > 0 && !m.can_receive[exit.relayer] {
                     Op::Authorize(exit.relayer, true)
-                } else if exit.payout + exit.fee <= room {
-                    Op::Claim(exit.id)
                 } else {
-                    Op::Advance(DAY - now % DAY)
+                    Op::Claim(exit.id)
+                };
+            }
+        }
+        // Pending deposits are flagged now and then, and a flagged one unflagged or, once a day
+        // has passed, refunded.
+        if let Some(&first) = m.pending.keys().next() {
+            if s.below(8) == 0 {
+                return match m.pending.iter().find(|(_, d)| d.flag.is_some()) {
+                    Some((&id, d)) if s.below(2) == 0 => {
+                        if now >= d.flagged_at + DAY && s.below(2) == 0 {
+                            Op::Refund(id)
+                        } else {
+                            Op::Unflag(id)
+                        }
+                    }
+                    _ => Op::Flag(first, self.pick(&[1, 2, 5])),
                 };
             }
         }
@@ -873,7 +888,7 @@ impl Run {
             Op::ApplyLimits => outcome(v.try_apply_limits()).map(|_| Done::Unit),
             Op::CancelLimits => outcome(v.try_cancel_limits()).map(|_| Done::Unit),
             Op::Release(max) => outcome(v.try_release(max)).map(Done::Count),
-            Op::Claim(id) => outcome(v.try_claim(id)).map(|_| Done::Unit),
+            Op::Claim(id) => outcome(v.try_claim(id)).map(Done::Id),
             Op::Authorize(party, authorized) => {
                 self.asset.set_authorized(&self.parties[*party], authorized);
                 Ok(Done::Unit)
@@ -1035,10 +1050,10 @@ fn run(seed: u64, steps: usize, mix: Mix) -> BTreeMap<std::string::String, usize
         }
         if let Op::Claim(id) = &op {
             if actual.is_ok() && run.model.stranded.contains_key(id) {
-                *seen.entry("Claim paid in part".into()).or_insert(0) += 1;
+                *seen.entry("Claim moved one part".into()).or_insert(0) += 1;
             }
             if actual == Err(Error::NothingClaimable) {
-                *seen.entry("Claim paid nothing".into()).or_insert(0) += 1;
+                *seen.entry("Claim moved nothing".into()).or_insert(0) += 1;
             }
         }
     }
@@ -1105,15 +1120,15 @@ fn random_exit_sequences_keep_the_vault_equal_to_the_spec_model() {
             *seen.entry(k).or_insert(0) += n;
         }
     }
-    // Exits queued, paid in part and stranded, claims that paid both parts, one or nothing, and
-    // exits refused because a party cannot receive.
+    // Exits queued, paid in part and stranded, claims that moved both parts, one or nothing back
+    // into the queue, and exits refused because a party cannot receive.
     for case in [
         "Transact queued",
         "Release paid in part",
         "Release stranded",
         "Claim ok",
-        "Claim paid in part",
-        "Claim paid nothing",
+        "Claim moved one part",
+        "Claim moved nothing",
         "Transact cannot receive",
     ] {
         assert!(seen.contains_key(case), "never {case}: {seen:?}");

@@ -58,7 +58,8 @@ fn costs_of_a_queued_exit_its_release_and_a_claim() {
     assert_eq!(flow.s.vault.release(&1), 1);
     report(&flow.s.env, "release");
 
-    // Both parts of this exit strand, so the claim makes both transfers.
+    // Both parts of this exit strand, so the claim moves both and their release makes both
+    // transfers.
     let c = Classic::new(limits());
     c.fund(3, 2_500 * XLM);
     let s = &c.s;
@@ -76,5 +77,7 @@ fn costs_of_a_queued_exit_its_release_and_a_claim() {
     c.asset.set_authorized(&relayer, &true);
     s.vault.claim(&id);
     report(&s.env, "claim");
+    assert_eq!(s.vault.release(&1), 1);
+    report(&s.env, "requeued release");
     assert_eq!((s.balance(&flaky), s.balance(&relayer)), (10 * XLM, XLM));
 }
