@@ -61,7 +61,8 @@ type Writer struct {
 }
 
 // Append records the events of ledgers [from, to] and that the range is complete. It returns
-// only once the data is on disk. A later write of the same ledgers replaces an earlier one.
+// only once the data is on disk. A later write of the same ledgers replaces an earlier one. A
+// write that fails is cut off the file again, so a failure leaves no torn line behind.
 func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 	if from > to {
 		return fmt.Errorf("%w: ledgers %d to %d", ErrRange, from, to)
@@ -85,41 +86,7 @@ func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 		if err != nil {
 			return err
 		}
-		buf := bufio.NewWriter(f)
-		if err := terminateTornLine(f, buf); err != nil {
-			f.Close()
-			return err
-		}
-		sum, count := sha256.New(), 0
-		for i := range events {
-			if events[i].Ledger >= lo && events[i].Ledger <= hi {
-				b, err := json.Marshal(line{Write: write, Event: &events[i]})
-				if err != nil {
-					f.Close()
-					return err
-				}
-				b = append(b, '\n')
-				sum.Write(b)
-				count++
-				if _, err := buf.Write(b); err != nil {
-					f.Close()
-					return err
-				}
-			}
-		}
-		closing, err := json.Marshal(line{Write: write, Covered: &[2]uint32{lo, hi}, Count: &count, SHA256: hex.EncodeToString(sum.Sum(nil))})
-		if err == nil {
-			_, err = buf.Write(append(closing, '\n'))
-		}
-		if err != nil {
-			f.Close()
-			return err
-		}
-		if err := buf.Flush(); err != nil {
-			f.Close()
-			return err
-		}
-		if err := f.Sync(); err != nil {
+		if err := appendWrite(f, write, events, lo, hi); err != nil {
 			f.Close()
 			return err
 		}
@@ -132,6 +99,55 @@ func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 		return syncDir(w.Dir)
 	}
 	return nil
+}
+
+// appendWrite writes the events of ledgers [lo, hi] and the record that closes the write, and
+// syncs them. On a failure it truncates the file to where the write began.
+func appendWrite(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint32) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if err := writeLines(f, write, events, lo, hi); err != nil {
+		if cut := f.Truncate(info.Size()); cut != nil {
+			return errors.Join(err, cut)
+		}
+		return errors.Join(err, f.Sync())
+	}
+	return nil
+}
+
+func writeLines(f *os.File, write uint64, events []vault.RawEvent, lo, hi uint32) error {
+	buf := bufio.NewWriter(f)
+	if err := terminateTornLine(f, buf); err != nil {
+		return err
+	}
+	sum, count := sha256.New(), 0
+	for i := range events {
+		if events[i].Ledger >= lo && events[i].Ledger <= hi {
+			b, err := json.Marshal(line{Write: write, Event: &events[i]})
+			if err != nil {
+				return err
+			}
+			b = append(b, '\n')
+			sum.Write(b)
+			count++
+			if _, err := buf.Write(b); err != nil {
+				return err
+			}
+		}
+	}
+	closing, err := json.Marshal(line{Write: write, Covered: &[2]uint32{lo, hi}, Count: &count, SHA256: hex.EncodeToString(sum.Sum(nil))})
+	if err != nil {
+		return err
+	}
+	if _, err := buf.Write(append(closing, '\n')); err != nil {
+		return err
+	}
+	if err := buf.Flush(); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 func syncDir(dir string) error {
