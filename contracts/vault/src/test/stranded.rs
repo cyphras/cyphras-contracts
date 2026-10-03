@@ -1,6 +1,6 @@
-//! Exits whose recipient or relayer cannot receive the asset. A part the asset contract refuses
-//! is set aside as a stranded exit, the queue moves on, and anyone claims it once the party can
-//! receive.
+//! Exits whose recipient or relayer can no longer receive the asset when they are released. A
+//! part the asset contract refuses is set aside as a stranded exit, the queue moves on, and anyone
+//! claims it once the party can receive.
 
 use soroban_sdk::{
     testutils::{Events as _, Ledger, MuxedAddress as _},
@@ -10,7 +10,7 @@ use soroban_sdk::{
 use super::{
     exits::{fill_window, funded, queue, to_midnight, used},
     queue::authorizers,
-    setup::{account_address, limits, outcome, Classic, DAY, XLM},
+    setup::{limits, outcome, Classic, DAY, XLM},
 };
 use crate::{events, Error, Exit, Status};
 
@@ -25,17 +25,19 @@ fn classic() -> Classic {
 }
 
 #[test]
-fn an_exit_to_a_recipient_without_a_trustline_strands_and_the_queue_moves_on() {
+fn an_exit_whose_recipient_loses_the_right_to_hold_the_asset_strands_and_the_queue_moves_on() {
     let c = classic();
     let s = &c.s;
     let filler = c.holder("filler", 0);
     let relayer = c.holder("relayer", 0);
     let honest = c.holder("honest", 0);
-    let untrusting = s.account("untrusting", 0);
+    let flaky = c.holder("flaky", 0);
     fill_window(s, &filler);
-    let stuck = queue(s, 10 * XLM, XLM, &untrusting, &relayer);
+    let stuck = queue(s, 10 * XLM, XLM, &flaky, &relayer);
     let queued_at = s.now();
     let next = queue(s, 20 * XLM, XLM, &honest, &relayer);
+    // The issuer revokes the recipient's right to hold the asset after its exit was queued.
+    c.asset.set_authorized(&flaky, &false);
     to_midnight(s);
     let status = s.vault.status();
 
@@ -65,7 +67,7 @@ fn an_exit_to_a_recipient_without_a_trustline_strands_and_the_queue_moves_on() {
     assert_eq!(
         s.vault.stranded(&stuck),
         Some(Exit {
-            recipient: untrusting.clone().into(),
+            recipient: flaky.clone().into(),
             payout: 10 * XLM,
             relayer: relayer.clone(),
             fee: 0,
@@ -94,7 +96,7 @@ fn an_exit_to_a_recipient_without_a_trustline_strands_and_the_queue_moves_on() {
     assert!(s.vault.stranded(&stuck).is_some());
 
     // Once it can, anyone claims it.
-    c.asset.trust(&untrusting);
+    c.asset.set_authorized(&flaky, &true);
     s.env.set_auths(&[]);
     s.vault.claim(&stuck);
     assert!(authorizers(s).is_empty());
@@ -103,13 +105,13 @@ fn an_exit_to_a_recipient_without_a_trustline_strands_and_the_queue_moves_on() {
         std::vec![events::Settled {
             ext_amount: -10 * XLM,
             fee: 0,
-            recipient: untrusting.clone().into(),
+            recipient: flaky.clone().into(),
             relayer: relayer.clone(),
             exit_id: Some(stuck)
         }
         .to_xdr(&s.env, &vault)]
     );
-    assert_eq!(s.balance(&untrusting), 10 * XLM);
+    assert_eq!(s.balance(&flaky), 10 * XLM);
     assert_eq!(s.vault.stranded(&stuck), None);
     assert_eq!(
         s.vault.status(),
@@ -254,13 +256,14 @@ fn a_claimed_part_is_paid_whole_within_what_is_left_of_todays_window() {
     let window = s.vault.limits().max_daily_outflow;
     let filler = c.holder("filler", 0);
     let relayer = c.holder("relayer", 0);
-    let untrusting = s.account("untrusting", 0);
+    let flaky = c.holder("flaky", 0);
     fill_window(s, &filler);
-    let id = queue(s, 10 * XLM, XLM, &untrusting, &relayer);
+    let id = queue(s, 10 * XLM, XLM, &flaky, &relayer);
+    c.asset.set_authorized(&flaky, &false);
     c.asset.set_authorized(&relayer, &false);
     to_midnight(s);
     assert_eq!(s.vault.release(&1), 1);
-    c.asset.trust(&untrusting);
+    c.asset.set_authorized(&flaky, &true);
     c.asset.set_authorized(&relayer, &true);
 
     // With no exit queued, an exit paid at once leaves room for the fee but not the payout.
@@ -292,17 +295,14 @@ fn a_claimed_part_is_paid_whole_within_what_is_left_of_todays_window() {
         std::vec![events::Settled {
             ext_amount: -10 * XLM,
             fee: 0,
-            recipient: untrusting.clone().into(),
+            recipient: flaky.clone().into(),
             relayer: relayer.clone(),
             exit_id: Some(id)
         }
         .to_xdr(&s.env, &vault)]
     );
     assert_eq!(used(s), 10 * XLM);
-    assert_eq!(
-        (s.balance(&untrusting), s.balance(&relayer)),
-        (10 * XLM, XLM)
-    );
+    assert_eq!((s.balance(&flaky), s.balance(&relayer)), (10 * XLM, XLM));
     assert_eq!(s.vault.status().queued_total, 0);
     assert_eq!(outcome(s.vault.try_claim(&id)), Err(Error::NotStranded));
 }
@@ -313,11 +313,12 @@ fn a_party_that_can_never_receive_cannot_hold_up_the_others_part() {
     let s = &c.s;
     let filler = c.holder("filler", 0);
     let relayer = c.holder("relayer", 0);
-    let untrusting = s.account("untrusting", 0);
+    let flaky = c.holder("flaky", 0);
     fill_window(s, &filler);
-    let id = queue(s, 10 * XLM, XLM, &untrusting, &relayer);
+    let id = queue(s, 10 * XLM, XLM, &flaky, &relayer);
     let queued_at = s.now();
-    // The relayer loses the right to hold the asset for good.
+    // The recipient loses the right to hold the asset for a while, the relayer for good.
+    c.asset.set_authorized(&flaky, &false);
     c.asset.set_authorized(&relayer, &false);
     to_midnight(s);
     assert_eq!(s.vault.release(&1), 1);
@@ -329,7 +330,7 @@ fn a_party_that_can_never_receive_cannot_hold_up_the_others_part() {
     );
 
     // Once the recipient can receive, its payout is claimed on its own.
-    c.asset.trust(&untrusting);
+    c.asset.set_authorized(&flaky, &true);
     s.vault.claim(&id);
     let vault = s.vault.address.clone();
     assert_eq!(
@@ -343,11 +344,11 @@ fn a_party_that_can_never_receive_cannot_hold_up_the_others_part() {
         }
         .to_xdr(&s.env, &vault)]
     );
-    assert_eq!(s.balance(&untrusting), 10 * XLM);
+    assert_eq!(s.balance(&flaky), 10 * XLM);
     assert_eq!(
         s.vault.stranded(&id),
         Some(Exit {
-            recipient: untrusting.clone().into(),
+            recipient: flaky.clone().into(),
             payout: 0,
             relayer: relayer.clone(),
             fee: XLM,
@@ -366,13 +367,14 @@ fn a_claim_is_refused_while_halted_and_works_while_paused() {
     let c = classic();
     let s = &c.s;
     let filler = c.holder("filler", 0);
-    let untrusting = s.account("untrusting", 0);
+    let flaky = c.holder("flaky", 0);
     fill_window(s, &filler);
-    let first = queue(s, XLM, 0, &untrusting, &untrusting);
-    let second = queue(s, XLM, 0, &untrusting, &untrusting);
+    let first = queue(s, XLM, 0, &flaky, &flaky);
+    let second = queue(s, XLM, 0, &flaky, &flaky);
+    c.asset.set_authorized(&flaky, &false);
     to_midnight(s);
     assert_eq!(s.vault.release(&2), 2);
-    c.asset.trust(&untrusting);
+    c.asset.set_authorized(&flaky, &true);
 
     s.vault.set_pause(&true, &true);
     s.vault.claim(&first);
@@ -380,7 +382,7 @@ fn a_claim_is_refused_while_halted_and_works_while_paused() {
     assert_eq!(outcome(s.vault.try_claim(&second)), Err(Error::Halted));
     s.advance(HALT);
     s.vault.claim(&second);
-    assert_eq!(s.balance(&untrusting), 2 * XLM);
+    assert_eq!(s.balance(&flaky), 2 * XLM);
 }
 
 #[test]
@@ -403,21 +405,20 @@ fn only_a_stranded_exit_can_be_claimed() {
 }
 
 #[test]
-fn a_payment_too_small_to_create_its_missing_account_strands() {
+fn a_payment_that_would_leave_its_account_below_the_reserve_strands() {
     let s = funded();
-    // Paying a missing account creates it, which needs two base reserves.
-    s.env.ledger().with_mut(|l| l.base_reserve = 5_000_000);
     let filler = s.account("filler", 0);
-    let missing = account_address(&s.env, "missing");
+    let poor = s.account("poor", 0);
     fill_window(&s, &filler);
-    let id = queue(&s, XLM / 2, 0, &missing, &filler);
+    let id = queue(&s, XLM / 2, 0, &poor, &filler);
+    // The base reserve rises, and an account must hold two of them after any payment it takes.
+    s.env.ledger().with_mut(|l| l.base_reserve = 5_000_000);
     to_midnight(&s);
     assert_eq!(s.vault.release(&1), 1);
     assert_eq!(s.vault.stranded(&id).map(|e| e.payout), Some(XLM / 2));
 
-    // An account must hold its two base reserves to receive anything.
-    s.account("missing", XLM);
+    s.account("poor", XLM);
     s.vault.claim(&id);
-    assert_eq!(s.balance(&missing), XLM + XLM / 2);
+    assert_eq!(s.balance(&poor), XLM + XLM / 2);
     assert_eq!(s.vault.status().queued_total, 0);
 }

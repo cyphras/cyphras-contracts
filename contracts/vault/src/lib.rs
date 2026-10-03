@@ -17,8 +17,10 @@ extern crate std;
 mod test;
 
 use soroban_sdk::{
-    contract, contractimpl, token::TokenClient, Address, Bytes, BytesN, Env, MuxedAddress, Vec,
-    U256,
+    contract, contractimpl,
+    token::{StellarAssetClient, TokenClient},
+    xdr::ToXdr,
+    Address, Bytes, BytesN, Env, MuxedAddress, Vec, U256,
 };
 use types::{ExtData, TxProof};
 
@@ -259,6 +261,14 @@ impl Vault {
             .ok_or(Error::Overflow)?;
         if outflow > notes {
             return Err(Error::ExceedsAdmittedValue);
+        }
+        // Refused before anything is spent, an exit to a party that cannot receive is never
+        // queued only to strand, and paying at once and queueing treat it alike.
+        let asset = StellarAssetClient::new(&env, &config.token);
+        if (payout > 0 && !can_receive(&env, &asset, &ext.recipient.address()))
+            || (ext.fee > 0 && !can_receive(&env, &asset, &ext.relayer))
+        {
+            return Err(Error::CannotReceive);
         }
 
         proof::check_shape(&env, &proof, &ext)?;
@@ -855,6 +865,22 @@ fn outflow_today(status: &Status, day: u64) -> i128 {
     } else {
         0
     }
+}
+
+/// Whether `to` can receive the asset now, judged from reads alone: an account must exist, and the
+/// asset contract must let `to` hold the asset. A contract address needs only the second, as the
+/// asset contract credits any contract address.
+fn can_receive(env: &Env, asset: &StellarAssetClient, to: &Address) -> bool {
+    if is_account(env, to) && !to.exists() {
+        return false;
+    }
+    matches!(asset.try_authorized(to), Ok(Ok(true)))
+}
+
+/// Whether `address` is an account rather than a contract. Its XDR is the ScVal tag followed by
+/// the ScAddress tag, which is 0 for an account.
+fn is_account(env: &Env, address: &Address) -> bool {
+    address.clone().to_xdr(env).get(7) == Some(0)
 }
 
 /// Pays `amount` from the vault without failing the call, and returns what was paid: all of it, or

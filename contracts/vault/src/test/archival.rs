@@ -12,7 +12,7 @@ use soroban_sdk::{
 use super::{
     e2e::Flow,
     fixtures,
-    setup::{account_address, limits, outcome, Setup, DAY, XLM},
+    setup::{limits, outcome, Setup, DAY, XLM},
 };
 use crate::{DataKey, Error, Limits};
 
@@ -103,23 +103,24 @@ fn an_archived_queued_or_stranded_exit_is_still_paid() {
     });
     s.fund_pool("funder", 50 * XLM);
     let user = s.account("user", 0);
-    let missing = account_address(&s.env, "missing");
+    let poor = s.account("poor", 0);
     s.transact(&user, &s.ext(-10 * XLM, 0, &user, &user))
         .unwrap();
-    s.transact(&user, &s.ext(-XLM / 2, 0, &missing, &user))
+    s.transact(&user, &s.ext(-XLM / 2, 0, &poor, &user))
         .unwrap();
     s.transact(&user, &s.ext(-XLM, 0, &user, &user)).unwrap();
     // Both exits were written in the same ledger, so they are archived together.
     archive(&s.env, &s.vault.address, &DataKey::Exit(1));
     s.advance(DAY);
 
-    // Too small to create the missing account, the first exit strands; the second is paid.
+    // The base reserve rises, and the first exit would leave its account below it, so it strands;
+    // the second is paid.
     s.env.ledger().with_mut(|l| l.base_reserve = 5_000_000);
     assert_eq!(s.vault.release(&2), 2);
     assert_eq!(s.balance(&user), 11 * XLM);
     archive(&s.env, &s.vault.address, &DataKey::Stranded(1));
-    s.account("missing", XLM);
+    s.account("poor", XLM);
     s.vault.claim(&1);
-    assert_eq!(s.balance(&missing), XLM + XLM / 2);
+    assert_eq!(s.balance(&poor), XLM + XLM / 2);
     assert_eq!(s.vault.status().queued_total, 0);
 }

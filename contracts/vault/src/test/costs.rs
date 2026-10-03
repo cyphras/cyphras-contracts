@@ -64,19 +64,17 @@ fn costs_of_a_queued_exit_its_release_and_a_claim() {
     let s = &c.s;
     let filler = c.holder("filler", 0);
     let relayer = c.holder("relayer", 0);
-    let untrusting = s.account("untrusting", 0);
+    let flaky = c.holder("flaky", 0);
     fill_window(s, &filler);
-    let id = queue(s, 10 * XLM, XLM, &untrusting, &relayer);
+    let id = queue(s, 10 * XLM, XLM, &flaky, &relayer);
+    c.asset.set_authorized(&flaky, &false);
     c.asset.set_authorized(&relayer, &false);
     to_midnight(s);
     assert_eq!(s.vault.release(&1), 1);
     report(&s.env, "stranded release");
-    c.asset.trust(&untrusting);
+    c.asset.set_authorized(&flaky, &true);
     c.asset.set_authorized(&relayer, &true);
     s.vault.claim(&id);
     report(&s.env, "claim");
-    assert_eq!(
-        (s.balance(&untrusting), s.balance(&relayer)),
-        (10 * XLM, XLM)
-    );
+    assert_eq!((s.balance(&flaky), s.balance(&relayer)), (10 * XLM, XLM));
 }

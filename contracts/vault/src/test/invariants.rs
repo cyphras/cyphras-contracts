@@ -6,8 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use soroban_sdk::{
-    testutils::MuxedAddress as _, token::StellarAssetClient, Address, InvokeError, MuxedAddress,
-    Vec, U256,
+    testutils::MuxedAddress as _, token::StellarAssetClient, Address, MuxedAddress, Vec, U256,
 };
 
 use super::setup::{outcome, Classic, Setup, DAY, DELAY_LARGE, DELAY_SMALL, XLM};
@@ -18,9 +17,6 @@ const WEEK: u64 = 7 * DAY;
 // The accounts exits pay, as recipients and as relayers.
 const PARTIES: usize = 3;
 const MUXED_ID: u64 = 77;
-// The asset contract's BalanceDeauthorizedError, with which it refuses a party that may not hold
-// the asset.
-const DEAUTHORIZED: u32 = 11;
 
 #[derive(Clone)]
 struct Deposit {
@@ -89,19 +85,6 @@ enum Done {
 enum Mix {
     Everything,
     Exits,
-}
-
-#[derive(Debug, PartialEq)]
-enum Fail {
-    Refused(Error),
-    // The asset contract refused a plain transfer, which failed the whole call.
-    Reverted,
-}
-
-impl From<Error> for Fail {
-    fn from(error: Error) -> Self {
-        Fail::Refused(error)
-    }
 }
 
 #[derive(Clone)]
@@ -178,12 +161,6 @@ impl Model {
         Ok(())
     }
 
-    /// Whether plain transfers of the parts of `owed` would all go through.
-    fn can_pay(&self, owed: &Owed) -> bool {
-        (owed.payout == 0 || self.can_receive[owed.recipient])
-            && (owed.fee == 0 || self.can_receive[owed.relayer])
-    }
-
     /// Records `amount` of outflow paid today.
     fn pay(&mut self, day: u64, amount: i128) {
         self.status.tvl -= amount;
@@ -192,31 +169,31 @@ impl Model {
     }
 
     /// The result the spec gives for `op`; the model changes only when it succeeds.
-    fn expect(&mut self, op: &Op, now: u64) -> Result<Done, Fail> {
+    fn expect(&mut self, op: &Op, now: u64) -> Result<Done, Error> {
         let day = now / DAY;
         match op {
             Op::Shield(depositor, amount) => {
                 if self.halted(now) {
-                    return Err(Error::Halted.into());
+                    return Err(Error::Halted);
                 }
                 if self.status.deposits_paused {
-                    return Err(Error::DepositsPaused.into());
+                    return Err(Error::DepositsPaused);
                 }
                 if *amount <= 0 {
-                    return Err(Error::BadAmount.into());
+                    return Err(Error::BadAmount);
                 }
                 if *amount < self.limits.min_deposit {
-                    return Err(Error::DepositTooSmall.into());
+                    return Err(Error::DepositTooSmall);
                 }
                 if *amount > self.limits.max_deposit {
-                    return Err(Error::DepositTooLarge.into());
+                    return Err(Error::DepositTooLarge);
                 }
                 let total = self.day_totals.get(&(*depositor, day)).unwrap_or(&0) + amount;
                 if total > self.limits.max_daily_per_depositor {
-                    return Err(Error::DepositorDailyLimit.into());
+                    return Err(Error::DepositorDailyLimit);
                 }
                 if self.status.tvl + amount > self.limits.tvl_cap {
-                    return Err(Error::TvlCapExceeded.into());
+                    return Err(Error::TvlCapExceeded);
                 }
                 let id = self.status.next_deposit_id;
                 self.status.next_deposit_id += 1;
@@ -243,23 +220,28 @@ impl Model {
                 reuse,
             } => {
                 if self.halted(now) {
-                    return Err(Error::Halted.into());
+                    return Err(Error::Halted);
                 }
                 if *payout == 0 && self.status.transfers_paused {
-                    return Err(Error::TransfersPaused.into());
+                    return Err(Error::TransfersPaused);
                 }
                 if *fee < 0 || *fee > self.limits.max_fee {
-                    return Err(Error::BadFee.into());
+                    return Err(Error::BadFee);
                 }
                 let outflow = payout + fee;
                 if outflow > self.limits.max_daily_outflow {
-                    return Err(Error::ExceedsDailyOutflow.into());
+                    return Err(Error::ExceedsDailyOutflow);
                 }
                 if outflow > self.notes {
-                    return Err(Error::ExceedsAdmittedValue.into());
+                    return Err(Error::ExceedsAdmittedValue);
+                }
+                if (*payout > 0 && !self.can_receive[*recipient])
+                    || (*fee > 0 && !self.can_receive[*relayer])
+                {
+                    return Err(Error::CannotReceive);
                 }
                 if reuse.is_some() {
-                    return Err(Error::NullifierSpent.into());
+                    return Err(Error::NullifierSpent);
                 }
                 self.notes -= outflow;
                 self.next_leaf += 2;
@@ -280,9 +262,6 @@ impl Model {
                     self.status.queued_total += outflow;
                     return Ok(Done::Unit);
                 }
-                if !self.can_pay(&owed) {
-                    return Err(Fail::Reverted);
-                }
                 self.received[*recipient] += payout;
                 self.received[*relayer] += fee;
                 self.pay(day, outflow);
@@ -290,17 +269,17 @@ impl Model {
             }
             Op::Attest(up_to) => {
                 if self.halted(now) {
-                    return Err(Error::Halted.into());
+                    return Err(Error::Halted);
                 }
                 if *up_to <= self.status.attested_up_to || *up_to >= self.status.next_deposit_id {
-                    return Err(Error::BadAttestation.into());
+                    return Err(Error::BadAttestation);
                 }
                 self.status.attested_up_to = *up_to;
                 Ok(Done::Unit)
             }
             Op::Flag(id, reason) => {
                 if *reason == 0 {
-                    return Err(Error::BadReason.into());
+                    return Err(Error::BadReason);
                 }
                 let deposit = self.pending.get_mut(id).ok_or(Error::UnknownDeposit)?;
                 if deposit.flag.is_none() {
@@ -317,10 +296,10 @@ impl Model {
             }
             Op::Admit(ids) => {
                 if self.halted(now) {
-                    return Err(Error::Halted.into());
+                    return Err(Error::Halted);
                 }
                 if ids.windows(2).any(|w| w[0] >= w[1]) {
-                    return Err(Error::BadIds.into());
+                    return Err(Error::BadIds);
                 }
                 let admitted: std::vec::Vec<u64> = ids
                     .iter()
@@ -340,7 +319,7 @@ impl Model {
                 if matches!(op, Op::Refund(_)) {
                     deposit.flag.ok_or(Error::NotFlagged)?;
                     if now < deposit.flagged_at + DAY {
-                        return Err(Error::RefundTooEarly.into());
+                        return Err(Error::RefundTooEarly);
                     }
                 }
                 self.status.tvl -= deposit.amount;
@@ -355,7 +334,7 @@ impl Model {
             }
             Op::Halt => {
                 if now < self.status.next_halt_at {
-                    return Err(Error::HaltCooldown.into());
+                    return Err(Error::HaltCooldown);
                 }
                 self.status.halted_until = now + HALT;
                 self.status.next_halt_at = now + HALT + WEEK;
@@ -363,7 +342,7 @@ impl Model {
             }
             Op::Resume => {
                 if !self.halted(now) {
-                    return Err(Error::NotHalted.into());
+                    return Err(Error::NotHalted);
                 }
                 self.status.halted_until = now;
                 self.status.next_halt_at = now + WEEK;
@@ -393,7 +372,7 @@ impl Model {
             Op::ApplyLimits => {
                 let queued = self.queued.clone().ok_or(Error::NoQueuedLimits)?;
                 if now < queued.ready_at {
-                    return Err(Error::LimitsNotReady.into());
+                    return Err(Error::LimitsNotReady);
                 }
                 self.check_change(&queued.limits)?;
                 self.limits = queued.limits;
@@ -406,7 +385,7 @@ impl Model {
             }
             Op::Release(max) => {
                 if self.halted(now) {
-                    return Err(Error::Halted.into());
+                    return Err(Error::Halted);
                 }
                 let mut count = 0;
                 while count < *max {
@@ -448,7 +427,7 @@ impl Model {
             }
             Op::Claim(id) => {
                 if self.halted(now) {
-                    return Err(Error::Halted.into());
+                    return Err(Error::Halted);
                 }
                 let mut owed = self.stranded.get(id).ok_or(Error::NotStranded)?.clone();
                 // Each part is paid whole if it fits the window and its party can receive.
@@ -468,7 +447,7 @@ impl Model {
                     };
                 let paid = payout_paid + fee_paid;
                 if paid == 0 {
-                    return Err(Error::NothingClaimable.into());
+                    return Err(Error::NothingClaimable);
                 }
                 self.received[owed.recipient] += payout_paid;
                 self.received[owed.relayer] += fee_paid;
@@ -654,10 +633,17 @@ impl Run {
         let s = &self.s;
         let m = &self.model;
         let now = s.now();
-        // With the queue empty an exit may be paid at once, and its plain transfers fail when a
-        // party cannot receive.
+        // With the queue empty an exit may be paid at once.
         if m.exits.is_empty() && s.below(3) == 0 {
             return self.transact();
+        }
+        // Now and then a party of the head loses the right to hold the asset, so that the head
+        // strands, often with both of its parts.
+        if let Some(head) = m.exits.front() {
+            let party = self.pick(&[head.recipient, head.relayer]);
+            if m.can_receive[party] && s.below(4) == 0 {
+                return Op::Authorize(party, false);
+            }
         }
         if let Some(&last) = m.pending.keys().last() {
             if s.below(4) == 0 {
@@ -826,11 +812,10 @@ impl Run {
         self.parties.iter().map(|p| self.s.balance(p)).sum()
     }
 
-    fn execute(&mut self, op: &Op) -> Result<Done, Fail> {
+    fn execute(&mut self, op: &Op) -> Result<Done, Error> {
         let s = &self.s;
         let v = &s.vault;
         let ids = |list: &[u64]| Vec::from_slice(&s.env, list);
-        let refused = |result: Result<Done, Error>| result.map_err(Fail::Refused);
         match op {
             Op::Shield(d, amount) => {
                 let depositor = &self.depositors[*d];
@@ -845,7 +830,7 @@ impl Run {
                 if result.is_ok() {
                     self.spent.extend(proof.input_nullifiers.iter());
                 }
-                refused(result)
+                result
             }
             Op::Transact {
                 payout,
@@ -867,32 +852,28 @@ impl Run {
                     };
                     proof = s.prove_with(&ext, proof.root, nullifiers, [s.field(), s.field()]);
                 }
-                // A refused plain transfer fails the call with the asset contract's own code.
-                let result = match v.try_transact(&proof, &ext, relayer) {
-                    Err(Err(InvokeError::Contract(DEAUTHORIZED))) => Err(Fail::Reverted),
-                    result => refused(outcome(result).map(|_| Done::Unit)),
-                };
+                let result = outcome(v.try_transact(&proof, &ext, relayer)).map(|_| Done::Unit);
                 if result.is_ok() {
                     self.spent.extend(proof.input_nullifiers.iter());
                 }
                 result
             }
-            Op::Attest(up_to) => refused(outcome(v.try_attest(up_to)).map(|_| Done::Unit)),
-            Op::Flag(id, reason) => refused(outcome(v.try_flag(id, reason)).map(|_| Done::Unit)),
-            Op::Unflag(id) => refused(outcome(v.try_unflag(id)).map(|_| Done::Unit)),
+            Op::Attest(up_to) => outcome(v.try_attest(up_to)).map(|_| Done::Unit),
+            Op::Flag(id, reason) => outcome(v.try_flag(id, reason)).map(|_| Done::Unit),
+            Op::Unflag(id) => outcome(v.try_unflag(id)).map(|_| Done::Unit),
             Op::Admit(list) => {
-                refused(outcome(v.try_admit(&ids(list))).map(|a| Done::Ids(a.iter().collect())))
+                outcome(v.try_admit(&ids(list))).map(|a| Done::Ids(a.iter().collect()))
             }
-            Op::Cancel(id) => refused(outcome(v.try_cancel(id)).map(|_| Done::Unit)),
-            Op::Refund(id) => refused(outcome(v.try_refund(id)).map(|_| Done::Unit)),
-            Op::SetPause(d, t) => refused(outcome(v.try_set_pause(d, t)).map(|_| Done::Unit)),
-            Op::Halt => refused(outcome(v.try_halt()).map(|_| Done::Unit)),
-            Op::Resume => refused(outcome(v.try_resume()).map(|_| Done::Unit)),
-            Op::SetLimits(l) => refused(outcome(v.try_set_limits(l)).map(|_| Done::Unit)),
-            Op::ApplyLimits => refused(outcome(v.try_apply_limits()).map(|_| Done::Unit)),
-            Op::CancelLimits => refused(outcome(v.try_cancel_limits()).map(|_| Done::Unit)),
-            Op::Release(max) => refused(outcome(v.try_release(max)).map(Done::Count)),
-            Op::Claim(id) => refused(outcome(v.try_claim(id)).map(|_| Done::Unit)),
+            Op::Cancel(id) => outcome(v.try_cancel(id)).map(|_| Done::Unit),
+            Op::Refund(id) => outcome(v.try_refund(id)).map(|_| Done::Unit),
+            Op::SetPause(d, t) => outcome(v.try_set_pause(d, t)).map(|_| Done::Unit),
+            Op::Halt => outcome(v.try_halt()).map(|_| Done::Unit),
+            Op::Resume => outcome(v.try_resume()).map(|_| Done::Unit),
+            Op::SetLimits(l) => outcome(v.try_set_limits(l)).map(|_| Done::Unit),
+            Op::ApplyLimits => outcome(v.try_apply_limits()).map(|_| Done::Unit),
+            Op::CancelLimits => outcome(v.try_cancel_limits()).map(|_| Done::Unit),
+            Op::Release(max) => outcome(v.try_release(max)).map(Done::Count),
+            Op::Claim(id) => outcome(v.try_claim(id)).map(|_| Done::Unit),
             Op::Authorize(party, authorized) => {
                 self.asset.set_authorized(&self.parties[*party], authorized);
                 Ok(Done::Unit)
@@ -1025,17 +1006,13 @@ fn run(seed: u64, steps: usize, mix: Mix) -> BTreeMap<std::string::String, usize
 
         let name =
             std::string::String::from(std::format!("{op:?}").split(['(', ' ']).next().unwrap());
-        let result = match &actual {
-            Ok(_) => "ok",
-            Err(Fail::Refused(_)) => "refused",
-            Err(Fail::Reverted) => "reverted",
-        };
+        let result = if actual.is_ok() { "ok" } else { "refused" };
         *seen.entry(std::format!("{name} {result}")).or_insert(0) += 1;
         if let (
             Op::Transact {
                 reuse: Some(slot), ..
             },
-            Err(Fail::Refused(Error::NullifierSpent)),
+            Err(Error::NullifierSpent),
         ) = (&op, &actual)
         {
             *seen
@@ -1044,6 +1021,9 @@ fn run(seed: u64, steps: usize, mix: Mix) -> BTreeMap<std::string::String, usize
         }
         if run.model.status.exit_tail > before.status.exit_tail {
             *seen.entry("Transact queued".into()).or_insert(0) += 1;
+        }
+        if matches!(op, Op::Transact { .. }) && actual == Err(Error::CannotReceive) {
+            *seen.entry("Transact cannot receive".into()).or_insert(0) += 1;
         }
         if run.model.stranded.len() > before.stranded.len() {
             *seen.entry("Release stranded".into()).or_insert(0) += 1;
@@ -1057,7 +1037,7 @@ fn run(seed: u64, steps: usize, mix: Mix) -> BTreeMap<std::string::String, usize
             if actual.is_ok() && run.model.stranded.contains_key(id) {
                 *seen.entry("Claim paid in part".into()).or_insert(0) += 1;
             }
-            if actual == Err(Fail::Refused(Error::NothingClaimable)) {
+            if actual == Err(Error::NothingClaimable) {
                 *seen.entry("Claim paid nothing".into()).or_insert(0) += 1;
             }
         }
@@ -1126,7 +1106,7 @@ fn random_exit_sequences_keep_the_vault_equal_to_the_spec_model() {
         }
     }
     // Exits queued, paid in part and stranded, claims that paid both parts, one or nothing, and
-    // the asset contract refusing the plain transfers of an exit paid at once.
+    // exits refused because a party cannot receive.
     for case in [
         "Transact queued",
         "Release paid in part",
@@ -1134,7 +1114,7 @@ fn random_exit_sequences_keep_the_vault_equal_to_the_spec_model() {
         "Claim ok",
         "Claim paid in part",
         "Claim paid nothing",
-        "Transact reverted",
+        "Transact cannot receive",
     ] {
         assert!(seen.contains_key(case), "never {case}: {seen:?}");
     }

@@ -366,20 +366,19 @@ fn a_forged_spend_cannot_take_pending_deposits() {
 #[test]
 fn a_transact_is_atomic_when_its_payout_fails() {
     let s = funded();
-    // Paying a missing account creates it, which needs two base reserves; one stroop fails after
-    // every check and effect has run.
+    // An account must hold two base reserves after any payment it takes, so one stroop to an
+    // empty account passes every check and fails after every effect has run.
+    let poor = s.account("poor", 0);
     s.env.ledger().with_mut(|l| l.base_reserve = 5_000_000);
-    let missing = super::setup::account_address(&s.env, "missing");
     let relayer = s.account("relayer", 0);
-    let ext = s.ext(-1, 0, &missing, &relayer);
+    let ext = s.ext(-1, 0, &poor, &relayer);
     let proof = s.prove(&ext);
     let leaf = s.vault.next_leaf_index();
     let status = s.vault.status();
-    // The asset contract refuses the payout with its own InsufficientAccountReserve, a code no
-    // vault error uses.
+    // The asset contract refuses the payout with its own BalanceError, a code no vault error uses.
     assert!(matches!(
         s.vault.try_transact(&proof, &ext, &relayer),
-        Err(Err(InvokeError::Contract(14)))
+        Err(Err(InvokeError::Contract(10)))
     ));
     assert!(!s.vault.is_spent(&proof.input_nullifiers.get_unchecked(0)));
     assert_eq!(s.vault.next_leaf_index(), leaf);

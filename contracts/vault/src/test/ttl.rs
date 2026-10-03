@@ -8,7 +8,7 @@ use soroban_sdk::{
 
 use super::{
     queue::authorizers,
-    setup::{account_address, limits, Setup, DAY, DELAY_SMALL, XLM},
+    setup::{limits, Setup, DAY, DELAY_SMALL, XLM},
 };
 use crate::{DataKey, Limits};
 
@@ -103,16 +103,16 @@ fn bump_ttl_extends_the_listed_queued_and_stranded_exits_to_the_maximum() {
     });
     s.fund_pool("funder", 50 * XLM);
     let user = s.account("user", 0);
-    let missing = account_address(&s.env, "missing");
+    let poor = s.account("poor", 0);
     s.transact(&user, &s.ext(-10 * XLM, 0, &user, &user))
         .unwrap();
-    s.transact(&user, &s.ext(-XLM / 2, 0, &missing, &user))
+    s.transact(&user, &s.ext(-XLM / 2, 0, &poor, &user))
         .unwrap();
     for _ in 0..2 {
         s.transact(&user, &s.ext(-XLM, 0, &user, &user)).unwrap();
     }
     s.advance(DAY);
-    // Too small to create the missing account, the first exit strands.
+    // The base reserve rises, and the first exit would leave its account below it, so it strands.
     s.env.ledger().with_mut(|l| l.base_reserve = 5_000_000);
     assert_eq!(s.vault.release(&1), 1);
 
@@ -188,11 +188,11 @@ fn the_exit_queue_writes_only_the_entries_it_changes() {
     assert_eq!(s.vault.release(&1), 1);
     assert_eq!(writes(), 5);
 
-    // A payout too small to create its missing account strands.
+    // A payout that would leave its account below the base reserve strands.
     s.transact(&relayer, &s.ext(-8 * XLM, 0, &relayer, &relayer))
         .unwrap();
-    let missing = account_address(&s.env, "missing");
-    s.transact(&relayer, &s.ext(-XLM / 2, 0, &missing, &relayer))
+    let poor = s.account("poor", 0);
+    s.transact(&relayer, &s.ext(-XLM / 2, 0, &poor, &relayer))
         .unwrap();
     s.advance(DAY);
     s.env.ledger().with_mut(|l| l.base_reserve = 5_000_000);
@@ -202,7 +202,7 @@ fn the_exit_queue_writes_only_the_entries_it_changes() {
     assert_eq!(writes(), 4);
     assert_eq!(persistent_ttl(&s, &DataKey::Stranded(2)), WRITE_TTL);
     // Claiming it writes the instance, the stranded exit and two balances.
-    s.account("missing", XLM);
+    s.account("poor", XLM);
     s.vault.claim(&2);
     assert_eq!(writes(), 4);
 
