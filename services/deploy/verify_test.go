@@ -127,22 +127,23 @@ func TestAReleaseTagIsCheckedOnTheHost(t *testing.T) {
 	if out, ok := r.verify("services-v1.0.0", reviewed, maintainer); !ok {
 		t.Fatalf("a good release was refused:\n%s", out)
 	}
-	for name, c := range map[string]struct {
-		tag, commit, variable, says string
+	// In a fixed order, so the case that catches a broken check is always the same.
+	for _, c := range []struct {
+		name, tag, commit, variable, says string
 	}{
-		"a signer not allowed":         {"services-v1.0.1", reviewed, maintainer, "No principal matched"},
-		"an unsigned tag":              {"services-v1.0.2", reviewed, maintainer, "no signature found"},
-		"a lightweight tag":            {"services-v1.0.3", reviewed, maintainer, "not a signed tag"},
-		"a commit on neither branch":   {"services-v1.0.4", unreviewed, maintainer, "neither dev nor main"},
-		"another release's signed tag": {"services-v1.0.5", reviewed, maintainer, "signed tag of another release"},
-		"a tag whose message names it": {"services-v1.0.7", reviewed, maintainer, "signed tag of another release"},
-		"a tag of another commit":      {"services-v1.0.0", unreviewed, maintainer, "does not point at RELEASE_COMMIT"},
-		"a tag of another dev commit":  {"services-v1.0.0", later, maintainer, "does not point at RELEASE_COMMIT"},
-		"a variable that disagrees":    {"services-v1.0.0", reviewed, stranger, "disagree"},
-		"an empty variable":            {"services-v1.0.0", reviewed, "", "disagree"},
+		{"a signer not allowed", "services-v1.0.1", reviewed, maintainer, "No principal matched"},
+		{"an unsigned tag", "services-v1.0.2", reviewed, maintainer, "no signature found"},
+		{"a lightweight tag", "services-v1.0.3", reviewed, maintainer, "not a signed tag"},
+		{"a commit on neither branch", "services-v1.0.4", unreviewed, maintainer, "neither dev nor main"},
+		{"another release's signed tag", "services-v1.0.5", reviewed, maintainer, "signed tag of another release"},
+		{"a tag whose message names it", "services-v1.0.7", reviewed, maintainer, "signed tag of another release"},
+		{"a tag of another dev commit", "services-v1.0.0", later, maintainer, "does not point at RELEASE_COMMIT"},
+		{"a tag of another commit", "services-v1.0.0", unreviewed, maintainer, "does not point at RELEASE_COMMIT"},
+		{"a variable that disagrees", "services-v1.0.0", reviewed, stranger, "disagree"},
+		{"an empty variable", "services-v1.0.0", reviewed, "", "disagree"},
 	} {
 		if out, ok := r.verify(c.tag, c.commit, c.variable); ok || !strings.Contains(out, c.says) {
-			t.Fatalf("%s: passed %v\n%s", name, ok, out)
+			t.Fatalf("%s: passed %v\n%s", c.name, ok, out)
 		}
 	}
 }

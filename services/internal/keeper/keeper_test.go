@@ -63,6 +63,9 @@ type harness struct {
 	// let the vault hold the asset.
 	funds        *big.Int
 	deauthorized bool
+	// flaggedAt is when each flagged deposit was flagged, which the simulated vault refunds only a
+	// day after.
+	flaggedAt map[uint64]uint64
 }
 
 // released is what the simulated vault's release(max) returns: how many exits it handles from the
@@ -143,6 +146,12 @@ func newHarness(t *testing.T) *harness {
 		_ = xdr.SafeUnmarshalBase64(req.Transaction, &env)
 		if h.simFail != nil && h.simFail(describe(env)) {
 			return protocol.SimulateTransactionResponse{Error: "resource limit exceeded"}, nil
+		}
+		var refunded uint64
+		if _, err := fmt.Sscanf(describe(env), "refund %d", &refunded); err == nil {
+			if at, ok := h.flaggedAt[refunded]; ok && uint64(h.now.Unix()) < at+86_400 {
+				return protocol.SimulateTransactionResponse{Error: "HostError: Error(Contract, #138)"}, nil
+			}
 		}
 		data := xdr.SorobanTransactionData{}
 		if env.V1.Tx.Ext.SorobanData != nil {
@@ -260,6 +269,12 @@ func (h *harness) live(ledgers uint32) *uint32 {
 
 func (h *harness) shield(amount int64, flag *uint32, flaggedAt uint64) uint64 {
 	id := h.chain.Shield(vaulttest.Depositor, amount)
+	if flag != nil {
+		if h.flaggedAt == nil {
+			h.flaggedAt = map[uint64]uint64{}
+		}
+		h.flaggedAt[id] = flaggedAt
+	}
 	h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)),
 		vaulttest.Pending(id, vaulttest.Depositor, amount, uint64(h.chain.ClosedAt), 3600, flag, flaggedAt), h.chain.Ledger, h.live(600_000))
 	return id
@@ -376,8 +391,10 @@ func TestAScreeningHoldIsRefundedADayAfterItAndNotBefore(t *testing.T) {
 	h.sync()
 	h.now = h.now.Add(24*time.Hour - time.Second)
 	h.sync()
-	if err := h.k.Refund(context.Background()); err != nil || len(h.take()) != 0 {
-		t.Fatalf("refunded before a day passed: %v", err)
+	// The vault would refuse the refund, so the keeper does not even simulate it.
+	simulated := h.fake.CallCount("simulateTransaction")
+	if err := h.k.Refund(context.Background()); err != nil || len(h.take()) != 0 || h.fake.CallCount("simulateTransaction") != simulated {
+		t.Fatalf("refunded, or tried to, before a day passed: %v", err)
 	}
 	h.now = h.now.Add(time.Second)
 	h.sync()
