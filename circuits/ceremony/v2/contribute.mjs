@@ -122,10 +122,12 @@ Contribution complete. Publish this attestation from your own account, signed:
   Entropy: <how you destroyed it, for example: process exited, machine powered off>
 
 Next:
-  1. Send ${output} to the coordinator.
-  2. Post the signed attestation in the public ceremony thread.
-  3. Once the coordinator confirms receipt, delete ${input} and ${output} and power off this
-     machine. The secret was never written to disk; powering off clears it from memory.
+  1. Save this attestation and ${output}, then power off this machine. The secret was
+     never written to disk, and powering off clears it from memory.
+  2. As soon as you can, post the attestation, signed, from your own account in the public
+     ceremony thread: it is what ties this contribution to you.
+  3. Send ${output} straight to the coordinator, not through anyone else.
+  4. Once the coordinator confirms receipt, delete ${input} and ${output}.
 `);
 });
 
