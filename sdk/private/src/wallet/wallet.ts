@@ -606,7 +606,7 @@ export class PrivateWallet {
       checked ? data.horizon : undefined,
     );
     applyExits(core.state, events.exits, await live?.exits().catch(() => undefined), view.ledger);
-    if (live !== undefined) await this.#pollRelayers(core, view.ledger);
+    await this.#pollRelayers(core, view.ledger);
     return {
       leafCount: core.state.tree.leafCount,
       staged:

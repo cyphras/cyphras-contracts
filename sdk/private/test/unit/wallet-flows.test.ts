@@ -335,6 +335,18 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 1);
   });
 
+  it("asks the relayer about a held payment while the indexer is down", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    world.indexer.down = true;
+    world.relayer.restart();
+    assert.equal((await alice.sync()).source, "rpc");
+    assert.equal((await alice.plans())[0]?.relayerStatus, "held");
+    assert.equal(world.relayer.submissions.length, 2);
+  });
+
   it("keeps following a held payment the relayer refuses again as a duplicate", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
