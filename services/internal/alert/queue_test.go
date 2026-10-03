@@ -530,3 +530,43 @@ func TestACopyItsChannelRefusesIsDroppedWithoutRestingTheLane(t *testing.T) {
 		t.Fatal("a channel refusing every copy for 11 minutes is not stalled")
 	}
 }
+
+// named is a channel with a name of its own.
+type named struct {
+	Channel
+	name string
+}
+
+func (n named) Name() string { return n.name }
+
+func TestStoredCopiesFollowTheirChannelWhereverTheConfigurationPutsIt(t *testing.T) {
+	ctx := context.Background()
+	store := outboxStore(t)
+	now := time.Unix(1_728_000_000, 0)
+	clock := func() time.Time { return now }
+	a, b := &recorder{}, &recorder{}
+	q := &Queue{Name: "operator", Store: store, Now: clock, Channels: []Channel{named{a, "a"}, named{b, "b"}, named{&counted{}, "c"}}}
+	q.Put(Alert{Severity: Critical, Code: "invariant", Time: now})
+	q.Flush(ctx)
+	// The middle channel is taken out: the third one, now second, still gets its own copy.
+	now = now.Add(time.Hour)
+	c := &recorder{}
+	restarted := &Queue{Name: "operator", Store: store, Now: clock, Channels: []Channel{named{a, "a"}, named{c, "c"}}}
+	restarted.Flush(ctx)
+	if len(c.sent) != 1 || len(a.sent) != 1 {
+		t.Fatalf("the third channel got %d, the first %d", len(c.sent), len(a.sent))
+	}
+	if n, err := restarted.Waiting(ctx); err != nil || n != 0 {
+		t.Fatalf("%d copies wait, %v", n, err)
+	}
+	// A copy stored by place before names is named by the channel now at its place.
+	old := fmt.Sprintf(`{"code": "old", "time": %q}`, now.UTC().Format(time.RFC3339))
+	if _, err := store.Pool.Exec(ctx, `INSERT INTO alert_outbox (queue, channel, alert, next_at, rank) VALUES ('operator', 1, $1, 0, 0)`, old); err != nil {
+		t.Fatal(err)
+	}
+	upgraded := &Queue{Name: "operator", Store: store, Now: clock, Channels: []Channel{named{a, "a"}, named{c, "c"}}}
+	upgraded.Flush(ctx)
+	if len(c.sent) != 2 || c.sent[1].Code != "old" {
+		t.Fatalf("the old copy went to %+v", c.sent)
+	}
+}

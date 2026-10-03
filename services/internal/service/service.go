@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -44,13 +45,9 @@ func Logger(name string) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", name, "version", Version)
 }
 
-// Alerter pages through the webhooks in ALERT_WEBHOOKS_FILE, if that is set.
+// Alerter pages through the webhooks in ALERT_WEBHOOKS_FILE, which must list at least one.
 func Alerter(name string, log *slog.Logger) (*alert.Alerter, error) {
 	a := &alert.Alerter{Service: name, Log: log, Cooldown: 15 * time.Minute}
-	if os.Getenv("ALERT_WEBHOOKS_FILE") == "" {
-		log.Warn("no alert webhooks configured; alerts go to the log only")
-		return a, nil
-	}
 	data, err := config.Secret("ALERT_WEBHOOKS")
 	if err != nil {
 		return nil, err
@@ -58,6 +55,9 @@ func Alerter(name string, log *slog.Logger) (*alert.Alerter, error) {
 	channels, err := alert.ParseWebhooks(data)
 	if err != nil {
 		return nil, err
+	}
+	if len(channels) == 0 {
+		return nil, errors.New("ALERT_WEBHOOKS_FILE lists no alert channel")
 	}
 	a.Channels = channels
 	return a, nil
