@@ -74,6 +74,9 @@ export interface VaultCall {
 
 export interface InvokeContext {
   readonly rpc: SorobanRpc;
+  // A second provider, which must report a failure on the host's storage too before a call goes
+  // again.
+  readonly second: SorobanRpc | undefined;
   readonly networkPassphrase: string;
   readonly vault: string;
   readonly feeCaps: NetworkFeeCaps;
@@ -92,6 +95,8 @@ const MIN_INCLUSION_FEE = 100n;
 const POLL_MS = 1_500;
 // How often a call on the exit queue goes in all while it fails on the host's storage.
 const ATTEMPTS = 5;
+// How often a second provider is asked about a failed transaction it may not hold yet.
+const SECOND_POLLS = 20;
 // The bytes added to what a call may read for each account or trustline in its footprint, and to
 // what it may write for each it writes: anyone can grow their own account, by signers or
 // sponsorships, between a simulation and the ledger the call lands in. An account entry holds at
@@ -391,12 +396,36 @@ export async function invokeVault(
     const outcome = await attemptCall(ctx, signer, call, onSubmitted);
     if (outcome.result !== undefined) return outcome.result;
     // A call on the exit queue that failed on the host's storage touched an entry the queue moved
-    // to past the room its footprint was given: a fresh simulation sees where it moved.
-    if (call.extend === undefined || !outcome.conflict || attempt === ATTEMPTS) {
+    // to past the room its footprint was given: a fresh simulation sees where it moved. With a
+    // second provider, the first one's word alone does not send it again.
+    if (
+      call.extend === undefined ||
+      !outcome.conflict ||
+      attempt === ATTEMPTS ||
+      !(await conflictSeen(ctx, outcome.hash))
+    ) {
       throw new CyphrasError("transaction_failed", "the transaction failed on chain", {
         hash: outcome.hash,
       });
     }
+  }
+}
+
+// Whether the second provider, when one is set, reports the transaction failed on the host's
+// storage as well, once it holds the transaction.
+async function conflictSeen(ctx: InvokeContext, hash: string): Promise<boolean> {
+  const { second } = ctx;
+  if (second === undefined) return true;
+  for (let poll = 1; ; poll++) {
+    const status = await second.getTransaction(hash).catch((err: unknown) => {
+      if (err instanceof CyphrasError) return undefined;
+      throw err;
+    });
+    if (status !== undefined && status.status !== "NOT_FOUND") {
+      return status.status === "FAILED" && status.conflict;
+    }
+    if (poll === SECOND_POLLS) return false;
+    await ctx.sleep(POLL_MS);
   }
 }
 

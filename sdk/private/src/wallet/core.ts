@@ -54,6 +54,7 @@ export const newId = (): string => bytesToHex(randomBytes(16));
 export function invokeContext(core: Core): InvokeContext {
   return {
     rpc: core.services.rpc,
+    second: core.services.second?.rpc,
     networkPassphrase: core.deployment.networkPassphrase,
     vault: core.deployment.vault,
     feeCaps: core.feeCaps,

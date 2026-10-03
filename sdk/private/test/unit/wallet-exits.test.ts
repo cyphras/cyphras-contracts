@@ -1667,6 +1667,57 @@ describe("exits that other exits race in the same ledger", () => {
     assert.equal(plan?.mustRetry, true);
   });
 
+  it("sends a call on the exit queue again only once a second RPC provider reports its failure on the host's storage too", async () => {
+    const second = "http://rpc2.test";
+    // What the second provider answers about the failed transaction: the failure as it is, after it
+    // first answers that it does not hold it yet or is busy; the failure without its storage error;
+    // or never the transaction.
+    for (const [shows, sent] of [
+      ["the failure", 2],
+      ["the failure, late", 2],
+      ["the failure, once not busy", 2],
+      ["no storage error", 1],
+      ["no transaction", 1],
+    ] as const) {
+      const world = await createWorld({ limits: SMALL });
+      let asked = 0;
+      const fetch: FetchLike = async (input, init) => {
+        if (new URL(input).origin !== second) return world.fetch(input, init);
+        const res = await world.fetch(RPC, init);
+        const body = JSON.parse(String(init?.body));
+        if (body.method !== "getTransaction") return res;
+        const reply = await res.json();
+        if (reply.result?.status !== "FAILED") return new Response(JSON.stringify(reply));
+        asked++;
+        const { latestLedger } = reply.result;
+        if (shows === "the failure, once not busy" && asked <= 2) {
+          const error = { code: -32603, message: "busy" };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+        }
+        if (shows === "no transaction" || (shows === "the failure, late" && asked <= 3)) {
+          reply.result = { status: "NOT_FOUND", latestLedger };
+        } else if (shows === "no storage error") {
+          reply.result = { ...reply.result, diagnosticEventsXdr: undefined };
+        }
+        return new Response(JSON.stringify(reply));
+      };
+      const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+        secondRpcUrl: second,
+      });
+      await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+      world.advance(3_601);
+      world.admitAll();
+      await alice.sync();
+      world.vault.outflowDay = world.vault.timestamp / 86_400n;
+      world.vault.outflow = 50n * XLM;
+      world.rpc.conflictNext = 1;
+      const landing = selfRelayed(world, alice);
+      if (sent === 2) await landing;
+      else await assert.rejects(landing, isError("transaction_failed"));
+      assert.equal(sentCalls(world, "transact"), sent, shows);
+    }
+  });
+
   it("releases again after a failure on the host's storage, and goes no further after any other", async () => {
     const { world, alice } = await funded();
     world.vault.outflowDay = world.vault.timestamp / 86_400n;
@@ -1806,6 +1857,7 @@ describe("exits that other exits race in the same ledger", () => {
     };
     const context = {
       rpc: new SorobanRpc(RPC, world.fetch),
+      second: undefined,
       networkPassphrase: world.deployment.networkPassphrase,
       vault,
       feeCaps: DEFAULT_NETWORK_FEE_CAPS,
@@ -1893,6 +1945,7 @@ describe("exits that other exits race in the same ledger", () => {
     };
     const context = {
       rpc: new SorobanRpc(RPC, world.fetch),
+      second: undefined,
       networkPassphrase: world.deployment.networkPassphrase,
       vault,
       feeCaps: DEFAULT_NETWORK_FEE_CAPS,
