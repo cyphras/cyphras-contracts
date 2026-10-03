@@ -7,6 +7,7 @@ import {
   PTAU_BLAKE2B,
   PTAU_NAME,
   R1CS_SHA256,
+  checkName,
   digest,
   expectHash,
   mem,
@@ -14,6 +15,7 @@ import {
   quiet,
   readZkey,
   run,
+  sameContributor,
   show,
   step,
 } from "./common.mjs";
@@ -28,9 +30,9 @@ Usage:
       --contributions <file> --vk <verification_key.json> (--drand-round <n> | --beacon <hex>)
       [--vk-sha256 <hex>] [--zkey-sha256 <hex>]
 
-  --contributions <file>  the contribution hashes from the signed attestations, one per line in
-                          contribution order, each optionally followed by the contributor's name;
-                          blank lines and lines starting with # are skipped
+  --contributions <file>  one line per signed attestation, in contribution order: the contribution
+                          hash, a space and the contributor's name exactly as attested; blank
+                          lines and lines starting with # are skipped
   --vk <file>             the published verification_key.json, compared byte for byte with the
                           key exported here from the final zkey
   --drand-round <n>       the announced beacon round, fetched from the drand relays and checked
@@ -48,15 +50,26 @@ zkey verify re-derives the whole chain, beacon included, from the r1cs and the p
 exported key passes the vault build's checks and equals the published one.`;
 
 function readAttested(path) {
-  const lines = readFileSync(path, "utf8").split("\n");
   const attested = [];
-  lines.forEach((raw, i) => {
-    const line = raw.trim();
-    if (!line || line.startsWith("#")) return;
-    const m = /^([0-9a-fA-F]{128})(?:\s+(.*))?$/.exec(line);
-    if (!m) throw new Error(`${path} line ${i + 1} is not "<128 hex characters> [name]"`);
-    attested.push({ hash: m[1].toLowerCase(), name: m[2] });
-  });
+  readFileSync(path, "utf8")
+    .split("\n")
+    .forEach((raw, i) => {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) return;
+      const at = `${path} line ${i + 1}`;
+      const m = /^([0-9a-fA-F]{128})\s+(\S.*)$/.exec(line);
+      if (!m) throw new Error(`${at} is not "<128 hex characters> <name>"`);
+      const [, hash, name] = m;
+      try {
+        checkName(name);
+      } catch (e) {
+        throw new Error(`${at}: ${e.message}`);
+      }
+      const same = attested.find((a) => sameContributor(a.name, name));
+      if (same)
+        throw new Error(`${at}: ${show(name)} is the same contributor as ${show(same.name)}`);
+      attested.push({ hash: hash.toLowerCase(), name });
+    });
   return attested;
 }
 
@@ -142,7 +155,7 @@ run(USAGE, async (argv) => {
     if (c.hash !== a.hash) {
       throw new Error(`contribution #${i + 1} has hash ${c.hash}, not the attested ${a.hash}`);
     }
-    if (a.name !== undefined && c.name !== a.name) {
+    if (c.name !== a.name) {
       throw new Error(`contribution #${i + 1} is named ${show(c.name)}, not ${show(a.name)}`);
     }
   });

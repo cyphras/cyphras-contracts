@@ -93,9 +93,24 @@ export function checkName(name) {
       "the name must be 1 to 64 printable ASCII characters without leading or trailing spaces",
     );
   }
-  if (/\S@\S+\.\S/.test(name)) {
+  // An email address would be published forever, so user@host, a spaced "user @ host" and
+  // bracketed forms such as "user [at] host" are refused; a handle such as "@name" is not.
+  if (/[\w.+-]@|\s@\s|[[({<]\s*(at|@)\s*[\])}>]/i.test(name)) {
     throw new Error('the name looks like an email address; use a handle: "Name (github: handle)"');
   }
+}
+
+// One person must not count as two contributors: names that match ignoring case and spacing, or
+// that share a handle such as "(github: handle)", belong to the same contributor.
+export function sameContributor(a, b) {
+  const keys = (name) => [
+    `name:${name.toLowerCase().replace(/\s+/g, " ")}`,
+    ...[...name.matchAll(/\(\s*([\w.-]+)\s*:\s*@?([^\s()]+)\s*\)/g)].map((m) =>
+      `handle:${m[1]}:${m[2]}`.toLowerCase(),
+    ),
+  ];
+  const other = new Set(keys(b));
+  return keys(a).some((k) => other.has(k));
 }
 
 // A name read from a zkey may hold anything. Escaping all but printable ASCII keeps it from moving
