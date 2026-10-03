@@ -66,9 +66,10 @@ func (k *Keeper) window(ctx context.Context) (vault.Instance, *big.Int, bool, er
 	return inst, room, !inst.Status.Halted(now), nil
 }
 
-// Release pays queued exits in order while each fits what is left of today's outflow window. It
-// counts from the chain how many fit before it calls, so it never pays for a release that pays
-// nothing, and a batch the transaction limits refuse in simulation is halved.
+// Release pays queued exits in order while today's outflow window has room. It counts from the
+// chain how many exits fit, and when none fits whole it still tries the head, which a vault that
+// pays exits in parts will part pay. A release whose simulation handles no exit is not sent, so
+// none is paid for in vain, and a batch the transaction limits refuse in simulation is halved.
 func (k *Keeper) Release(ctx context.Context) error {
 	batch := max(k.cfg.MaxReleases, 1)
 	for range 100 {
@@ -77,7 +78,7 @@ func (k *Keeper) Release(ctx context.Context) error {
 			return err
 		}
 		head, tail := inst.Status.ExitHead, inst.Status.ExitTail
-		if !open || head >= tail {
+		if !open || head >= tail || room.Sign() <= 0 {
 			return nil
 		}
 		ids := make([]uint64, 0, batch)
@@ -97,21 +98,30 @@ func (k *Keeper) Release(ctx context.Context) error {
 			room.Sub(room, outflow)
 			n++
 		}
-		if n == 0 {
-			return nil
-		}
-		_, err = k.call(ctx, fmt.Sprintf("release of %d exits", n), func() (txnbuild.Operation, error) {
+		n = max(n, 1)
+		_, err = k.callWorth(ctx, fmt.Sprintf("release of %d exits", n), func() (txnbuild.Operation, error) {
 			return k.invoke("release", vault.U32(uint32(n)))
-		})
-		if errors.Is(err, submit.ErrSimulation) && n > 1 {
+		}, handledAny)
+		switch {
+		case errors.Is(err, submit.ErrNotWorth):
+			return nil
+		case errors.Is(err, submit.ErrSimulation) && n > 1:
 			batch = n / 2
 			continue
-		}
-		if err != nil {
+		case err != nil:
 			return err
 		}
 	}
 	return nil
+}
+
+// handledAny reports whether a simulated release handled at least one exit.
+func handledAny(ret *xdr.ScVal) bool {
+	if ret == nil {
+		return true
+	}
+	n, ok := ret.GetU32()
+	return !ok || n > 0
 }
 
 // Claim pays stranded exits whose recipient and relayer can receive again, oldest first, while

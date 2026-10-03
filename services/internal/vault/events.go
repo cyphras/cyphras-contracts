@@ -106,7 +106,8 @@ type NewNullifier struct {
 }
 
 // Settled is emitted by transact when it pays at once. With the exit's ID it is emitted by release
-// for a queued exit it paid in full, and by claim for the unpaid parts of a stranded exit.
+// for the step that completes a queued exit, and by claim for the unpaid parts of a stranded exit;
+// it then carries only what that step paid.
 type Settled struct {
 	ExtAmount *big.Int
 	Fee       *big.Int
@@ -124,8 +125,18 @@ type ExitQueued struct {
 	Relayer   string
 }
 
+// ExitPaid is emitted by release for a part payment of the exit at the head of the queue, when
+// the day's window cannot pay all it owes; the rest stays at the head.
+type ExitPaid struct {
+	ID         uint64
+	PayoutPaid *big.Int
+	FeePaid    *big.Int
+	PayoutLeft *big.Int
+	FeeLeft    *big.Int
+}
+
 // ExitStranded is emitted by release for a queued exit with a part the asset contract refused.
-// Payout and Fee are the unpaid parts, which stay owed until claim pays them.
+// Payout and Fee are what it still owes, which claim pays.
 type ExitStranded struct {
 	ID     uint64
 	Payout *big.Int
@@ -325,6 +336,25 @@ var decoders = map[string]func(xdr.ScVal) (any, error){
 			return nil, malformed("queued exit with ext_amount %v and fee %v", e.ExtAmount, e.Fee)
 		}
 		return e, d.err
+	},
+	"exit_paid": func(v xdr.ScVal) (any, error) {
+		d := newDecoder(v, []string{"id", "payout_paid", "fee_paid", "payout_left", "fee_left"})
+		if d.err != nil {
+			return nil, d.err
+		}
+		e := ExitPaid{ID: d.u64("id"), PayoutPaid: d.i128("payout_paid"), FeePaid: d.i128("fee_paid"), PayoutLeft: d.i128("payout_left"), FeeLeft: d.i128("fee_left")}
+		if d.err != nil {
+			return nil, d.err
+		}
+		for _, n := range []*big.Int{e.PayoutPaid, e.FeePaid, e.PayoutLeft, e.FeeLeft} {
+			if n.Sign() < 0 {
+				return nil, malformed("exit part payment with a negative part")
+			}
+		}
+		if e.PayoutPaid.Sign()+e.FeePaid.Sign() == 0 || e.PayoutLeft.Sign()+e.FeeLeft.Sign() == 0 {
+			return nil, malformed("exit part payment that pays nothing or leaves nothing")
+		}
+		return e, nil
 	},
 	"exit_stranded": func(v xdr.ScVal) (any, error) {
 		d := newDecoder(v, []string{"id", "payout", "fee"})

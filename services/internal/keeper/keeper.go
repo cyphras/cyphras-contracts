@@ -34,7 +34,8 @@ type Config struct {
 	MaxAdmissions int
 	// MaxExtensions is the most entries one footprint extension carries.
 	MaxExtensions int
-	// MaxReleases is the most exits one release call pays.
+	// MaxReleases is the most exits one release call handles; the vault measures fifteen as what
+	// fits every transaction limit in the worst case.
 	MaxReleases int
 	// RefundDelay is how long a deposit must stay flagged before anyone may refund it.
 	RefundDelay time.Duration
@@ -123,12 +124,17 @@ func (k *Keeper) invoke(fn string, args ...xdr.ScVal) (txnbuild.Operation, error
 
 // call runs one keeper transaction to its outcome and alerts when it still fails after retries.
 func (k *Keeper) call(ctx context.Context, what string, build func() (txnbuild.Operation, error)) (submit.Result, error) {
-	res, err := k.engine.Do(ctx, k.account, build, 5)
+	return k.callWorth(ctx, what, build, nil)
+}
+
+// callWorth is call for a transaction sent only when worth accepts its simulated return value.
+func (k *Keeper) callWorth(ctx context.Context, what string, build func() (txnbuild.Operation, error), worth func(*xdr.ScVal) bool) (submit.Result, error) {
+	res, err := k.engine.DoWorth(ctx, k.account, build, 5, worth)
 	if err == nil && res.Outcome != submit.Success {
 		err = fmt.Errorf("%s %s: %s", what, res.Outcome, res.Code)
 	}
 	if err != nil {
-		if !errors.Is(err, submit.ErrSimulation) {
+		if !errors.Is(err, submit.ErrSimulation) && !errors.Is(err, submit.ErrNotWorth) {
 			k.alerts.Raise(ctx, alert.Critical, "call_failed", "%s failed after retries: %v", what, err)
 		}
 		return res, err

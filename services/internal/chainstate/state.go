@@ -51,7 +51,8 @@ func (d *Deposit) clone() *Deposit {
 }
 
 // Exit is a payment the vault owes: one waiting in the exit queue, or, among the stranded exits,
-// the parts a release could not pay.
+// the parts a release could not pay. Payout and Fee are what is still owed, less any part
+// payment.
 type Exit struct {
 	ID        uint64
 	Payout    *big.Int
@@ -61,6 +62,11 @@ type Exit struct {
 	QueuedAt  uint64
 	Ledger    uint32
 	TxHash    string
+	// StrandedLedger, StrandedAt and StrandedTx are set on a stranded exit: the release that
+	// stranded it.
+	StrandedLedger uint32
+	StrandedAt     int64
+	StrandedTx     string
 }
 
 // Outflow is what the exit takes from a day's window.
@@ -209,6 +215,13 @@ type Released struct {
 	PaidTx       string
 }
 
+// PartPaid is the exit at the head of the queue after a release paid part of it.
+type PartPaid struct {
+	ID         uint64
+	PayoutLeft *big.Int
+	FeeLeft    *big.Int
+}
+
 // Claimed is a stranded exit that claim paid.
 type Claimed struct {
 	ID       uint64
@@ -243,6 +256,7 @@ type Delta struct {
 	Resolved    []Resolution
 	Settlements []Settlement
 	Queued      []Exit
+	PartPaid    []PartPaid
 	Released    []Released
 	Claimed     []Claimed
 	Notices     []Notice
@@ -301,6 +315,8 @@ func (s *State) apply(tx vault.Tx, call any, d *Delta, spent map[fr.Element]bool
 			return s.claim(tx, c.Settled, d)
 		}
 		return s.release(tx, c.Settled, d)
+	case vault.ExitPaid:
+		return s.payPart(tx, c, d)
 	case vault.ExitStranded:
 		return s.strand(tx, c, d)
 	case vault.Admission:
@@ -468,8 +484,7 @@ func (s *State) transact(tx vault.Tx, c vault.Transact, d *Delta, spent map[fr.E
 	return nil
 }
 
-// head returns the exit at the head of the queue, which a release must take next, and checks that
-// it fits today's window in full, as release requires even of an exit it then strands.
+// head returns the exit at the head of the queue, which a release must handle next.
 func (s *State) head(now uint64, id uint64) (*Exit, error) {
 	if s.halted(now) {
 		return nil, inconsistent("a release while halted")
@@ -478,13 +493,10 @@ func (s *State) head(now uint64, id uint64) (*Exit, error) {
 	if !ok || id != s.ExitHead {
 		return nil, inconsistent("exit %d released out of turn; the head is %d", id, s.ExitHead)
 	}
-	if !s.fits(now, e.Outflow()) {
-		return nil, inconsistent("exit %d released beyond today's window", id)
-	}
 	return e, nil
 }
 
-// release pays the exit at the head of the queue in full.
+// release pays what the exit at the head of the queue still owes and completes it.
 func (s *State) release(tx vault.Tx, settled vault.Settled, d *Delta) error {
 	now := uint64(tx.ClosedAt)
 	id := *settled.ExitID
@@ -493,7 +505,10 @@ func (s *State) release(tx vault.Tx, settled vault.Settled, d *Delta) error {
 		return err
 	}
 	if new(big.Int).Neg(settled.ExtAmount).Cmp(e.Payout) != 0 || settled.Fee.Cmp(e.Fee) != 0 || settled.Recipient != e.Recipient || settled.Relayer != e.Relayer {
-		return inconsistent("exit %d paid differently from how it was queued", id)
+		return inconsistent("exit %d paid differently from what it owes", id)
+	}
+	if !s.fits(now, e.Outflow()) {
+		return inconsistent("exit %d paid beyond today's window", id)
 	}
 	if err := s.takeOff(now, id, e.Outflow()); err != nil {
 		return err
@@ -504,31 +519,71 @@ func (s *State) release(tx vault.Tx, settled vault.Settled, d *Delta) error {
 	return nil
 }
 
+// payPart pays part of the exit at the head of the queue and leaves the rest there, as release
+// does when the day's window cannot pay all of it: the window is full afterwards.
+func (s *State) payPart(tx vault.Tx, c vault.ExitPaid, d *Delta) error {
+	now := uint64(tx.ClosedAt)
+	e, err := s.head(now, c.ID)
+	if err != nil {
+		return err
+	}
+	if new(big.Int).Add(c.PayoutPaid, c.PayoutLeft).Cmp(e.Payout) != 0 || new(big.Int).Add(c.FeePaid, c.FeeLeft).Cmp(e.Fee) != 0 {
+		return inconsistent("exit %d part paid differently from what it owes", c.ID)
+	}
+	if p, f, known := s.step(now, e); known && (c.PayoutPaid.Cmp(p) != 0 || c.FeePaid.Cmp(f) != 0) {
+		return inconsistent("exit %d part paid other than what today's window allows", c.ID)
+	}
+	paid := new(big.Int).Add(c.PayoutPaid, c.FeePaid)
+	e.Payout, e.Fee = new(big.Int).Set(c.PayoutLeft), new(big.Int).Set(c.FeeLeft)
+	s.QueuedTotal.Sub(s.QueuedTotal, paid)
+	s.pay(now, paid)
+	if s.Tvl.Sign() < 0 || s.QueuedTotal.Sign() < 0 {
+		return inconsistent("exit %d pays more than the vault holds", c.ID)
+	}
+	id := c.ID
+	part := vault.Settled{ExtAmount: new(big.Int).Neg(c.PayoutPaid), Fee: new(big.Int).Set(c.FeePaid), Recipient: e.Recipient, Relayer: e.Relayer, ExitID: &id}
+	d.PartPaid = append(d.PartPaid, PartPaid{ID: c.ID, PayoutLeft: e.Payout, FeeLeft: e.Fee})
+	d.Settlements = append(d.Settlements, Settlement{Settled: part, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
+	s.notice(tx, "exit_paid", c, d)
+	return nil
+}
+
 // strand releases the exit at the head of the queue with the parts the asset contract refused
-// left owed. A transfer is taken in full or refused in full, so each unpaid part is all or nothing.
+// left owed.
 func (s *State) strand(tx vault.Tx, c vault.ExitStranded, d *Delta) error {
 	now := uint64(tx.ClosedAt)
 	e, err := s.head(now, c.ID)
 	if err != nil {
 		return err
 	}
-	whole := func(unpaid, part *big.Int) bool { return unpaid.Sign() == 0 || unpaid.Cmp(part) == 0 }
-	if !whole(c.Payout, e.Payout) || !whole(c.Fee, e.Fee) {
-		return inconsistent("exit %d stranded with parts it does not owe", c.ID)
+	if c.Payout.Cmp(e.Payout) > 0 || c.Fee.Cmp(e.Fee) > 0 {
+		return inconsistent("exit %d stranded with more than it owes", c.ID)
 	}
 	paidPayout := new(big.Int).Sub(e.Payout, c.Payout)
 	paidFee := new(big.Int).Sub(e.Fee, c.Fee)
-	if err := s.takeOff(now, c.ID, new(big.Int).Add(paidPayout, paidFee)); err != nil {
+	paid := new(big.Int).Add(paidPayout, paidFee)
+	if !s.fits(now, paid) {
+		return inconsistent("exit %d released beyond today's window", c.ID)
+	}
+	// Each transfer of the step is taken in full or refused in full, and at least one was refused.
+	if p, f, known := s.step(now, e); known {
+		whole := func(paid, part *big.Int) bool { return paid.Sign() == 0 || paid.Cmp(part) == 0 }
+		if !whole(paidPayout, p) || !whole(paidFee, f) || (paidPayout.Cmp(p) == 0 && paidFee.Cmp(f) == 0) {
+			return inconsistent("exit %d stranded with parts its release could not have left", c.ID)
+		}
+	}
+	if err := s.takeOff(now, c.ID, paid); err != nil {
 		return err
 	}
 	left := e.clone()
 	left.Payout, left.Fee = new(big.Int).Set(c.Payout), new(big.Int).Set(c.Fee)
+	left.StrandedLedger, left.StrandedAt, left.StrandedTx = tx.Ledger, tx.ClosedAt, tx.Hash
 	s.Stranded[c.ID] = left
 	d.Released = append(d.Released, Released{Exit: *e, UnpaidPayout: left.Payout, UnpaidFee: left.Fee, PaidLedger: tx.Ledger, PaidAt: tx.ClosedAt, PaidTx: tx.Hash})
-	if paidPayout.Sign() > 0 || paidFee.Sign() > 0 {
+	if paid.Sign() > 0 {
 		id := c.ID
-		paid := vault.Settled{ExtAmount: new(big.Int).Neg(paidPayout), Fee: paidFee, Recipient: e.Recipient, Relayer: e.Relayer, ExitID: &id}
-		d.Settlements = append(d.Settlements, Settlement{Settled: paid, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
+		part := vault.Settled{ExtAmount: new(big.Int).Neg(paidPayout), Fee: paidFee, Recipient: e.Recipient, Relayer: e.Relayer, ExitID: &id}
+		d.Settlements = append(d.Settlements, Settlement{Settled: part, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
 	}
 	s.notice(tx, "exit_stranded", c, d)
 	return nil
@@ -571,6 +626,28 @@ func (s *State) claim(tx vault.Tx, settled vault.Settled, d *Delta) error {
 	d.Settlements = append(d.Settlements, Settlement{Settled: settled, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
 	s.notice(tx, "exit_claimed", settled, d)
 	return nil
+}
+
+// step is what a release tries to pay of an exit today: the payout first, then the fee, each cut
+// to what is left of the window. It is unknown before the first limits event.
+func (s *State) step(now uint64, e *Exit) (payout, fee *big.Int, known bool) {
+	if s.Limits == nil {
+		return nil, nil, false
+	}
+	room := new(big.Int).Sub(s.Limits.MaxDailyOutflow, s.OutflowOn(now/day))
+	if room.Sign() < 0 {
+		room.SetInt64(0)
+	}
+	payout = minInt(e.Payout, room)
+	fee = minInt(e.Fee, new(big.Int).Sub(room, payout))
+	return payout, fee, true
+}
+
+func minInt(a, b *big.Int) *big.Int {
+	if a.Cmp(b) < 0 {
+		return new(big.Int).Set(a)
+	}
+	return new(big.Int).Set(b)
 }
 
 // fits reports whether an outflow fits what is left of today's window. Before the first limits

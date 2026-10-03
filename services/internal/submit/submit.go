@@ -415,9 +415,17 @@ func (e *Engine) result(s *Signed, resp protocol.GetTransactionResponse) Result 
 	return r
 }
 
+// ErrNotWorth reports a call whose simulation showed it would achieve nothing, so it was not sent.
+var ErrNotWorth = errors.New("submit: the call would achieve nothing")
+
 // Do runs one call on the account from simulation to its final outcome, sending it again with
 // backoff while it is refused or expires, and stops at the first failed simulation.
 func (e *Engine) Do(ctx context.Context, a *Account, build func() (txnbuild.Operation, error), attempts int) (Result, error) {
+	return e.DoWorth(ctx, a, build, attempts, nil)
+}
+
+// DoWorth is Do for a call that is sent only when worth accepts its simulated return value.
+func (e *Engine) DoWorth(ctx context.Context, a *Account, build func() (txnbuild.Operation, error), attempts int, worth func(*xdr.ScVal) bool) (Result, error) {
 	a.Lock()
 	defer a.Unlock()
 	backoff := time.Second
@@ -428,6 +436,9 @@ func (e *Engine) Do(ctx context.Context, a *Account, build func() (txnbuild.Oper
 			return Result{}, err
 		}
 		p, err := e.Prepare(ctx, a, op)
+		if err == nil && worth != nil && !worth(p.Return) {
+			return Result{}, ErrNotWorth
+		}
 		if err != nil {
 			if errors.Is(err, ErrSimulation) {
 				return Result{}, err

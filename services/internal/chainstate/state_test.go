@@ -300,6 +300,42 @@ func applyAt(s *State, at int64, calls ...any) (Delta, error) {
 	return s.Apply([]vault.Tx{{Ledger: 9, ClosedAt: at, Hash: "tx", Calls: calls}})
 }
 
+func TestAPartPaymentFillsTheWindowAndLeavesTheRestAtTheHead(t *testing.T) {
+	const day1, day2 = 1_728_000_000, 1_728_000_000 + 86_400
+	big1 := big.NewInt(1_000_000)
+	limits := vault.Limits{
+		MinDeposit: big.NewInt(1), MaxDeposit: big1, MaxDailyPerDepositor: big1, TvlCap: big1,
+		MaxDailyOutflow: big.NewInt(600), MaxFee: big.NewInt(50), LargeDepositThreshold: big1,
+	}
+	s := New()
+	if _, err := applyAt(s, day1, shield(1, 1, 2000), vault.Attested{UpTo: 1}, admission(1, 0),
+		vault.LimitsApplied{LimitsChange: vault.LimitsChange{Limits: limits, ReadyAt: day1}},
+		paidAtOnce(10, 2, -500, 0), queued(20, 4, 1, -580, 20)); err != nil {
+		t.Fatal(err)
+	}
+	// 100 is left today: the payout takes it all and the fee waits.
+	part := vault.ExitPaid{ID: 1, PayoutPaid: big.NewInt(100), FeePaid: new(big.Int), PayoutLeft: big.NewInt(480), FeeLeft: big.NewInt(20)}
+	wrong := part
+	wrong.PayoutPaid, wrong.PayoutLeft = big.NewInt(90), big.NewInt(490)
+	if _, err := applyAt(s.Clone(), day1, wrong); !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("a part payment that leaves room: %v", err)
+	}
+	d, err := applyAt(s, day1, part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ExitHead != 1 || s.Exits[1].Payout.Int64() != 480 || s.QueuedTotal.Int64() != 500 || s.Outflow.Int64() != 600 || len(d.PartPaid) != 1 || len(d.Settlements) != 1 {
+		t.Fatalf("after a part payment: head %d, exit %+v, queued %v, outflow %v", s.ExitHead, s.Exits[1], s.QueuedTotal, s.Outflow)
+	}
+	// The next day the rest completes it.
+	if _, err := applyAt(s, day2, release(1, -480, 20)); err != nil {
+		t.Fatal(err)
+	}
+	if s.ExitHead != 2 || s.QueuedTotal.Sign() != 0 || s.Outflow.Int64() != 500 {
+		t.Fatalf("after the rest: head %d, queued %v, outflow %v", s.ExitHead, s.QueuedTotal, s.Outflow)
+	}
+}
+
 func TestAStrandedExitLeavesTheQueueAndIsClaimedLater(t *testing.T) {
 	const day1, day2 = 1_728_000_000, 1_728_000_000 + 86_400
 	big1 := big.NewInt(1_000_000)
@@ -328,8 +364,10 @@ func TestAStrandedExitLeavesTheQueueAndIsClaimedLater(t *testing.T) {
 	if _, err := applyAt(s.Clone(), day1, release(1, -300, 5)); !errors.Is(err, ErrInconsistent) {
 		t.Fatalf("release beyond the window: %v", err)
 	}
-	if _, err := applyAt(s.Clone(), day2, vault.ExitStranded{ID: 1, Payout: big.NewInt(100), Fee: new(big.Int)}); !errors.Is(err, ErrInconsistent) {
-		t.Fatalf("a stranded part the exit does not owe: %v", err)
+	for name, left := range map[string][2]int64{"part of a payout": {100, 0}, "more than owed": {301, 5}, "nothing refused": {0, 0}} {
+		if _, err := applyAt(s.Clone(), day2, vault.ExitStranded{ID: 1, Payout: big.NewInt(left[0]), Fee: big.NewInt(left[1])}); !errors.Is(err, ErrInconsistent) {
+			t.Fatalf("stranded with %s: %v", name, err)
+		}
 	}
 	// The next day the recipient of exit 1 cannot receive: its fee is paid, its payout stranded,
 	// and exit 2 behind it is paid.

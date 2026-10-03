@@ -203,6 +203,17 @@ func (c *Chain) Release(exits ...Exit) {
 	}
 }
 
+// PayPart emits a release that pays part of the exit at the head and leaves the rest.
+func (c *Chain) PayPart(e Exit, payoutPaid, feePaid, payoutLeft, feeLeft int64) {
+	c.Tx().Emit("exit_paid",
+		vault.Field{Name: "id", Value: vault.U64(e.ID)},
+		vault.Field{Name: "payout_paid", Value: i128(big.NewInt(payoutPaid))},
+		vault.Field{Name: "fee_paid", Value: i128(big.NewInt(feePaid))},
+		vault.Field{Name: "payout_left", Value: i128(big.NewInt(payoutLeft))},
+		vault.Field{Name: "fee_left", Value: i128(big.NewInt(feeLeft))},
+	)
+}
+
 // Strand emits a release of one exit whose unpaid parts the asset contract refused.
 func (c *Chain) Strand(e Exit, unpaidPayout, unpaidFee int64) {
 	c.Tx().Emit("exit_stranded",

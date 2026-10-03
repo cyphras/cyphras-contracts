@@ -32,7 +32,18 @@ type tracked struct {
 	missing  bool
 	// liveUntil is nil when the entry is archived or missing.
 	liveUntil *uint32
+	// id and kind name a pending deposit or an exit, which bump_ttl takes by ID.
+	id   uint64
+	kind entryKind
 }
+
+type entryKind int
+
+const (
+	otherKind entryKind = iota
+	pendingKind
+	exitKind
+)
 
 func (t tracked) gone() bool {
 	return t.optional && t.missing
@@ -70,8 +81,8 @@ func (k *Keeper) read(ctx context.Context, items []tracked) ([]tracked, uint32, 
 }
 
 // TTLCycle reads the remaining life of every entry the vault depends on and extends each one within
-// 30 days of expiry to the network's maximum: the instance, the tree and pending deposits through
-// bump_ttl, and the code, the asset contract's entries, queued and stranded exits and the
+// 30 days of expiry to the network's maximum: the instance, the tree, pending deposits and queued
+// and stranded exits through bump_ttl, and the code, the asset contract's entries and the
 // nullifiers by footprint.
 func (k *Keeper) TTLCycle(ctx context.Context) error {
 	maxTTL, err := rpc.MaxEntryTTL(ctx, k.rpc)
@@ -100,26 +111,33 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		group = append(group, tracked{name: fmt.Sprintf("pending deposit %d", id), key: key, optional: true})
+		group = append(group, tracked{name: fmt.Sprintf("pending deposit %d", id), key: key, optional: true, id: id, kind: pendingKind})
 	}
-	group, latest, err := k.read(ctx, group)
+	exits, err := k.exitEntries()
+	if err != nil {
+		return err
+	}
+	group, latest, err := k.read(ctx, append(group, exits...))
 	if err != nil {
 		return err
 	}
 	bump := false
-	var duePending []xdr.ScVal
-	for i, t := range group {
+	var duePending, dueExits []xdr.ScVal
+	for _, t := range group {
 		if !t.due(latest) {
 			continue
 		}
 		bump = true
-		if i >= 1+len(treeKeys) {
-			duePending = append(duePending, vault.U64(ids[i-1-len(treeKeys)]))
+		switch t.kind {
+		case pendingKind:
+			duePending = append(duePending, vault.U64(t.id))
+		case exitKind:
+			dueExits = append(dueExits, vault.U64(t.id))
 		}
 	}
 	if bump {
 		if _, err := k.call(ctx, "bump_ttl", func() (txnbuild.Operation, error) {
-			return k.invoke("bump_ttl", vault.Vec(duePending...))
+			return k.invoke("bump_ttl", vault.Vec(duePending...), vault.Vec(dueExits...))
 		}); err != nil {
 			failures = append(failures, "bump_ttl")
 		}
@@ -136,12 +154,7 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 		return err
 	}
 	// The vault has no balance entry until its first deposit.
-	others := []tracked{{name: "vault code", key: codeKey}, {name: "asset contract", key: tokenInstance}, {name: "vault balance", key: balance, optional: true}}
-	exits, err := k.exitEntries()
-	if err != nil {
-		return err
-	}
-	others, _, err = k.read(ctx, append(others, exits...))
+	others, _, err := k.read(ctx, []tracked{{name: "vault code", key: codeKey}, {name: "asset contract", key: tokenInstance}, {name: "vault balance", key: balance, optional: true}})
 	if err != nil {
 		return err
 	}
@@ -313,14 +326,14 @@ func (k *Keeper) exitEntries() ([]tracked, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, tracked{name: fmt.Sprintf("exit %d", id), key: key, optional: true})
+		out = append(out, tracked{name: fmt.Sprintf("exit %d", id), key: key, optional: true, id: id, kind: exitKind})
 	}
 	for _, id := range stranded {
 		key, err := vault.StrandedKey(k.cfg.Vault, id)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, tracked{name: fmt.Sprintf("stranded exit %d", id), key: key, optional: true})
+		out = append(out, tracked{name: fmt.Sprintf("stranded exit %d", id), key: key, optional: true, id: id, kind: exitKind})
 	}
 	return out, nil
 }

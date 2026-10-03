@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS exits (
 	queued_at bigint NOT NULL,
 	ledger bigint NOT NULL,
 	tx_hash text NOT NULL,
+	payout_left numeric,
+	fee_left numeric,
 	released_ledger bigint,
 	released_at bigint,
 	released_tx text,
@@ -316,8 +318,9 @@ func (st *Store) Load(ctx context.Context, vaultID string, deployLedger uint32) 
 }
 
 func (st *Store) loadExits(ctx context.Context, s *State) error {
-	rows, err := st.Pool.Query(ctx, `SELECT id, payout::text, fee::text, recipient, relayer, queued_at, ledger, tx_hash,
-		released_ledger IS NOT NULL, coalesce(unpaid_payout, 0)::text, coalesce(unpaid_fee, 0)::text
+	rows, err := st.Pool.Query(ctx, `SELECT id, coalesce(payout_left, payout)::text, coalesce(fee_left, fee)::text, recipient, relayer,
+		queued_at, ledger, tx_hash, released_ledger IS NOT NULL, coalesce(unpaid_payout, 0)::text, coalesce(unpaid_fee, 0)::text,
+		coalesce(released_ledger, 0), coalesce(released_at, 0), coalesce(released_tx, '')
 		FROM exits WHERE released_ledger IS NULL OR (unpaid_payout IS NOT NULL AND claimed_ledger IS NULL) ORDER BY id`)
 	if err != nil {
 		return err
@@ -325,15 +328,17 @@ func (st *Store) loadExits(ctx context.Context, s *State) error {
 	defer rows.Close()
 	for rows.Next() {
 		var e Exit
-		var id, queuedAt, ledger int64
+		var id, queuedAt, ledger, strandedLedger int64
 		var payout, fee, unpaidPayout, unpaidFee string
 		var released bool
-		if err := rows.Scan(&id, &payout, &fee, &e.Recipient, &e.Relayer, &queuedAt, &ledger, &e.TxHash, &released, &unpaidPayout, &unpaidFee); err != nil {
+		if err := rows.Scan(&id, &payout, &fee, &e.Recipient, &e.Relayer, &queuedAt, &ledger, &e.TxHash, &released, &unpaidPayout, &unpaidFee,
+			&strandedLedger, &e.StrandedAt, &e.StrandedTx); err != nil {
 			return err
 		}
 		e.ID, e.QueuedAt, e.Ledger = uint64(id), uint64(queuedAt), uint32(ledger)
 		if released {
 			payout, fee = unpaidPayout, unpaidFee
+			e.StrandedLedger = uint32(strandedLedger)
 		}
 		var ok1, ok2 bool
 		e.Payout, ok1 = new(big.Int).SetString(payout, 10)
@@ -451,6 +456,16 @@ func (st *Store) Commit(ctx context.Context, from, to uint32, s *State, d Delta,
 			VALUES ($1, $2::numeric, $3::numeric, $4, $5, $6, $7, $8)`,
 			int64(e.ID), e.Payout.String(), e.Fee.String(), e.Recipient, e.Relayer, int64(e.QueuedAt), int64(e.Ledger), e.TxHash); err != nil {
 			return err
+		}
+	}
+	for _, p := range d.PartPaid {
+		tag, err := tx.Exec(ctx, `UPDATE exits SET payout_left = $2::numeric, fee_left = $3::numeric WHERE id = $1 AND released_ledger IS NULL`,
+			int64(p.ID), p.PayoutLeft.String(), p.FeeLeft.String())
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return inconsistent("exit %d part paid while not queued", p.ID)
 		}
 	}
 	for _, e := range d.Released {

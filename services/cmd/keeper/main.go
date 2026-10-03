@@ -55,9 +55,9 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
-	releases, err := config.Int("RELEASE_BATCH", 10)
-	if err == nil && (releases < 1 || releases > 100) {
-		err = errors.New("RELEASE_BATCH must be 1 to 100")
+	releases, err := config.Int("RELEASE_BATCH", 15)
+	if err == nil && (releases < 1 || releases > 15) {
+		err = errors.New("RELEASE_BATCH must be 1 to 15")
 	}
 	if err != nil {
 		service.Fatal(log, "config", err)

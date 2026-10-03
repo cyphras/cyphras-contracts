@@ -107,6 +107,7 @@ func TestQueuedExitsReload(t *testing.T) {
 	}
 	d, err := s.Apply([]vault.Tx{{Ledger: 10, ClosedAt: 1_728_000_000, Hash: "a", Calls: []any{
 		shield(1, 1, 1000), vault.Attested{UpTo: 1}, admission(1, 0), queued(10, 2, 1, -300, 5), queued(20, 4, 2, -100, 0),
+		vault.ExitPaid{ID: 1, PayoutPaid: big.NewInt(50), FeePaid: new(big.Int), PayoutLeft: big.NewInt(250), FeeLeft: big.NewInt(5)},
 	}}})
 	if err != nil {
 		t.Fatal(err)
@@ -114,8 +115,13 @@ func TestQueuedExitsReload(t *testing.T) {
 	if err := st.Commit(ctx, 10, 10, s, d, nil); err != nil {
 		t.Fatal(err)
 	}
+	// The part payment survives a reload.
+	reloaded, _, err := st.Load(ctx, testVault, 10)
+	if err != nil || reloaded.Exits[1].Payout.Int64() != 250 || reloaded.QueuedTotal.Int64() != 355 {
+		t.Fatalf("part paid exit reloaded as %+v, %v", reloaded.Exits[1], err)
+	}
 	next := s.Clone()
-	d, err = next.Apply([]vault.Tx{{Ledger: 11, ClosedAt: 1_728_000_005, Hash: "b", Calls: []any{release(1, -300, 5)}}})
+	d, err = next.Apply([]vault.Tx{{Ledger: 11, ClosedAt: 1_728_000_005, Hash: "b", Calls: []any{release(1, -250, 5)}}})
 	if err != nil {
 		t.Fatal(err)
 	}

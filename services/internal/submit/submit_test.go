@@ -228,7 +228,7 @@ func TestATransactionNotFoundAfterItsTimeBoundExpires(t *testing.T) {
 func TestAFailedSimulationIsNotRetriedOrSent(t *testing.T) {
 	h := newHarness(t)
 	h.fake.Simulate = func(protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
-		return protocol.SimulateTransactionResponse{Error: "HostError: Error(Contract, #26)"}, nil
+		return protocol.SimulateTransactionResponse{Error: "HostError: Error(WasmVm, InvalidAction)"}, nil
 	}
 	_, err := h.engine.Do(context.Background(), h.account, func() (txnbuild.Operation, error) { return invoke(), nil }, 5)
 	if !errors.Is(err, ErrSimulation) || h.fake.CallCount("sendTransaction") != 0 || h.fake.CallCount("simulateTransaction") != 1 {

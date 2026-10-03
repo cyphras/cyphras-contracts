@@ -45,6 +45,32 @@ type harness struct {
 	limit    int64
 	// outflows holds the outflow of each queued exit by ID.
 	outflows map[uint64]int64
+	// partial makes the simulated vault pay the head exit in part when it does not fit whole.
+	partial bool
+}
+
+// released is what the simulated vault's release(max) returns: how many exits it handles from the
+// head while the window has room.
+func (h *harness) released(max uint64) uint64 {
+	day := uint64(h.now.Unix()) / secondsPerDay
+	used := int64(0)
+	if h.status.OutflowDay == day && h.status.Outflow != nil {
+		used = h.status.Outflow.Int64()
+	}
+	room := h.limit - used
+	n := uint64(0)
+	for id := h.status.ExitHead; id < h.status.ExitTail && n < max && room > 0; id++ {
+		o := h.outflows[id]
+		if o > room {
+			if h.partial {
+				n++
+			}
+			break
+		}
+		room -= o
+		n++
+	}
+	return n
 }
 
 func (h *harness) Send(_ context.Context, a alert.Alert) error {
@@ -109,7 +135,13 @@ func newHarness(t *testing.T) *harness {
 			data = *env.V1.Tx.Ext.SorobanData
 		}
 		encoded, _ := xdr.MarshalBase64(data)
-		return protocol.SimulateTransactionResponse{TransactionDataXDR: encoded, MinResourceFee: 100, Results: []protocol.SimulateHostFunctionResult{{}}}, nil
+		result := protocol.SimulateHostFunctionResult{}
+		var max uint64
+		if _, err := fmt.Sscanf(describe(env), "release %d", &max); err == nil {
+			ret, _ := xdr.MarshalBase64(vault.U32(uint32(h.released(max))))
+			result.ReturnValueXDR = &ret
+		}
+		return protocol.SimulateTransactionResponse{TransactionDataXDR: encoded, MinResourceFee: 100, Results: []protocol.SimulateHostFunctionResult{result}}, nil
 	}
 	h.fake.Send = func(req protocol.SendTransactionRequest) (protocol.SendTransactionResponse, error) {
 		var env xdr.TransactionEnvelope
@@ -323,7 +355,7 @@ func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 	if err := h.k.TTLCycle(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"bump_ttl [1]", "restore 1", "extend 2 to 3110399", "restore 1", "extend 3 to 3110399"}
+	want := []string{"bump_ttl [1] []", "restore 1", "extend 2 to 3110399", "restore 1", "extend 3 to 3110399"}
 	if got := h.take(); !equal(got, want) {
 		t.Fatalf("ttl cycle sent %v", got)
 	}
@@ -419,6 +451,18 @@ func TestReleasePaysWhatFitsTheWindowAndWaitsForMidnight(t *testing.T) {
 	}
 	if h.status.ExitHead != h.status.ExitTail {
 		t.Fatalf("queue left at %d of %d", h.status.ExitHead, h.status.ExitTail)
+	}
+
+	// A vault that pays exits in parts is asked to release the head even when it does not fit.
+	h.partial, h.simFail = true, nil
+	h.queueExits(900)
+	h.status.Outflow = big.NewInt(500)
+	h.setInstance()
+	if err := h.k.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.take(); !equal(got, []string{"release 1"}) {
+		t.Fatalf("part payment %v", got)
 	}
 	if d := untilRelease(time.Date(2026, 10, 3, 23, 59, 50, 0, time.UTC), 30*time.Second); d != 20*time.Second {
 		t.Fatalf("sleeps %s before midnight", d)
