@@ -162,6 +162,30 @@ func (r Reader) Events(ctx context.Context, from, to uint32) ([]vault.RawEvent, 
 	return out, nil
 }
 
+// LastCovered returns the last ledger of the newest file's coverage, or 0 for an empty archive.
+func LastCovered(dir string) (uint32, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if err != nil || len(files) == 0 {
+		return 0, err
+	}
+	slices.Sort(files)
+	f, err := os.Open(files[len(files)-1])
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	var last uint32
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		var l line
+		if json.Unmarshal(scanner.Bytes(), &l) == nil && l.Covered != nil {
+			last = max(last, l.Covered[1])
+		}
+	}
+	return last, scanner.Err()
+}
+
 // contains reports whether the union of the ranges covers [from, to].
 func contains(ranges [][2]uint32, from, to uint32) bool {
 	slices.SortFunc(ranges, func(a, b [2]uint32) int { return int(a[0]) - int(b[0]) })

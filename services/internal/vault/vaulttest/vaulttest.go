@@ -200,3 +200,95 @@ func Limits(n, large int64) xdr.ScVal {
 func (c *Chain) Governance(name string, fields ...vault.Field) {
 	c.Tx().Emit(name, fields...)
 }
+
+// Asp and Guardian are the vault's privileged accounts in tests.
+const (
+	Asp      = "GA53HZCSOZI5ZUDYCMYXXUGHO7XEZSM3BYW4M5FGSTYGKWMGVL7QLFB3"
+	Guardian = "GCFK3MDGB4MMH3YCPF42DWOQ47JSAMITMIO3UEHYE62XJAJA4KPERZGO"
+	Token    = "CCVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKVKUD2U"
+)
+
+// InstanceOptions describes the vault's instance storage.
+type InstanceOptions struct {
+	DelaySmall, DelayLarge uint64
+	Limit, Large           int64
+	Status                 vault.Status
+	Queued                 *xdr.ScVal
+	WasmHash               [32]byte
+}
+
+// Instance encodes the vault's contract instance entry value.
+func Instance(o InstanceOptions) xdr.ScVal {
+	cfg := vault.Struct(
+		vault.Field{Name: "token", Value: addr(Token)},
+		vault.Field{Name: "domain", Value: Field(fr.SetUint64(5))},
+		vault.Field{Name: "guardian", Value: addr(Guardian)},
+		vault.Field{Name: "asp", Value: addr(Asp)},
+		vault.Field{Name: "delay_small", Value: vault.U64(o.DelaySmall)},
+		vault.Field{Name: "delay_large", Value: vault.U64(o.DelayLarge)},
+	)
+	s := o.Status
+	zero := big.NewInt(0)
+	or := func(n *big.Int) *big.Int {
+		if n == nil {
+			return zero
+		}
+		return n
+	}
+	status := vault.Struct(
+		vault.Field{Name: "deposits_paused", Value: vault.Bool(s.DepositsPaused)},
+		vault.Field{Name: "transfers_paused", Value: vault.Bool(s.TransfersPaused)},
+		vault.Field{Name: "halted_until", Value: vault.U64(s.HaltedUntil)},
+		vault.Field{Name: "next_halt_at", Value: vault.U64(s.NextHaltAt)},
+		vault.Field{Name: "next_deposit_id", Value: vault.U64(max(s.NextDepositID, 1))},
+		vault.Field{Name: "attested_up_to", Value: vault.U64(s.AttestedUpTo)},
+		vault.Field{Name: "tvl", Value: i128(or(s.Tvl))},
+		vault.Field{Name: "pending_total", Value: i128(or(s.PendingTotal))},
+		vault.Field{Name: "outflow_day", Value: vault.U64(s.OutflowDay)},
+		vault.Field{Name: "outflow", Value: i128(or(s.Outflow))},
+	)
+	storage := xdr.ScMap{
+		{Key: vault.Vec(vault.Symbol("Config")), Val: cfg},
+		{Key: vault.Vec(vault.Symbol("Limits")), Val: Limits(o.Limit, o.Large)},
+		{Key: vault.Vec(vault.Symbol("Status")), Val: status},
+	}
+	if o.Queued != nil {
+		storage = append(storage, xdr.ScMapEntry{Key: vault.Vec(vault.Symbol("QueuedLimits")), Val: *o.Queued})
+	}
+	hash := xdr.Hash(o.WasmHash)
+	inst := xdr.ScContractInstance{
+		Executable: xdr.ContractExecutable{Type: xdr.ContractExecutableTypeContractExecutableWasm, WasmHash: &hash},
+		Storage:    &storage,
+	}
+	return xdr.ScVal{Type: xdr.ScValTypeScvContractInstance, Instance: &inst}
+}
+
+// RootRing encodes a root ring whose newest root is root.
+func RootRing(root fr.Element, newest uint32) xdr.ScVal {
+	roots := make([]xdr.ScVal, vault.RootHistory)
+	for i := range roots {
+		roots[i] = Field(fr.Element{})
+	}
+	roots[newest] = Field(root)
+	return vault.Struct(vault.Field{Name: "roots", Value: vault.Vec(roots...)}, vault.Field{Name: "newest", Value: vault.U32(newest)})
+}
+
+// Pending encodes a Pending(id) entry of a deposit made by Shield.
+func Pending(id uint64, depositor string, amount int64, createdAt, delay uint64, flag *uint32, flaggedAt uint64) xdr.ScVal {
+	flagVal := xdr.ScVal{Type: xdr.ScValTypeScvVoid}
+	if flag != nil {
+		flagVal = vault.U32(*flag)
+	}
+	return vault.Struct(
+		vault.Field{Name: "depositor", Value: addr(depositor)},
+		vault.Field{Name: "amount", Value: i128(big.NewInt(amount))},
+		vault.Field{Name: "commitment0", Value: Field(Commitment(2 * id))},
+		vault.Field{Name: "commitment1", Value: Field(Commitment(2*id + 1))},
+		vault.Field{Name: "encrypted_output0", Value: vault.Bytes(make([]byte, vault.CiphertextLen))},
+		vault.Field{Name: "encrypted_output1", Value: vault.Bytes(make([]byte, vault.CiphertextLen))},
+		vault.Field{Name: "created_at", Value: vault.U64(createdAt)},
+		vault.Field{Name: "delay", Value: vault.U64(delay)},
+		vault.Field{Name: "flag", Value: flagVal},
+		vault.Field{Name: "flagged_at", Value: vault.U64(flaggedAt)},
+	)
+}
