@@ -87,8 +87,12 @@ services:
       DATABASE_URL_FILE: /run/secrets/keeper_database_url
       ALERT_WEBHOOKS_FILE: /run/secrets/keeper_alert_webhooks
       KEEPER_KEY_FILE: /run/secrets/keeper_key
+      ARCHIVE_DIR: /var/lib/cyphras/archive
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
+      # The indexer's event archive, read only, lets a rebuild reach ledgers RPC has dropped where
+      # no public ledger archive exists, as on testnet.
+      - ./data/${NETWORK}/${ASSET}/archive:/var/lib/cyphras/archive:ro
     secrets: [keeper_database_url, keeper_alert_webhooks, keeper_key]
     networks: [egress, keeper_db]
     depends_on: [keeper_db]
@@ -106,8 +110,10 @@ services:
       LISTEN_ADDR: 0.0.0.0:8090
       # The internal endpoint is reachable from the relayer only, never through nginx.
       INTERNAL_ADDR: 0.0.0.0:8091
+      ARCHIVE_DIR: /var/lib/cyphras/archive
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
+      - ./data/${NETWORK}/${ASSET}/archive:/var/lib/cyphras/archive:ro
       - ./lists:/etc/cyphras/lists:ro
     secrets: [screening_database_url, screening_alert_webhooks, screening_asp_key]
     ports: ["127.0.0.1:${SCREENING_PORT:?}:8090"]
