@@ -175,6 +175,25 @@ describe("plan fate", () => {
     assert.equal(plan.state, "dead");
   });
 
+  it("declares a plan dead once the tree it holds has a leaf from past its deadline", () => {
+    const { state, plan } = walletWith(40);
+    // The vault holds leaves the wallet does not, and no spend was checked.
+    const view = viewAt(400, 42);
+    state.lastLeafLedger = 320;
+    advancePlans(state, [view]);
+    assert.equal(plan.state, "submitted");
+    state.lastLeafLedger = 321;
+    plan.evidence = [evidence({ outputs: [undefined, 39] })];
+    advancePlans(state, [view]);
+    assert.equal(plan.state, "submitted");
+    // Nor while a provider's view is from before the deadline.
+    plan.evidence = [];
+    advancePlans(state, [view, viewAt(319, 42)]);
+    assert.equal(plan.state, "submitted");
+    advancePlans(state, [view]);
+    assert.equal(plan.state, "dead");
+  });
+
   it("declares a plan dead once its root has left the history of the vault's whole tree", () => {
     const kept = walletWith(40, treeOf(38).root());
     advancePlans(kept.state, [viewAt(250, 40)]);

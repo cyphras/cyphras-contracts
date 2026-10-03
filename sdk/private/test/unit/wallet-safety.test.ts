@@ -1140,6 +1140,29 @@ describe("wallet safety: when a payment is dead", () => {
     assert.equal(balance.locked, 0n);
   });
 
+  it("declares a payment dead once the tree it holds has a leaf from past its deadline, though no spend was checked", async () => {
+    const { world, store } = await funded();
+    const rpc = flakyEvents(world);
+    const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, store);
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    world.advance(121 * 5);
+    // Other users' pairs past the deadline, the newest of which the indexer has not taken in.
+    world.fill(1);
+    world.indexer.leafLimit = world.vault.leaves.length;
+    world.fill(1);
+    rpc.down = true;
+    const summary = await alice.sync();
+    assert.equal(summary.crossChecked, false);
+    assert.equal(summary.rootVerified, true);
+    assert.ok(summary.leafCount < world.vault.leaves.length);
+    assert.equal((await alice.plans())[0]?.state, "dead");
+    assert.equal((await alice.balance()).spendable, 100n * XLM);
+  });
+
   it("confirms a payment marked dead once its own transaction shows it landed", async () => {
     const world = await createWorld();
     const backend = new MemoryStore();

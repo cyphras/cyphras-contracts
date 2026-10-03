@@ -578,12 +578,14 @@ function landingRefuted(state: WalletState, plan: Plan): boolean {
   });
 }
 
-// The checked spends of every ledger from the plan's building to its deadline show none of its
-// notes spent, and none of its commitments is known: a landing would have spent its notes, so it
-// never landed, and now never will.
+// No sign of the plan up to its deadline: none of its commitments is known, and either the tree
+// the vault's root confirmed holds a leaf added after the deadline, and so every leaf added up to
+// it, or the checked spends of every ledger from the plan's building to its deadline show none of
+// its notes spent, as a landing would have. It never landed, and now never will.
 function missedDeadline(state: WalletState, plan: Plan): boolean {
-  if (!checkedBetween(state, plan.builtAt, plan.deadline)) return false;
   if (plan.evidence.some((e) => e.outputs.some((pos) => pos !== undefined))) return false;
+  if (state.lastLeafLedger > plan.deadline) return true;
+  if (!checkedBetween(state, plan.builtAt, plan.deadline)) return false;
   return plan.inputs.every((input) => {
     const spent = state.notes.find((n) => n.pos === input.pos)?.spent;
     return (
@@ -599,9 +601,9 @@ function missedDeadline(state: WalletState, plan: Plan): boolean {
 // is dead once its deadline or its root's place in the vault's history has passed with no sign of
 // it, as every one of `views`, the vault read from each RPC provider, shows: either each holds the
 // tree the wallet holds, without the plan's commitments in it, at or past the plan's deadline or
-// with the plan's root gone from the vault's history; or the checked spends of every ledger up to
-// its deadline show its notes unspent, and each view is past the deadline. From then on the vault
-// refuses its proof. A dead or superseded plan whose commitments turn up is confirmed all the
+// with the plan's root gone from the vault's history; or each view is past the deadline, and the
+// wallet's tree, or the checked spends, cover every ledger up to it with no sign of the plan. From
+// then on the vault refuses its proof. A dead or superseded plan whose commitments turn up is confirmed all the
 // same. A landed plan whose evidence a rescan dropped takes the transaction the rebuilt leaves
 // show, or starts over once the checked spends refute its landing.
 export function advancePlans(state: WalletState, views: readonly ChainView[]): void {
