@@ -333,6 +333,9 @@ export class MockRelayer {
   ready = true;
   // Test hook: relaying is paused, as after transactions that failed on chain.
   paused = false;
+  // Test hook: the seconds per ledger the relayer predicts with, when not the close times RPC
+  // reports.
+  pace: number | undefined;
   // Test hook: a fee address the quote names instead of the one the health reports.
   quoteFeeAddress: string | undefined;
   // Test hooks: errors to answer submissions with, in order.
@@ -488,8 +491,8 @@ export class MockRelayer {
     // A held request must still be valid at the end of the window after not_before, whose ledger
     // the pace of recent ledgers predicts, and 20 ledgers past it.
     if (notBefore !== undefined && notBefore > now) {
-      const end =
-        this.vault.ledger + Math.ceil((notBefore + 600 - now) / this.rpc.secondsPerLedger);
+      const pace = this.pace ?? this.rpc.secondsPerLedger;
+      const end = this.vault.ledger + Math.ceil((notBefore + 600 - now) / pace);
       if (ext.deadline < end + 20) return json(422, { error: "rejected" });
     }
     this.submissions.push({

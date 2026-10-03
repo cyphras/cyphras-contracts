@@ -122,6 +122,7 @@ describe("wallet: deposits", () => {
     await alice.sync();
     const flagged = (await alice.deposits()).find((d) => d.id === second.depositId);
     assert.equal(flagged?.flag?.reason, 1);
+    assert.equal(flagged?.flag?.kind, "refused");
     assert.equal(flagged?.refundableAt, Number(world.vault.timestamp) + 86_400);
     await assert.rejects(
       alice.refundDeposit(second.depositId, stranger),
@@ -138,6 +139,49 @@ describe("wallet: deposits", () => {
       world.vault.transfers.filter((t) => t.from === world.vault.address).map((t) => t.to),
       [depositor.publicKey, depositor.publicKey],
     );
+  });
+});
+
+describe("wallet: screening", () => {
+  it("presents a deposit held for review, which may still be admitted, apart from refusals", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("alice depositor");
+    const held = await alice.shield({ amount: 10n * XLM, signer: depositor });
+    const refused = await alice.shield({ amount: 20n * XLM, signer: depositor });
+    const ordered = await alice.shield({ amount: 30n * XLM, signer: depositor });
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(held.depositId, 6));
+    world.rpc.run("ac".repeat(32), () => world.vault.flag(refused.depositId, 5));
+    world.rpc.run("ad".repeat(32), () => world.vault.flag(ordered.depositId, 100));
+    await alice.sync();
+    const byId = async () => new Map((await alice.deposits()).map((d) => [d.id, d]));
+    let deposits = await byId();
+    assert.equal(deposits.get(held.depositId)?.flag?.kind, "held_for_review");
+    assert.equal(deposits.get(held.depositId)?.flag?.reason, 6);
+    assert.equal(
+      deposits.get(held.depositId)?.refundableAt,
+      Number(world.vault.timestamp) + 86_400,
+    );
+    assert.equal(deposits.get(refused.depositId)?.flag?.kind, "refused_by_reviewer");
+    assert.equal(deposits.get(ordered.depositId)?.flag?.kind, "legal_hold");
+    // The review clears the held deposit, which is then admitted.
+    world.rpc.run("ae".repeat(32), () => world.vault.unflag(held.depositId));
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    deposits = await byId();
+    assert.equal(deposits.get(held.depositId)?.state, "admitted");
+    assert.equal(deposits.get(held.depositId)?.flag, undefined);
+    // A refused deposit goes back with the reason it was refused for.
+    world.advance(86_400);
+    await alice.refundDeposit(refused.depositId, world.signer("anyone"));
+    await alice.cancelDeposit(ordered.depositId, depositor);
+    await alice.sync();
+    deposits = await byId();
+    assert.equal(deposits.get(refused.depositId)?.state, "refunded");
+    assert.equal(deposits.get(refused.depositId)?.refundKind, "refused_by_reviewer");
+    assert.equal(deposits.get(ordered.depositId)?.state, "cancelled");
+    assert.equal(deposits.get(ordered.depositId)?.refundKind, "cancelled");
   });
 });
 
@@ -298,6 +342,24 @@ describe("wallet: spends", () => {
     // an hour and the relayer's 10-minute window in four-second ledgers, and the usual 120
     assert.ok((submission?.ext.deadline as number) >= world.vault.ledger + 1_050 + 120);
     assert.equal((await alice.plans())[0]?.state, "submitted");
+  });
+
+  it("at most doubles a held payment's validity when close times claim faster ledgers", async () => {
+    const world = await createWorld();
+    // RPC's close times claim a ledger a second; the relayer goes by five.
+    world.rpc.secondsPerLedger = 1;
+    world.relayer.pace = 5;
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 3_600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    const deadline = world.relayer.submissions[0]?.ext.deadline as number;
+    // the hold and the relayer's window at five seconds a ledger, twice over, and the usual 120
+    assert.ok(deadline <= world.vault.ledger + 2 * 840 + 120);
   });
 
   it("follows a held payment by its ID, sends it again to a relayer that restarted, and takes its hash", async () => {

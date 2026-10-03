@@ -29,6 +29,7 @@ import { RelayerClient } from "../net/relayer.ts";
 import type { Prover } from "../prover.ts";
 import { type AccountLock, lockName, soleInstance, webLock } from "../lock.ts";
 import { type KeyValueStore, SealedStore } from "../storage.ts";
+import type { ChainView } from "../vault/state.ts";
 import {
   DEFAULT_NETWORK_FEE_CAPS,
   type NetworkFeeCaps,
@@ -77,6 +78,7 @@ import {
   type Operation,
   type OwnedNote,
   type Plan,
+  type RootCheck,
   StateStore,
   type WalletState,
   emptyState,
@@ -90,6 +92,7 @@ import {
   downloadChain,
   eventsUpTo,
   isActive,
+  landingProviders,
   recheck,
   recordEvents,
   resetEvidence,
@@ -154,7 +157,8 @@ export interface SyncSummary {
   readonly newNotes: number;
   readonly source: "indexer" | "rpc";
   readonly rootVerified: boolean;
-  // The indexer's new data matched the vault's RPC events for the same ledgers.
+  // The new data matched the vault's events from every RPC provider other than the one it came
+  // from, for the same ledgers.
   readonly crossChecked: boolean;
   // Ledgers whose spends, and leaves whose contents, came from the indexer alone: later syncs check
   // them against the vault's events while RPC still holds them.
@@ -263,12 +267,14 @@ function randomGap(): number {
 
 // What became of the part an operation awaits. It landed, itself or as a retry by the same notes;
 // it is dead with all its notes free, to go again with them; one of its notes was spent by a
-// landed payment of this wallet that is no part of the operation, so it can never land and never
-// paid; or it did not land and its notes were spent elsewhere, which only the caller can judge.
+// payment of this wallet that is no part of the operation and whose landing each of `providers`
+// RPC providers confirmed, so the part can never land and never paid; or it did not land and its
+// notes were spent elsewhere, which only the caller can judge.
 function partFate(
   state: WalletState,
   parts: readonly Plan[],
   part: Plan,
+  providers: number,
 ): "landed" | "again" | "unpaid" | "blocked" {
   const landed = (p: Plan): boolean => LANDED_STATES.includes(p.state);
   if (
@@ -284,7 +290,7 @@ function partFate(
   const ours = state.plans.some(
     (q) =>
       !parts.includes(q) &&
-      landed(q) &&
+      landingProviders(q) >= providers &&
       q.inputs.some((i) => part.inputs.some((input) => input.nf === i.nf)),
   );
   return ours ? "unpaid" : "blocked";
@@ -639,9 +645,12 @@ export class PrivateWallet {
       indexer === undefined
         ? this.#rpcSource(core)
         : new IndexerSource(indexer, limits.nullifierPages);
+    const second = core.services.second;
+    const vaults =
+      second === undefined ? [core.services.vault] : [core.services.vault, second.vault];
     let download;
     try {
-      download = await downloadChain(core.state, source, core.services.vault, limits.leafPages);
+      download = await downloadChain(core.state, source, vaults, limits.leafPages);
     } catch (err) {
       // An indexer that becomes unreachable is passed over for the vault's RPC events; one that
       // served inconsistent data is a fault the caller must see.
@@ -653,66 +662,63 @@ export class PrivateWallet {
         throw err;
       }
       source = this.#rpcSource(core);
-      download = await downloadChain(core.state, source, core.services.vault, limits.leafPages);
+      download = await downloadChain(core.state, source, vaults, limits.leafPages);
     }
-    const { view, data } = download;
-    // The second provider's view, when one is set; a provider that cannot answer lets no plan die.
-    const second = await core.services.second?.vault.view().catch((err: unknown) => {
-      if (err instanceof CyphrasError) return undefined;
-      throw err;
-    });
-    let crossChecked = false;
-    // The vault's own events, from RPC, for the ledgers of this sync, when RPC held them.
+    const { views, data } = download;
+    const view = views[0] as ChainView;
+    const vault = core.deployment.vault;
+    const rpcs = second === undefined ? [core.services.rpc] : [core.services.rpc, second.rpc];
+    // The new data matched the vault's events from every RPC provider other than its source.
+    let crossChecked: boolean;
+    // The new data counts as the vault's own: cross-checked, or from the only RPC provider.
+    let checked: boolean;
+    // The vault's own events, from the first RPC provider, for the ledgers of this sync, when it
+    // held them.
     let events: VaultEvents | undefined;
     if (source.kind === "indexer") {
-      const check = await crossCheck(
-        core.services.rpc,
-        core.deployment.vault,
-        data,
-        limits.eventPages,
-      );
-      crossChecked = check.verified;
-      events = check.events;
+      const matches = [];
+      for (const rpc of rpcs) matches.push(await crossCheck(rpc, vault, data, limits.eventPages));
+      const heads = matches.flatMap((m) => (m.events === undefined ? [] : [m.events.head]));
+      if (heads.length > 0 && data.completeTo > Math.max(data.horizon, ...heads)) {
+        fail("indexer_fault", "the indexer claims to be complete past the chain's latest ledger");
+      }
+      crossChecked = matches.every((m) => m.verified);
+      checked = crossChecked;
+      events = matches[0]?.events;
     } else {
       events = await source.events();
+      crossChecked =
+        second !== undefined &&
+        (await crossCheck(second.rpc, vault, data, limits.eventPages)).verified;
+      checked = second === undefined || crossChecked;
     }
-    const check = checkRoot(data.tree, view.roots);
-    if (
-      check.state === "mismatch" ||
-      (second !== undefined && checkRoot(data.tree, second.roots).state === "mismatch")
-    ) {
+    const checks = views.map((v) => (v === undefined ? undefined : checkRoot(data.tree, v.roots)));
+    if (checks.some((c) => c?.state === "mismatch")) {
       fail(
         "tree_unverified",
         "the synced tree contradicts the vault; nothing of this sync was kept",
       );
     }
+    const check = checks[0] as RootCheck;
+    // Only leaves under a root every RPC provider confirms count: notes at them, spends of notes and
+    // where payments landed. While a provider is behind or cannot answer, they wait in staging, and
+    // no payment's fate moves.
+    const verified = checks.every((c) => c?.state === "verified");
     let newNotes = 0;
-    if (check.state === "verified") {
-      // Only leaves under a root the vault confirms count: notes at them, and spends of notes.
-      const checked = source.kind === "rpc" || crossChecked;
-      newNotes = applyDownload(core.state, core.scan, data, checked);
+    if (verified) {
+      newNotes = applyDownload(core.state, core.scan, data, checked, views.length);
       core.state.rootCheck = check;
-      // RPC's events count towards a plan's fate only where they matched the indexer's data.
+      // RPC's events count towards a plan's fate only where every provider's matched the data.
       if (crossChecked && events !== undefined) {
         recordEvents(core.state.plans, eventsUpTo(events, data.horizon));
       }
     } else {
-      stageDownload(core.state, core.scan, data, source.kind === "rpc" || crossChecked);
+      stageDownload(core.state, core.scan, data, checked);
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
-    const rechecked = await recheck(
-      core.state,
-      core.scan,
-      core.services.rpc,
-      core.deployment.vault,
-      limits.eventPages,
-    );
+    const rechecked = await recheck(core.state, rpcs, vault, limits.eventPages);
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
-    if (check.state === "verified") {
-      const views =
-        core.services.second === undefined ? [view] : second === undefined ? [] : [view, second];
-      advancePlans(core.state, views);
-    }
+    if (verified) advancePlans(core.state, views as [ChainView, ...ChainView[]]);
     const live = source.kind === "indexer" ? indexer : undefined;
     const pace = updatePace(core.state, events?.times ?? []);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
@@ -1021,7 +1027,8 @@ export class PrivateWallet {
     const relay = op.route.kind === "self" ? signer : undefined;
     const awaiting = parts.find((p) => p.id === op.awaiting);
     if (awaiting !== undefined) {
-      const fate = partFate(state, parts, awaiting);
+      const providers = this.#core.services.second === undefined ? 1 : 2;
+      const fate = partFate(state, parts, awaiting, providers);
       if (fate === "blocked" && !resume) {
         op.state = "blocked";
         op.blockedBy = awaiting.id;

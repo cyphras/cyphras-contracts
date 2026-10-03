@@ -11,12 +11,14 @@ export interface SpentBy {
 
 // What one transaction showed of a plan: the leaf positions at which it added the plan's two output
 // commitments, which of the plan's two nullifiers it spent, and whether it added a leaf that is not
-// the plan's. Positions come only from leaves the vault's root confirmed; the spends of the plan's
-// notes and the other leaves only from the vault's events the wallet checked, when `checked`.
+// the plan's. Positions come only from leaves the vault's root confirmed, as read from `providers`
+// RPC providers; the spends of the plan's notes and the other leaves only from the vault's events
+// the wallet checked, when `checked`.
 export interface Evidence {
   readonly txHash: string;
   readonly ledger: number;
   outputs: [number | undefined, number | undefined];
+  providers: number;
   nullifiers: [boolean, boolean];
   foreign: boolean;
   checked: boolean;
@@ -195,8 +197,18 @@ export interface Staging {
   readonly paths: { readonly pos: number; readonly pagePath: bigint[] }[];
   // The staged leaves that hold a plan's output commitment.
   readonly found: readonly FoundLeaf[];
-  // The first staged leaf a sync took while RPC could not confirm it, and the ledger it was added at.
-  readonly unchecked: { readonly first: number; readonly ledger: number } | undefined;
+  // The first staged leaf a sync took while RPC could not confirm it, the ledger it was added at,
+  // and the digests of the staged leaves from it on.
+  readonly unchecked:
+    | { readonly first: number; readonly ledger: number; readonly chunks: readonly LeafChunk[] }
+    | undefined;
+}
+
+// A digest of the leaves from the previous chunk's end, or the range's first leaf, up to `end`:
+// their positions, commitments, ciphertexts, ledgers and transactions, as a sync took them.
+export interface LeafChunk {
+  readonly end: number;
+  readonly digest: string;
 }
 
 export interface FoundLeaf {
@@ -208,13 +220,18 @@ export interface FoundLeaf {
 
 // What syncs took from the indexer while RPC could not confirm it: the spends of the ledgers from
 // `from` to `to`, none when `from` is past `to`, and the leaves at positions from `first` up to
-// `end`, the first of them added at `ledger`. `lost` once RPC no longer holds them, so that nothing
-// can check them any more.
+// `end`, the first of them added at `ledger`, kept as digests of runs of them. `lost` once RPC no
+// longer holds them, so that nothing can check them any more.
 export interface UncheckedRange {
   readonly from: number;
   readonly to: number;
   readonly leaves:
-    | { readonly first: number; readonly end: number; readonly ledger: number }
+    | {
+        readonly first: number;
+        readonly end: number;
+        readonly ledger: number;
+        readonly chunks: readonly LeafChunk[];
+      }
     | undefined;
   readonly lost: boolean;
 }
@@ -238,6 +255,8 @@ export interface WalletState {
   revision: number;
   tree: TreeSnapshot;
   lastLeafLedger: number;
+  // The ledger at which the newest leaf whose ledger a cross-check or a recheck confirmed was added.
+  checkedLeafLedger: number;
   staging: Staging | undefined;
   nullifierSince: number;
   // Every other ledger before nullifierSince, since the wallet started, was cross-checked, and so
@@ -260,6 +279,7 @@ export function emptyState(deployLedger: number): WalletState {
     revision: 0,
     tree: { leafCount: 0, upper: [], partial: [] },
     lastLeafLedger: 0,
+    checkedLeafLedger: 0,
     staging: undefined,
     nullifierSince: deployLedger,
     unchecked: [],
@@ -312,8 +332,22 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   if (bytes === undefined) return undefined;
   const state = JSON.parse(new TextDecoder().decode(bytes), reviver) as WalletState;
   if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
-  // A state need not hold close times yet; its next sync records them.
+  // A state need not hold close times yet, nor a checked leaf's ledger; its next syncs record them.
+  // Leaves it took unchecked without the digests a recheck compares can no longer be checked, and
+  // leaves it staged without them the next sync takes again.
   state.ledgerTimes ??= [];
+  state.checkedLeafLedger ??= 0;
+  state.unchecked = state.unchecked.map((r) =>
+    r.leaves !== undefined && r.leaves.chunks === undefined ? { ...r, lost: true } : r,
+  );
+  if (state.staging?.unchecked !== undefined && state.staging.unchecked.chunks === undefined) {
+    state.staging = undefined;
+  }
+  // A landing kept without the count of RPC providers that confirmed it rests on the first one's
+  // root alone.
+  for (const e of state.plans.flatMap((p) => p.evidence)) {
+    e.providers ??= e.outputs.some((pos) => pos !== undefined) ? 1 : 0;
+  }
   return state;
 }
 

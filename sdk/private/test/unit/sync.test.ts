@@ -1,29 +1,30 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { mnemonicToSeedSync } from "@scure/bip39";
+import { sha256 } from "@noble/hashes/sha2";
 import { StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
+import { bytesToHex, utf8 } from "../../src/bytes.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import { P } from "../../src/field.ts";
-import { deriveSpendingKeys } from "../../src/keys.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
+import type { Leaf } from "../../src/net/indexer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
 import type { ChainView, RootHistory } from "../../src/vault/state.ts";
 import {
   type Evidence,
+  type LeafChunk,
   type OwnedNote,
   type Plan,
   type WalletState,
   emptyState,
 } from "../../src/wallet/state.ts";
 import {
-  type ScanKeys,
   advancePlans,
   checkRoot,
   checkedBetween,
   recheck,
   recordEvents,
 } from "../../src/wallet/sync.ts";
-import { MNEMONIC, testScalar } from "../helpers.ts";
+import { testScalar } from "../helpers.ts";
 import { map } from "../support/vault.ts";
 
 const leaf = (i: number): bigint => testScalar("sync/leaf", i, P);
@@ -136,6 +137,7 @@ describe("plan fate", () => {
     txHash: "ab".repeat(32),
     ledger: 210,
     outputs: [undefined, undefined],
+    providers: 1,
     nullifiers: [false, false],
     foreign: false,
     checked: false,
@@ -192,10 +194,10 @@ describe("plan fate", () => {
     const { state, plan } = walletWith(40);
     // The vault holds leaves the wallet does not, and no spend was checked.
     const view = viewAt(400, 42);
-    state.lastLeafLedger = 320;
+    state.checkedLeafLedger = 320;
     advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
-    state.lastLeafLedger = 321;
+    state.checkedLeafLedger = 321;
     plan.evidence = [evidence({ outputs: [undefined, 39] })];
     advancePlans(state, [view]);
     assert.equal(plan.state, "submitted");
@@ -333,65 +335,136 @@ describe("plan fate", () => {
 
 describe("unchecked ranges", () => {
   const VAULT = StrKey.encodeContract(Buffer.alloc(32, 9));
-  const spending = deriveSpendingKeys(mnemonicToSeedSync(MNEMONIC), "testnet", 0);
-  const keys: ScanKeys = {
-    network: "testnet",
-    incoming: spending,
-    ovk: spending.ovk,
-    nkFold: spending.nkFold,
-  };
+  const TX = "ab".repeat(32);
 
-  // An RPC whose getEvents shows the vault adding leaves at these positions, all in ledger 60.
-  function showing(indices: readonly number[]): SorobanRpc {
-    const events = indices.map((index, i) => ({
+  // The leaf at a position as the vault added it, in ledger 60, or as a sync took it.
+  const leafAt = (index: number, ledger = 60): Leaf => ({
+    index,
+    commitment: leaf(index),
+    ciphertext: new Uint8Array(181).fill(index),
+    ledger,
+    txHash: TX,
+  });
+
+  // A run of leaves as an unchecked sync keeps it: a digest of what it took of each.
+  const chunk = (leaves: readonly Leaf[]): LeafChunk => ({
+    end: (leaves[leaves.length - 1] as Leaf).index + 1,
+    digest: bytesToHex(
+      sha256(
+        utf8(
+          leaves
+            .map(
+              (l) =>
+                `${l.index}/${l.commitment}/${bytesToHex(l.ciphertext)}/${l.ledger}/${l.txHash}`,
+            )
+            .join("\n"),
+        ),
+      ),
+    ),
+  });
+
+  // An RPC whose getEvents shows the vault adding these leaves, up to the ledger `latest`.
+  function showing(leaves: readonly Leaf[], latest = 70): SorobanRpc {
+    const events = leaves.map((l, i) => ({
       type: "contract",
-      ledger: 60,
+      ledger: l.ledger,
       ledgerClosedAt: "2026-10-04T00:00:00Z",
       contractId: VAULT,
-      id: `${String(60).padStart(12, "0")}-${String(i).padStart(8, "0")}`,
-      txHash: "ab".repeat(32),
+      id: `${String(l.ledger).padStart(12, "0")}-${String(i).padStart(8, "0")}`,
+      txHash: l.txHash,
       inSuccessfulContractCall: true,
       topic: [xdr.ScVal.scvSymbol("new_commitment").toXDR("base64")],
       value: map([
-        ["index", xdr.ScVal.scvU64(new xdr.Uint64(BigInt(index)))],
-        ["commitment", nativeToScVal(leaf(index), { type: "u256" })],
-        ["encrypted_output", xdr.ScVal.scvBytes(Buffer.alloc(181, index))],
+        ["index", xdr.ScVal.scvU64(new xdr.Uint64(BigInt(l.index)))],
+        ["commitment", nativeToScVal(l.commitment, { type: "u256" })],
+        ["encrypted_output", xdr.ScVal.scvBytes(Buffer.from(l.ciphertext))],
       ]).toXDR("base64"),
     }));
     return new SorobanRpc("http://rpc", async (_input, init) => {
       const { id } = JSON.parse(String(init?.body));
-      const result = { events, latestLedger: 70, oldestLedger: 1 };
+      const result = { events, latestLedger: latest, oldestLedger: 1 };
       return new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
     });
   }
 
-  // A wallet that took the leaves at positions 4 to 7 unchecked, the first of them added at
-  // ledger 50, in a sync whose spends, from ledger 100 on, were checked.
-  function walletAfterUncheckedLeaves(): WalletState {
+  // A wallet that took the leaves at positions 4 to 7 unchecked, in two runs, the first of them
+  // added at ledger 60, in a sync whose spends, from ledger 100 on, were checked.
+  function walletAfter(taken: readonly Leaf[]): WalletState {
     const state = emptyState(1);
     state.nullifierSince = 120;
+    const chunks = [chunk(taken.slice(0, 2)), chunk(taken.slice(2))];
     state.unchecked = [
-      { from: 100, to: 99, leaves: { first: 4, end: 8, ledger: 50 }, lost: false },
+      { from: 100, to: 99, leaves: { first: 4, end: 8, ledger: 60, chunks }, lost: false },
     ];
     return state;
   }
+  const four = [4, 5, 6, 7].map((i) => leafAt(i));
 
   it("counts a range of leaves alone as no unchecked ledger", () => {
-    const state = walletAfterUncheckedLeaves();
+    const state = walletAfter(four);
     assert.equal(checkedBetween(state, 50, 110), true);
   });
 
-  it("checks the leaves of a range by position and clears it", async () => {
-    const state = walletAfterUncheckedLeaves();
-    await recheck(state, keys, showing([4, 5, 6, 7]), VAULT, 1);
+  it("checks every leaf of a range by its runs, clears it and takes the ledgers as checked", async () => {
+    const state = walletAfter(four);
+    await recheck(state, [showing(four)], VAULT, 1);
     assert.deepEqual(state.unchecked, []);
+    assert.equal(state.checkedLeafLedger, 60);
   });
 
-  it("refuses leaves RPC shows with a gap after the range's first", async () => {
-    const state = walletAfterUncheckedLeaves();
+  it("checks the runs RPC shows in full and keeps the rest of the range", async () => {
+    const state = walletAfter(four);
+    await recheck(state, [showing(four.slice(0, 3))], VAULT, 1);
+    const [rest] = state.unchecked;
+    assert.equal(rest?.leaves?.first, 6);
+    assert.equal(rest?.leaves?.ledger, 60);
+    assert.equal(rest?.leaves?.chunks.length, 1);
+  });
+
+  it("refuses a leaf whose ledger or transaction the sync took otherwise", async () => {
+    const forged = [...four.slice(0, 3), { ...leafAt(7), ledger: 400 }];
     await assert.rejects(
-      recheck(state, keys, showing([6, 7]), VAULT, 1),
+      recheck(walletAfter(forged), [showing(four)], VAULT, 1),
       (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
     );
+    const renamed = [...four.slice(0, 3), { ...leafAt(7), txHash: "cd".repeat(32) }];
+    await assert.rejects(
+      recheck(walletAfter(renamed), [showing(four)], VAULT, 1),
+      (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
+    );
+  });
+
+  it("takes a range's spends as checked only up to the ledger every RPC provider reaches", async () => {
+    const state = emptyState(1);
+    state.nullifierSince = 120;
+    state.unchecked = [{ from: 60, to: 100, leaves: undefined, lost: false }];
+    await recheck(state, [showing([], 90), showing([], 80)], VAULT, 1);
+    assert.deepEqual(
+      state.unchecked.map((r) => [r.from, r.to]),
+      [[81, 100]],
+    );
+  });
+
+  it("checks a range against every RPC provider, as far as the one that reaches least", async () => {
+    const state = walletAfter(four);
+    await recheck(state, [showing(four), showing(four.slice(0, 3))], VAULT, 1);
+    assert.equal(state.unchecked[0]?.leaves?.first, 6);
+    await recheck(state, [showing(four), showing(four)], VAULT, 1);
+    assert.deepEqual(state.unchecked, []);
+    // A provider whose events differ from what the sync took is as much a fault as the first.
+    const forged = [...four.slice(0, 3), { ...leafAt(7), ledger: 400 }];
+    await assert.rejects(
+      recheck(walletAfter(forged), [showing(forged), showing(four)], VAULT, 1),
+      (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
+    );
+  });
+
+  it("refuses leaves RPC shows with a gap after the range's first, in full runs or not", async () => {
+    for (const shown of [four.slice(2), four.slice(1, 2)]) {
+      await assert.rejects(
+        recheck(walletAfter(four), [showing(shown)], VAULT, 1),
+        (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
+      );
+    }
   });
 });

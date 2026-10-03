@@ -3,7 +3,9 @@ import type { LedgerTime, WalletState } from "./state.ts";
 // The pace the network aims at, taken when no close times give one, and the most a wallet takes:
 // a slower pace would shorten held deadlines that a relayer's own estimate may not allow.
 const FALLBACK_SECONDS = 5;
-const MIN_SECONDS = 1;
+// The least a wallet takes: close times that lie can at most double the ledgers a held proof stays
+// valid for, beyond what the fallback gives.
+const MIN_SECONDS = FALLBACK_SECONDS / 2;
 // A pace is taken only over a span of at least this many ledgers, as the relayers take theirs.
 const MIN_SPAN = 60;
 // How far back the close times kept between syncs reach.
