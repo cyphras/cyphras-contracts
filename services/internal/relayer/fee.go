@@ -53,11 +53,17 @@ func ceilDiv(a, b *big.Int) *big.Int {
 
 // Quote is roundUp(toAsset(cost) * (10000 + margin) / 10000, tier).
 func (p Pricing) Quote(costStroops int64) *big.Int {
+	return p.QuoteAt(costStroops, p.MarginBps)
+}
+
+// QuoteAt is Quote with another margin, capped at MaxMarginBps.
+func (p Pricing) QuoteAt(costStroops, marginBps int64) *big.Int {
 	cost := big.NewInt(costStroops)
 	if !p.Native {
 		cost = ceilDiv(new(big.Int).Mul(cost, p.PerStroopNum), p.PerStroopDen)
 	}
-	withMargin := ceilDiv(new(big.Int).Mul(cost, big.NewInt(10_000+p.MarginBps)), big.NewInt(10_000))
+	margin := min(marginBps, MaxMarginBps)
+	withMargin := ceilDiv(new(big.Int).Mul(cost, big.NewInt(10_000+margin)), big.NewInt(10_000))
 	return new(big.Int).Mul(ceilDiv(withMargin, p.Tier), p.Tier)
 }
 
@@ -125,7 +131,6 @@ func (q *quotes) publish(now time.Time, fee *big.Int) {
 	q.history = q.history[i:]
 }
 
-// lowest returns the lowest fee quoted within the lifetime, or nil.
 // newest returns the latest quote published since a time.
 func (q *quotes) newest(since time.Time) *big.Int {
 	q.mu.Lock()
@@ -136,6 +141,7 @@ func (q *quotes) newest(since time.Time) *big.Int {
 	return nil
 }
 
+// lowest returns the lowest fee quoted within the lifetime, or nil.
 func (q *quotes) lowest(now time.Time) *big.Int {
 	q.mu.Lock()
 	defer q.mu.Unlock()

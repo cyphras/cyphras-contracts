@@ -316,6 +316,7 @@ func (h *harness) waitIdle() {
 			idle := len(h.r.inflight) == 0
 			h.r.mu.Unlock()
 			if idle {
+				h.r.Wait()
 				return
 			}
 		}
@@ -432,6 +433,7 @@ func TestTheSameNotesCannotBeInFlightTwice(t *testing.T) {
 
 func TestSubmissionsAreCheckedBeforeAnySimulation(t *testing.T) {
 	h := newHarness(t, vault.Status{})
+	reads := h.fake.CallCount("getLedgerEntries")
 	cases := map[string]func(map[string]any){
 		CodeWrongVault: func(b map[string]any) { b["ext"].(map[string]any)["vault"] = vaulttest.Token },
 		CodeFeeTooLow:  func(b map[string]any) { b["ext"].(map[string]any)["fee"] = "1" },
@@ -458,6 +460,13 @@ func TestSubmissionsAreCheckedBeforeAnySimulation(t *testing.T) {
 		}
 		if out["error"] != expected {
 			t.Fatalf("%s: answered %v", name, out)
+		}
+		// Refused means untouched: nothing claimed, screened, simulated, sent or recorded, and no
+		// part of the costly budget spent.
+		var records int
+		_ = h.r.db.pool.QueryRow(context.Background(), `SELECT count(*) FROM relays`).Scan(&records)
+		if len(h.r.inflight) != 0 || len(h.screen.asked) != 0 || h.sent != 0 || records != 0 || h.fake.CallCount("getLedgerEntries") != reads {
+			t.Fatalf("%s: a refused request left a trace", name)
 		}
 	}
 	if h.fake.CallCount("simulateTransaction") != 0 {
@@ -668,11 +677,11 @@ func TestForgedOrSpentProofsAreRefusedBeforeAnything(t *testing.T) {
 		for _, nf := range req.Proof.Nullifiers {
 			h.fake.DeleteEntry(mustKey(vault.NullifierKey(vaulttest.Vault, nf.Bytes())))
 		}
-		if f := h.r.verified(context.Background(), req); f != nil {
+		if f := h.r.fresh(context.Background(), req); f != nil {
 			t.Fatalf("%s refused while unspent: %s", name, f.code)
 		}
 		h.fake.SetContractData(mustKey(vault.NullifierKey(vaulttest.Vault, req.Proof.Nullifiers[slot].Bytes())), xdr.ScVal{Type: xdr.ScValTypeScvVoid}, 10, nil)
-		if f := h.r.verified(context.Background(), req); f == nil || f.code != CodeRejected {
+		if f := h.r.fresh(context.Background(), req); f == nil || f.code != CodeRejected {
 			t.Fatalf("%s accepted with a spent nullifier", name)
 		}
 	}

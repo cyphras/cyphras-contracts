@@ -9,15 +9,17 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 )
 
-// Handler serves the relayer API. Nothing about a request is logged.
+// Handler serves the relayer API. Nothing about a request is logged. Per-client limits live in
+// nginx; the budgets here guard only what costs the network or the database, after the checks
+// that cost nothing.
 func (r *Relayer) Handler() http.Handler {
-	quoteLimit, statusLimit := httpapi.NewLimiter(600, 60), httpapi.NewLimiter(600, 60)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, req *http.Request) {
 		inst, _, _ := r.view()
+		paused := r.brk.open(r.now())
 		body := map[string]any{
-			"ready": inst != nil && r.channels.ready() > 0, "vault": r.cfg.Vault, "network_id": hex.EncodeToString(r.cfg.NetworkID[:]),
-			"fee_address": r.cfg.FeeAddress, "ready_channels": r.channels.ready(), "channels": r.channels.total,
+			"ready": inst != nil && r.channels.ready() > 0 && !paused, "vault": r.cfg.Vault, "network_id": hex.EncodeToString(r.cfg.NetworkID[:]),
+			"fee_address": r.cfg.FeeAddress, "ready_channels": r.channels.ready(), "channels": r.channels.total, "paused": paused,
 		}
 		status := http.StatusOK
 		if inst == nil {
@@ -27,32 +29,27 @@ func (r *Relayer) Handler() http.Handler {
 			// The largest exit, payout and fee together, the vault accepts; larger ones are split.
 			body["max_daily_outflow"] = inst.Limits.MaxDailyOutflow.String()
 		}
-		if r.channels.ready() == 0 {
+		if r.channels.ready() == 0 || paused {
 			status = http.StatusServiceUnavailable
 		}
 		httpapi.JSON(w, status, body)
 	})
 	mux.HandleFunc("GET /v1/quote", func(w http.ResponseWriter, req *http.Request) {
-		if !quoteLimit.Allow() {
-			httpapi.Fail(w, http.StatusTooManyRequests, CodeRateLimited)
-			return
-		}
 		fee, err := r.CurrentQuote(req.Context())
 		if err != nil {
 			httpapi.Fail(w, http.StatusServiceUnavailable, CodeUnavailable)
 			return
 		}
 		httpapi.JSON(w, http.StatusOK, map[string]any{
-			"fee": fee.String(), "asset": r.cfg.Asset, "tier": r.cfg.Pricing.Tier.String(), "margin_bps": r.cfg.Pricing.MarginBps,
+			"fee": fee.String(), "asset": r.cfg.Asset, "tier": r.cfg.Pricing.Tier.String(), "margin_bps": r.Margin(),
 			"valid_until": r.now().Add(QuoteLifetime).Unix(), "fee_address": r.cfg.FeeAddress, "vault": r.cfg.Vault,
 			"network_id": hex.EncodeToString(r.cfg.NetworkID[:]),
 		})
 	})
 	mux.HandleFunc("POST /v1/submit", func(w http.ResponseWriter, req *http.Request) {
-		if !r.submitLimit.Allow() {
-			httpapi.Fail(w, http.StatusTooManyRequests, CodeRateLimited)
-			return
-		}
+		// Sending can wait for a channel and for the network to take the transaction, longer than
+		// the server's write timeout allows any other answer.
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(sendWait + 30*time.Second))
 		var body SubmitBody
 		if err := httpapi.ReadJSON(w, req, 16<<10, &body); err != nil {
 			httpapi.Fail(w, http.StatusBadRequest, CodeBadRequest)
@@ -75,10 +72,6 @@ func (r *Relayer) Handler() http.Handler {
 		httpapi.JSON(w, http.StatusAccepted, accepted)
 	})
 	mux.HandleFunc("GET /v1/tx/{hash}", func(w http.ResponseWriter, req *http.Request) {
-		if !statusLimit.Allow() {
-			httpapi.Fail(w, http.StatusTooManyRequests, CodeRateLimited)
-			return
-		}
 		hash := req.PathValue("hash")
 		if _, err := lowerHex(hash, 32); err != nil {
 			httpapi.Fail(w, http.StatusBadRequest, CodeBadRequest)
@@ -91,11 +84,19 @@ func (r *Relayer) Handler() http.Handler {
 		}
 		httpapi.JSON(w, http.StatusOK, s)
 	})
-	mux.HandleFunc("GET /v1/held/{id}", func(w http.ResponseWriter, req *http.Request) {
-		if !statusLimit.Allow() {
-			httpapi.Fail(w, http.StatusTooManyRequests, CodeRateLimited)
+	mux.HandleFunc("DELETE /v1/held/{id}", func(w http.ResponseWriter, req *http.Request) {
+		id := req.PathValue("id")
+		if _, err := lowerHex(id, 16); err != nil {
+			httpapi.Fail(w, http.StatusBadRequest, CodeBadRequest)
 			return
 		}
+		if !r.CancelHeld(id) {
+			httpapi.Fail(w, http.StatusNotFound, "not_found")
+			return
+		}
+		httpapi.JSON(w, http.StatusOK, map[string]any{"status": "cancelled"})
+	})
+	mux.HandleFunc("GET /v1/held/{id}", func(w http.ResponseWriter, req *http.Request) {
 		id := req.PathValue("id")
 		if _, err := lowerHex(id, 16); err != nil {
 			httpapi.Fail(w, http.StatusBadRequest, CodeBadRequest)

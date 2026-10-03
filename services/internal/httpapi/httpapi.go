@@ -32,7 +32,7 @@ func Public(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("Access-Control-Allow-Origin", "*")
-		h.Set("Access-Control-Allow-Methods", "GET, POST")
+		h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
 		h.Set("Access-Control-Allow-Headers", "Content-Type")
 		h.Set("Access-Control-Max-Age", "600")
 		h.Set("X-Content-Type-Options", "nosniff")

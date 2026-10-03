@@ -47,6 +47,7 @@ func main() {
 	if err := httpapi.Serve(ctx, addr, r.Handler()); err != nil && ctx.Err() == nil {
 		service.Fatal(log, "serve", err)
 	}
+	r.Wait()
 }
 
 func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
