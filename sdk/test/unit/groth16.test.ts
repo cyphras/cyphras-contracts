@@ -9,7 +9,7 @@ import { CyphrasError } from "../../src/errors.ts";
 import { type TxProofJson, fromHostProof, txProofFromJson } from "../../src/extdata.ts";
 import { P } from "../../src/field.ts";
 import { parseVerifyingKey, verifyGroth16 } from "../../src/groth16.ts";
-import { SDK_ROOT, fixture } from "../helpers.ts";
+import { SDK_ROOT, fixture, wireProof } from "../helpers.ts";
 
 const VK_FILE = join(SDK_ROOT, "test", "fixtures", "testnet-forgeable-vk.json");
 const VK_BYTES = readFileSync(VK_FILE);
@@ -47,14 +47,14 @@ describe("Groth16 verification", () => {
 
   for (const step of STEPS) {
     it(`verifies the vault fixture proof of ${step.name}`, () => {
-      const proof = fromHostProof(txProofFromJson(step.proof as TxProofJson).proof);
+      const proof = fromHostProof(txProofFromJson(wireProof(step.proof as TxProofJson)).proof);
       assert.equal(verifyGroth16(vk, proof, inputs(step)), true);
     });
   }
 
   it("refuses a changed input, a swapped proof element and bad input ranges", () => {
     const step = STEPS[0] as Step;
-    const proof = fromHostProof(txProofFromJson(step.proof as TxProofJson).proof);
+    const proof = fromHostProof(txProofFromJson(wireProof(step.proof as TxProofJson)).proof);
     const good = inputs(step);
     good.forEach((_, i) => {
       const changed = [...good];

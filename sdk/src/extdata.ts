@@ -1,6 +1,6 @@
 import { keccak_256 } from "@noble/hashes/sha3";
 import { Address, StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
-import { bigIntToBytesBE, bytesToBigIntBE, bytesToHex, hexToBytes, toHex32 } from "./bytes.ts";
+import { bigIntToBytesBE, bytesToBigIntBE, bytesToHex, hexToBytes } from "./bytes.ts";
 import { CIPHERTEXT_LENGTH } from "./encryption.ts";
 import { fail } from "./errors.ts";
 import { P, isCanonical, mod } from "./field.ts";
@@ -176,8 +176,8 @@ export function txProofToScVal(p: TxProof): xdr.ScVal {
   ]);
 }
 
-// The JSON forms the relayer's /v1/submit takes: field elements as 0x-prefixed 32-byte hex, bytes
-// as unprefixed hex and amounts as decimal strings, as in the vault's proof fixtures.
+// The JSON forms the relayer's /v1/submit takes: binary values as lowercase hex of exact length,
+// field elements as 32-byte big-endian hex, amounts as decimal strings.
 export interface ExtDataJson {
   vault: string;
   network_id: string;
@@ -232,26 +232,29 @@ export function extDataFromJson(json: ExtDataJson): ExtData {
   return ext;
 }
 
+const fieldHex = (x: bigint): string => bytesToHex(be32(x));
+const hexField = (hex: string): bigint => bytesToBigIntBE(hexToBytes(hex));
+
 export function txProofToJson(p: TxProof): TxProofJson {
   return {
     a: bytesToHex(p.proof.a),
     b: bytesToHex(p.proof.b),
     c: bytesToHex(p.proof.c),
-    root: toHex32(p.root),
-    public_amount: toHex32(p.publicAmount),
-    ext_data_hash: toHex32(p.extDataHash),
-    input_nullifiers: [toHex32(p.inputNullifiers[0]), toHex32(p.inputNullifiers[1])],
-    output_commitments: [toHex32(p.outputCommitments[0]), toHex32(p.outputCommitments[1])],
+    root: fieldHex(p.root),
+    public_amount: fieldHex(p.publicAmount),
+    ext_data_hash: fieldHex(p.extDataHash),
+    input_nullifiers: [fieldHex(p.inputNullifiers[0]), fieldHex(p.inputNullifiers[1])],
+    output_commitments: [fieldHex(p.outputCommitments[0]), fieldHex(p.outputCommitments[1])],
   };
 }
 
 export function txProofFromJson(json: TxProofJson): TxProof {
   return {
     proof: { a: hexToBytes(json.a), b: hexToBytes(json.b), c: hexToBytes(json.c) },
-    root: BigInt(json.root),
-    publicAmount: BigInt(json.public_amount),
-    extDataHash: BigInt(json.ext_data_hash),
-    inputNullifiers: [BigInt(json.input_nullifiers[0]), BigInt(json.input_nullifiers[1])],
-    outputCommitments: [BigInt(json.output_commitments[0]), BigInt(json.output_commitments[1])],
+    root: hexField(json.root),
+    publicAmount: hexField(json.public_amount),
+    extDataHash: hexField(json.ext_data_hash),
+    inputNullifiers: [hexField(json.input_nullifiers[0]), hexField(json.input_nullifiers[1])],
+    outputCommitments: [hexField(json.output_commitments[0]), hexField(json.output_commitments[1])],
   };
 }

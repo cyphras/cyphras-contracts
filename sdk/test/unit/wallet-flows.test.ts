@@ -257,6 +257,17 @@ describe("wallet: spends", () => {
     assert.equal(submission?.notBefore, notBefore);
     // an hour of five-second ledgers, the relayer's 10-minute jitter and the usual 120 ledgers
     assert.ok((submission?.ext.deadline as number) >= world.vault.ledger + 720 + 120);
+    // The relayer builds the transaction only when it sends it, so there is no hash yet; the
+    // chain shows the payment once it lands.
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "submitted");
+    assert.equal(plan?.txHash, undefined);
+    world.advance(3_700);
+    world.relayer.releaseHeld();
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    assert.match(plan?.txHash ?? "", /^[0-9a-f]{64}$/);
     await assert.rejects(
       alice.send({
         to: bob.generateAddress(),

@@ -37,8 +37,10 @@ const RELAYER_ERRORS = [
 
 export type RelayerError = (typeof RELAYER_ERRORS)[number] | "unknown";
 
+// A request held until not_before has no hash yet: the relayer builds the transaction only when it
+// sends it.
 export type SubmitResult =
-  | { readonly accepted: true; readonly hash: string }
+  | { readonly accepted: true; readonly hash: string | undefined }
   | { readonly accepted: false; readonly error: RelayerError; readonly reason: number | undefined };
 
 export type RelayedStatus = "pending" | "success" | "failed" | "unknown";
@@ -102,7 +104,11 @@ export class RelayerClient {
     });
     if (reply.status === 202 || reply.status === 200) {
       const f = Fields.of(reply.body, "service_rejected", "relayer submission");
-      return { accepted: true, hash: f.hash("hash") };
+      if (f.has("hash")) return { accepted: true, hash: f.hash("hash") };
+      if (notBefore === undefined || !f.has("held") || !f.boolean("held")) {
+        f.fault("an accepted submission has no hash");
+      }
+      return { accepted: true, hash: undefined };
     }
     const f = Fields.of(reply.body ?? {}, "service_rejected", "relayer error");
     const code = f.has("error") ? f.string("error") : "";

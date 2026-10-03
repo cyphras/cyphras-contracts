@@ -43,6 +43,69 @@ export const DEFAULT_LIMITS: Limits = {
 const json = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
+const PROOF_KEYS = [
+  "a",
+  "b",
+  "c",
+  "root",
+  "public_amount",
+  "ext_data_hash",
+  "input_nullifiers",
+  "output_commitments",
+];
+const EXT_KEYS = [
+  "vault",
+  "network_id",
+  "deadline",
+  "ext_amount",
+  "fee",
+  "recipient",
+  "relayer",
+  "encrypted_output0",
+  "encrypted_output1",
+];
+
+function exactKeys(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    required.every((k) => k in value) &&
+    Object.keys(value).every((k) => required.includes(k) || optional.includes(k))
+  );
+}
+
+const isHex = (value: unknown, bytes: number): boolean =>
+  typeof value === "string" && value.length === 2 * bytes && /^[0-9a-f]*$/.test(value);
+
+// The relayer's strict parsing: exactly the known members, and binary values as lowercase hex of
+// exact length with no prefix.
+function wellFormed(body: unknown): boolean {
+  if (!exactKeys(body, ["proof", "ext"], ["not_before"])) return false;
+  const { proof, ext } = body;
+  if (!exactKeys(proof, PROOF_KEYS) || !exactKeys(ext, EXT_KEYS)) return false;
+  const pairs = [proof["input_nullifiers"], proof["output_commitments"]];
+  if (!pairs.every((p) => Array.isArray(p) && p.length === 2)) return false;
+  const fields = [
+    proof["root"],
+    proof["public_amount"],
+    proof["ext_data_hash"],
+    ...(pairs.flat() as unknown[]),
+  ];
+  return (
+    isHex(proof["a"], 64) &&
+    isHex(proof["b"], 128) &&
+    isHex(proof["c"], 64) &&
+    fields.every((f) => isHex(f, 32)) &&
+    isHex(ext["network_id"], 32) &&
+    isHex(ext["encrypted_output0"], 181) &&
+    isHex(ext["encrypted_output1"], 181)
+  );
+}
+
 export class MockIndexer {
   readonly vault: MockVault;
   readonly networkId: string;
@@ -192,6 +255,8 @@ export class MockRelayer {
   inFlight = new Set<string>();
   submissions: { proof: TxProofJson; ext: ExtDataJson; notBefore: number | undefined }[] = [];
   status = new Map<string, string>();
+  // Requests held until their not_before; releaseHeld sends them.
+  held: (() => void)[] = [];
 
   constructor(rpc: MockRpc, networkId: string, feeAddress: string) {
     this.rpc = rpc;
@@ -234,10 +299,15 @@ export class MockRelayer {
     return json(404, { error: "not_found" });
   }
 
+  releaseHeld(): void {
+    for (const send of this.held.splice(0)) send();
+  }
+
   // Strict parsing, then the vault call with a channel account as the submitter.
   #submit(body: Record<string, unknown>): Response {
     const failure = this.failures.shift();
     if (failure !== undefined) return json(400, failure);
+    if (!wellFormed(body)) return json(400, { error: "bad_request" });
     let proof;
     let ext;
     try {
@@ -257,22 +327,30 @@ export class MockRelayer {
     if (proof.inputNullifiers.some((nf) => this.inFlight.has(nf.toString()))) {
       return json(409, { error: "duplicate" });
     }
+    const notBefore = body["not_before"] as number | undefined;
     this.submissions.push({
       proof: body["proof"] as TxProofJson,
       ext: body["ext"] as ExtDataJson,
-      notBefore: body["not_before"] as number | undefined,
+      notBefore,
     });
     const hash = createHash("sha256")
       .update(`relayed/${key}/${this.submissions.length}`)
       .digest("hex");
-    try {
-      this.rpc.run(hash, () => this.vault.transact(proof, ext, this.channel.publicKey()));
-      this.status.set(hash, "success");
-    } catch {
-      this.status.set(hash, "failed");
-      return json(400, { error: "rejected" });
+    const send = (): boolean => {
+      try {
+        this.rpc.run(hash, () => this.vault.transact(proof, ext, this.channel.publicKey()));
+        this.status.set(hash, "success");
+        return true;
+      } catch {
+        this.status.set(hash, "failed");
+        return false;
+      }
+    };
+    if (notBefore !== undefined && notBefore > Number(this.vault.timestamp)) {
+      this.held.push(send);
+      return json(202, { held: true });
     }
-    return json(202, { hash });
+    return send() ? json(202, { hash }) : json(422, { error: "rejected" });
   }
 }
 

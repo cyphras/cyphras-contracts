@@ -131,31 +131,48 @@ describe("indexer client", () => {
 });
 
 describe("relayer client", () => {
+  const proof = {
+    a: "",
+    b: "",
+    c: "",
+    root: "",
+    public_amount: "",
+    ext_data_hash: "",
+    input_nullifiers: ["", ""] as [string, string],
+    output_commitments: ["", ""] as [string, string],
+  };
+  const ext = {
+    vault: "",
+    network_id: "",
+    deadline: 0,
+    ext_amount: "0",
+    fee: "0",
+    recipient: "",
+    relayer: "",
+    encrypted_output0: "",
+    encrypted_output1: "",
+  };
+
+  it("takes the hash of a submission, or none for one held until not_before", async () => {
+    const hash = "ab".repeat(32);
+    const sent = await new RelayerClient("http://r", reply(202, { hash })).submit(proof, ext);
+    assert.deepEqual(sent, { accepted: true, hash });
+    const held = new RelayerClient("http://r", reply(202, { held: true }));
+    assert.deepEqual(await held.submit(proof, ext, 1_800_000_000), {
+      accepted: true,
+      hash: undefined,
+    });
+    // Only a delayed request may come back without a hash.
+    await assert.rejects(held.submit(proof, ext), isCode("service_rejected"));
+    await assert.rejects(
+      new RelayerClient("http://r", reply(202, {})).submit(proof, ext, 1_800_000_000),
+      isCode("service_rejected"),
+    );
+  });
+
   it("reads error codes and refusal reasons", async () => {
     const relayer = new RelayerClient("http://r", reply(403, { error: "refused", reason: 1 }));
-    const result = await relayer.submit(
-      {
-        a: "",
-        b: "",
-        c: "",
-        root: "",
-        public_amount: "",
-        ext_data_hash: "",
-        input_nullifiers: ["", ""],
-        output_commitments: ["", ""],
-      },
-      {
-        vault: "",
-        network_id: "",
-        deadline: 0,
-        ext_amount: "0",
-        fee: "0",
-        recipient: "",
-        relayer: "",
-        encrypted_output0: "",
-        encrypted_output1: "",
-      },
-    );
+    const result = await relayer.submit(proof, ext);
     assert.deepEqual(result, { accepted: false, error: "refused", reason: 1 });
     const odd = await new RelayerClient("http://r", reply(500, { error: "teapot" })).status(
       "aa".repeat(32),

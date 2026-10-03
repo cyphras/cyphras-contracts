@@ -19,7 +19,7 @@ import {
   txProofToScVal,
 } from "../../src/extdata.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
-import { fixture } from "../helpers.ts";
+import { fixture, wireProof } from "../helpers.ts";
 
 // contracts/vault/fixtures/proofs.json of the contracts branch, which the vault's tests replay.
 interface Step {
@@ -69,8 +69,10 @@ describe("vault fixtures", () => {
     for (const step of withExt) {
       const { domain, ...json } = step.proof as TxProofJson & { domain: string };
       assert.equal(domain, PROOFS.domain);
-      const proof = txProofFromJson(json);
-      assert.deepEqual(txProofToJson(proof), json);
+      const proof = txProofFromJson(wireProof(json));
+      assert.equal(toHex32(proof.root), json.root);
+      assert.equal(toHex32(proof.inputNullifiers[1]), json.input_nullifiers[1]);
+      assert.deepEqual(txProofToJson(proof), wireProof(json));
       assert.deepEqual(toHostProof(fromHostProof(proof.proof)), proof.proof);
       const decoded = xdr.ScVal.fromXDR(txProofToScVal(proof).toXDR());
       const keys = decoded.map()?.map((e) => e.key().sym().toString());
