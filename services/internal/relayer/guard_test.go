@@ -358,3 +358,15 @@ func TestARestartHoldsTheNotesAndChannelOfAPendingRelay(t *testing.T) {
 	}
 	h.waitIdle()
 }
+
+func TestAWithheldDestinationIsRefusedWithoutAReason(t *testing.T) {
+	h := newHarness(t, vault.Status{})
+	h.screen.err = ErrWithheld
+	code, out := h.post(fixture(t, "unshield_muxed"))
+	if code != http.StatusUnprocessableEntity || out["error"] != CodeRejected || out["reason"] != nil {
+		t.Fatalf("withheld destination: %d %v", code, out)
+	}
+	if h.fake.CallCount("simulateTransaction") != 0 || len(h.r.inflight) != 0 {
+		t.Fatal("a withheld destination was simulated or kept in flight")
+	}
+}

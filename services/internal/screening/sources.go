@@ -4,10 +4,13 @@
 package screening
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +38,9 @@ const (
 	ReasonFraud     = 4
 	ReasonReview    = 5
 	ReasonOther     = 99
+	// ReasonCourtOrder refuses a deposit a written order from an authority concerns. The keeper
+	// never refunds it; the depositor still can.
+	ReasonCourtOrder = 100
 )
 
 func validReason(r uint32) bool {
@@ -69,15 +76,72 @@ type Source interface {
 	Status() SourceStatus
 }
 
+// Guard refuses a source update that looks broken: one that shrinks the list by more than
+// MaxShrinkPct percent, or that lacks a canary, an entry every good copy holds. The previous list
+// stays in use, and ages until a good update arrives.
+type Guard struct {
+	MaxShrinkPct int
+	Canaries     []string
+}
+
+func (g *Guard) check(name string, prev, size int, has func(string) bool) error {
+	if g == nil {
+		return nil
+	}
+	if prev > 0 && g.MaxShrinkPct > 0 && size*100 < prev*(100-g.MaxShrinkPct) {
+		return fmt.Errorf("%s: %w: the update shrinks the list from %d to %d entries", name, ErrSuspect, prev, size)
+	}
+	for _, c := range g.Canaries {
+		if !has(c) {
+			return fmt.Errorf("%s: %w: the update lacks the canary %q", name, ErrSuspect, c)
+		}
+	}
+	return nil
+}
+
+// ErrSuspect reports a source update the guard refused.
+var ErrSuspect = errors.New("suspect update refused")
+
 // list holds a source's entries and when they were fetched.
 type list struct {
 	name   string
 	maxAge time.Duration
+	guard  *Guard
 
 	mu        sync.RWMutex
 	entries   map[string]Hit
 	version   string
 	fetchedAt time.Time
+	// size is how big the source's last accepted copy was, in the unit its guard counts.
+	size int
+}
+
+// Guard sets the checks every update of the source must pass.
+func (l *list) Guard(g *Guard) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.guard = g
+}
+
+// accept checks an update against the guard and the last accepted copy, and keeps it.
+func (l *list) accept(entries map[string]Hit, version string, fetchedAt time.Time, size int, has func(string) bool) error {
+	l.mu.RLock()
+	g, prev := l.guard, l.size
+	l.mu.RUnlock()
+	if err := g.check(l.name, prev, size, has); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries, l.version, l.fetchedAt, l.size = entries, version, fetchedAt, size
+	return nil
+}
+
+func inEntries(entries map[string]Hit) func(string) bool {
+	return func(address string) bool {
+		_, ok := entries[address]
+		return ok
+	}
 }
 
 func (l *list) Name() string { return l.name }
@@ -142,10 +206,11 @@ func NewFileSource(name, path string, maxAge time.Duration) *FileSource {
 	return &FileSource{list: list{name: name, maxAge: maxAge}, Path: path}
 }
 
+// listFile is the curated list's schema: every member is required, and no other is allowed.
 type listFile struct {
 	Version   string    `json:"version"`
 	UpdatedAt time.Time `json:"updated_at"`
-	Entries   []struct {
+	Entries   *[]struct {
 		Address string `json:"address"`
 		Reason  uint32 `json:"reason"`
 		Source  string `json:"source"`
@@ -159,24 +224,26 @@ func (s *FileSource) Refresh(context.Context) error {
 		return err
 	}
 	var f listFile
-	if err := json.Unmarshal(raw, &f); err != nil {
+	if err := jsonv2.Unmarshal(raw, &f, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return fmt.Errorf("%s: %w", s.name, err)
 	}
-	if f.Version == "" || f.UpdatedAt.IsZero() {
-		return fmt.Errorf("%s: the list has no version or update time", s.name)
+	if f.Version == "" || f.UpdatedAt.IsZero() || f.Entries == nil {
+		return fmt.Errorf("%s: the list lacks its version, update time or entries", s.name)
 	}
 	entries := map[string]Hit{}
-	for i, e := range f.Entries {
+	for i, e := range *f.Entries {
 		if !strkey.IsValidEd25519PublicKey(e.Address) && !strkey.IsValidContractAddress(e.Address) {
 			return fmt.Errorf("%s: entry %d has no valid address", s.name, i)
 		}
 		if !validReason(e.Reason) || e.Reason == ReasonFrozen || e.Reason == ReasonReview {
 			return fmt.Errorf("%s: entry %d has reason %d", s.name, i, e.Reason)
 		}
+		if strings.TrimSpace(e.Source) == "" {
+			return fmt.Errorf("%s: entry %d names no source", s.name, i)
+		}
 		entries[e.Address] = Hit{Source: s.name, Reason: e.Reason, Detail: e.Source}
 	}
-	s.set(entries, f.Version, f.UpdatedAt)
-	return nil
+	return s.accept(entries, f.Version, f.UpdatedAt, len(entries), inEntries(entries))
 }
 
 // OFACSource reads the Stellar addresses of the OFAC SDN list.
@@ -194,14 +261,47 @@ func NewOFACSource(url string, maxAge time.Duration) *OFACSource {
 
 var digitalCurrency = regexp.MustCompile(`Digital Currency Address - ([A-Z0-9]+) ([A-Za-z0-9]+)`)
 
+// sdnFields is the number of fields of each record of the SDN list in CSV form.
+const sdnFields = 12
+
+// sdnRecords checks the SDN list's form: CSV whose every record has the SDN fields and starts
+// with an entity number, optionally after a header, and returns how many records it holds.
+func sdnRecords(body []byte) (int, error) {
+	r := csv.NewReader(bytes.NewReader(bytes.TrimRight(body, "\x1a\r\n ")))
+	r.FieldsPerRecord = sdnFields
+	r.LazyQuotes = true
+	n := 0
+	for {
+		rec, err := r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return 0, fmt.Errorf("ofac: not the SDN list in CSV form: %w", err)
+		}
+		if n == 0 && strings.EqualFold(strings.TrimSpace(rec[0]), "ent_num") {
+			continue
+		}
+		if _, err := strconv.ParseUint(strings.TrimSpace(rec[0]), 10, 64); err != nil {
+			return 0, errors.New("ofac: a record does not start with an entity number")
+		}
+		n++
+	}
+	if n == 0 {
+		return 0, errors.New("ofac: the list is empty")
+	}
+	return n, nil
+}
+
 // Refresh implements Source.
 func (s *OFACSource) Refresh(ctx context.Context) error {
 	body, err := fetch(ctx, s.HTTP, s.URL, 128<<20)
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(string(body[:min(len(body), 4096)]), ",") {
-		return errors.New("ofac: not a CSV list")
+	records, err := sdnRecords(body)
+	if err != nil {
+		return err
 	}
 	entries := map[string]Hit{}
 	for _, m := range digitalCurrency.FindAllSubmatch(body, -1) {
@@ -214,8 +314,8 @@ func (s *OFACSource) Refresh(ctx context.Context) error {
 		}
 	}
 	sum := sha256.Sum256(body)
-	s.set(entries, hex.EncodeToString(sum[:8]), s.now())
-	return nil
+	// The list holds few Stellar addresses, so its size and canaries are those of the whole list.
+	return s.accept(entries, hex.EncodeToString(sum[:8]), s.now(), records, func(token string) bool { return bytes.Contains(body, []byte(token)) })
 }
 
 // DirectorySource reads the accounts the stellar.expert directory tags as malicious, and refers
@@ -238,13 +338,15 @@ type directoryPage struct {
 			Href string `json:"href"`
 		} `json:"next"`
 	} `json:"_links"`
-	Embedded struct {
-		Records []struct {
-			Address string   `json:"address"`
-			Name    string   `json:"name"`
-			Tags    []string `json:"tags"`
-		} `json:"records"`
+	Embedded *struct {
+		Records *[]directoryRecord `json:"records"`
 	} `json:"_embedded"`
+}
+
+type directoryRecord struct {
+	Address string   `json:"address"`
+	Name    string   `json:"name"`
+	Tags    []string `json:"tags"`
 }
 
 const directoryPageSize = 200
@@ -267,7 +369,11 @@ func (s *DirectorySource) Refresh(ctx context.Context) error {
 			if err := json.Unmarshal(body, &page); err != nil {
 				return fmt.Errorf("stellar.expert: %w", err)
 			}
-			for _, r := range page.Embedded.Records {
+			if page.Embedded == nil || page.Embedded.Records == nil {
+				return errors.New("stellar.expert: a page without records")
+			}
+			records := *page.Embedded.Records
+			for _, r := range records {
 				if !strkey.IsValidEd25519PublicKey(r.Address) && !strkey.IsValidContractAddress(r.Address) {
 					continue
 				}
@@ -278,13 +384,12 @@ func (s *DirectorySource) Refresh(ctx context.Context) error {
 				}
 			}
 			next = ""
-			if len(page.Embedded.Records) == directoryPageSize {
+			if len(records) == directoryPageSize {
 				next = page.Links.Next.Href
 			}
 		}
 	}
-	s.set(entries, fmt.Sprintf("%d accounts", len(entries)), s.now())
-	return nil
+	return s.accept(entries, fmt.Sprintf("%d accounts", len(entries)), s.now(), len(entries), inEntries(entries))
 }
 
 // ReportSource holds the addresses of accepted compromised-address self-reports.
@@ -293,6 +398,8 @@ type ReportSource struct {
 	load func(ctx context.Context) ([]string, error)
 	now  func() time.Time
 }
+
+func (s *ReportSource) directOnly() bool { return true }
 
 // Refresh implements Source.
 func (s *ReportSource) Refresh(ctx context.Context) error {

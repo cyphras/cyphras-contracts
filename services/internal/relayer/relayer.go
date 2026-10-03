@@ -544,6 +544,9 @@ func (r *Relayer) screenDestination(ctx context.Context, e vault.ExtData) *failu
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	allow, reason, err := r.screen.Screen(sctx, e.Recipient)
+	if errors.Is(err, ErrWithheld) {
+		return fail(http.StatusUnprocessableEntity, CodeRejected)
+	}
 	if err != nil {
 		return fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
@@ -1080,6 +1083,11 @@ func (p *channelPool) ready() int {
 	return len(p.free)
 }
 
+// ErrWithheld reports a destination the screening service does not clear without a person, which a
+// relay cannot wait for. The relay is refused without a public reason; the screening record holds
+// it.
+var ErrWithheld = errors.New("relayer: screening withheld the destination")
+
 // ScreeningClient asks the screening service's internal endpoint.
 type ScreeningClient struct {
 	URL   string
@@ -1116,6 +1124,8 @@ func (c ScreeningClient) Screen(ctx context.Context, address string) (bool, uint
 		return true, 0, nil
 	case "refuse":
 		return false, out.Reason, nil
+	case "withheld":
+		return false, 0, ErrWithheld
 	}
 	return false, 0, fmt.Errorf("screening answered %q", out.Result)
 }

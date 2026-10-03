@@ -57,6 +57,8 @@ type harness struct {
 	effects []call
 	pages   []alert.Alert
 	attest  uint64
+	// flags are the reasons the landed flags carry, by deposit.
+	flags map[uint64]uint32
 }
 
 func (h *harness) Send(_ context.Context, a alert.Alert) error {
@@ -98,11 +100,11 @@ func newHarness(t *testing.T) *harness {
 	}
 	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, Validity: time.Minute, Poll: time.Millisecond, Now: func() time.Time { return h.now }}
 	h.sources = static("exploits", h.now, map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}})
-	check := &Checker{Sources: []Source{h.sources}, Funders: h.funders, MaxFunders: 25, Now: func() time.Time { return h.now }}
+	check := &Checker{Sources: []Source{h.sources}, Inflows: h.funders, MaxFunders: 25, Now: func() time.Time { return h.now }}
 	alerts := &alert.Alerter{Service: "screening", Channels: []alert.Channel{h}, Cooldown: time.Hour, Now: func() time.Time { return h.now }}
 	s, err := New(context.Background(), Config{
 		Vault: vaulttest.Vault, DeployLedger: 10, Network: "testnet", PolicyVersion: "1",
-		RecheckWindow: 10 * time.Minute, Cutoff: 2 * time.Minute, FirstCheckWithin: 10 * time.Minute,
+		RecheckWindow: 10 * time.Minute, Cutoff: 8 * time.Minute, FirstCheckWithin: 10 * time.Minute, Workers: 1,
 	}, h.fake, &chainstate.Store{Pool: pool}, check, engine, submit.NewAccount(vaulttest.Asp, hot), alerts, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -128,12 +130,18 @@ func (h *harness) land() {
 	effects := h.effects
 	h.effects = nil
 	h.mu.Unlock()
+	// The calls land in a ledger after the one the screener has ingested.
+	h.chain.NextLedger(5)
 	for _, c := range effects {
 		switch c.fn {
 		case "flag":
+			if h.flags == nil {
+				h.flags = map[uint64]uint32{}
+			}
+			h.flags[uint64(*c.args[0].U64)] = uint32(*c.args[1].U32)
 			h.chain.Flag(uint64(*c.args[0].U64), uint32(*c.args[1].U32))
 		case "unflag":
-			h.chain.Unflag(uint64(*c.args[0].U64), 0)
+			h.chain.Unflag(uint64(*c.args[0].U64), h.flags[uint64(*c.args[0].U64)])
 		case "attest":
 			h.attest = uint64(*c.args[0].U64)
 			h.chain.Attest(h.attest)
@@ -319,7 +327,7 @@ func TestAnAttestedDepositThatCannotBeRecheckedIsRefused(t *testing.T) {
 	h.tick()
 	h.attest = 1
 	h.funders["unreachable"] = nil
-	h.s.check.Funders = funderMap{clean: nil}
+	h.s.check.Inflows = funderMap{clean: nil}
 	// The sources go stale inside the final window.
 	h.now = h.now.Add(59 * time.Minute)
 	h.sources.set(map[string]Hit{}, "1", h.now.Add(-2*time.Hour))
@@ -392,27 +400,42 @@ func TestTheRelayerScreenNeedsItsTokenAndFailsClosed(t *testing.T) {
 }
 
 func TestTheCandidateNeverVouchesForAnUnflaggedRefusal(t *testing.T) {
-	r := func(id uint64, first, recheck string) row { return row{id: id, firstCheck: first, recheck: recheck} }
-	four := uint32(4)
+	at := uint64(1_728_000_000)
+	r := func(id uint64, first, recheck string) row {
+		out := row{id: id, firstCheck: first, recheck: recheck}
+		if recheck != "" {
+			out.recheckAt = &at
+		}
+		return out
+	}
+	four, five := uint32(4), uint32(5)
 	cases := []struct {
 		rows []row
 		want uint64
 	}{
-		{[]row{r(1, "pass", "pass"), r(2, "pass", ""), r(3, "pass", "pass")}, 3},
+		// A deposit that passed only its first check ends the run: its own final check comes later.
+		{[]row{r(1, "pass", "pass"), r(2, "pass", ""), r(3, "pass", "pass")}, 1},
 		{[]row{r(1, "pass", "pass"), r(2, "", ""), r(3, "pass", "pass")}, 1},
 		{[]row{r(1, "refuse", ""), r(2, "pass", "pass")}, 0},
 		{[]row{{id: 1, firstCheck: "refuse", flagSent: &four}, r(2, "pass", "pass")}, 2},
 		{[]row{r(1, "pass", "refuse"), r(2, "pass", "pass")}, 0},
-		{[]row{{id: 1, firstCheck: "refer", review: "needed"}, r(2, "pass", "pass")}, 2},
+		// A deposit under review ends the run until it is cleared and re-checked, or flagged.
+		{[]row{{id: 1, firstCheck: "refer", review: "needed"}, r(2, "pass", "pass")}, 0},
+		{[]row{{id: 1, firstCheck: "refer", review: "needed", flag: &five, flagKind: "review_timeout"}, r(2, "pass", "pass")}, 2},
+		{[]row{{id: 1, firstCheck: "refer", review: "cleared", recheck: "pass", recheckAt: &at}, r(2, "pass", "pass")}, 2},
 		{[]row{{id: 1, firstCheck: "pass", needsFlag: true}, r(2, "pass", "pass")}, 0},
 	}
 	for i, c := range cases {
-		if got := attestCandidate(c.rows, 0); got != c.want {
+		if got := attestCandidate(c.rows, 0, at+60, 600); got != c.want {
 			t.Fatalf("case %d: %d, want %d", i, got, c.want)
 		}
 	}
-	if got := attestCandidate([]row{r(1, "", ""), r(2, "pass", "pass")}, 1); got != 2 {
+	if got := attestCandidate([]row{r(1, "", ""), r(2, "pass", "pass")}, 1, at+60, 600); got != 2 {
 		t.Fatal("attested deposits do not block")
+	}
+	// A final check that passed too long ago vouches for nothing.
+	if got := attestCandidate([]row{r(1, "pass", "pass")}, 0, at+601, 600); got != 0 {
+		t.Fatal("a stale final check was attested")
 	}
 }
 
@@ -450,7 +473,7 @@ func TestAttestationIsWithheldWhenTheChainHoldsADepositTheReplayMissed(t *testin
 	h.setVault(h.attest)
 	h.sync()
 	h.s.RefreshSources(context.Background())
-	if err := h.s.Tick(context.Background()); err == nil || !strings.Contains(err.Error(), "without a first check") {
+	if err := h.s.Tick(context.Background()); err == nil || !strings.Contains(err.Error(), "without a passed final check") {
 		t.Fatalf("round: %v", err)
 	}
 	for _, c := range h.sent() {
@@ -469,19 +492,22 @@ func TestAttestationIsWithheldWhenTheChainHoldsADepositTheReplayMissed(t *testin
 
 type countingFunders struct {
 	funderMap
+	mu    sync.Mutex
 	calls int
 }
 
-func (c *countingFunders) Funders(ctx context.Context, account string, since time.Time) ([]string, bool, error) {
+func (c *countingFunders) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, bool, error) {
+	c.mu.Lock()
 	c.calls++
-	return c.funderMap.Funders(ctx, account, since)
+	c.mu.Unlock()
+	return c.funderMap.Inflows(ctx, account, since)
 }
 
 func TestRequestsCannotSpendTheLookupsDepositsNeed(t *testing.T) {
 	h := newHarness(t)
 	counter := &countingFunders{funderMap: h.funders}
-	h.s.check.Funders = counter
-	h.s.requestCheck.Funders = BudgetedFunders{Inner: counter, Budget: httpapi.NewLimiter(60, 1)}
+	h.s.check.Inflows = counter
+	h.s.requestCheck.Inflows = BudgetedInflows{Inner: counter, Budget: httpapi.NewLimiter(60, 1)}
 	public := h.s.Public(httpapi.NewLimiter(60, 10), httpapi.NewLimiter(60, 10))
 	rec := httptest.NewRecorder()
 	public.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/check?address="+clean, nil))
@@ -514,15 +540,15 @@ func TestRequestsCannotSpendTheLookupsDepositsNeed(t *testing.T) {
 func TestFunderLookupsAreCachedBriefly(t *testing.T) {
 	now := time.Unix(1_728_000_000, 0)
 	counter := &countingFunders{funderMap: funderMap{clean: {funder}}}
-	c := &CachedFunders{Inner: counter, TTL: 10 * time.Minute, Now: func() time.Time { return now }}
+	c := &CachedInflows{Inner: counter, TTL: 10 * time.Minute, Now: func() time.Time { return now }}
 	for range 3 {
-		got, complete, err := c.Funders(context.Background(), clean, now.Add(-FunderWindow))
+		got, complete, err := c.Inflows(context.Background(), clean, now.Add(-FunderWindow))
 		if err != nil || !complete || len(got) != 1 {
 			t.Fatalf("funders %v %v", got, err)
 		}
 	}
 	now = now.Add(11 * time.Minute)
-	if _, _, err := c.Funders(context.Background(), clean, now.Add(-FunderWindow)); err != nil || counter.calls != 2 {
+	if _, _, err := c.Inflows(context.Background(), clean, now.Add(-FunderWindow)); err != nil || counter.calls != 2 {
 		t.Fatalf("%d lookups, %v", counter.calls, err)
 	}
 }

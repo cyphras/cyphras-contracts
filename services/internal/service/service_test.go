@@ -81,3 +81,32 @@ func TestASignerMustMeetTheMediumThreshold(t *testing.T) {
 		t.Fatal("a key that is not a signer accepted")
 	}
 }
+
+func TestAHotSignerIsNeitherTheMasterNorAtTheHighThreshold(t *testing.T) {
+	f := rpctest.New("Test SDF Network ; September 2015", 1)
+	account, hot := keypair.MustRandom(), keypair.MustRandom()
+	key, _ := vault.AccountKey(account.Address())
+	set := func(medium, high, hotWeight uint32) {
+		sk, _ := xdr.AddressToAccountId(hot.Address())
+		f.SetEntry(key, xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeAccount, Account: &xdr.AccountEntry{
+			AccountId: key.MustAccount().AccountId, Thresholds: xdr.Thresholds{0, 1, byte(medium), byte(high)},
+			Signers: []xdr.Signer{{Key: xdr.SignerKey{Type: xdr.SignerKeyTypeSignerKeyTypeEd25519, Ed25519: sk.Ed25519}, Weight: xdr.Uint32(hotWeight)}},
+		}}, 1, nil)
+	}
+	ctx := context.Background()
+	set(2, 10, 2)
+	if err := CheckHotSigner(ctx, f, account.Address(), hot); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckHotSigner(ctx, f, account.Address(), account); err == nil {
+		t.Fatal("the master key accepted as the hot signer")
+	}
+	set(2, 10, 10)
+	if err := CheckHotSigner(ctx, f, account.Address(), hot); err == nil {
+		t.Fatal("a signer that reaches the high threshold accepted")
+	}
+	set(2, 10, 1)
+	if err := CheckHotSigner(ctx, f, account.Address(), hot); err == nil {
+		t.Fatal("a signer below the medium threshold accepted")
+	}
+}

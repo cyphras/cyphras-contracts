@@ -38,7 +38,8 @@ func VerifySEP53(address, message string, signature []byte) error {
 }
 
 // Public serves the policy, the statistics, self-reports and the pre-deposit check. Nothing here
-// records anything about a request.
+// records anything about a request. Per-client limits live in nginx; the budgets here guard only
+// what a request costs past the checks that cost nothing.
 func (s *Screener) Public(reports, checks *httpapi.Limiter) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
@@ -63,10 +64,6 @@ func (s *Screener) Public(reports, checks *httpapi.Limiter) http.Handler {
 		httpapi.JSON(w, http.StatusOK, st)
 	})
 	mux.HandleFunc("POST /v1/self-report", func(w http.ResponseWriter, r *http.Request) {
-		if !reports.Allow() {
-			httpapi.Fail(w, http.StatusTooManyRequests, "rate_limited")
-			return
-		}
 		var body struct {
 			Address   string `json:"address"`
 			Date      string `json:"date"`
@@ -91,6 +88,10 @@ func (s *Screener) Public(reports, checks *httpapi.Limiter) http.Handler {
 			httpapi.Fail(w, http.StatusBadRequest, "bad_signature")
 			return
 		}
+		if !reports.Allow() {
+			httpapi.Fail(w, http.StatusTooManyRequests, "rate_limited")
+			return
+		}
 		fresh, err := s.db.addSelfReport(r.Context(), body.Address, body.Date, body.Signature, now)
 		if err != nil {
 			httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
@@ -105,13 +106,13 @@ func (s *Screener) Public(reports, checks *httpapi.Limiter) http.Handler {
 		httpapi.JSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 	})
 	mux.HandleFunc("GET /v1/check", func(w http.ResponseWriter, r *http.Request) {
-		if !checks.Allow() {
-			httpapi.Fail(w, http.StatusTooManyRequests, "rate_limited")
-			return
-		}
 		address := r.URL.Query().Get("address")
 		if !strkey.IsValidEd25519PublicKey(address) {
 			httpapi.Fail(w, http.StatusBadRequest, "bad_request")
+			return
+		}
+		if !checks.Allow() {
+			httpapi.Fail(w, http.StatusTooManyRequests, "rate_limited")
 			return
 		}
 		// The lists only: a public question must not cost Horizon lookups. Funders are checked when
@@ -160,16 +161,22 @@ func (s *Screener) Internal(tokenSHA256 [32]byte) http.Handler {
 			httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 			return
 		}
-		if v.Refused {
+		switch {
+		case v.Refused:
 			// Only refusals are kept here; the relayer's own record holds the result of every relay.
 			if err := s.db.countUnshieldRefusal(r.Context(), v.Reason); err != nil {
 				s.log.Error("refusal count failed", "error", err.Error())
 			}
 			s.record(r.Context(), Decision{Kind: "unshield", Address: body.Address, Outcome: "refuse", Reason: &v.Reason, Detail: v.Detail, Sources: v.Sources})
 			httpapi.JSON(w, http.StatusOK, map[string]any{"result": "refuse", "reason": v.Reason})
-			return
+		case !v.Clear():
+			// A funder's match or a history read only in part needs a person, and there is none to
+			// wait for here: the relay is refused without a public reason, which stays in the record.
+			s.record(r.Context(), Decision{Kind: "unshield", Address: body.Address, Outcome: "withhold", Detail: v.Detail, Sources: v.Sources})
+			httpapi.JSON(w, http.StatusOK, map[string]any{"result": "withheld"})
+		default:
+			httpapi.JSON(w, http.StatusOK, map[string]any{"result": "allow"})
 		}
-		httpapi.JSON(w, http.StatusOK, map[string]any{"result": "allow"})
 	})
 	return mux
 }

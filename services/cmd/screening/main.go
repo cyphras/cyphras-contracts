@@ -4,9 +4,12 @@
 //
 //	screening review list
 //	screening review clear|refuse <deposit> <reviewer>
-//	screening flag <deposit> <4|99> <reviewer> <note>
+//	screening flag <deposit> <4|99|100> <reviewer> <note>
 //	screening unflag <deposit> <reviewer> <note>
 //	screening register fraud_report|legal_request <note>
+//
+// Only one process sends as the asp account. A flag or unflag given while the service runs is
+// queued, and the service carries it out in its next round.
 package main
 
 import (
@@ -14,10 +17,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stellar/go-stellar-sdk/strkey"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
@@ -37,16 +45,22 @@ func main() {
 		service.Fatal(service.Logger("screening"), "start", err)
 	}
 	log := base.Log
-	s, err := build(ctx, base)
+	b, err := build(ctx, base)
 	if err != nil {
 		service.Fatal(log, "start", err)
 	}
+	s := b.screener
 	if cmd := service.Command("serve"); cmd != "serve" {
-		if err := operate(ctx, s, os.Args[1:]); err != nil {
+		if err := operate(ctx, b, os.Args[1:]); err != nil {
 			service.Fatal(log, cmd, err)
 		}
 		return
 	}
+	release, err := screening.LockWriter(ctx, b.pool, b.asp)
+	if err != nil {
+		service.Fatal(log, "start", err)
+	}
+	defer release()
 
 	tokenHash, err := hex.DecodeString(config.Env("SCREEN_TOKEN_SHA256", ""))
 	if err != nil || len(tokenHash) != 32 {
@@ -69,12 +83,19 @@ func main() {
 	}()
 	addr := config.Env("LISTEN_ADDR", "127.0.0.1:8090")
 	log.Info("serving", "vault", base.Vault.Vault, "addr", addr)
-	if err := httpapi.Serve(ctx, addr, s.Public(httpapi.NewLimiter(30, 10), httpapi.NewLimiter(60, 20))); err != nil && ctx.Err() == nil {
+	if err := httpapi.Serve(ctx, addr, s.Public(httpapi.NewLimiter(300, 50), httpapi.NewLimiter(3000, 300))); err != nil && ctx.Err() == nil {
 		service.Fatal(log, "serve", err)
 	}
 }
 
-func build(ctx context.Context, base *service.Base) (*screening.Screener, error) {
+// built is the screener with what an operator command needs besides it.
+type built struct {
+	screener *screening.Screener
+	pool     *pgxpool.Pool
+	asp      string
+}
+
+func build(ctx context.Context, base *service.Base) (*built, error) {
 	dbURL, err := service.DatabaseURL()
 	if err != nil {
 		return nil, err
@@ -94,7 +115,7 @@ func build(ctx context.Context, base *service.Base) (*screening.Screener, error)
 	if err != nil {
 		return nil, err
 	}
-	if err := service.CheckSigner(ctx, base.RPC, inst.Config.ASP, hot); err != nil {
+	if err := service.CheckHotSigner(ctx, base.RPC, inst.Config.ASP, hot); err != nil {
 		return nil, err
 	}
 	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase)
@@ -105,11 +126,7 @@ func build(ctx context.Context, base *service.Base) (*screening.Screener, error)
 	if err != nil {
 		return nil, err
 	}
-	maxFunders, err := config.Int("MAX_FUNDERS", 25)
-	if err != nil {
-		return nil, err
-	}
-	horizonURL, err := config.Value("HORIZON_URL")
+	check, err := checker(sources)
 	if err != nil {
 		return nil, err
 	}
@@ -117,19 +134,101 @@ func build(ctx context.Context, base *service.Base) (*screening.Screener, error)
 	if err != nil {
 		return nil, err
 	}
-	check := &screening.Checker{
+	workers, err := config.Int("SCREEN_WORKERS", 4)
+	if err != nil {
+		return nil, err
+	}
+	tickChecks, err := config.Int("SCREEN_TICK_CHECKS", 40)
+	if err != nil {
+		return nil, err
+	}
+	tickBudget, err := config.Duration("SCREEN_TICK_BUDGET", 15*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	s, err := screening.New(ctx, screening.Config{
+		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, NetworkID: base.NetworkID, Network: base.Deployment.Network,
+		PolicyVersion: config.Env("POLICY_VERSION", "1"),
+		RecheckWindow: 10 * time.Minute, Cutoff: 8 * time.Minute, FirstCheckWithin: 10 * time.Minute, RequestLookups: int(lookups),
+		Workers: int(workers), TickChecks: int(tickChecks), TickBudget: tickBudget,
+	}, base.RPC, &chainstate.Store{Pool: pool}, check, engine, submit.NewAccount(inst.Config.ASP, hot), base.Alerts, base.Log)
+	if err != nil {
+		return nil, err
+	}
+	return &built{screener: s, pool: pool, asp: inst.Config.ASP}, nil
+}
+
+// checker builds the deposit checker from the funder settings, with conservative defaults: a
+// funder counts unless it sent less than 1 percent of an address's inflows and less than 10 XLM.
+func checker(sources []screening.Source) (*screening.Checker, error) {
+	maxFunders, err := config.Int("MAX_FUNDERS", 25)
+	if err != nil {
+		return nil, err
+	}
+	maxPages, err := config.Int("FUNDER_MAX_PAGES", 10)
+	if err != nil {
+		return nil, err
+	}
+	shareBps, err := config.Int("FUNDER_DUST_SHARE_BPS", 100)
+	if err != nil {
+		return nil, err
+	}
+	if maxFunders < 1 || maxPages < 1 || shareBps < 0 || shareBps > 10_000 {
+		return nil, errors.New("MAX_FUNDERS and FUNDER_MAX_PAGES must be positive, FUNDER_DUST_SHARE_BPS 0 to 10000")
+	}
+	floors := map[string]*big.Int{}
+	for _, f := range list(config.Env("FUNDER_DUST_FLOORS", "native=100000000"), ",") {
+		asset, amount, ok := strings.Cut(f, "=")
+		n, valid := new(big.Int).SetString(amount, 10)
+		if !ok || !valid || n.Sign() < 0 {
+			return nil, fmt.Errorf("FUNDER_DUST_FLOORS entry %q is not asset=amount", f)
+		}
+		floors[asset] = n
+	}
+	exempt := map[string]bool{}
+	for _, a := range list(config.Env("FUNDER_EXEMPT", ""), ",") {
+		if !strkey.IsValidEd25519PublicKey(a) {
+			return nil, fmt.Errorf("FUNDER_EXEMPT entry %q is not an account", a)
+		}
+		exempt[a] = true
+	}
+	horizonURL, err := config.Value("HORIZON_URL")
+	if err != nil {
+		return nil, err
+	}
+	return &screening.Checker{
 		Sources: sources,
-		Funders: &screening.CachedFunders{
-			Inner: horizon.Client{URL: horizonURL, HTTP: &http.Client{Timeout: 20 * time.Second}, MaxPages: 10},
+		Inflows: &screening.CachedInflows{
+			Inner: horizon.Client{URL: horizonURL, HTTP: &http.Client{Timeout: 20 * time.Second}, MaxPages: int(maxPages)},
 			TTL:   10 * time.Minute, Now: time.Now,
 		},
 		MaxFunders: int(maxFunders),
+		Dust:       screening.Dust{ShareBps: shareBps, Floors: floors},
+		Exempt:     exempt,
+	}, nil
+}
+
+func list(s, sep string) []string {
+	var out []string
+	for _, v := range strings.Split(s, sep) {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
 	}
-	return screening.New(ctx, screening.Config{
-		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, NetworkID: base.NetworkID, Network: base.Deployment.Network,
-		PolicyVersion: config.Env("POLICY_VERSION", "1"),
-		RecheckWindow: 10 * time.Minute, Cutoff: 2 * time.Minute, FirstCheckWithin: 10 * time.Minute, RequestLookups: int(lookups),
-	}, base.RPC, &chainstate.Store{Pool: pool}, check, engine, submit.NewAccount(inst.Config.ASP, hot), base.Alerts, base.Log)
+	return out
+}
+
+// guard is a source's update guard: SOURCE_MAX_SHRINK_PCT, 20 unless set, and the canaries in the
+// variable named, separated by "|".
+func guard(canaries string) (*screening.Guard, error) {
+	shrink, err := config.Int("SOURCE_MAX_SHRINK_PCT", 20)
+	if err != nil {
+		return nil, err
+	}
+	if shrink < 0 || shrink > 100 {
+		return nil, errors.New("SOURCE_MAX_SHRINK_PCT must be 0 to 100")
+	}
+	return &screening.Guard{MaxShrinkPct: int(shrink), Canaries: list(config.Env(canaries, ""), "|")}, nil
 }
 
 func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
@@ -143,26 +242,64 @@ func sourcesFromEnv(base *service.Base) ([]screening.Source, error) {
 		if err != nil {
 			return nil, err
 		}
-		sources = append(sources, screening.NewFileSource("curated_list", path, age))
+		g, err := guard("EXPLOIT_LIST_CANARIES")
+		if err != nil {
+			return nil, err
+		}
+		src := screening.NewFileSource("curated_list", path, age)
+		src.Guard(g)
+		sources = append(sources, src)
 	}
 	if url := config.Env("OFAC_URL", ""); url != "" {
 		age, err := config.Duration("OFAC_MAX_AGE", 48*time.Hour)
 		if err != nil {
 			return nil, err
 		}
-		sources = append(sources, screening.NewOFACSource(url, age))
+		g, err := guard("OFAC_CANARIES")
+		if err != nil {
+			return nil, err
+		}
+		src := screening.NewOFACSource(url, age)
+		src.Guard(g)
+		sources = append(sources, src)
 	}
 	if url := config.Env("DIRECTORY_URL", ""); url != "" {
 		age, err := config.Duration("DIRECTORY_MAX_AGE", 24*time.Hour)
 		if err != nil {
 			return nil, err
 		}
-		sources = append(sources, screening.NewDirectorySource(url, age))
+		g, err := guard("DIRECTORY_CANARIES")
+		if err != nil {
+			return nil, err
+		}
+		src := screening.NewDirectorySource(url, age)
+		src.Guard(g)
+		sources = append(sources, src)
 	}
 	return sources, nil
 }
 
-func operate(ctx context.Context, s *screening.Screener, args []string) error {
+// writeOrQueue sends an operator's decision as the asp account when no other process does, and
+// otherwise queues it for the running service.
+func writeOrQueue(ctx context.Context, b *built, send func() error, queue func() (int64, error)) error {
+	release, err := screening.LockWriter(ctx, b.pool, b.asp)
+	switch {
+	case errors.Is(err, screening.ErrWriterRunning):
+		id, err := queue()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("queued as %d; the running service carries it out in its next round\n", id)
+		return nil
+	case err != nil:
+		return err
+	}
+	defer release()
+	return send()
+}
+
+func operate(ctx context.Context, b *built, args []string) error {
+	s := b.screener
 	id := func(i int) (uint64, error) {
 		if len(args) <= i {
 			return 0, errors.New("missing deposit id")
@@ -194,13 +331,17 @@ func operate(ctx context.Context, s *screening.Screener, args []string) error {
 		if err != nil {
 			return err
 		}
-		return s.FlagManually(ctx, dep, uint32(reason), args[3], args[4])
+		return writeOrQueue(ctx, b,
+			func() error { return s.FlagManually(ctx, dep, uint32(reason), args[3], args[4]) },
+			func() (int64, error) { return s.QueueFlag(ctx, dep, uint32(reason), args[3], args[4]) })
 	case len(args) == 4 && args[0] == "unflag":
 		dep, err := id(1)
 		if err != nil {
 			return err
 		}
-		return s.Unflag(ctx, dep, args[2], args[3])
+		return writeOrQueue(ctx, b,
+			func() error { return s.Unflag(ctx, dep, args[2], args[3]) },
+			func() (int64, error) { return s.QueueUnflag(ctx, dep, args[2], args[3]) })
 	case len(args) == 3 && args[0] == "register":
 		return s.Register(ctx, args[1], args[2])
 	}

@@ -48,6 +48,44 @@ func CheckSigner(ctx context.Context, c rpc.Client, account string, key *keypair
 	return nil
 }
 
+// CheckHotSigner refuses a key that may not serve as the online signer of an account whose own
+// key stays offline: the account's master key, which can do anything, or a signer whose weight
+// reaches the account's high threshold, which can change the signers. Its weight must still meet
+// the medium threshold a contract's require_auth asks.
+func CheckHotSigner(ctx context.Context, c rpc.Client, account string, key *keypair.Full) error {
+	if key.Address() == account {
+		return fmt.Errorf("the key is the master key of %s, which must stay offline", account)
+	}
+	k, err := vault.AccountKey(account)
+	if err != nil {
+		return err
+	}
+	entry, _, err := rpc.One(ctx, c, k)
+	if err != nil {
+		return fmt.Errorf("read account %s: %w", account, err)
+	}
+	acct := entry.Data.Account
+	if acct == nil {
+		return fmt.Errorf("%s is not an account", account)
+	}
+	medium, high := uint32(acct.Thresholds[2]), uint32(acct.Thresholds[3])
+	var weight uint32
+	for _, s := range acct.Signers {
+		if s.Key.Type == xdr.SignerKeyTypeSignerKeyTypeEd25519 {
+			if addr, err := s.Key.GetAddress(); err == nil && addr == key.Address() {
+				weight = uint32(s.Weight)
+			}
+		}
+	}
+	switch {
+	case weight == 0 || weight < medium:
+		return fmt.Errorf("the key has weight %d on %s, which needs %d", weight, account, medium)
+	case weight >= high:
+		return fmt.Errorf("the key has weight %d on %s, which reaches its high threshold %d", weight, account, high)
+	}
+	return nil
+}
+
 // Engine builds the submission engine from INCLUSION_FEE_CAP and RESOURCE_FEE_CAP, in stroops,
 // and the defaults the services share.
 func Engine(c rpc.Client, passphrase string) (*submit.Engine, error) {

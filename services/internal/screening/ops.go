@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
@@ -18,7 +19,8 @@ type Review struct {
 	CreatedAt uint64
 }
 
-// Reviews lists the deposits a person must review.
+// Reviews lists the deposits a person must review, those a late review got flagged included: a
+// review that clears one of them lifts its flag.
 func (s *Screener) Reviews(ctx context.Context) ([]Review, error) {
 	rows, err := s.db.pending(ctx)
 	if err != nil {
@@ -26,7 +28,8 @@ func (s *Screener) Reviews(ctx context.Context) ([]Review, error) {
 	}
 	var out []Review
 	for _, r := range rows {
-		if r.review == "needed" && r.flag == nil && r.flagSent == nil {
+		flagged := r.flag != nil || r.flagSent != nil
+		if r.review == "needed" && (!flagged || r.flagKind == "review_timeout") {
 			out = append(out, Review{ID: r.id, Depositor: r.depositor, Amount: r.amount, CreatedAt: r.createdAt})
 		}
 	}
@@ -69,16 +72,63 @@ func (s *Screener) DecideReview(ctx context.Context, id uint64, reviewer string,
 	return nil
 }
 
-// FlagManually refuses a pending deposit for a fraud report (reason 4) or a written order from an
-// authority (reason 99).
+// manualReason reports the reasons a person may flag with: a fraud report (4), another reason the
+// record explains (99), and a written order from an authority (100).
+func manualReason(r uint32) bool {
+	return r == ReasonFraud || r == ReasonOther || r == ReasonCourtOrder
+}
+
+// FlagManually refuses a pending deposit with a reason only a person decides.
 func (s *Screener) FlagManually(ctx context.Context, id uint64, reason uint32, reviewer, note string) error {
-	if reason != ReasonFraud && reason != ReasonOther {
-		return fmt.Errorf("screening: manual flags use reason %d or %d", ReasonFraud, ReasonOther)
+	if !manualReason(reason) {
+		return fmt.Errorf("screening: manual flags use reason %d, %d or %d", ReasonFraud, ReasonOther, ReasonCourtOrder)
 	}
 	if _, err := s.pendingRow(ctx, id); err != nil {
 		return err
 	}
 	return s.Flag(ctx, id, reason, "manual", fmt.Sprintf("reviewer: %s; %s", reviewer, note))
+}
+
+// QueueFlag leaves a manual flag for the process that writes as the asp account, and returns its
+// queue number.
+func (s *Screener) QueueFlag(ctx context.Context, id uint64, reason uint32, reviewer, note string) (int64, error) {
+	if !manualReason(reason) {
+		return 0, fmt.Errorf("screening: manual flags use reason %d, %d or %d", ReasonFraud, ReasonOther, ReasonCourtOrder)
+	}
+	return s.db.queueOp(ctx, op{kind: "flag", deposit: id, reason: &reason, reviewer: reviewer, note: note}, s.now())
+}
+
+// QueueUnflag leaves an unflag for the process that writes as the asp account.
+func (s *Screener) QueueUnflag(ctx context.Context, id uint64, reviewer, note string) (int64, error) {
+	return s.db.queueOp(ctx, op{kind: "unflag", deposit: id, reviewer: reviewer, note: note}, s.now())
+}
+
+// runOps carries out the operators' queued decisions and records each result.
+func (s *Screener) runOps(ctx context.Context) error {
+	ops, err := s.db.queuedOps(ctx)
+	if err != nil {
+		return err
+	}
+	for _, o := range ops {
+		var err error
+		switch o.kind {
+		case "flag":
+			err = s.FlagManually(ctx, o.deposit, *o.reason, o.reviewer, o.note)
+		case "unflag":
+			err = s.Unflag(ctx, o.deposit, o.reviewer, o.note)
+		default:
+			err = fmt.Errorf("unknown operation %q", o.kind)
+		}
+		result := "done"
+		if err != nil {
+			result = "failed: " + err.Error()
+			s.alerts.Raise(ctx, alert.Warning, fmt.Sprintf("operator_op_failed_%d", o.id), "the queued %s of deposit %d failed: %v", o.kind, o.deposit, err)
+		}
+		if err := s.db.finishOp(ctx, o.id, result, s.now()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Unflag corrects a mistaken flag while the deposit is pending. A deposit inside the attested
@@ -108,7 +158,7 @@ func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string)
 	if err != nil {
 		return err
 	}
-	for column, value := range map[string]any{"first_check": "pass", "review": "cleared", "recheck": nil, "flag_sent": nil, "refuse_reason": nil} {
+	for column, value := range map[string]any{"first_check": "pass", "review": "cleared", "recheck": nil, "recheck_at": nil, "flag_sent": nil, "refuse_reason": nil, "flag_kind": nil} {
 		if err := s.db.update(ctx, id, column, value); err != nil {
 			return err
 		}

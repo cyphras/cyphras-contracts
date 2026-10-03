@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -21,6 +22,20 @@ CREATE TABLE IF NOT EXISTS screening (
 	review text,
 	recheck text,
 	flag_sent integer
+);
+ALTER TABLE screening ADD COLUMN IF NOT EXISTS first_findings text;
+ALTER TABLE screening ADD COLUMN IF NOT EXISTS flag_kind text;
+ALTER TABLE screening ADD COLUMN IF NOT EXISTS recheck_at bigint;
+CREATE TABLE IF NOT EXISTS operator_ops (
+	id bigserial PRIMARY KEY,
+	kind text NOT NULL,
+	deposit_id bigint NOT NULL,
+	reason integer,
+	reviewer text NOT NULL,
+	note text NOT NULL,
+	queued_at bigint NOT NULL,
+	done_at bigint,
+	result text
 );
 CREATE TABLE IF NOT EXISTS decisions (
 	id bigserial PRIMARY KEY,
@@ -109,14 +124,21 @@ type row struct {
 	refuseReason *uint32
 	review       string
 	recheck      string
-	flagSent     *uint32
+	// recheckAt is when the final check ran; a pass vouches for the deposit only for a while.
+	recheckAt *uint64
+	flagSent  *uint32
+	// firstFindings are what the first check found, which a cleared review accepted.
+	firstFindings []string
+	// flagKind is the kind of decision behind this service's flag, such as review_timeout.
+	flagKind string
 	// needsFlag marks a refusal whose flag has not been sent yet.
 	needsFlag bool
 }
 
 func (s store) pending(ctx context.Context) ([]row, error) {
 	rows, err := s.pool.Query(ctx, `SELECT d.id, d.depositor, d.amount::text, d.created_at, d.flag_reason,
-		s.delay, COALESCE(s.first_check, ''), s.refuse_reason, COALESCE(s.review, ''), COALESCE(s.recheck, ''), s.flag_sent
+		s.delay, COALESCE(s.first_check, ''), s.refuse_reason, COALESCE(s.review, ''), COALESCE(s.recheck, ''), s.flag_sent,
+		COALESCE(s.first_findings, ''), COALESCE(s.flag_kind, ''), s.recheck_at
 		FROM deposits d LEFT JOIN screening s ON s.deposit_id = d.id
 		WHERE d.outcome IS NULL ORDER BY d.id`)
 	if err != nil {
@@ -129,8 +151,18 @@ func (s store) pending(ctx context.Context) ([]row, error) {
 		var id, created int64
 		var flag, refuseReason, flagSent *int32
 		var delay *int64
-		if err := rows.Scan(&id, &r.depositor, &r.amount, &created, &flag, &delay, &r.firstCheck, &refuseReason, &r.review, &r.recheck, &flagSent); err != nil {
+		var findings string
+		var recheckAt *int64
+		if err := rows.Scan(&id, &r.depositor, &r.amount, &created, &flag, &delay, &r.firstCheck, &refuseReason, &r.review, &r.recheck, &flagSent,
+			&findings, &r.flagKind, &recheckAt); err != nil {
 			return nil, err
+		}
+		if recheckAt != nil {
+			at := uint64(*recheckAt)
+			r.recheckAt = &at
+		}
+		if findings != "" {
+			r.firstFindings = strings.Split(findings, "\n")
 		}
 		r.id, r.createdAt = uint64(id), uint64(created)
 		r.flag, r.refuseReason, r.flagSent = u32p(flag), u32p(refuseReason), u32p(flagSent)
@@ -153,12 +185,59 @@ func u32p(v *int32) *uint32 {
 
 func (s store) update(ctx context.Context, id uint64, column string, value any) error {
 	switch column {
-	case "delay", "first_check", "refuse_reason", "review", "recheck", "flag_sent":
+	case "delay", "first_check", "refuse_reason", "review", "recheck", "flag_sent", "first_findings", "flag_kind", "recheck_at":
 	default:
 		return errors.New("screening: unknown column")
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO screening (deposit_id, `+column+`) VALUES ($1, $2)
 		ON CONFLICT (deposit_id) DO UPDATE SET `+column+` = EXCLUDED.`+column, int64(id), value)
+	return err
+}
+
+// op is an operator's flag or unflag, queued for the process that writes as the asp account.
+type op struct {
+	id       int64
+	kind     string
+	deposit  uint64
+	reason   *uint32
+	reviewer string
+	note     string
+}
+
+func (s store) queueOp(ctx context.Context, o op, at time.Time) (int64, error) {
+	var reason *int32
+	if o.reason != nil {
+		r := int32(*o.reason)
+		reason = &r
+	}
+	var id int64
+	err := s.pool.QueryRow(ctx, `INSERT INTO operator_ops (kind, deposit_id, reason, reviewer, note, queued_at)
+		VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`, o.kind, int64(o.deposit), reason, o.reviewer, o.note, at.Unix()).Scan(&id)
+	return id, err
+}
+
+func (s store) queuedOps(ctx context.Context) ([]op, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, kind, deposit_id, reason, reviewer, note FROM operator_ops WHERE done_at IS NULL ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []op
+	for rows.Next() {
+		var o op
+		var deposit int64
+		var reason *int32
+		if err := rows.Scan(&o.id, &o.kind, &deposit, &reason, &o.reviewer, &o.note); err != nil {
+			return nil, err
+		}
+		o.deposit, o.reason = uint64(deposit), u32p(reason)
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+func (s store) finishOp(ctx context.Context, id int64, result string, at time.Time) error {
+	_, err := s.pool.Exec(ctx, `UPDATE operator_ops SET done_at = $2, result = $3 WHERE id = $1`, id, at.Unix(), result)
 	return err
 }
 
