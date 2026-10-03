@@ -458,9 +458,10 @@ impl Vault {
         Ok(())
     }
 
-    /// The guardian changes the limits. A tightening, where no field rises, applies at once; any
-    /// loosening replaces the queued one and applies 7 days later through `apply_limits`.
-    /// `max_daily_outflow` never decreases, so a full pool can always exit within a week.
+    /// The guardian changes the limits. A tightening, where no field rises, applies at once and
+    /// cancels any queued loosening; any loosening replaces the queued one and applies 7 days later
+    /// through `apply_limits`. `max_daily_outflow` never decreases, so a full pool can always exit
+    /// within a week.
     pub fn set_limits(env: Env, limits: Limits) -> Result<(), Error> {
         storage::config(&env).guardian.require_auth();
         let current = storage::limits(&env);
@@ -473,6 +474,15 @@ impl Vault {
             && limits.max_fee <= current.max_fee
             && limits.large_deposit_threshold <= current.large_deposit_threshold;
         if tightening {
+            // A loosening queued before an emergency tightening would otherwise undo it when due.
+            if let Some(queued) = storage::queued_limits(&env) {
+                storage::remove_queued_limits(&env);
+                events::LimitsCancelled {
+                    limits: queued.limits,
+                    ready_at: queued.ready_at,
+                }
+                .publish(&env);
+            }
             storage::set_limits(&env, &limits);
             events::LimitsApplied {
                 limits,

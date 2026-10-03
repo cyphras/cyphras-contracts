@@ -350,16 +350,58 @@ fn a_new_loosening_replaces_the_queued_one_and_restarts_the_clock() {
 }
 
 #[test]
-fn a_tightening_leaves_a_queued_loosening_in_place() {
+fn a_tightening_cancels_a_queued_loosening() {
     let s = Setup::new();
     let mut looser = s.vault.limits();
     looser.max_fee += 1;
     s.vault.set_limits(&looser);
+    let ready_at = s.now() + WEEK;
     let mut tighter = s.vault.limits();
     tighter.max_deposit -= 1;
     s.vault.set_limits(&tighter);
+    let vault = s.vault.address.clone();
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&vault),
+        std::vec![
+            events::LimitsCancelled {
+                limits: looser,
+                ready_at
+            }
+            .to_xdr(&s.env, &vault),
+            events::LimitsApplied {
+                limits: tighter.clone(),
+                ready_at: s.now()
+            }
+            .to_xdr(&s.env, &vault),
+        ]
+    );
     assert_eq!(s.vault.limits(), tighter);
-    assert_eq!(s.vault.queued_limits().unwrap().limits, looser);
+    assert_eq!(s.vault.queued_limits(), None);
+}
+
+#[test]
+fn a_loosening_queued_before_an_emergency_tightening_cannot_undo_it() {
+    let s = Setup::new();
+    let base = s.vault.limits();
+    let mut looser = base.clone();
+    looser.max_deposit = 2 * base.max_deposit;
+    s.vault.set_limits(&looser);
+    s.advance(6 * DAY);
+
+    // An incident: the guardian closes deposits through the limits.
+    let mut emergency = base.clone();
+    emergency.max_deposit = 0;
+    emergency.max_daily_per_depositor = 0;
+    emergency.tvl_cap = 0;
+    s.vault.set_limits(&emergency);
+
+    // When the old loosening would have come due, there is nothing left to apply.
+    s.advance(DAY);
+    assert_eq!(
+        outcome(s.vault.try_apply_limits()),
+        Err(Error::NoQueuedLimits)
+    );
+    assert_eq!(s.vault.limits(), emergency);
 }
 
 #[test]

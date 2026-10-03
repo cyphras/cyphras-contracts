@@ -258,6 +258,7 @@ impl Model {
                     && next.large_deposit_threshold <= l.large_deposit_threshold;
                 if tightening {
                     self.limits = next.clone();
+                    self.queued = None;
                 } else {
                     self.queued = Some(QueuedLimits {
                         limits: next.clone(),
