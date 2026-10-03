@@ -39,12 +39,21 @@ export interface Deployment {
 /** The deployments an SDK release can pin. */
 export type DeploymentName = "mainnet/xlm" | "testnet/xlm";
 
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    for (const inner of Object.values(value)) deepFreeze(inner);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 // No v2 vault is deployed yet. The release script fills these in from the deployment files;
-// until then opening a wallet on either refuses.
-export const PINNED_DEPLOYMENTS: Readonly<Record<DeploymentName, Deployment | null>> = {
+// until then opening a wallet on either refuses. Frozen to the last nested value, so no code in
+// the page can swap a pinned vault, artifact hash or service for another.
+export const PINNED_DEPLOYMENTS: Readonly<Record<DeploymentName, Deployment | null>> = deepFreeze({
   "mainnet/xlm": null,
   "testnet/xlm": null,
-};
+});
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const ASSET_NAME = /^(native|[A-Za-z0-9]{1,12}:G[A-Z2-7]{55})$/;

@@ -31,6 +31,19 @@ describe("pinned deployments", () => {
     );
   });
 
+  it("cannot be changed at run time", async () => {
+    const { deployment } = await createWorld();
+    const pins = PINNED_DEPLOYMENTS as Record<string, Deployment | null>;
+    assert.ok(Object.isFrozen(PINNED_DEPLOYMENTS));
+    assert.throws(() => {
+      pins["testnet/xlm"] = deployment;
+    }, TypeError);
+    assert.throws(() => {
+      pins["devnet/xlm"] = deployment;
+    }, TypeError);
+    assert.equal(PINNED_DEPLOYMENTS["testnet/xlm"], null);
+  });
+
   it("takes an unpinned deployment only when asked to, and checks it", async () => {
     const { deployment } = await createWorld();
     assert.throws(() => resolveDeployment(deployment, false), isCode("deployment_not_pinned"));
