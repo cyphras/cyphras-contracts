@@ -24,6 +24,7 @@ func (ix *Indexer) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/leaves", ix.leaves)
 	mux.HandleFunc("GET /v1/nullifiers", ix.nullifiers)
 	mux.HandleFunc("GET /v1/deposits", ix.deposits)
+	mux.HandleFunc("GET /v1/exits", ix.exits)
 	mux.HandleFunc("GET /v1/stats", ix.stats)
 	mux.HandleFunc("GET /v1/stream", ix.stream)
 	return httpapi.Public(mux)

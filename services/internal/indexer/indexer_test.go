@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -390,5 +392,66 @@ func TestTheStreamWakesSubscribers(t *testing.T) {
 			}
 			return
 		}
+	}
+}
+
+func TestReleaseTimesFollowTheDailyWindow(t *testing.T) {
+	const day = 20_000 * secondsPerDay
+	n := func(v int64) *big.Int { return big.NewInt(v) }
+	got := releaseSchedule([]*big.Int{n(300), n(500), n(1000), n(1)}, day+100, 0, n(600), n(1000))
+	// 300 fits today's 400 left; 500 waits for tomorrow, 1000 for the day after, and 1 fits after it
+	// only the day after that.
+	want := []uint64{day + 100, day + secondsPerDay, day + 2*secondsPerDay, day + 3*secondsPerDay}
+	if !slices.Equal(got, want) {
+		t.Fatalf("schedule %v, want %v", got, want)
+	}
+	// A halt that ends tomorrow starts the schedule there, with tomorrow's whole window.
+	got = releaseSchedule([]*big.Int{n(900)}, day+100, day+secondsPerDay+50, n(600), n(1000))
+	if got[0] != day+secondsPerDay+50 {
+		t.Fatalf("after a halt %v", got)
+	}
+}
+
+func TestTheExitQueueIsServedWithReleaseTimes(t *testing.T) {
+	h := newHarness(t)
+	c := h.chain
+	c.Shield(vaulttest.Depositor, 9_000_000_000)
+	c.NextLedger(5)
+	c.Attest(1)
+	c.Admit(1)
+	c.NextLedger(5)
+	first := c.QueueExit(1, -2_000_000_000, 1_000, vaulttest.Depositor)
+	second := c.QueueExit(2, -1_000_000_000, 0, vaulttest.Relayer)
+	c.QueueExit(3, -500_000_000, 0, vaulttest.Relayer)
+	c.NextLedger(5)
+	c.Strand(first, 2_000_000_000, 0)
+	c.Release(second)
+	c.NextLedger(5)
+	h.publish()
+	h.drain()
+	h.ix.Probe(context.Background())
+	if err := h.ix.RefreshPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	h.now = time.Unix(c.ClosedAt, 0)
+	code, body := h.get("/v1/exits")
+	if code != http.StatusOK {
+		t.Fatalf("exits %d %v", code, body)
+	}
+	queued := body["queued"].([]any)
+	stranded := body["stranded"].([]any)
+	if body["head"].(float64) != 3 || body["tail"].(float64) != 4 || len(queued) != 1 || len(stranded) != 1 {
+		t.Fatalf("exits %v", body)
+	}
+	q := queued[0].(map[string]any)
+	if q["id"].(float64) != 3 || q["position"].(float64) != 0 || q["payout"] != "500000000" || q["earliest_release"].(float64) != float64(c.ClosedAt) {
+		t.Fatalf("queued exit %v", q)
+	}
+	s := stranded[0].(map[string]any)
+	if s["id"].(float64) != 1 || s["payout"] != "2000000000" || s["fee"] != "0" || s["recipient"] != vaulttest.Depositor {
+		t.Fatalf("stranded exit %v", s)
+	}
+	if body["queued_total"] != "2500000000" || body["window"].(map[string]any)["used"] != "1000001000" {
+		t.Fatalf("totals %v", body)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"strings"
 	"sync"
 	"testing"
@@ -38,7 +39,12 @@ type harness struct {
 	sent    []string
 	pages   []alert.Alert
 	simFail func(string) bool
-	status  vault.Status
+	// sentHook sees each sent transaction, so a test can play its effect on the chain.
+	sentHook func(string)
+	status   vault.Status
+	limit    int64
+	// outflows holds the outflow of each queued exit by ID.
+	outflows map[uint64]int64
 }
 
 func (h *harness) Send(_ context.Context, a alert.Alert) error {
@@ -56,6 +62,8 @@ func describe(env xdr.TransactionEnvelope) string {
 			switch a.Type {
 			case xdr.ScValTypeScvU64:
 				parts = append(parts, fmt.Sprint(uint64(*a.U64)))
+			case xdr.ScValTypeScvU32:
+				parts = append(parts, fmt.Sprint(uint32(*a.U32)))
 			case xdr.ScValTypeScvVec:
 				var ids []string
 				for _, v := range **a.Vec {
@@ -75,7 +83,7 @@ func describe(env xdr.TransactionEnvelope) string {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{t: t, fake: rpctest.New(passphrase, 9), chain: vaulttest.New(10, 1_728_000_000), now: time.Unix(1_728_000_000, 0)}
+	h := &harness{t: t, fake: rpctest.New(passphrase, 9), chain: vaulttest.New(10, 1_728_000_000), now: time.Unix(1_728_000_000, 0), limit: 1_000_000_000_000}
 	pool, err := chainstate.Open(context.Background(), testdb.URL(t), "")
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +116,11 @@ func newHarness(t *testing.T) *harness {
 		_ = xdr.SafeUnmarshalBase64(req.Transaction, &env)
 		h.mu.Lock()
 		h.sent = append(h.sent, describe(env))
+		hook := h.sentHook
 		h.mu.Unlock()
+		if hook != nil {
+			hook(describe(env))
+		}
 		return protocol.SendTransactionResponse{Status: "PENDING"}, nil
 	}
 	h.fake.Get = func(protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
@@ -118,7 +130,7 @@ func newHarness(t *testing.T) *harness {
 	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, Validity: time.Minute, Poll: time.Millisecond, Now: func() time.Time { return h.now }}
 	alerts := &alert.Alerter{Service: "keeper", Channels: []alert.Channel{h}, Cooldown: time.Hour, Now: func() time.Time { return h.now }}
 	k, err := New(context.Background(), Config{
-		Vault: vaulttest.Vault, DeployLedger: 10, MaxAdmissions: 17, MaxExtensions: 50, RefundDelay: 24 * time.Hour,
+		Vault: vaulttest.Vault, DeployLedger: 10, MaxAdmissions: 17, MaxExtensions: 50, MaxReleases: 10, RefundDelay: 24 * time.Hour,
 		HoldReasons: map[uint32]bool{99: true}, BalanceFloor: 1_000_000_000,
 	}, h.fake, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(kp.Address(), kp), alerts, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -147,9 +159,7 @@ func (h *harness) sync() {
 	h.fake.SetLatest(h.chain.Ledger)
 	h.fake.CloseTime = h.now.Unix()
 	h.status.NextDepositID = h.chain.NextID
-	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Vault)), vaulttest.Instance(vaulttest.InstanceOptions{
-		DelaySmall: 3600, DelayLarge: 86400, Limit: 1_000_000_000_000, Large: 5_000_000_000, Status: h.status, WasmHash: [32]byte{9},
-	}), 10, h.live(4_000_000))
+	h.setInstance()
 	for range 50 {
 		progressed, err := h.f.Step(context.Background())
 		if err != nil {
@@ -159,6 +169,12 @@ func (h *harness) sync() {
 			return
 		}
 	}
+}
+
+func (h *harness) setInstance() {
+	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Vault)), vaulttest.Instance(vaulttest.InstanceOptions{
+		DelaySmall: 3600, DelayLarge: 86400, Limit: h.limit, Large: 5_000_000_000, Status: h.status, WasmHash: [32]byte{9},
+	}), 10, h.live(4_000_000))
 }
 
 func (h *harness) live(ledgers uint32) *uint32 {
@@ -292,6 +308,8 @@ func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 	// The code is due, the asset contract is not, and the vault's balance entry is archived.
 	h.fake.SetEntry(vault.CodeKey([32]byte{9}), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeContractCode, ContractCode: &xdr.ContractCodeEntry{Hash: xdr.Hash{9}}}, 10, &near)
 	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Token)), vault.U64(0), 10, &far)
+	archived := latest - 1
+	h.fake.SetContractData(mustKey(vault.BalanceKey(vaulttest.Token, vaulttest.Vault)), vault.U64(0), 10, &archived)
 	// Of the four nullifiers, one is fresh, two are due and one is archived.
 	var nfKeys []xdr.LedgerKey
 	for i := range 4 {
@@ -337,5 +355,108 @@ func TestAStaleCycleAndALowBalancePage(t *testing.T) {
 	}
 	if h.pages[len(h.pages)-1].Code != "balance_low" {
 		t.Fatalf("pages %+v", h.pages)
+	}
+}
+
+// queueExits stores exit entries the way transact leaves them and moves the queue's tail.
+func (h *harness) queueExits(outflows ...int64) {
+	if h.outflows == nil {
+		h.outflows = map[uint64]int64{}
+	}
+	for _, o := range outflows {
+		id := h.status.ExitTail
+		h.fake.SetContractData(mustKey(vault.ExitKey(vaulttest.Vault, id)), vaulttest.ExitEntry(vaulttest.Depositor, o, 0, 1), h.chain.Ledger, h.live(500_000))
+		h.outflows[id] = o
+		h.status.ExitTail++
+	}
+}
+
+// release plays a release of n exits on the harness's vault status.
+func (h *harness) release(n uint64) {
+	day := uint64(h.now.Unix()) / secondsPerDay
+	if h.status.OutflowDay != day {
+		h.status.OutflowDay, h.status.Outflow = day, new(big.Int)
+	}
+	for range n {
+		h.status.Outflow = new(big.Int).Add(h.status.Outflow, big.NewInt(h.outflows[h.status.ExitHead]))
+		h.status.ExitHead++
+	}
+	h.setInstance()
+}
+
+func TestReleasePaysWhatFitsTheWindowAndWaitsForMidnight(t *testing.T) {
+	h := newHarness(t)
+	h.limit = 1000
+	h.status.ExitHead, h.status.ExitTail = 1, 1
+	h.queueExits(300, 250, 500)
+	h.status.OutflowDay, h.status.Outflow = uint64(h.now.Unix())/secondsPerDay, big.NewInt(600)
+	h.sentHook = func(d string) {
+		var n uint64
+		if _, err := fmt.Sscanf(d, "release %d", &n); err == nil {
+			h.release(n)
+		}
+	}
+	h.sync()
+	if err := h.k.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// 300 fits the 400 left today; 250 does not fit the 100 left after it.
+	if got := h.take(); !equal(got, []string{"release 1"}) {
+		t.Fatalf("releases %v", got)
+	}
+	if err := h.k.Release(context.Background()); err != nil || len(h.take()) != 0 {
+		t.Fatalf("released with the window spent: %v", err)
+	}
+	// After midnight the whole window is free: 250 and 500 both fit.
+	h.now = h.now.Add(24 * time.Hour)
+	h.sync()
+	h.simFail = func(d string) bool { return d == "release 2" }
+	if err := h.k.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.take(); !equal(got, []string{"release 1", "release 1"}) {
+		t.Fatalf("halved releases %v", got)
+	}
+	if h.status.ExitHead != h.status.ExitTail {
+		t.Fatalf("queue left at %d of %d", h.status.ExitHead, h.status.ExitTail)
+	}
+	if d := untilRelease(time.Date(2026, 10, 3, 23, 59, 50, 0, time.UTC), 30*time.Second); d != 20*time.Second {
+		t.Fatalf("sleeps %s before midnight", d)
+	}
+}
+
+func TestStrandedExitsAreClaimedWhenTheyCanBePaid(t *testing.T) {
+	h := newHarness(t)
+	h.limit = 1000
+	h.chain.Shield(vaulttest.Depositor, 5000)
+	h.chain.Attest(1)
+	h.chain.Admit(1)
+	first := h.chain.QueueExit(1, -400, 0, vaulttest.Depositor)
+	second := h.chain.QueueExit(2, -300, 0, vaulttest.Depositor)
+	h.chain.NextLedger(5)
+	h.chain.Strand(first, 400, 0)
+	h.chain.Strand(second, 300, 0)
+	h.chain.NextLedger(5)
+	h.status.ExitHead, h.status.ExitTail = 3, 3
+	h.status.OutflowDay, h.status.Outflow = uint64(h.now.Unix())/secondsPerDay, big.NewInt(500)
+	for id, payout := range map[uint64]int64{1: 400, 2: 300} {
+		h.fake.SetContractData(mustKey(vault.StrandedKey(vaulttest.Vault, id)), vaulttest.ExitEntry(vaulttest.Depositor, payout, 0, 1), h.chain.Ledger, h.live(500_000))
+	}
+	h.sync()
+	// Exit 1 cannot be paid yet; exit 2 can, and fits the 500 left.
+	h.simFail = func(d string) bool { return d == "claim 1" }
+	if err := h.k.Claim(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.take(); !equal(got, []string{"claim 2"}) {
+		t.Fatalf("claims %v", got)
+	}
+	if len(h.pages) != 0 {
+		t.Fatalf("a claim that cannot pay yet paged: %+v", h.pages)
+	}
+	// Both stranded entries are kept alive by the TTL cycle.
+	exits, err := h.k.exitEntries()
+	if err != nil || len(exits) != 2 || exits[0].name != "stranded exit 1" {
+		t.Fatalf("exit entries %+v, %v", exits, err)
 	}
 }

@@ -1,0 +1,162 @@
+package keeper
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"math/big"
+	"slices"
+	"time"
+
+	"github.com/stellar/go-stellar-sdk/txnbuild"
+	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
+	"github.com/cyphras/cyphras-contracts/services/internal/submit"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault"
+)
+
+const secondsPerDay = 86_400
+
+// readExits reads exit entries by ID in order and stops at the first one that is gone.
+func (k *Keeper) readExits(ctx context.Context, ids []uint64, key func(string, uint64) (xdr.LedgerKey, error)) ([]vault.Exit, error) {
+	keys := make([]xdr.LedgerKey, len(ids))
+	for i, id := range ids {
+		var err error
+		if keys[i], err = key(k.cfg.Vault, id); err != nil {
+			return nil, err
+		}
+	}
+	entries, _, err := rpc.Entries(ctx, k.rpc, keys)
+	if err != nil {
+		return nil, err
+	}
+	var out []vault.Exit
+	for i := range ids {
+		s, _ := rpc.KeyString(keys[i])
+		e, ok := entries[s]
+		if !ok {
+			break
+		}
+		v, err := rpc.ContractValue(e)
+		if err != nil {
+			return nil, err
+		}
+		x, err := vault.DecodeExit(v)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, nil
+}
+
+// window reads what is left of today's outflow window, and whether the vault takes payments now.
+func (k *Keeper) window(ctx context.Context) (vault.Instance, *big.Int, bool, error) {
+	inst, _, _, err := rpc.VaultInstance(ctx, k.rpc, k.cfg.Vault)
+	if err != nil {
+		return vault.Instance{}, nil, false, err
+	}
+	now, _, err := k.chainTime(ctx)
+	if err != nil {
+		return vault.Instance{}, nil, false, err
+	}
+	room := new(big.Int).Sub(inst.Limits.MaxDailyOutflow, inst.Status.OutflowOn(now/secondsPerDay))
+	return inst, room, !inst.Status.Halted(now), nil
+}
+
+// Release pays queued exits in order while each fits what is left of today's outflow window. It
+// counts from the chain how many fit before it calls, so it never pays for a release that pays
+// nothing, and a batch the transaction limits refuse in simulation is halved.
+func (k *Keeper) Release(ctx context.Context) error {
+	batch := max(k.cfg.MaxReleases, 1)
+	for range 100 {
+		inst, room, open, err := k.window(ctx)
+		if err != nil {
+			return err
+		}
+		head, tail := inst.Status.ExitHead, inst.Status.ExitTail
+		if !open || head >= tail {
+			return nil
+		}
+		ids := make([]uint64, 0, batch)
+		for id := head; id < tail && len(ids) < batch; id++ {
+			ids = append(ids, id)
+		}
+		exits, err := k.readExits(ctx, ids, vault.ExitKey)
+		if err != nil {
+			return err
+		}
+		n := 0
+		for _, e := range exits {
+			outflow := new(big.Int).Add(e.Payout, e.Fee)
+			if outflow.Cmp(room) > 0 {
+				break
+			}
+			room.Sub(room, outflow)
+			n++
+		}
+		if n == 0 {
+			return nil
+		}
+		_, err = k.call(ctx, fmt.Sprintf("release of %d exits", n), func() (txnbuild.Operation, error) {
+			return k.invoke("release", vault.U32(uint32(n)))
+		})
+		if errors.Is(err, submit.ErrSimulation) && n > 1 {
+			batch = n / 2
+			continue
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Claim pays stranded exits whose recipient and relayer can receive again, oldest first, while
+// they fit today's window. A claim that still cannot pay fails in simulation and costs nothing.
+func (k *Keeper) Claim(ctx context.Context) error {
+	k.mu.RLock()
+	ids := slices.Sorted(maps.Keys(k.state.Stranded))
+	k.mu.RUnlock()
+	if len(ids) == 0 {
+		return nil
+	}
+	_, room, open, err := k.window(ctx)
+	if err != nil || !open {
+		return err
+	}
+	for _, id := range ids {
+		exits, err := k.readExits(ctx, []uint64{id}, vault.StrandedKey)
+		if err != nil {
+			return err
+		}
+		if len(exits) == 0 {
+			continue
+		}
+		outflow := new(big.Int).Add(exits[0].Payout, exits[0].Fee)
+		if outflow.Cmp(room) > 0 {
+			continue
+		}
+		_, err = k.call(ctx, fmt.Sprintf("claim of exit %d", id), func() (txnbuild.Operation, error) {
+			return k.invoke("claim", vault.U64(id))
+		})
+		if errors.Is(err, submit.ErrSimulation) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		room.Sub(room, outflow)
+	}
+	return nil
+}
+
+// untilRelease is how long the release job sleeps: its interval, or until just after the next UTC
+// midnight, when the window resets, if that comes first.
+func untilRelease(now time.Time, every time.Duration) time.Duration {
+	midnight := now.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
+	// A ledger closed after midnight must exist before release can use the new window.
+	return min(every, midnight.Sub(now)+10*time.Second)
+}

@@ -1,5 +1,6 @@
-// Package keeper keeps the vault's entries alive, admits eligible deposits and refunds deposits
-// that stayed flagged. Every call it makes is permissionless, so its key only risks its float.
+// Package keeper keeps the vault's entries alive, admits eligible deposits, refunds deposits that
+// stayed flagged and pays queued and stranded exits as the outflow window allows. Every call it
+// makes is permissionless, so its key only risks its float.
 package keeper
 
 import (
@@ -33,6 +34,8 @@ type Config struct {
 	MaxAdmissions int
 	// MaxExtensions is the most entries one footprint extension carries.
 	MaxExtensions int
+	// MaxReleases is the most exits one release call pays.
+	MaxReleases int
 	// RefundDelay is how long a deposit must stay flagged before anyone may refund it.
 	RefundDelay time.Duration
 	// HoldReasons are flag reasons the keeper never refunds, such as a written order from an
@@ -296,12 +299,15 @@ func (k *Keeper) Run(ctx context.Context, f *follow.Follower, poll time.Duration
 		name  string
 		every time.Duration
 		run   func(context.Context) error
+		next  func(time.Time, time.Duration) time.Duration
 	}{
-		{"admission", 30 * time.Second, k.Admit},
-		{"refunds", 5 * time.Minute, k.Refund},
-		{"ttl", time.Hour, k.TTLCycle},
-		{"balance", 10 * time.Minute, k.CheckBalance},
-		{"watch", time.Minute, func(ctx context.Context) error { k.Watch(ctx); return nil }},
+		{"admission", 30 * time.Second, k.Admit, nil},
+		{"release", 30 * time.Second, k.Release, untilRelease},
+		{"claims", 10 * time.Minute, k.Claim, nil},
+		{"refunds", 5 * time.Minute, k.Refund, nil},
+		{"ttl", time.Hour, k.TTLCycle, nil},
+		{"balance", 10 * time.Minute, k.CheckBalance, nil},
+		{"watch", time.Minute, func(ctx context.Context) error { k.Watch(ctx); return nil }, nil},
 	}
 	var wg sync.WaitGroup
 	for _, j := range jobs {
@@ -310,7 +316,11 @@ func (k *Keeper) Run(ctx context.Context, f *follow.Follower, poll time.Duration
 				if err := j.run(ctx); err != nil && ctx.Err() == nil {
 					k.log.Warn("job incomplete", "job", j.name, "error", err.Error())
 				}
-				t := time.NewTimer(j.every)
+				wait := j.every
+				if j.next != nil {
+					wait = j.next(k.now(), j.every)
+				}
+				t := time.NewTimer(wait)
 				select {
 				case <-ctx.Done():
 					t.Stop()

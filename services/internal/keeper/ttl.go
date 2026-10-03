@@ -3,6 +3,8 @@ package keeper
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/txnbuild"
@@ -24,16 +26,24 @@ const (
 type tracked struct {
 	name string
 	key  xdr.LedgerKey
-	// liveUntil is nil when the entry is archived or was never created.
+	// optional marks an entry that may be gone by the time it is read, such as a deposit admitted
+	// or an exit paid since the list was made; a missing one is skipped rather than restored.
+	optional bool
+	missing  bool
+	// liveUntil is nil when the entry is archived or missing.
 	liveUntil *uint32
 }
 
+func (t tracked) gone() bool {
+	return t.optional && t.missing
+}
+
 func (t tracked) due(latest uint32) bool {
-	return t.liveUntil == nil || *t.liveUntil < latest+renewWithin
+	return !t.gone() && (t.liveUntil == nil || *t.liveUntil < latest+renewWithin)
 }
 
 func (t tracked) urgent(latest uint32) bool {
-	return t.liveUntil == nil || *t.liveUntil < latest+warnWithin
+	return !t.gone() && (t.liveUntil == nil || *t.liveUntil < latest+warnWithin)
 }
 
 func (k *Keeper) read(ctx context.Context, items []tracked) ([]tracked, uint32, error) {
@@ -48,8 +58,9 @@ func (k *Keeper) read(ctx context.Context, items []tracked) ([]tracked, uint32, 
 	out := make([]tracked, len(items))
 	for i, it := range items {
 		s, _ := rpc.KeyString(it.key)
-		it.liveUntil = nil
-		if e, ok := entries[s]; ok && e.LiveUntil != nil && *e.LiveUntil >= latest {
+		e, ok := entries[s]
+		it.liveUntil, it.missing = nil, !ok
+		if ok && e.LiveUntil != nil && *e.LiveUntil >= latest {
 			v := *e.LiveUntil
 			it.liveUntil = &v
 		}
@@ -60,7 +71,8 @@ func (k *Keeper) read(ctx context.Context, items []tracked) ([]tracked, uint32, 
 
 // TTLCycle reads the remaining life of every entry the vault depends on and extends each one within
 // 30 days of expiry to the network's maximum: the instance, the tree and pending deposits through
-// bump_ttl, and the code, the asset contract's entries and the nullifiers by footprint.
+// bump_ttl, and the code, the asset contract's entries, queued and stranded exits and the
+// nullifiers by footprint.
 func (k *Keeper) TTLCycle(ctx context.Context) error {
 	maxTTL, err := rpc.MaxEntryTTL(ctx, k.rpc)
 	if err != nil {
@@ -88,7 +100,7 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		group = append(group, tracked{name: fmt.Sprintf("pending deposit %d", id), key: key})
+		group = append(group, tracked{name: fmt.Sprintf("pending deposit %d", id), key: key, optional: true})
 	}
 	group, latest, err := k.read(ctx, group)
 	if err != nil {
@@ -123,7 +135,13 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	others, _, err := k.read(ctx, []tracked{{name: "vault code", key: codeKey}, {name: "asset contract", key: tokenInstance}, {name: "vault balance", key: balance}})
+	// The vault has no balance entry until its first deposit.
+	others := []tracked{{name: "vault code", key: codeKey}, {name: "asset contract", key: tokenInstance}, {name: "vault balance", key: balance, optional: true}}
+	exits, err := k.exitEntries()
+	if err != nil {
+		return err
+	}
+	others, _, err = k.read(ctx, append(others, exits...))
 	if err != nil {
 		return err
 	}
@@ -161,6 +179,7 @@ func (k *Keeper) extend(ctx context.Context, items []tracked, maxTTL, latest uin
 	var archived, due []xdr.LedgerKey
 	for _, t := range items {
 		switch {
+		case t.gone():
 		case t.liveUntil == nil:
 			archived = append(archived, t.key)
 			due = append(due, t.key)
@@ -280,4 +299,28 @@ func (k *Keeper) Watch(ctx context.Context) {
 	if k.now().Sub(last) > 2*time.Hour {
 		k.alerts.Raise(ctx, alert.Critical, "ttl_cycle_stale", "the last complete TTL cycle was %s ago", k.now().Sub(last).Round(time.Minute))
 	}
+}
+
+// exitEntries lists the entries of the queued and stranded exits the keeper has ingested.
+func (k *Keeper) exitEntries() ([]tracked, error) {
+	k.mu.RLock()
+	head, tail := k.state.ExitHead, k.state.ExitTail
+	stranded := slices.Sorted(maps.Keys(k.state.Stranded))
+	k.mu.RUnlock()
+	var out []tracked
+	for id := head; id < tail; id++ {
+		key, err := vault.ExitKey(k.cfg.Vault, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tracked{name: fmt.Sprintf("exit %d", id), key: key, optional: true})
+	}
+	for _, id := range stranded {
+		key, err := vault.StrandedKey(k.cfg.Vault, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tracked{name: fmt.Sprintf("stranded exit %d", id), key: key, optional: true})
+	}
+	return out, nil
 }

@@ -1,8 +1,9 @@
-// Command keeper keeps one vault's entries alive, admits eligible deposits and refunds deposits that
-// stayed flagged, from its own funded account. It serves no API.
+// Command keeper keeps one vault's entries alive, admits eligible deposits, refunds deposits that
+// stayed flagged and pays queued and stranded exits, from its own funded account. It serves no API.
 package main
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -55,9 +56,16 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
+	releases, err := config.Int("RELEASE_BATCH", 10)
+	if err == nil && (releases < 1 || releases > 100) {
+		err = errors.New("RELEASE_BATCH must be 1 to 100")
+	}
+	if err != nil {
+		service.Fatal(log, "config", err)
+	}
 	k, err := keeper.New(ctx, keeper.Config{
 		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, MaxAdmissions: 17, MaxExtensions: 50,
-		RefundDelay: 24 * time.Hour, HoldReasons: hold, BalanceFloor: floor,
+		MaxReleases: int(releases), RefundDelay: 24 * time.Hour, HoldReasons: hold, BalanceFloor: floor,
 	}, base.RPC, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(key.Address(), key), base.Alerts, log)
 	if err != nil {
 		service.Fatal(log, "load", err)

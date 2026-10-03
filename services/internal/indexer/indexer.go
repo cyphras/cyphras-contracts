@@ -139,7 +139,7 @@ func (ix *Indexer) Apply(ctx context.Context, b follow.Batch) error {
 	ix.mu.Unlock()
 	ix.log.Info("ingested", "from", b.From, "to", b.To, "leaves", next.Tree.Len(), "nullifiers", next.NullifierCount)
 	if len(delta.Leaves)+len(delta.Nullifiers)+len(delta.Created)+len(delta.Updated)+len(delta.Resolved)+len(delta.Notices) > 0 {
-		ix.hub.publish(Wake{Ledger: b.To, LeafCount: next.Tree.Len(), NullifierCount: next.NullifierCount})
+		ix.hub.publish(Wake{Ledger: b.To, LeafCount: next.Tree.Len(), NullifierCount: next.NullifierCount, ExitHead: next.ExitHead, ExitTail: next.ExitTail})
 	}
 	if b.To == b.Latest {
 		if err := ix.Reconcile(ctx); err != nil {

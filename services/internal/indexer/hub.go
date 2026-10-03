@@ -9,6 +9,8 @@ type Wake struct {
 	Ledger         uint32 `json:"ledger"`
 	LeafCount      uint64 `json:"leaf_count"`
 	NullifierCount uint64 `json:"nullifier_count"`
+	ExitHead       uint64 `json:"exit_head"`
+	ExitTail       uint64 `json:"exit_tail"`
 }
 
 // hub fans wake events out to stream subscribers. A slow subscriber misses wakes rather than

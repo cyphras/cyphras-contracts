@@ -352,3 +352,14 @@ func Pending(id uint64, depositor string, amount int64, createdAt, delay uint64,
 		vault.Field{Name: "flagged_at", Value: vault.U64(flaggedAt)},
 	)
 }
+
+// ExitEntry encodes the value of an Exit(id) or Stranded(id) entry.
+func ExitEntry(recipient string, payout, fee int64, queuedAt uint64) xdr.ScVal {
+	return vault.Struct(
+		vault.Field{Name: "recipient", Value: addr(recipient)},
+		vault.Field{Name: "payout", Value: i128(big.NewInt(payout))},
+		vault.Field{Name: "relayer", Value: addr(Relayer)},
+		vault.Field{Name: "fee", Value: i128(big.NewInt(fee))},
+		vault.Field{Name: "queued_at", Value: vault.U64(queuedAt)},
+	)
+}
