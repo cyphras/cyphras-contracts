@@ -21,6 +21,7 @@ import (
 // Client is the part of *rpcclient.Client the services use.
 type Client interface {
 	GetHealth(ctx context.Context) (protocol.GetHealthResponse, error)
+	GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error)
 	GetNetwork(ctx context.Context) (protocol.GetNetworkResponse, error)
 	GetEvents(ctx context.Context, req protocol.GetEventsRequest) (protocol.GetEventsResponse, error)
 	GetLedgerEntries(ctx context.Context, req protocol.GetLedgerEntriesRequest) (protocol.GetLedgerEntriesResponse, error)
@@ -74,6 +75,11 @@ func (s scrubbed) clean(err error) error {
 
 func (s scrubbed) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
 	r, err := s.inner.GetHealth(ctx)
+	return r, s.clean(err)
+}
+
+func (s scrubbed) GetLatestLedger(ctx context.Context) (protocol.GetLatestLedgerResponse, error) {
+	r, err := s.inner.GetLatestLedger(ctx)
 	return r, s.clean(err)
 }
 
@@ -236,4 +242,22 @@ func MaxEntryTTL(ctx context.Context, c Client) (uint32, error) {
 		return 0, errors.New("rpc: no state archival settings")
 	}
 	return uint32(e.Data.ConfigSetting.StateArchivalSettings.MaxEntryTtl), nil
+}
+
+// BaseReserve reads the network's base reserve, in stroops, from the latest ledger's header.
+func BaseReserve(ctx context.Context, c Client) (int64, error) {
+	l, err := c.GetLatestLedger(ctx)
+	if err != nil {
+		return 0, err
+	}
+	// getLedgers gives the header as its history entry; the bare header is accepted too.
+	var entry xdr.LedgerHeaderHistoryEntry
+	if err := xdr.SafeUnmarshalBase64(l.LedgerHeader, &entry); err == nil {
+		return int64(entry.Header.BaseReserve), nil
+	}
+	var header xdr.LedgerHeader
+	if err := xdr.SafeUnmarshalBase64(l.LedgerHeader, &header); err != nil {
+		return 0, fmt.Errorf("rpc: the latest ledger's header: %w", err)
+	}
+	return int64(header.BaseReserve), nil
 }

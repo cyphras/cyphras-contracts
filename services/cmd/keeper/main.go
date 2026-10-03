@@ -45,7 +45,7 @@ func main() {
 		service.Fatal(log, "config", err)
 	}
 	hold := map[uint32]bool{}
-	for _, r := range strings.Split(config.Env("HOLD_REASONS", "99"), ",") {
+	for _, r := range strings.Split(config.Env("HOLD_REASONS", "100"), ",") {
 		if r = strings.TrimSpace(r); r == "" {
 			continue
 		}

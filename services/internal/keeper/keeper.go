@@ -64,6 +64,7 @@ type Keeper struct {
 	cursor    uint32
 	lastCycle time.Time
 	claims    map[uint64]claimTry
+	idle      *releaseIdle
 }
 
 // New loads the stored chain state.
@@ -135,18 +136,23 @@ func (k *Keeper) call(ctx context.Context, what string, build func() (txnbuild.O
 
 // callWorth is call for a transaction sent only when worth accepts its simulated return value.
 func (k *Keeper) callWorth(ctx context.Context, what string, build func() (txnbuild.Operation, error), worth func(*xdr.ScVal) bool) (submit.Result, error) {
+	res, err := k.attempt(ctx, what, build, worth)
+	if err != nil && !errors.Is(err, submit.ErrSimulation) && !errors.Is(err, submit.ErrNotWorth) {
+		k.alerts.Raise(ctx, alert.Critical, "call_failed", "%s failed after retries: %v", what, err)
+	}
+	return res, err
+}
+
+// attempt is callWorth without the alert, for a caller that judges a failure itself.
+func (k *Keeper) attempt(ctx context.Context, what string, build func() (txnbuild.Operation, error), worth func(*xdr.ScVal) bool) (submit.Result, error) {
 	res, err := k.engine.DoWorth(ctx, k.account, build, 5, worth)
 	if err == nil && res.Outcome != submit.Success {
 		err = fmt.Errorf("%s %s: %s", what, res.Outcome, res.Code)
 	}
-	if err != nil {
-		if !errors.Is(err, submit.ErrSimulation) && !errors.Is(err, submit.ErrNotWorth) {
-			k.alerts.Raise(ctx, alert.Critical, "call_failed", "%s failed after retries: %v", what, err)
-		}
-		return res, err
+	if err == nil {
+		k.log.Info("submitted", "call", what, "tx", res.Hash, "ledger", res.Ledger, "fee", res.FeeCharged)
 	}
-	k.log.Info("submitted", "call", what, "tx", res.Hash, "ledger", res.Ledger, "fee", res.FeeCharged)
-	return res, nil
+	return res, err
 }
 
 // chainTime is the close time of the latest ledger, the clock the vault's checks use.
@@ -238,15 +244,15 @@ func (k *Keeper) Admit(ctx context.Context) error {
 		for i, id := range eligible[:n] {
 			ids[i] = vault.U64(id)
 		}
-		_, err := k.call(ctx, fmt.Sprintf("admit of %d deposits", n), func() (txnbuild.Operation, error) {
+		_, err := k.callWorth(ctx, fmt.Sprintf("admit of %d deposits", n), func() (txnbuild.Operation, error) {
 			return k.invoke("admit", vault.Vec(ids...))
-		})
+		}, admittedAny)
 		if errors.Is(err, submit.ErrSimulation) && n > 1 {
 			// A batch over the transaction's limits fails in simulation; try a smaller one.
 			batch = n / 2
 			continue
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, submit.ErrNotWorth) {
 			return err
 		}
 		eligible = eligible[n:]
@@ -255,7 +261,18 @@ func (k *Keeper) Admit(ctx context.Context) error {
 	return nil
 }
 
-// Refund returns deposits that stayed flagged past the correction window, except those held.
+// admittedAny reports whether a simulated admit admitted at least one deposit.
+func admittedAny(ret *xdr.ScVal) bool {
+	if ret == nil {
+		return true
+	}
+	v, ok := ret.GetVec()
+	return !ok || v == nil || len(*v) > 0
+}
+
+// Refund returns deposits that stayed flagged past the correction window, except those held. A
+// refund that fails because the deposit left the queue first, as when its depositor cancels it,
+// does not page.
 func (k *Keeper) Refund(ctx context.Context) error {
 	now, _, err := k.chainTime(ctx)
 	if err != nil {
@@ -271,13 +288,31 @@ func (k *Keeper) Refund(ctx context.Context) error {
 			continue
 		}
 		id := p.id
-		if _, err := k.call(ctx, fmt.Sprintf("refund of deposit %d", id), func() (txnbuild.Operation, error) {
+		what := fmt.Sprintf("refund of deposit %d", id)
+		res, err := k.attempt(ctx, what, func() (txnbuild.Operation, error) {
 			return k.invoke("refund", vault.U64(id))
-		}); err != nil {
-			k.log.Warn("refund failed", "deposit", id, "error", err.Error())
+		}, nil)
+		switch {
+		case err == nil:
+		case errors.Is(err, submit.ErrSimulation):
+			k.log.Info("refund not sent", "deposit", id, "error", err.Error())
+		case res.Outcome == submit.Failed && k.pendingGone(ctx, id):
+			k.log.Info("refund came after the deposit left the queue", "deposit", id, "tx", res.Hash)
+		default:
+			k.alerts.Raise(ctx, alert.Critical, "call_failed", "%s failed after retries: %v", what, err)
 		}
 	}
 	return nil
+}
+
+// pendingGone reports whether a deposit's pending entry is gone, as after its cancellation.
+func (k *Keeper) pendingGone(ctx context.Context, id uint64) bool {
+	key, err := vault.PendingKey(k.cfg.Vault, id)
+	if err != nil {
+		return false
+	}
+	_, _, err = rpc.One(ctx, k.rpc, key)
+	return errors.Is(err, rpc.ErrMissing)
 }
 
 // CheckBalance alerts when the keeper's own account runs low.

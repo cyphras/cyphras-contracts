@@ -29,7 +29,9 @@ type Fake struct {
 	Latest     uint32
 	Oldest     uint32
 	CloseTime  int64
-	FeeStats   protocol.GetFeeStatsResponse
+	// BaseReserve is the base reserve, in stroops, the latest ledger's header carries.
+	BaseReserve uint32
+	FeeStats    protocol.GetFeeStatsResponse
 	// Events must be in chain order.
 	Events  []protocol.EventInfo
 	entries map[string]protocol.LedgerEntryResult
@@ -110,6 +112,22 @@ func (f *Fake) GetHealth(context.Context) (protocol.GetHealthResponse, error) {
 		return protocol.GetHealthResponse{}, err
 	}
 	return protocol.GetHealthResponse{Status: "healthy", LatestLedger: f.Latest, OldestLedger: f.Oldest, LatestLedgerCloseTime: f.CloseTime}, nil
+}
+
+// GetLatestLedger implements rpc.Client.
+func (f *Fake) GetLatestLedger(context.Context) (protocol.GetLatestLedgerResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.call("getLatestLedger"); err != nil {
+		return protocol.GetLatestLedgerResponse{}, err
+	}
+	header, err := xdr.MarshalBase64(xdr.LedgerHeaderHistoryEntry{Header: xdr.LedgerHeader{
+		LedgerSeq: xdr.Uint32(f.Latest), BaseReserve: xdr.Uint32(f.BaseReserve), ScpValue: xdr.StellarValue{CloseTime: xdr.TimePoint(f.CloseTime)},
+	}})
+	if err != nil {
+		return protocol.GetLatestLedgerResponse{}, err
+	}
+	return protocol.GetLatestLedgerResponse{Sequence: f.Latest, LedgerCloseTime: f.CloseTime, LedgerHeader: header, ProtocolVersion: 26}, nil
 }
 
 // GetNetwork implements rpc.Client.

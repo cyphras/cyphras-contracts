@@ -2,6 +2,7 @@ package keeper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -13,6 +14,7 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
+	"github.com/cyphras/cyphras-contracts/services/internal/submit"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
@@ -124,12 +126,16 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 		return err
 	}
 	bump := false
+	var archived []xdr.LedgerKey
 	var duePending, dueExits []xdr.ScVal
 	for _, t := range group {
 		if !t.due(latest) {
 			continue
 		}
 		bump = true
+		if t.liveUntil == nil {
+			archived = append(archived, t.key)
+		}
 		switch t.kind {
 		case pendingKind:
 			duePending = append(duePending, vault.U64(t.id))
@@ -137,15 +143,30 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 			dueExits = append(dueExits, vault.U64(t.id))
 		}
 	}
+	// bump_ttl cannot run with an archived entry in its footprint, so those are restored first.
+	if err := k.restore(ctx, archived); err != nil {
+		failures = append(failures, "restore before bump_ttl")
+		bump = false
+	}
 	// Each call extends the instance and the tree; the IDs are split so that a call's footprint
-	// stays within the transaction limits, an exit ID counting twice for its two possible keys.
+	// stays within the transaction limits, an exit ID counting twice for its two possible keys,
+	// and a call the limits refuse in simulation is split further.
+	slots := bumpFootprint
 	for bump {
-		nPending := min(len(duePending), bumpFootprint)
-		nExits := min(len(dueExits), (bumpFootprint-nPending)/2)
+		nPending := min(len(duePending), slots)
+		nExits := min(len(dueExits), (slots-nPending)/2)
+		if nPending == 0 && len(dueExits) > 0 {
+			nExits = max(nExits, 1)
+		}
 		pending, exits := duePending[:nPending], dueExits[:nExits]
-		if _, err := k.call(ctx, "bump_ttl", func() (txnbuild.Operation, error) {
+		_, err := k.call(ctx, "bump_ttl", func() (txnbuild.Operation, error) {
 			return k.invoke("bump_ttl", vault.Vec(pending...), vault.Vec(exits...))
-		}); err != nil {
+		})
+		if errors.Is(err, submit.ErrSimulation) && nPending+nExits > 1 {
+			slots = max((nPending+2*nExits)/2, 1)
+			continue
+		}
+		if err != nil {
 			failures = append(failures, "bump_ttl")
 			break
 		}
@@ -197,6 +218,19 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 	return nil
 }
 
+// restore restores archived entries, in batches.
+func (k *Keeper) restore(ctx context.Context, archived []xdr.LedgerKey) error {
+	for start := 0; start < len(archived); start += k.cfg.MaxExtensions {
+		keys := archived[start:min(start+k.cfg.MaxExtensions, len(archived))]
+		if _, err := k.call(ctx, fmt.Sprintf("restore of %d entries", len(keys)), func() (txnbuild.Operation, error) {
+			return &txnbuild.RestoreFootprint{Ext: footprint(nil, keys)}, nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // extend restores archived entries, then extends those within 30 days of expiry, in batches.
 func (k *Keeper) extend(ctx context.Context, items []tracked, maxTTL, latest uint32) error {
 	var archived, due []xdr.LedgerKey
@@ -210,13 +244,8 @@ func (k *Keeper) extend(ctx context.Context, items []tracked, maxTTL, latest uin
 			due = append(due, t.key)
 		}
 	}
-	for start := 0; start < len(archived); start += k.cfg.MaxExtensions {
-		keys := archived[start:min(start+k.cfg.MaxExtensions, len(archived))]
-		if _, err := k.call(ctx, fmt.Sprintf("restore of %d entries", len(keys)), func() (txnbuild.Operation, error) {
-			return &txnbuild.RestoreFootprint{Ext: footprint(nil, keys)}, nil
-		}); err != nil {
-			return err
-		}
+	if err := k.restore(ctx, archived); err != nil {
+		return err
 	}
 	for start := 0; start < len(due); start += k.cfg.MaxExtensions {
 		keys := due[start:min(start+k.cfg.MaxExtensions, len(due))]

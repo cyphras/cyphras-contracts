@@ -484,6 +484,35 @@ func (st *Store) Commit(ctx context.Context, from, to uint32, s *State, d Delta,
 	return tx.Commit(ctx)
 }
 
+// Strands counts, for each stranded exit, how many times what it owes has stranded: once, plus
+// once for each stranded exit a claim moved it from.
+func (st *Store) Strands(ctx context.Context, ids []uint64) (map[uint64]int, error) {
+	starts := make([]int64, len(ids))
+	for i, id := range ids {
+		starts[i] = int64(id)
+	}
+	rows, err := st.Pool.Query(ctx, `WITH RECURSIVE line(start, parent, depth) AS (
+			SELECT id, requeued_from, 1 FROM exits WHERE id = ANY($1)
+			UNION ALL
+			SELECT line.start, e.requeued_from, line.depth + 1 FROM exits e JOIN line ON e.id = line.parent
+		)
+		SELECT start, max(depth) FROM line GROUP BY start`, starts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[uint64]int, len(ids))
+	for rows.Next() {
+		var id int64
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[uint64(id)] = n
+	}
+	return out, rows.Err()
+}
+
 // Reset deletes everything the chain state holds, for a rebuild from the deploy ledger.
 func (st *Store) Reset(ctx context.Context) error {
 	_, err := st.Pool.Exec(ctx, `TRUNCATE chain_meta, leaves, nullifiers, deposits, settlements, exits`)

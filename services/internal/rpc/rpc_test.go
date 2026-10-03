@@ -79,6 +79,28 @@ func TestTheMaximumEntryTTLIsRead(t *testing.T) {
 	}
 }
 
+func TestTheBaseReserveIsReadFromEitherFormOfTheHeader(t *testing.T) {
+	header := xdr.LedgerHeader{LedgerSeq: 7, BaseReserve: 7_500_000}
+	entry, _ := xdr.MarshalBase64(xdr.LedgerHeaderHistoryEntry{Header: header})
+	bare, _ := xdr.MarshalBase64(header)
+	for _, h := range []string{entry, bare} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"id":"00","protocolVersion":26,"sequence":7,"closeTime":"1","headerXdr":"` + h + `"}}`))
+		}))
+		got, err := rpc.BaseReserve(context.Background(), rpc.Dial(srv.URL))
+		srv.Close()
+		if err != nil || got != 7_500_000 {
+			t.Fatalf("reserve %d, %v", got, err)
+		}
+	}
+	f := rpctest.New(passphrase, 1)
+	f.BaseReserve = 5_000_000
+	if got, err := rpc.BaseReserve(context.Background(), f); err != nil || got != 5_000_000 {
+		t.Fatalf("reserve %d, %v", got, err)
+	}
+}
+
 func TestErrorsLeaveTheAccessKeyOut(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no", http.StatusUnauthorized)

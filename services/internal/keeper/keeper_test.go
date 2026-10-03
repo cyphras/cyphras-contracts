@@ -41,12 +41,20 @@ type harness struct {
 	simFail func(string) bool
 	// sentHook sees each sent transaction, so a test can play its effect on the chain.
 	sentHook func(string)
-	status   vault.Status
-	limit    int64
+	// chainFail makes the sent transactions it matches fail on chain.
+	chainFail func(string) bool
+	last      string
+	status    vault.Status
+	limit     int64
 	// outflows holds the outflow of each queued exit by ID.
 	outflows map[uint64]int64
 	// partial makes the simulated vault pay the head exit in part when it does not fit whole.
 	partial bool
+	// creates marks exits whose recipient account does not exist yet, which the vault does not pay
+	// in a part below 1 XLM.
+	creates map[uint64]bool
+	// skipped are deposits a simulated admit no longer finds.
+	skipped map[uint64]bool
 	// funds is the vault's balance, unlimited when nil; deauthorized makes the issuer refuse to
 	// let the vault hold the asset.
 	funds        *big.Int
@@ -66,6 +74,9 @@ func (h *harness) released(max uint64) uint64 {
 	for id := h.status.ExitHead; id < h.status.ExitTail && n < max && room > 0; id++ {
 		o := h.outflows[id]
 		if o > room {
+			if h.creates[id] && room < vault.MinNewAccountPayout && o >= vault.MinNewAccountPayout {
+				break
+			}
 			if h.partial {
 				n++
 			}
@@ -145,6 +156,16 @@ func newHarness(t *testing.T) *harness {
 			ret, _ := xdr.MarshalBase64(vault.U32(uint32(h.released(max))))
 			result.ReturnValueXDR = &ret
 		}
+		if inv := env.V1.Tx.Operations[0].Body.InvokeHostFunctionOp; inv != nil && inv.HostFunction.InvokeContract.FunctionName == "admit" {
+			var admitted []xdr.ScVal
+			for _, v := range **inv.HostFunction.InvokeContract.Args[0].Vec {
+				if !h.skipped[uint64(*v.U64)] {
+					admitted = append(admitted, v)
+				}
+			}
+			ret, _ := xdr.MarshalBase64(vault.Vec(admitted...))
+			result.ReturnValueXDR = &ret
+		}
 		return protocol.SimulateTransactionResponse{TransactionDataXDR: encoded, MinResourceFee: 100, Results: []protocol.SimulateHostFunctionResult{result}}, nil
 	}
 	h.fake.Send = func(req protocol.SendTransactionRequest) (protocol.SendTransactionResponse, error) {
@@ -152,6 +173,7 @@ func newHarness(t *testing.T) *harness {
 		_ = xdr.SafeUnmarshalBase64(req.Transaction, &env)
 		h.mu.Lock()
 		h.sent = append(h.sent, describe(env))
+		h.last = describe(env)
 		hook := h.sentHook
 		h.mu.Unlock()
 		if hook != nil {
@@ -160,6 +182,13 @@ func newHarness(t *testing.T) *harness {
 		return protocol.SendTransactionResponse{Status: "PENDING"}, nil
 	}
 	h.fake.Get = func(protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
+		h.mu.Lock()
+		failed := h.chainFail != nil && h.chainFail(h.last)
+		h.mu.Unlock()
+		if failed {
+			r, _ := xdr.MarshalBase64(xdr.TransactionResult{Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxFailed, Results: &[]xdr.OperationResult{}}})
+			return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusFailed, ResultXDR: r}}, nil
+		}
 		r, _ := xdr.MarshalBase64(xdr.TransactionResult{Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxSuccess, Results: &[]xdr.OperationResult{}}})
 		return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusSuccess, ResultXDR: r}}, nil
 	}
@@ -167,7 +196,7 @@ func newHarness(t *testing.T) *harness {
 	alerts := &alert.Alerter{Service: "keeper", Channels: []alert.Channel{h}, Cooldown: time.Hour, Now: func() time.Time { return h.now }}
 	k, err := New(context.Background(), Config{
 		Vault: vaulttest.Vault, DeployLedger: 10, Asset: "native", MaxAdmissions: 16, MaxExtensions: 50, MaxReleases: 10, RefundDelay: 24 * time.Hour,
-		HoldReasons: map[uint32]bool{99: true}, BalanceFloor: 1_000_000_000,
+		HoldReasons: map[uint32]bool{100: true}, BalanceFloor: 1_000_000_000,
 	}, h.fake, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(kp.Address(), kp), alerts, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -312,10 +341,10 @@ func TestADepositLeftUnadmittedPages(t *testing.T) {
 
 func TestFlaggedDepositsAreRefundedAfterTheCorrectionWindowUnlessHeld(t *testing.T) {
 	h := newHarness(t)
-	four, ninetyNine := uint32(4), uint32(99)
+	four, courtOrder := uint32(4), uint32(100)
 	flaggedAt := uint64(h.now.Unix())
 	h.shield(10, &four, flaggedAt)
-	h.shield(10, &ninetyNine, flaggedAt)
+	h.shield(10, &courtOrder, flaggedAt)
 	h.shield(10, nil, 0)
 	h.sync()
 	h.now = h.now.Add(23 * time.Hour)

@@ -13,6 +13,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/txnbuild"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
@@ -53,23 +54,32 @@ func (k *Keeper) readExits(ctx context.Context, ids []uint64, key func(string, u
 	return out, nil
 }
 
-// window reads what is left of today's outflow window, what the vault can pay out, and whether
-// the vault takes payments now.
-func (k *Keeper) window(ctx context.Context) (vault.Instance, *big.Int, *big.Int, bool, error) {
+// outflowWindow is the state release works from: the vault, today's UTC day, what is left of the
+// day's outflow window, what the vault can pay out, and whether the vault takes payments now.
+type outflowWindow struct {
+	inst  vault.Instance
+	day   uint64
+	room  *big.Int
+	funds *big.Int
+	open  bool
+}
+
+func (k *Keeper) window(ctx context.Context) (outflowWindow, error) {
 	inst, _, _, err := rpc.VaultInstance(ctx, k.rpc, k.cfg.Vault)
 	if err != nil {
-		return vault.Instance{}, nil, nil, false, err
+		return outflowWindow{}, err
 	}
 	now, _, err := k.chainTime(ctx)
 	if err != nil {
-		return vault.Instance{}, nil, nil, false, err
+		return outflowWindow{}, err
 	}
 	funds, err := k.funds(ctx, inst.Config.Token)
 	if err != nil {
-		return vault.Instance{}, nil, nil, false, err
+		return outflowWindow{}, err
 	}
-	room := new(big.Int).Sub(inst.Limits.MaxDailyOutflow, inst.Status.OutflowOn(now/secondsPerDay))
-	return inst, room, funds, !inst.Status.Halted(now), nil
+	day := now / secondsPerDay
+	room := new(big.Int).Sub(inst.Limits.MaxDailyOutflow, inst.Status.OutflowOn(day))
+	return outflowWindow{inst: inst, day: day, room: room, funds: funds, open: !inst.Status.Halted(now)}, nil
 }
 
 // funds is what the vault can pay out as release judges it: its balance in the asset contract,
@@ -97,21 +107,38 @@ func (k *Keeper) funds(ctx context.Context, token string) (*big.Int, error) {
 	return amount, nil
 }
 
+// releaseIdle is the state in which a release last handled no exit: the day, the room left in its
+// window and the head of the queue.
+type releaseIdle struct {
+	day  uint64
+	room string
+	head uint64
+}
+
 // Release pays queued exits in order while today's outflow window has room. It counts from the
 // chain how many exits fit the window and the vault's funds, and when none fits the window whole
 // it still tries the head, which the vault pays in part. A release whose simulation handles no
 // exit is not sent, so none is paid for in vain, and a batch the transaction limits refuse in
 // simulation is halved. While the vault cannot pay the next step, which the watcher reports,
-// nothing is tried.
+// nothing is tried. A release that handles no exit, as when the head would create an account and
+// less than 1 XLM of the window is left, is not tried again until the day, the room left or the
+// head changes.
 func (k *Keeper) Release(ctx context.Context) error {
 	batch := max(k.cfg.MaxReleases, 1)
 	for range 100 {
-		inst, room, funds, open, err := k.window(ctx)
+		w, err := k.window(ctx)
 		if err != nil {
 			return err
 		}
-		head, tail := inst.Status.ExitHead, inst.Status.ExitTail
-		if !open || head >= tail || room.Sign() <= 0 {
+		head, tail := w.inst.Status.ExitHead, w.inst.Status.ExitTail
+		if !w.open || head >= tail || w.room.Sign() <= 0 {
+			return nil
+		}
+		state := releaseIdle{day: w.day, room: w.room.String(), head: head}
+		k.mu.RLock()
+		idle := k.idle != nil && *k.idle == state
+		k.mu.RUnlock()
+		if idle {
 			return nil
 		}
 		ids := make([]uint64, 0, batch)
@@ -122,6 +149,7 @@ func (k *Keeper) Release(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		room, funds := w.room, w.funds
 		n := 0
 		for _, e := range exits {
 			outflow := new(big.Int).Add(e.Payout, e.Fee)
@@ -142,11 +170,12 @@ func (k *Keeper) Release(ctx context.Context) error {
 			}
 		}
 		n = max(n, 1)
-		_, err = k.callWorth(ctx, fmt.Sprintf("release of %d exits", n), func() (txnbuild.Operation, error) {
+		res, err := k.callWorth(ctx, fmt.Sprintf("release of %d exits", n), func() (txnbuild.Operation, error) {
 			return k.invoke("release", vault.U32(uint32(n)))
 		}, handledAny)
 		switch {
 		case errors.Is(err, submit.ErrNotWorth):
+			k.setIdle(state)
 			return nil
 		case errors.Is(err, submit.ErrSimulation) && n > 1:
 			batch = n / 2
@@ -154,8 +183,18 @@ func (k *Keeper) Release(ctx context.Context) error {
 		case err != nil:
 			return err
 		}
+		if !handledAny(res.Return) {
+			k.setIdle(state)
+			return nil
+		}
 	}
 	return nil
+}
+
+func (k *Keeper) setIdle(state releaseIdle) {
+	k.mu.Lock()
+	k.idle = &state
+	k.mu.Unlock()
 }
 
 // handledAny reports whether a simulated release handled at least one exit.
@@ -167,14 +206,40 @@ func handledAny(ret *xdr.ScVal) bool {
 	return !ok || n > 0
 }
 
-// claimRetry is how often a stranded exit is tried again although nothing its parties hold has
-// changed: whether a contract may hold the asset also depends on the issuer's flags.
-const claimRetry = time.Hour
+const (
+	// claimRetry is how often a stranded exit is tried again although nothing its parties hold has
+	// changed: whether a contract may hold the asset also depends on the issuer's flags.
+	claimRetry = time.Hour
+	// claimRestMax caps how long an exit rests after it strands again or its claim fails on chain.
+	claimRestMax = 24 * time.Hour
+	// creatingReserveMax is the highest base reserve, in stroops, at which the 1 XLM the vault lets
+	// create an account still covers the account's two reserves.
+	creatingReserveMax = vault.MinNewAccountPayout / 2
+)
 
-// claimTry is the keeper's last claim of a stranded exit: the parties' entries it saw, and when.
+// rest is how long an exit waits after its n-th setback in a row: an hour, doubling up to a day.
+func rest(n int) time.Duration {
+	if n <= 0 {
+		return 0
+	}
+	return min(claimRetry<<min(n-1, 5), claimRestMax)
+}
+
+// claimTry is the keeper's last claim of a stranded exit: the parties' entries it saw, when, and
+// how many of its claims in a row failed on chain.
 type claimTry struct {
-	seen string
-	at   time.Time
+	seen     string
+	at       time.Time
+	failures int
+}
+
+// strandedExit is what Claims needs of a stranded exit.
+type strandedExit struct {
+	id         uint64
+	parties    []string
+	payout     *big.Int
+	recipient  string
+	strandedAt int64
 }
 
 // Claims moves stranded exits back into the exit queue once their recipient or relayer can
@@ -182,7 +247,10 @@ type claimTry struct {
 // it still owes can receive has changed since the last try, and at least every claimRetry, and
 // sends the claims that would move a part; one that would move nothing fails in simulation and is
 // not sent. A requeued exit waits behind every exit queued before it, so claims never compete
-// with the queue for the window.
+// with the queue for the window. An exit that strands again, or whose claim fails on chain, rests
+// for an hour, doubling with each further setback up to a day. A claim whose payout would create
+// an account waits while the base reserve is above 0.5 XLM: 1 XLM then no longer covers the
+// account's two reserves, and the payout would only strand again.
 func (k *Keeper) Claims(ctx context.Context) error {
 	inst, _, _, err := rpc.VaultInstance(ctx, k.rpc, k.cfg.Vault)
 	if err != nil {
@@ -192,36 +260,53 @@ func (k *Keeper) Claims(ctx context.Context) error {
 	if err != nil || inst.Status.Halted(now) {
 		return err
 	}
-	k.mu.RLock()
-	ids := slices.Sorted(maps.Keys(k.state.Stranded))
-	parties := make(map[uint64][]string, len(ids))
-	for _, id := range ids {
+	k.mu.Lock()
+	stranded := make([]strandedExit, 0, len(k.state.Stranded))
+	for _, id := range slices.Sorted(maps.Keys(k.state.Stranded)) {
 		e := k.state.Stranded[id]
+		s := strandedExit{id: id, payout: new(big.Int).Set(e.Payout), recipient: e.Recipient, strandedAt: e.StrandedAt}
 		if e.Payout.Sign() > 0 {
-			parties[id] = append(parties[id], e.Recipient)
+			s.parties = append(s.parties, e.Recipient)
 		}
 		if e.Fee.Sign() > 0 {
-			parties[id] = append(parties[id], e.Relayer)
+			s.parties = append(s.parties, e.Relayer)
+		}
+		stranded = append(stranded, s)
+	}
+	for id := range k.claims {
+		if _, ok := k.state.Stranded[id]; !ok {
+			delete(k.claims, id)
 		}
 	}
-	k.mu.RUnlock()
-	keys := make(map[uint64][]string, len(ids))
+	k.mu.Unlock()
+	if len(stranded) == 0 {
+		return nil
+	}
+	ids := make([]uint64, len(stranded))
+	for i, s := range stranded {
+		ids[i] = s.id
+	}
+	strands, err := k.chain.Strands(ctx, ids)
+	if err != nil {
+		return err
+	}
+	keys := make(map[uint64][]string, len(stranded))
 	var all []xdr.LedgerKey
 	known := map[string]bool{}
-	for _, id := range ids {
-		for _, p := range parties[id] {
+	for _, s := range stranded {
+		for _, p := range s.parties {
 			ks, err := k.receiveKeys(inst.Config.Token, p)
 			if err != nil {
 				return err
 			}
 			for _, key := range ks {
-				s, err := rpc.KeyString(key)
+				name, err := rpc.KeyString(key)
 				if err != nil {
 					return err
 				}
-				keys[id] = append(keys[id], s)
-				if !known[s] {
-					known[s] = true
+				keys[s.id] = append(keys[s.id], name)
+				if !known[name] {
+					known[name] = true
 					all = append(all, key)
 				}
 			}
@@ -232,40 +317,116 @@ func (k *Keeper) Claims(ctx context.Context) error {
 		return err
 	}
 	at := k.now()
-	for _, id := range ids {
+	var reserve *int64
+	var reserveErr error
+	waiting := 0
+	for _, s := range stranded {
+		if n := strands[s.id]; n > 1 && now < uint64(s.strandedAt)+uint64(rest(n-1)/time.Second) {
+			continue
+		}
+		creating, err := k.creates(s, entries)
+		if err != nil {
+			return err
+		}
+		if creating {
+			if reserve == nil && reserveErr == nil {
+				r, err := rpc.BaseReserve(ctx, k.rpc)
+				reserve, reserveErr = &r, err
+			}
+			if reserveErr != nil || *reserve > creatingReserveMax {
+				waiting++
+				continue
+			}
+		}
 		var seen strings.Builder
-		for _, s := range keys[id] {
-			if e, ok := entries[s]; ok {
+		for _, name := range keys[s.id] {
+			if e, ok := entries[name]; ok {
 				fmt.Fprintf(&seen, "%d,", e.LastModified)
 			} else {
 				seen.WriteString("-,")
 			}
 		}
 		k.mu.Lock()
-		last, tried := k.claims[id]
+		last, tried := k.claims[s.id]
 		due := !tried || last.seen != seen.String() || at.Sub(last.at) >= claimRetry
+		if tried && at.Sub(last.at) < rest(last.failures) {
+			due = false
+		}
 		if due {
-			k.claims[id] = claimTry{seen: seen.String(), at: at}
+			k.claims[s.id] = claimTry{seen: seen.String(), at: at, failures: last.failures}
 		}
 		k.mu.Unlock()
 		if !due {
 			continue
 		}
-		_, err := k.call(ctx, fmt.Sprintf("claim of exit %d", id), func() (txnbuild.Operation, error) {
-			return k.invoke("claim", vault.U64(id))
-		})
-		if err != nil && !errors.Is(err, submit.ErrSimulation) {
+		if err := k.claim(ctx, s.id); err != nil {
 			return err
 		}
 	}
-	k.mu.Lock()
-	for id := range k.claims {
-		if _, ok := parties[id]; !ok {
-			delete(k.claims, id)
-		}
+	switch {
+	case waiting > 0 && reserveErr != nil:
+		k.alerts.Raise(ctx, alert.Warning, "creating_claims_wait", "%d stranded exits that would create an account wait: the base reserve could not be read: %v", waiting, reserveErr)
+	case waiting > 0:
+		k.alerts.Raise(ctx, alert.Warning, "creating_claims_wait", "%d stranded exits that would create an account wait while the base reserve is %d stroops", waiting, *reserve)
+	default:
+		k.alerts.Clear(ctx, "creating_claims_wait", "no stranded exit waits for the base reserve")
 	}
-	k.mu.Unlock()
 	return nil
+}
+
+// claim sends one claim. A claim that fails on chain, which anyone's claim of the same exit or a
+// party that stops receiving between simulation and inclusion can cause, rests the exit and lets
+// the other claims go ahead.
+func (k *Keeper) claim(ctx context.Context, id uint64) error {
+	what := fmt.Sprintf("claim of exit %d", id)
+	res, err := k.attempt(ctx, what, func() (txnbuild.Operation, error) {
+		return k.invoke("claim", vault.U64(id))
+	}, nil)
+	if errors.Is(err, submit.ErrSimulation) {
+		return nil
+	}
+	k.mu.Lock()
+	try := k.claims[id]
+	if err == nil {
+		try.failures = 0
+	} else if res.Outcome == submit.Failed {
+		try.failures++
+	}
+	k.claims[id] = try
+	k.mu.Unlock()
+	switch {
+	case err == nil:
+		return nil
+	case res.Outcome == submit.Failed:
+		k.log.Warn("claim failed on chain", "exit", id, "tx", res.Hash, "code", res.Code, "rest", rest(try.failures).String())
+		k.alerts.Raise(ctx, alert.Warning, "claim_failed", "%s failed on chain with %s; the exit rests %s", what, res.Code, rest(try.failures))
+		return nil
+	default:
+		k.alerts.Raise(ctx, alert.Critical, "call_failed", "%s failed after retries: %v", what, err)
+		return err
+	}
+}
+
+// creates reports whether claiming the exit would queue a payout that creates its recipient's
+// account: a native payout of at least 1 XLM to an account that does not exist.
+func (k *Keeper) creates(s strandedExit, entries map[string]rpc.Entry) (bool, error) {
+	if k.cfg.Asset != "native" || s.payout.Cmp(big.NewInt(vault.MinNewAccountPayout)) < 0 {
+		return false, nil
+	}
+	account, err := vault.AccountOf(s.recipient)
+	if err != nil || account[0] != 'G' {
+		return false, err
+	}
+	key, err := vault.AccountKey(account)
+	if err != nil {
+		return false, err
+	}
+	ks, err := rpc.KeyString(key)
+	if err != nil {
+		return false, err
+	}
+	_, ok := entries[ks]
+	return !ok, nil
 }
 
 // receiveKeys are the entries that decide whether a party can receive the asset: for an account,
