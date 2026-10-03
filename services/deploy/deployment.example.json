@@ -3,7 +3,7 @@
   "network_passphrase": "Test SDF Network ; September 2015",
   "vaults": [
     {
-      "asset": "xlm",
+      "asset": "native",
       "vault": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
       "token": "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526",
       "deploy_ledger": 1,

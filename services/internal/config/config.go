@@ -168,7 +168,8 @@ type Deployment struct {
 	Vaults            []DeployedVault `json:"vaults"`
 }
 
-// DeployedVault is one vault of the deployment.
+// DeployedVault is one vault of the deployment. Asset is the asset contract's name(): native for
+// XLM, CODE:ISSUER for an issued asset.
 type DeployedVault struct {
 	Asset        string `json:"asset"`
 	Vault        string `json:"vault"`
