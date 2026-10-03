@@ -139,3 +139,26 @@ func TestAWebhookIsNamedWithoutItsToken(t *testing.T) {
 		t.Fatalf("named %q", n)
 	}
 }
+
+func TestAURLListedTwiceIsRefusedHoweverItIsWritten(t *testing.T) {
+	for _, file := range []string{
+		"discord https://discord.example/api/webhooks/1/TOKEN\ndiscord https://discord.example/api/webhooks/1/TOKEN\n",
+		"discord https://Discord.Example:443/api/webhooks/1/TOKEN\ntext https://discord.example/api/webhooks/1/TOKEN#x\n",
+		"telegram https://api.example/bot1/sendMessage?chat_id=1&x=2\ntelegram https://api.example/bot1/sendMessage?x=2&chat_id=1\n",
+	} {
+		if _, err := ParseWebhooks([]byte(file)); err == nil || !strings.Contains(err.Error(), "repeats the URL of line 1") {
+			t.Fatalf("%q: %v", file, err)
+		}
+	}
+	// A path that differs, in a token's case, is another channel.
+	channels, err := ParseWebhooks([]byte("discord https://discord.example/api/webhooks/1/TOKEN\ndiscord https://discord.example/api/webhooks/1/token\n"))
+	if err != nil || len(channels) != 2 || channels[0].(Named).Name() == channels[1].(Named).Name() {
+		t.Fatalf("%d channels, %v", len(channels), err)
+	}
+	// A channel is named the same however its URL is written.
+	a, _ := ParseWebhooks([]byte("discord https://DISCORD.example:443/api/webhooks/1/TOKEN\n"))
+	b, _ := ParseWebhooks([]byte("discord https://discord.example/api/webhooks/1/TOKEN\n"))
+	if a[0].(Named).Name() != b[0].(Named).Name() {
+		t.Fatal("one channel under two names")
+	}
+}

@@ -191,9 +191,11 @@ func seconds(n float64) time.Duration {
 }
 
 // ParseWebhooks reads one "format url" pair per line; blank lines and lines starting with # are
-// skipped.
+// skipped. A URL listed twice, however it is written, is refused, as a channel's copies are kept
+// under its name.
 func ParseWebhooks(data []byte) ([]Channel, error) {
 	var out []Channel
+	seen := map[string]int{}
 	sc := bufio.NewScanner(bytes.NewReader(data))
 	for n := 1; sc.Scan(); n++ {
 		line := strings.TrimSpace(sc.Text())
@@ -214,9 +216,25 @@ func ParseWebhooks(data []byte) ([]Channel, error) {
 		if err != nil || u.Scheme != "https" || u.Host == "" {
 			return nil, fmt.Errorf("alert: line %d has no valid https URL", n)
 		}
-		out = append(out, Webhook{Format: format, URL: u.String()})
+		normal := normalize(u)
+		if first, ok := seen[normal]; ok {
+			return nil, fmt.Errorf("alert: line %d repeats the URL of line %d", n, first)
+		}
+		seen[normal] = n
+		out = append(out, Webhook{Format: format, URL: normal})
 	}
 	return out, sc.Err()
+}
+
+// normalize writes a URL one way however it was spelled: the host in lower case without the
+// default port, no fragment, and the query sorted. The path, which may hold a token, is kept as
+// it is.
+func normalize(u *url.URL) string {
+	n := *u
+	n.Host = strings.ToLower(strings.TrimSuffix(n.Host, ":443"))
+	n.Fragment, n.RawFragment = "", ""
+	n.RawQuery = n.Query().Encode()
+	return n.String()
 }
 
 // Alerter raises alerts on every channel, at most once per code within the cooldown, and reports
