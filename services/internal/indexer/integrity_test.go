@@ -17,6 +17,7 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
 	"github.com/cyphras/cyphras-contracts/services/internal/follow"
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
@@ -407,7 +408,7 @@ func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
 			other[i].TxHash = strings.Repeat("ee", 32)
 		}
 	}
-	if err := h.ix.confirm(context.Background(), base, other, from, to); err != nil {
+	if err := h.ix.confirm(context.Background(), base, other, from, to, to); err != nil {
 		t.Fatal(err)
 	}
 	kept, err := archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}.Events(context.Background(), from, to)
@@ -423,7 +424,7 @@ func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
 	if err := h.ix.archive.Append(bogus, from, to); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.ix.confirm(context.Background(), base, good, from, to); err != nil {
+	if err := h.ix.confirm(context.Background(), base, good, from, to, to); err != nil {
 		t.Fatal(err)
 	}
 	if kept, err = (archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}).Events(context.Background(), from, to); err != nil || !maps.Equal(digests(kept, from, to), digests(good, from, to)) {
@@ -442,7 +443,7 @@ func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if err := h.ix.confirm(context.Background(), base, other, from, to); err != nil {
+	if err := h.ix.confirm(context.Background(), base, other, from, to, to); err != nil {
 		t.Fatal(err)
 	}
 	if !h.paged("archive_unreadable") {
@@ -466,4 +467,75 @@ func mustB64(t *testing.T, v xdr.ScVal) string {
 		t.Fatal(err)
 	}
 	return s
+}
+
+// batchOf is the window a follower would hand the indexer for raw events.
+func batchOf(t *testing.T, raw []vault.RawEvent, from, to uint32) follow.Batch {
+	t.Helper()
+	var events []vault.Event
+	for _, r := range raw {
+		e, err := vault.Decode(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, e)
+	}
+	txs, err := vault.ParseTxs(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return follow.Batch{From: from, To: to, Raw: raw, Txs: txs, Latest: to + 1000}
+}
+
+func eventsIn(events []vault.RawEvent, from, to uint32) []vault.RawEvent {
+	var out []vault.RawEvent
+	for _, e := range events {
+		if e.Ledger >= from && e.Ledger <= to {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestAWindowAcrossWhatWasArchivedKeepsTheGoodCopy(t *testing.T) {
+	for _, straddle := range []bool{false, true} {
+		h := newHarness(t)
+		h.activity()
+		h.ready()
+		from := h.chain.Ledger + 1
+		lie := *h.chain
+		lie.Events = slices.Clone(h.chain.Events)
+		// The chain holds a deposit in each of two ledgers; a lying RPC serves only the second.
+		h.chain.NextLedger(5)
+		h.chain.Shield(vaulttest.Depositor, 10_000_000)
+		h.chain.NextLedger(5)
+		h.chain.Shield(vaulttest.Depositor, 20_000_000)
+		lie.NextLedger(5)
+		lie.NextLedger(5)
+		lie.Shield(vaulttest.Depositor, 20_000_000)
+		to := h.chain.Ledger
+		good := eventsIn(h.chain.Events, from, to)
+		// The archive copied the good history of the window, or of its first ledger only.
+		archivedTo := to
+		if straddle {
+			archivedTo = from
+		}
+		if err := h.ix.keep(eventsIn(good, from, archivedTo), from, archivedTo); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.ix.Apply(context.Background(), batchOf(t, eventsIn(lie.Events, from, to), from, to)); err != nil {
+			t.Fatal(err)
+		}
+		kept, err := archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}.Events(context.Background(), from, from)
+		if err != nil || !maps.Equal(digests(kept, from, from), digests(eventsIn(good, from, from), from, from)) {
+			t.Fatalf("straddle %v: the archive gave up the good copy of ledger %d: %v", straddle, from, err)
+		}
+		critical := false
+		for _, a := range h.pages.alerts {
+			critical = critical || (a.Code == "archive_disagrees" && a.Severity == alert.Critical)
+		}
+		if !critical {
+			t.Fatalf("straddle %v: pages %+v", straddle, h.pages.alerts)
+		}
+	}
 }
