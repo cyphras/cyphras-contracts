@@ -356,6 +356,8 @@ describe("wallet safety: refusals before proving", () => {
     const { world } = await funded();
     world.fill(2);
     world.indexer.leafLimit = 3;
+    // RPC no longer holds these ledgers, so only the leaves themselves show the cut.
+    world.rpc.oldestLedger = world.vault.ledger + 1;
     const fresh = await openWallet(world, 0);
     await assert.rejects(fresh.sync(), isError("indexer_fault"));
   });
