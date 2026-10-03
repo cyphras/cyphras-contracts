@@ -1,5 +1,8 @@
 //! Real proofs with one public input, ExtData field or proof point changed.
 
+use ark_bn254::{Fq, Fq2, G2Affine};
+use ark_ec::AffineRepr;
+use ark_ff::{BigInteger, PrimeField};
 use soroban_sdk::{
     crypto::bn254::{Bn254Fr, Bn254G1Affine, Bn254G2Affine},
     testutils::{Address as _, Ledger, MuxedAddress as _},
@@ -433,6 +436,47 @@ fn malformed_proof_points_are_refused() {
         .try_transact(&proof, &fixtures::ext(env, &step), &flow.caller(&step));
     assert!(host_aborted(result));
     assert_eq!(attempt(&flow, STEP, |_, _, _| {}), Ok(()));
+}
+
+/// The host encoding of a G2 point: each Fq2 coordinate as c1 || c0.
+fn host_g2(p: &G2Affine) -> [u8; 128] {
+    let be = |f: &Fq| {
+        let bytes = f.into_bigint().to_bytes_be();
+        let mut out = [0u8; 32];
+        out[32 - bytes.len()..].copy_from_slice(&bytes);
+        out
+    };
+    let mut out = [0u8; 128];
+    out[..32].copy_from_slice(&be(&p.x.c1));
+    out[32..64].copy_from_slice(&be(&p.x.c0));
+    out[64..96].copy_from_slice(&be(&p.y.c1));
+    out[96..].copy_from_slice(&be(&p.y.c0));
+    out
+}
+
+#[test]
+fn a_b_on_the_curve_but_outside_g2_is_refused() {
+    // The G2 curve has points outside the prime-order subgroup: search x = c0 + 0i for one.
+    let outside = (1u64..)
+        .find_map(|x| {
+            G2Affine::get_point_from_x_unchecked(Fq2::new(Fq::from(x), Fq::from(0u64)), false)
+                .filter(|p| p.is_on_curve() && !p.is_in_correct_subgroup_assuming_on_curve())
+        })
+        .unwrap();
+    assert!(!outside.is_zero());
+
+    let flow = Flow::at(STEP);
+    let env = &flow.s.env;
+    let step = fixtures::step(STEP);
+    let mut proof = fixtures::proof(env, &step);
+    proof.proof.b = Bn254G2Affine::from_bytes(BytesN::from_array(env, &host_g2(&outside)));
+    let result = flow
+        .s
+        .vault
+        .try_transact(&proof, &fixtures::ext(env, &step), &flow.caller(&step));
+    assert!(host_aborted(result));
+    // The genuine proof still settles afterwards.
+    flow.run(&step).unwrap();
 }
 
 #[test]

@@ -1,4 +1,5 @@
 mod archival;
+mod auth;
 mod costs;
 mod domain;
 mod e2e;
