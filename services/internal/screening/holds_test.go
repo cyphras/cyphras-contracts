@@ -172,9 +172,17 @@ func TestADepositEligibleMoreThanADayAwayIsNotHeld(t *testing.T) {
 	if got := h.sent(); len(got) != 0 {
 		t.Fatalf("a hold that could end in a refund: %v", got)
 	}
-	// Within a day of eligibility, it is held.
-	h.now = h.now.Add(2*24*time.Hour + time.Minute)
+	// Half an hour more than a day before eligibility, a hold could still end in a refund.
+	eligible := time.Unix(int64(h.deposits[big].createdAt), 0).Add(3 * 24 * time.Hour)
+	h.now = eligible.Add(-24*time.Hour - 30*time.Minute)
 	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+	h.tick()
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("a hold that could end in a refund: %v", got)
+	}
+	// Within a day of eligibility, it is held.
+	h.now = eligible.Add(-23 * time.Hour)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "3", h.now)
 	h.tick()
 	if got := h.sent(); !equal(got, []string{"flag 1 6", "attest 2"}) {
 		t.Fatalf("a day before eligibility: %v", got)
