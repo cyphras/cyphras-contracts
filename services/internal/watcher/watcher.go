@@ -55,6 +55,8 @@ type Config struct {
 	// HealthURLs are health endpoints that must answer 200.
 	HealthURLs  []string
 	HotAccounts []HotAccount
+	// Lumens is the contract of the native asset, whose transfers out of a hot account page.
+	Lumens string
 	// ServiceAccounts are checked against CAP-77 freezes, with the vault, its code and its asset.
 	ServiceAccounts []string
 	// BurstMultiple and BurstFloor bound transact calls within 10 minutes: alert above the
@@ -202,6 +204,9 @@ func (w *Watcher) Apply(ctx context.Context, b follow.Batch) error {
 		return err
 	}
 	if err := w.checkTransfers(ctx, b, delta); err != nil {
+		return err
+	}
+	if err := w.checkHotTransfers(ctx, b); err != nil {
 		return err
 	}
 	err = w.chain.Commit(ctx, b.From, b.To, next, delta, func(tx pgx.Tx) error {
@@ -594,6 +599,59 @@ func transferFilters(vaultID string) []protocol.TopicFilter {
 		{{ScVal: &name}, {ScVal: &from}, {Wildcard: &one}, {Wildcard: &one}},
 		{{ScVal: &burned}, {ScVal: &from}, {Wildcard: &one}},
 	}
+}
+
+// checkHotTransfers pages on any transfer of lumens out of a hot account in the window, whoever
+// sent the transaction: a hot account only pays its own fees, which the native asset reports as
+// fee events, never as transfers.
+func (w *Watcher) checkHotTransfers(ctx context.Context, b follow.Batch) error {
+	if w.cfg.Lumens == "" {
+		return nil
+	}
+	transfer := xdr.ScSymbol("transfer")
+	name := xdr.ScVal{Type: xdr.ScValTypeScvSymbol, Sym: &transfer}
+	one := protocol.WildCardExactOne
+	// A request takes at most five topic filters.
+	for group := range slices.Chunk(w.cfg.HotAccounts, 5) {
+		var topics []protocol.TopicFilter
+		sender := map[string]HotAccount{}
+		for _, h := range group {
+			from, err := vault.Address(h.Address)
+			if err != nil {
+				return err
+			}
+			topic, err := xdr.MarshalBase64(from)
+			if err != nil {
+				return err
+			}
+			sender[topic] = h
+			topics = append(topics, protocol.TopicFilter{{ScVal: &name}, {ScVal: &from}, {Wildcard: &one}, {Wildcard: &one}})
+		}
+		src := follow.RPCSource{Client: w.rpc, Contract: w.cfg.Lumens, Topics: topics, PageLimit: 1000}
+		events, err := src.Events(ctx, b.From, b.To)
+		if errors.Is(err, follow.ErrRetention) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("hot account transfers: %w", err)
+		}
+		for _, e := range events {
+			if len(e.Topics) < 2 {
+				continue
+			}
+			h, ok := sender[e.Topics[1]]
+			if !ok {
+				continue
+			}
+			what := "lumens"
+			if t, err := vault.DecodeTransfer(e); err == nil {
+				what = fmt.Sprintf("%v stroops to %s", t.Amount, t.To)
+			}
+			w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("hot_account_transfer_%.16s_%d", e.TxHash, e.Index),
+				"the %s account %s sent %s in ledger %d, which only a stolen key does", h.Name, h.Address, what, e.Ledger)
+		}
+	}
+	return nil
 }
 
 func sameAmounts(a, b map[string]*big.Int) bool {

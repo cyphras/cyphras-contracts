@@ -326,14 +326,21 @@ func (c Client) Funders(ctx context.Context, account string, since time.Time) ([
 }
 
 // Operation is one operation an account took part in, as Horizon reports it. Trustor is set on
-// an issuer's change to the account's trustline flags.
+// an issuer's change to the account's trustline flags, and Changes on a Soroban call that moved
+// assets.
 type Operation struct {
-	ID            string    `json:"id"`
-	PagingToken   string    `json:"paging_token"`
-	Type          string    `json:"type"`
-	SourceAccount string    `json:"source_account"`
-	CreatedAt     time.Time `json:"created_at"`
-	Trustor       string    `json:"trustor"`
+	ID            string          `json:"id"`
+	PagingToken   string          `json:"paging_token"`
+	Type          string          `json:"type"`
+	SourceAccount string          `json:"source_account"`
+	CreatedAt     time.Time       `json:"created_at"`
+	Trustor       string          `json:"trustor"`
+	Changes       []BalanceChange `json:"asset_balance_changes"`
+}
+
+// BalanceChange is a movement of an asset a Soroban call made.
+type BalanceChange struct {
+	From string `json:"from"`
 }
 
 type operationRecordsPage struct {

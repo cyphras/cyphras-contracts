@@ -12,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/stellar/go-stellar-sdk/strkey"
+	"github.com/stellar/go-stellar-sdk/xdr"
+
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
@@ -156,5 +159,10 @@ func settings(base *service.Base) (watcher.Config, error) {
 	for _, h := range cfg.HotAccounts {
 		cfg.ServiceAccounts = append(cfg.ServiceAccounts, h.Address)
 	}
+	lumens, err := xdr.MustNewNativeAsset().ContractID(base.Deployment.NetworkPassphrase)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Lumens = strkey.MustEncode(strkey.VersionByteContract, lumens[:])
 	return cfg, nil
 }
