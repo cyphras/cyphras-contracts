@@ -3,15 +3,14 @@
 //! receive.
 
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, IssuerFlags, Ledger, MuxedAddress as _},
-    token::StellarAssetClient,
-    vec, Address, Event, MuxedAddress,
+    testutils::{Events as _, Ledger, MuxedAddress as _},
+    Event, MuxedAddress,
 };
 
 use super::{
     exits::{fill_window, funded, queue, to_midnight, used},
     queue::authorizers,
-    setup::{account_address, env, limits, outcome, Setup, DAY, TESTNET, XLM},
+    setup::{account_address, limits, outcome, Classic, DAY, XLM},
 };
 use crate::{events, Error, Exit, Status};
 
@@ -19,47 +18,15 @@ const HALT: u64 = 72 * 3_600;
 
 /// A vault of a classic asset whose issuer can revoke authorization, holding 15,000 units of
 /// admitted notes.
-struct Classic {
-    s: Setup,
-    asset: StellarAssetClient<'static>,
-}
-
-impl Classic {
-    fn new() -> Self {
-        let env = env(TESTNET);
-        let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
-        sac.issuer().set_flag(IssuerFlags::RevocableFlag);
-        let asset = StellarAssetClient::new(&env, &sac.address());
-        let c = Classic {
-            s: Setup::with_token(env, sac.address(), limits()),
-            asset,
-        };
-        for i in 0..6 {
-            let funder = c.holder(&std::format!("funder {i}"), 2_500 * XLM);
-            c.s.shield(&funder, 2_500 * XLM).unwrap();
-        }
-        c.s.attest_all_and_wait();
-        for id in 1..=6 {
-            let id = vec![&c.s.env, id];
-            assert_eq!(c.s.vault.admit(&id), id);
-        }
-        c
-    }
-
-    /// An account with a trustline to the asset, holding `balance`.
-    fn holder(&self, tag: &str, balance: i128) -> Address {
-        let address = self.s.account(tag, 0);
-        self.asset.trust(&address);
-        if balance > 0 {
-            self.asset.mint(&address, &balance);
-        }
-        address
-    }
+fn classic() -> Classic {
+    let c = Classic::new(limits());
+    c.fund(6, 2_500 * XLM);
+    c
 }
 
 #[test]
 fn an_exit_to_a_recipient_without_a_trustline_strands_and_the_queue_moves_on() {
-    let c = Classic::new();
+    let c = classic();
     let s = &c.s;
     let filler = c.holder("filler", 0);
     let relayer = c.holder("relayer", 0);
@@ -155,7 +122,7 @@ fn an_exit_to_a_recipient_without_a_trustline_strands_and_the_queue_moves_on() {
 
 #[test]
 fn a_deauthorized_recipient_strands_and_is_paid_once_authorized_again() {
-    let c = Classic::new();
+    let c = classic();
     let s = &c.s;
     let filler = c.holder("filler", 0);
     let frozen = c.holder("frozen", 0);
@@ -181,7 +148,7 @@ fn a_deauthorized_recipient_strands_and_is_paid_once_authorized_again() {
 
 #[test]
 fn a_fee_its_relayer_cannot_receive_strands_alone() {
-    let c = Classic::new();
+    let c = classic();
     let s = &c.s;
     let filler = c.holder("filler", 0);
     let exchange = c.holder("exchange", 0);
@@ -229,7 +196,7 @@ fn a_fee_its_relayer_cannot_receive_strands_alone() {
 
 #[test]
 fn a_claim_needs_room_in_todays_window_and_takes_it() {
-    let c = Classic::new();
+    let c = classic();
     let s = &c.s;
     let filler = c.holder("filler", 0);
     let untrusting = s.account("untrusting", 0);
@@ -251,7 +218,7 @@ fn a_claim_needs_room_in_todays_window_and_takes_it() {
 
 #[test]
 fn a_claim_is_refused_while_halted_and_works_while_paused() {
-    let c = Classic::new();
+    let c = classic();
     let s = &c.s;
     let filler = c.holder("filler", 0);
     let untrusting = s.account("untrusting", 0);

@@ -1,8 +1,8 @@
 use std::{cell::Cell, fmt::Debug, rc::Rc};
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token::TokenClient,
+    testutils::{Address as _, IssuerFlags, Ledger},
+    token::{StellarAssetClient, TokenClient},
     vec,
     xdr::{self, ScAddress},
     Address, Bytes, Env, InvokeError, MuxedAddress, TryFromVal, U256,
@@ -353,5 +353,50 @@ impl Setup {
         self.attest_all_and_wait();
         let admitted = self.vault.admit(&vec![&self.env, id]);
         assert_eq!(admitted, vec![&self.env, id]);
+    }
+}
+
+/// A vault of a classic asset whose issuer can revoke authorization, with the asset's admin
+/// client.
+pub struct Classic {
+    pub s: Setup,
+    pub asset: StellarAssetClient<'static>,
+}
+
+impl Classic {
+    pub fn new(limits: Limits) -> Self {
+        let env = env(TESTNET);
+        let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+        sac.issuer().set_flag(IssuerFlags::RevocableFlag);
+        Classic {
+            asset: StellarAssetClient::new(&env, &sac.address()),
+            s: Setup::with_token(env, sac.address(), limits),
+        }
+    }
+
+    /// An account with a trustline to the asset, holding `balance`.
+    pub fn holder(&self, tag: &str, balance: i128) -> Address {
+        let address = self.s.account(tag, 0);
+        self.asset.trust(&address);
+        if balance > 0 {
+            self.asset.mint(&address, &balance);
+        }
+        address
+    }
+
+    /// Shields `amount` from each of `count` new holders and admits it all, so the pool holds
+    /// spendable value.
+    pub fn fund(&self, count: u64, amount: i128) {
+        let first = self.s.vault.status().next_deposit_id;
+        for id in first..first + count {
+            let funder = self.holder(&std::format!("funder {id}"), amount);
+            assert_eq!(self.s.shield(&funder, amount), Ok(id));
+        }
+        self.s.attest_all_and_wait();
+        // An admission costs about 18M instructions, so one call admits one deposit here.
+        for id in first..first + count {
+            let id = vec![&self.s.env, id];
+            assert_eq!(self.s.vault.admit(&id), id);
+        }
     }
 }
