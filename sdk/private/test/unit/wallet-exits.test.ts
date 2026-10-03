@@ -674,6 +674,116 @@ describe("the exit queue: sources", () => {
   });
 });
 
+describe("an indexer that renames the transaction a payment landed in", () => {
+  // A fetch whose indexer names another transaction for the newest one in the replies of `paths`
+  // while `renaming` is set, and whose RPC answers getEvents with an error while `eventsDown` is
+  // set.
+  function renamingFetch(
+    world: Awaited<ReturnType<typeof createWorld>>,
+    paths = ["/v1/leaves", "/v1/nullifiers"],
+  ) {
+    const control = {
+      renaming: false,
+      eventsDown: false,
+      fetch: (async (input, init) => {
+        const url = new URL(input);
+        const body =
+          init?.body === undefined || init.body === null
+            ? undefined
+            : JSON.parse(String(init.body));
+        if (control.eventsDown && body?.method === "getEvents") {
+          const error = { code: -32603, message: "busy" };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+        }
+        const res = await world.fetch(input, init);
+        if (
+          !control.renaming ||
+          url.origin !== "http://indexer.test" ||
+          !paths.includes(url.pathname)
+        ) {
+          return res;
+        }
+        const reply = await res.json();
+        const landing = world.vault.leaves.at(-1)?.txHash;
+        const rename = (x: { tx_hash: string }) =>
+          x.tx_hash === landing ? { ...x, tx_hash: "ab".repeat(32) } : x;
+        if (reply.leaves !== undefined) reply.leaves = reply.leaves.map(rename);
+        if (reply.nullifiers !== undefined) reply.nullifiers = reply.nullifiers.map(rename);
+        return new Response(JSON.stringify(reply), { status: 200 });
+      }) as FetchLike,
+    };
+    return control;
+  }
+
+  async function fundedThrough(world: Awaited<ReturnType<typeof createWorld>>, fetch: FetchLike) {
+    const alice = await openWallet({ ...world, fetch }, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    return alice;
+  }
+
+  it("follows a queued payout's exit once a rescan takes its landing transaction again", async () => {
+    const world = await createWorld({ limits: SMALL });
+    const control = renamingFetch(world);
+    const alice = await fundedThrough(world, control.fetch);
+    // Today's window is nearly used up, so the payout waits in the exit queue.
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 45n * XLM;
+    const destination = world.signer("exchange").publicKey;
+    await alice.unshield({
+      to: destination,
+      amount: 20n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    const exit = [...world.vault.exits.values()][0];
+    // The sync that takes the landing cannot be cross-checked.
+    control.renaming = true;
+    control.eventsDown = true;
+    await alice.sync();
+    control.renaming = false;
+    control.eventsDown = false;
+    world.fill(1);
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    await alice.rescan();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.txHash, exit?.txHash);
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.exitId, exit?.id);
+    assert.equal(plan?.payoutLeft, 20n * XLM);
+  });
+
+  it("catches the renamed landing of a payment that left no change", async () => {
+    const world = await createWorld();
+    // Only the leaves are renamed: no note of the wallet, nor a spend of one, shows the lie.
+    const control = renamingFetch(world, ["/v1/leaves"]);
+    const alice = await fundedThrough(world, control.fetch);
+    // The payout and the fee take the whole note, so no note of the wallet is at its leaves.
+    const destination = world.signer("exchange").publicKey;
+    await alice.unshield({
+      to: destination,
+      amount: 99n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    const landing = world.vault.leaves.at(-1)?.txHash;
+    control.renaming = true;
+    control.eventsDown = true;
+    await alice.sync();
+    control.renaming = false;
+    control.eventsDown = false;
+    assert.equal((await alice.plans())[0]?.state, "confirmed");
+    world.fill(1);
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    await alice.rescan();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    assert.equal(plan?.txHash, landing);
+  });
+});
+
 describe("following an exit from the vault's events and the indexer's account", () => {
   const TX = "a".repeat(64);
   let order = 0;

@@ -1251,6 +1251,77 @@ describe("wallet safety: unchecked ledgers", () => {
     await assert.rejects(fooled.sync(), isError("indexer_fault"));
   });
 
+  it("finds a note an indexer hid past the ledgers of the spends it served, while RPC could not check it", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    const paid = new Set(world.vault.leaves.slice(-2).map((l) => l.index));
+    const rpc = flakyEvents(world);
+    let hiding = true;
+    const lying = rewritingFetch(
+      { ...world, fetch: rpc.fetch },
+      {
+        "/v1/leaves": (body) => {
+          const leaves = body["leaves"] as Record<string, unknown>[];
+          const blank = (l: Record<string, unknown>) =>
+            hiding && paid.has(l["index"] as number) ? { ...l, ciphertext: "00".repeat(181) } : l;
+          return { ...body, leaves: leaves.map(blank) };
+        },
+      },
+    );
+    // The indexer reports its spends complete one ledger short of the payment, whose leaves it
+    // serves all the same, with their contents blanked.
+    world.indexer.completeTo = world.vault.ledger - 1;
+    const fooled = await openWallet({ ...world, fetch: lying }, 1);
+    rpc.down = true;
+    const summary = await fooled.sync();
+    assert.equal(summary.crossChecked, false);
+    assert.equal(summary.uncheckedLeaves, world.vault.leaves.length);
+    assert.equal((await fooled.balance()).spendable, 0n);
+    rpc.down = false;
+    world.indexer.completeTo = undefined;
+    world.fill(1);
+    await assert.rejects(fooled.sync(), isError("indexer_fault"));
+    hiding = false;
+    await fooled.rescan();
+    assert.equal((await fooled.balance()).spendable, 10n * XLM);
+  });
+
+  it("finds a note an indexer hid in a batch held aside while RPC could not check it", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    const paid = new Set(world.vault.leaves.slice(-2).map((l) => l.index));
+    // Enough leaves from other users that a first page leaves the tree too far behind for the
+    // vault's root history, so it is held aside.
+    world.fill(800);
+    const rpc = flakyEvents(world);
+    let hiding = true;
+    const lying = rewritingFetch(
+      { ...world, fetch: rpc.fetch },
+      {
+        "/v1/leaves": (body) => {
+          const leaves = body["leaves"] as Record<string, unknown>[];
+          const blank = (l: Record<string, unknown>) =>
+            hiding && paid.has(l["index"] as number) ? { ...l, ciphertext: "00".repeat(181) } : l;
+          return { ...body, leaves: leaves.map(blank) };
+        },
+      },
+    );
+    const fooled = await openWallet({ ...world, fetch: lying }, 1, new MemoryStore(), undefined, {
+      syncLimits: { leafPages: 1 },
+    });
+    rpc.down = true;
+    assert.equal((await fooled.sync()).rootVerified, false);
+    rpc.down = false;
+    // This sync's own leaves are cross-checked; those held aside are checked against RPC too.
+    await assert.rejects(fooled.sync(), isError("indexer_fault"));
+    hiding = false;
+    await fooled.rescan();
+    await fooled.sync();
+    assert.equal((await fooled.balance()).spendable, 10n * XLM);
+  });
+
   it("keeps ledgers RPC no longer holds as unchecked, without asking for them again", async () => {
     const { world, store } = await funded();
     const rpc = flakyEvents(world);

@@ -18,6 +18,7 @@ import {
   type Plan,
   type RootCheck,
   type Staging,
+  type UncheckedRange,
   type WalletState,
 } from "./state.ts";
 
@@ -289,11 +290,12 @@ export function eventsUpTo(
 }
 
 // The notes and outgoing outputs this wallet finds in new leaves, with the paths of notes in the
-// pages those leaves completed.
+// pages those leaves completed. `checked` says whether a cross-check confirmed the new leaves.
 function scanDownload(
   state: WalletState,
   keys: ScanKeys,
   data: Download,
+  checked: boolean,
 ): { readonly staging: Staging; readonly newNotes: number } {
   const staged = state.staging;
   const found: WalletState = {
@@ -337,6 +339,11 @@ function scanDownload(
       sent: found.sent,
       paths,
       found: [...(staged?.found ?? []), ...planLeaves],
+      unchecked:
+        staged?.unchecked ??
+        (checked || data.leaves[0] === undefined
+          ? undefined
+          : { first: data.leaves[0].index, ledger: data.leaves[0].ledger }),
     },
     newNotes,
   };
@@ -344,21 +351,26 @@ function scanDownload(
 
 // Holds a download whose tree the vault's root history cannot confirm yet, because it stopped at
 // its page cap far behind the vault. None of it counts; the next sync continues from it.
-export function stageDownload(state: WalletState, keys: ScanKeys, data: Download): void {
-  if (data.leaves.length > 0) state.staging = scanDownload(state, keys, data).staging;
+export function stageDownload(
+  state: WalletState,
+  keys: ScanKeys,
+  data: Download,
+  checked: boolean,
+): void {
+  if (data.leaves.length > 0) state.staging = scanDownload(state, keys, data, checked).staging;
 }
 
 // Applies a download whose tree the vault's root history has confirmed, with anything staged
 // before it: the notes found count from now, spent notes are marked, and where plans' commitments
-// landed is recorded. Spends the cross-check did not confirm leave their ledgers unchecked. Returns
-// how many notes this sync found.
+// landed is recorded. Spends and leaves the cross-check did not confirm stay unchecked. Returns how
+// many notes this sync found.
 export function applyDownload(
   state: WalletState,
   keys: ScanKeys,
   data: Download,
   checked: boolean,
 ): number {
-  const { staging, newNotes } = scanDownload(state, keys, data);
+  const { staging, newNotes } = scanDownload(state, keys, data, checked);
   for (const { pos, pagePath: path } of staging.paths) {
     const note = state.notes.find((n) => n.pos === pos);
     if (note !== undefined) note.pagePath = path;
@@ -380,32 +392,46 @@ export function applyDownload(
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
   recordOutputs(state.plans, staging.found);
-  if (!checked && data.horizon >= data.since) addUnchecked(state, data.since, data.horizon);
+  const leaves =
+    staging.unchecked === undefined
+      ? undefined
+      : { ...staging.unchecked, end: staging.tree.leafCount };
+  const to = checked ? data.since - 1 : data.horizon;
+  if (to >= data.since || leaves !== undefined) {
+    addUnchecked(state, { from: data.since, to, leaves, lost: false });
+  }
   state.nullifierSince = data.horizon + 1;
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
   state.nullifierBuffer = buffer.filter((n) => n.ledger >= state.lastLeafLedger);
   return newNotes;
 }
 
-// Joins a range to the last one when they touch, so a run of unchecked syncs is one range.
-function addUnchecked(state: WalletState, from: number, to: number): void {
-  const last = state.unchecked[state.unchecked.length - 1];
-  if (last !== undefined && !last.lost && last.to + 1 >= from) {
-    state.unchecked[state.unchecked.length - 1] = {
-      from: last.from,
-      to: Math.max(last.to, to),
-      lost: false,
-    };
-  } else {
-    state.unchecked.push({ from, to, lost: false });
+// Joins a range to the last one when their ledgers touch, so a run of unchecked syncs is one range.
+function addUnchecked(state: WalletState, range: UncheckedRange): void {
+  const at = state.unchecked.length - 1;
+  const last = state.unchecked[at];
+  if (last === undefined || last.lost || last.to + 1 < range.from) {
+    state.unchecked.push(range);
+    return;
   }
+  const [a, b] = [last.leaves, range.leaves];
+  state.unchecked[at] = {
+    from: last.from,
+    to: Math.max(last.to, range.to),
+    leaves:
+      a === undefined || b === undefined
+        ? (a ?? b)
+        : { first: a.first, end: Math.max(a.end, b.end), ledger: a.ledger },
+    lost: false,
+  };
 }
 
-// Checks what the wallet kept from the oldest range of ledgers a sync took unchecked, against the
-// vault's own events for them while RPC still holds them: the wallet's notes and outgoing outputs,
-// found again by trial decryption, with the transaction and ledger of each, and the spends of its
-// notes. A difference is the indexer's. Returns the events of the ledgers checked, which leave the
-// range; a range RPC no longer holds is kept, as lost.
+// Checks what the wallet kept from the oldest range a sync took unchecked, against the vault's own
+// events while RPC still holds them: the wallet's notes and outgoing outputs at the range's leaves,
+// found again by trial decryption with the transaction and ledger of each, where the plans'
+// commitments landed among those leaves, and the spends of its notes in the range's ledgers. A
+// difference is the indexer's. Returns the events of the ledgers whose spends were checked; what
+// RPC does not reach yet stays in the range, and a range RPC no longer holds is kept, as lost.
 export async function recheck(
   state: WalletState,
   keys: ScanKeys,
@@ -416,35 +442,66 @@ export async function recheck(
   const at = state.unchecked.findIndex((r) => !r.lost);
   const range = state.unchecked[at];
   if (range === undefined) return undefined;
+  const start = Math.min(
+    range.from <= range.to ? range.from : Number.POSITIVE_INFINITY,
+    range.leaves?.ledger ?? Number.POSITIVE_INFINITY,
+  );
   let events: VaultEvents;
   try {
-    events = await new RpcEventSource(rpc, vault, range.from, maxPages).events();
+    events = await new RpcEventSource(rpc, vault, start, maxPages).events();
   } catch (err) {
     if (!(err instanceof CyphrasError)) throw err;
     // A busy RPC is asked again in the next sync.
     if (err.code === "history_unavailable") state.unchecked[at] = { ...range, lost: true };
     return undefined;
   }
+  const differ = (): never =>
+    fail("indexer_fault", "the vault's events contradict what an unchecked sync took");
+  let leaves = range.leaves;
+  if (leaves !== undefined) {
+    const { first, end } = leaves;
+    // The leaves RPC shows follow one another from the range's first, up to the last ledger it
+    // covers.
+    const shown = events.leaves.filter((l) => l.index >= first && l.index < end);
+    if (shown.some((l, i) => l.index !== first + i)) differ();
+    const covered = (pos: number): boolean => pos >= first && pos < first + shown.length;
+    const found: WalletState = { ...state, notes: [], sent: [] };
+    const cache = new AddressCache(keys.incoming);
+    for (const leaf of shown) scanLeaf(found, leaf, keys, cache);
+    const where = (x: { pos: number; txHash: string; ledger: number }): string =>
+      `${x.pos}/${x.txHash}/${x.ledger}`;
+    for (const [kept, chain] of [
+      [state.notes, found.notes],
+      [state.sent, found.sent],
+    ] as const) {
+      const ours = kept.filter((x) => covered(x.pos)).map(where);
+      const theirs = chain.map(where);
+      if (ours.length !== theirs.length || ours.some((x) => !theirs.includes(x))) differ();
+    }
+    for (const plan of state.plans) {
+      for (const e of plan.evidence) {
+        e.outputs.forEach((pos, slot) => {
+          const chain = pos === undefined || !covered(pos) ? undefined : shown[pos - first];
+          if (
+            chain !== undefined &&
+            (chain.commitment !== plan.commitments[slot] ||
+              chain.txHash !== e.txHash ||
+              chain.ledger !== e.ledger)
+          ) {
+            differ();
+          }
+        });
+      }
+    }
+    const next = first + shown.length;
+    leaves =
+      next === end
+        ? undefined
+        : { first: next, end, ledger: shown.length === 0 ? leaves.ledger : events.latest + 1 };
+  }
   const to = Math.min(range.to, events.latest);
   const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
     xs.filter((x) => x.ledger >= range.from && x.ledger <= to);
-  const differ = (): never =>
-    fail("indexer_fault", "the vault's events contradict what an unchecked sync took");
-  const leaves = within(events.leaves);
-  const found: WalletState = { ...state, notes: [], sent: [] };
-  const cache = new AddressCache(keys.incoming);
-  for (const leaf of leaves) scanLeaf(found, leaf, keys, cache);
-  const where = (x: { pos: number; txHash: string; ledger: number }): string =>
-    `${x.pos}/${x.txHash}/${x.ledger}`;
-  const positions = new Set(leaves.map((l) => l.index));
-  for (const [kept, chain] of [
-    [state.notes, found.notes],
-    [state.sent, found.sent],
-  ] as const) {
-    const ours = kept.filter((x) => positions.has(x.pos)).map(where);
-    const theirs = chain.map(where);
-    if (ours.length !== theirs.length || ours.some((x) => !theirs.includes(x))) differ();
-  }
   const spends = new Map(within(events.nullifiers).map((n) => [n.nullifier, n]));
   for (const note of state.notes) {
     if (note.nf === undefined) continue;
@@ -453,10 +510,16 @@ export async function recheck(
       note.spent !== undefined && note.spent.ledger >= range.from && note.spent.ledger <= to;
     if (chain === undefined ? kept : chain.txHash !== note.spent?.txHash) differ();
   }
-  state.unchecked.splice(at, 1, ...(to < range.to ? [{ ...range, from: to + 1 }] : []));
+  const rest: UncheckedRange = {
+    from: range.from <= range.to ? to + 1 : range.from,
+    to: range.to,
+    leaves,
+    lost: false,
+  };
+  state.unchecked.splice(at, 1, ...(rest.from <= rest.to || leaves !== undefined ? [rest] : []));
   return {
     ...events,
-    leaves,
+    leaves: within(events.leaves),
     nullifiers: within(events.nullifiers),
     deposits: within(events.deposits),
     exits: within(events.exits),
@@ -466,7 +529,10 @@ export async function recheck(
 
 // Whether every spend of the ledgers from `from` to `to` was cross-checked.
 export function checkedBetween(state: WalletState, from: number, to: number): boolean {
-  return to < state.nullifierSince && !state.unchecked.some((r) => r.from <= to && r.to >= from);
+  return (
+    to < state.nullifierSince &&
+    !state.unchecked.some((r) => r.from <= r.to && r.from <= to && r.to >= from)
+  );
 }
 
 export function isActive(plan: Plan): boolean {

@@ -147,9 +147,10 @@ export interface SyncSummary {
   readonly rootVerified: boolean;
   // The indexer's new data matched the vault's RPC events for the same ledgers.
   readonly crossChecked: boolean;
-  // Ledgers whose spends came from the indexer alone: later syncs check them against the vault's
-  // events while RPC still holds them.
+  // Ledgers whose spends, and leaves whose contents, came from the indexer alone: later syncs check
+  // them against the vault's events while RPC still holds them.
   readonly uncheckedLedgers: number;
+  readonly uncheckedLeaves: number;
 }
 
 /** A shielded payment through a relayer. */
@@ -623,7 +624,7 @@ export class PrivateWallet {
         recordEvents(core.state.plans, eventsUpTo(events, data.horizon));
       }
     } else {
-      stageDownload(core.state, core.scan, data);
+      stageDownload(core.state, core.scan, data, source.kind === "rpc" || crossChecked);
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
     const rechecked = await recheck(
@@ -660,7 +661,14 @@ export class PrivateWallet {
       source: source.kind,
       rootVerified: core.state.rootCheck.state === "verified",
       crossChecked,
-      uncheckedLedgers: core.state.unchecked.reduce((n, r) => n + r.to - r.from + 1, 0),
+      uncheckedLedgers: core.state.unchecked.reduce(
+        (n, r) => n + Math.max(0, r.to - r.from + 1),
+        0,
+      ),
+      uncheckedLeaves: core.state.unchecked.reduce(
+        (n, r) => n + (r.leaves === undefined ? 0 : r.leaves.end - r.leaves.first),
+        0,
+      ),
     };
   }
 

@@ -194,6 +194,8 @@ export interface Staging {
   readonly paths: { readonly pos: number; readonly pagePath: bigint[] }[];
   // The staged leaves that hold a plan's output commitment.
   readonly found: readonly FoundLeaf[];
+  // The first staged leaf a sync took while RPC could not confirm it, and the ledger it was added at.
+  readonly unchecked: { readonly first: number; readonly ledger: number } | undefined;
 }
 
 export interface FoundLeaf {
@@ -203,11 +205,16 @@ export interface FoundLeaf {
   readonly txHash: string;
 }
 
-// Ledgers whose spends a sync took from the indexer while RPC could not confirm them; `lost` once
-// RPC no longer holds them, so that nothing can check them any more.
-export interface LedgerRange {
+// What syncs took from the indexer while RPC could not confirm it: the spends of the ledgers from
+// `from` to `to`, none when `from` is past `to`, and the leaves at positions from `first` up to
+// `end`, the first of them added at `ledger`. `lost` once RPC no longer holds them, so that nothing
+// can check them any more.
+export interface UncheckedRange {
   readonly from: number;
   readonly to: number;
+  readonly leaves:
+    | { readonly first: number; readonly end: number; readonly ledger: number }
+    | undefined;
   readonly lost: boolean;
 }
 
@@ -226,8 +233,9 @@ export interface WalletState {
   lastLeafLedger: number;
   staging: Staging | undefined;
   nullifierSince: number;
-  // Every other ledger before nullifierSince, since the wallet started, was cross-checked.
-  unchecked: LedgerRange[];
+  // Every other ledger before nullifierSince, since the wallet started, was cross-checked, and so
+  // was every other leaf of the tree.
+  unchecked: UncheckedRange[];
   nullifierBuffer: { readonly nf: bigint; readonly ledger: number; readonly txHash: string }[];
   notes: OwnedNote[];
   sent: SentNote[];

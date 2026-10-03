@@ -157,7 +157,7 @@ describe("plan fate", () => {
     advancePlans(state, view);
     assert.equal(plan.state, "submitted");
     state.nullifierSince = 321;
-    state.unchecked = [{ from: 300, to: 310, lost: false }];
+    state.unchecked = [{ from: 300, to: 310, leaves: undefined, lost: false }];
     advancePlans(state, view);
     assert.equal(plan.state, "submitted");
     state.unchecked = [];
@@ -262,7 +262,7 @@ describe("plan fate", () => {
     advancePlans(state, viewAt(250, 40));
     assert.equal(plan.state, "settled");
     state.nullifierSince = 230;
-    state.unchecked = [{ from: 200, to: 229, lost: false }];
+    state.unchecked = [{ from: 200, to: 229, leaves: undefined, lost: false }];
     advancePlans(state, viewAt(250, 40));
     assert.equal(plan.state, "settled");
     state.unchecked = [];
