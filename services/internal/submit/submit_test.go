@@ -311,3 +311,33 @@ func TestAResourceFeeAboveTheCapIsRefused(t *testing.T) {
 		t.Fatalf("resource fee above the cap: %v", err)
 	}
 }
+
+func TestALedgerBoundStopsInclusionAtTheDeadline(t *testing.T) {
+	h := newHarness(t)
+	h.sendStatuses("PENDING")
+	p, err := h.engine.PrepareUntil(context.Background(), h.account, invoke(), 1_020)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := h.engine.Send(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cond := envelopeOf(t, h.sends[0]).V1.Tx.Cond
+	if cond.V2 == nil || cond.V2.LedgerBounds == nil || cond.V2.LedgerBounds.MaxLedger != 1_020 || cond.V2.TimeBounds == nil {
+		t.Fatalf("preconditions %+v", cond)
+	}
+	// Unseen once the network closed the bound ledger, it can never be included: it expired,
+	// although its time bound has not passed.
+	h.fake.Get = func(protocol.GetTransactionRequest) (protocol.GetTransactionResponse, error) {
+		return protocol.GetTransactionResponse{LatestLedger: 1_020, LatestLedgerCloseTime: h.clock.Unix(), TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusNotFound}}, nil
+	}
+	res, err := h.engine.Track(context.Background(), s)
+	if err != nil || res.Outcome != Expired {
+		t.Fatalf("track: %+v %v", res, err)
+	}
+	// Without a bound, the same transaction keeps waiting for its time bound.
+	if q, err := h.engine.Prepare(context.Background(), h.account, invoke()); err != nil || q.MaxLedger != 0 {
+		t.Fatalf("unbounded %+v %v", q, err)
+	}
+}

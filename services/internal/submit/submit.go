@@ -100,6 +100,8 @@ type Prepared struct {
 	InclusionFee int64
 	ResourceFee  int64
 	MaxTime      int64
+	// MaxLedger, when set, is the first ledger that may no longer include the transaction.
+	MaxLedger uint32
 	// Return is the simulated return value of the call.
 	Return *xdr.ScVal
 }
@@ -142,6 +144,13 @@ func (o restoreOp) setExt(ext xdr.TransactionExt) { o.Ext = ext }
 // Prepare simulates op from the account and returns the assembled transaction. The account must
 // be locked by the caller.
 func (e *Engine) Prepare(ctx context.Context, a *Account, op txnbuild.Operation) (*Prepared, error) {
+	return e.PrepareUntil(ctx, a, op, 0)
+}
+
+// PrepareUntil is Prepare for a transaction the network may include only in a ledger below
+// maxLedger, such as a call that stops being valid at a ledger: past that ledger the network
+// drops it for free instead of including it to fail. A maxLedger of 0 sets no bound.
+func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Operation, maxLedger uint32) (*Prepared, error) {
 	var sop sorobanOp
 	switch o := op.(type) {
 	case *txnbuild.InvokeHostFunction:
@@ -166,13 +175,17 @@ func (e *Engine) Prepare(ctx context.Context, a *Account, op txnbuild.Operation)
 		return nil, err
 	}
 	maxTime := e.now().Add(e.Validity).Unix()
+	pre := txnbuild.Preconditions{TimeBounds: txnbuild.NewTimebounds(0, maxTime)}
+	if maxLedger > 0 {
+		pre.LedgerBounds = &txnbuild.LedgerBounds{MaxLedger: maxLedger}
+	}
 	build := func(fee int64) (*txnbuild.Transaction, error) {
 		return txnbuild.NewTransaction(txnbuild.TransactionParams{
 			SourceAccount:        &txnbuild.SimpleAccount{AccountID: a.ID, Sequence: a.seq},
 			IncrementSequenceNum: true,
 			Operations:           []txnbuild.Operation{sop},
 			BaseFee:              fee,
-			Preconditions:        txnbuild.Preconditions{TimeBounds: txnbuild.NewTimebounds(0, maxTime)},
+			Preconditions:        pre,
 		})
 	}
 	draft, err := build(inclusion)
@@ -229,7 +242,7 @@ func (e *Engine) Prepare(ctx context.Context, a *Account, op txnbuild.Operation)
 	if err != nil {
 		return nil, err
 	}
-	return &Prepared{Account: a, Tx: tx, Seq: a.seq + 1, InclusionFee: inclusion, ResourceFee: resource, MaxTime: maxTime, Return: ret}, nil
+	return &Prepared{Account: a, Tx: tx, Seq: a.seq + 1, InclusionFee: inclusion, ResourceFee: resource, MaxTime: maxTime, MaxLedger: maxLedger, Return: ret}, nil
 }
 
 // Signed is a transaction accepted for inclusion.
@@ -259,6 +272,7 @@ func (e *Engine) Send(ctx context.Context, p *Prepared) (*Signed, error) {
 	backoff := e.poll()
 	ambiguous := false
 	closed := e.now().Unix()
+	var ledger uint32
 	for {
 		resp, err := e.RPC.SendTransaction(ctx, protocol.SendTransactionRequest{Transaction: envelope})
 		switch {
@@ -275,8 +289,9 @@ func (e *Engine) Send(ctx context.Context, p *Prepared) (*Signed, error) {
 			return nil, fmt.Errorf("%w: %s", ErrRejected, resultCode(resp.ErrorResultXDR))
 		default:
 			closed = max(closed, resp.LatestLedgerCloseTime)
+			ledger = max(ledger, resp.LatestLedger)
 		}
-		if closed > p.MaxTime {
+		if closed > p.MaxTime || p.pastLedger(ledger) {
 			if ambiguous {
 				return e.resolve(ctx, s)
 			}
@@ -301,7 +316,7 @@ func (e *Engine) resolve(ctx context.Context, s *Signed) (*Signed, error) {
 			case protocol.TransactionStatusSuccess, protocol.TransactionStatusFailed:
 				return s, nil
 			case protocol.TransactionStatusNotFound:
-				if resp.LatestLedgerCloseTime > s.MaxTime {
+				if resp.LatestLedgerCloseTime > s.MaxTime || s.pastLedger(resp.LatestLedger) {
 					s.Account.known = false
 					return nil, ErrExpired
 				}
@@ -312,6 +327,12 @@ func (e *Engine) resolve(ctx context.Context, s *Signed) (*Signed, error) {
 			return nil, err
 		}
 	}
+}
+
+// pastLedger reports whether the network has closed the ledger at which the transaction stopped
+// being includable.
+func (p *Prepared) pastLedger(latest uint32) bool {
+	return p.MaxLedger > 0 && latest >= p.MaxLedger
 }
 
 // poll is the polling interval, never zero.
@@ -364,7 +385,7 @@ func (e *Engine) Track(ctx context.Context, s *Signed) (Result, error) {
 				s.Account.known = true
 				return e.result(s, resp), nil
 			case protocol.TransactionStatusNotFound:
-				if resp.LatestLedgerCloseTime > s.MaxTime {
+				if resp.LatestLedgerCloseTime > s.MaxTime || s.pastLedger(resp.LatestLedger) {
 					s.Account.known = false
 					return Result{Hash: s.Hash, Outcome: Expired}, nil
 				}
