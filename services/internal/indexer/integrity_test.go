@@ -367,7 +367,7 @@ func TestAnRPCWhoseOldestLedgerIsPastItsLatestIsRefused(t *testing.T) {
 		t.Fatalf("the archive was damaged: %v", err)
 	}
 	for _, from := range []uint32{archivedTo, archivedTo + 10} {
-		if err := h.ix.keep(nil, from, from-1); !errors.Is(err, archive.ErrRange) {
+		if _, err := h.ix.keep(nil, from, from-1); !errors.Is(err, archive.ErrRange) {
 			t.Fatalf("an inverted window from %d was kept: %v", from, err)
 		}
 	}
@@ -395,7 +395,7 @@ func TestTheArchiveKeepsAGoodCopyItDisagreesWith(t *testing.T) {
 			good = append(good, e)
 		}
 	}
-	if err := h.ix.keep(good, from, to); err != nil {
+	if _, err := h.ix.keep(good, from, to); err != nil {
 		t.Fatal(err)
 	}
 	// A different history that applies as well: the same deposit, made by someone else.
@@ -530,7 +530,7 @@ func TestAWindowAcrossWhatWasArchivedKeepsTheGoodCopy(t *testing.T) {
 		if straddle {
 			archivedTo = from
 		}
-		if err := h.ix.keep(eventsIn(good, from, archivedTo), from, archivedTo); err != nil {
+		if _, err := h.ix.keep(eventsIn(good, from, archivedTo), from, archivedTo); err != nil {
 			t.Fatal(err)
 		}
 		if err := h.ix.Apply(context.Background(), batchOf(t, eventsIn(lie.Events, from, to), from, to)); err != nil {
@@ -547,6 +547,41 @@ func TestAWindowAcrossWhatWasArchivedKeepsTheGoodCopy(t *testing.T) {
 		if !critical {
 			t.Fatalf("straddle %v: pages %+v", straddle, h.pages.alerts)
 		}
+		// The window is applied whole, so none of its digests stays.
+		h.ix.archiveMu.Lock()
+		for l := from; l <= to; l++ {
+			if _, ok := h.ix.archived[l]; ok {
+				t.Fatalf("straddle %v: the digest of applied ledger %d stayed", straddle, l)
+			}
+		}
+		h.ix.archiveMu.Unlock()
+	}
+}
+
+func TestACopyArchivedJustBeforeItsWindowIsAppliedIsJudged(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.ready()
+	from := h.chain.Ledger + 1
+	lie := *h.chain
+	lie.Events = slices.Clone(h.chain.Events)
+	h.chain.NextLedger(5)
+	h.chain.Shield(vaulttest.Depositor, 10_000_000)
+	h.chain.NextLedger(5)
+	h.chain.Shield(vaulttest.Depositor, 20_000_000)
+	lie.NextLedger(5)
+	lie.NextLedger(5)
+	lie.Shield(vaulttest.Depositor, 20_000_000)
+	to := h.chain.Ledger
+	// The archive's own copy, from a faulty RPC, lands right before ingest applies the window.
+	if _, err := h.ix.keep(eventsIn(lie.Events, from, to), from, to); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ix.Apply(context.Background(), batchOf(t, eventsIn(h.chain.Events, from, to), from, to)); err != nil {
+		t.Fatal(err)
+	}
+	if !h.pagedAs("archive_disagrees", alert.Critical) {
+		t.Fatalf("pages %+v", h.pages.alerts)
 	}
 }
 
