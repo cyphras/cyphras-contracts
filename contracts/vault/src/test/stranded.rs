@@ -405,6 +405,84 @@ fn a_party_that_can_never_receive_cannot_hold_up_the_others_part() {
 }
 
 #[test]
+fn a_party_that_keeps_losing_its_right_is_requeued_without_duplicating_or_losing_value() {
+    let c = classic();
+    let s = &c.s;
+    let filler = c.holder("filler", 0);
+    let flaky = c.holder("flaky", 0);
+    let relayer = c.holder("relayer", 0);
+    fill_window(s, &filler);
+    let first = queue(s, 10 * XLM, XLM, &flaky, &relayer);
+    let owed = s.vault.status().queued_total;
+
+    // Twice the recipient loses its right before its exit is released, the payout strands, and
+    // it is requeued under a new ID.
+    let mut id = first;
+    for _ in 0..2 {
+        c.asset.set_authorized(&flaky, &false);
+        to_midnight(s);
+        s.vault.release(&10);
+        let stranded = s.vault.stranded(&id).unwrap();
+        assert_eq!((stranded.payout, stranded.fee), (10 * XLM, 0));
+        // The fee reached the relayer on the first release, and only then.
+        assert_eq!(s.balance(&relayer), XLM);
+        assert_eq!(
+            outcome(s.vault.try_claim(&id)),
+            Err(Error::NothingClaimable)
+        );
+        c.asset.set_authorized(&flaky, &true);
+        let requeued = s.vault.claim(&id);
+        assert!(requeued > id);
+        assert_eq!(outcome(s.vault.try_claim(&id)), Err(Error::NotStranded));
+        let exit = s.vault.exit(&requeued).unwrap();
+        assert_eq!((exit.payout, exit.fee), (10 * XLM, 0));
+        assert_eq!(s.vault.status().queued_total, owed - XLM);
+        id = requeued;
+    }
+    to_midnight(s);
+    s.vault.release(&10);
+    assert_eq!((s.balance(&flaky), s.balance(&relayer)), (10 * XLM, XLM));
+    assert_eq!(s.vault.status().queued_total, owed - 11 * XLM);
+    assert_eq!(s.balance(&s.vault.address), s.vault.status().tvl);
+}
+
+#[test]
+fn each_stranded_part_moves_back_into_the_queue_exactly_once() {
+    let c = classic();
+    let s = &c.s;
+    let filler = c.holder("filler", 0);
+    let user = c.holder("user", 0);
+    let relayer = c.holder("relayer", 0);
+    fill_window(s, &filler);
+    let id = queue(s, 10 * XLM, XLM, &user, &relayer);
+    c.asset.set_authorized(&user, &false);
+    c.asset.set_authorized(&relayer, &false);
+    to_midnight(s);
+    s.vault.release(&1);
+    let tail = s.vault.status().exit_tail;
+    let owed = s.vault.status().queued_total;
+
+    // Only the relayer can receive again: the fee moves and the payout stays.
+    c.asset.set_authorized(&relayer, &true);
+    assert_eq!(s.vault.claim(&id), tail);
+    let left = s.vault.stranded(&id).unwrap();
+    assert_eq!((left.payout, left.fee), (10 * XLM, 0));
+    assert_eq!(
+        outcome(s.vault.try_claim(&id)),
+        Err(Error::NothingClaimable)
+    );
+    // Then the payout moves as a second exit, and the stranded entry is gone.
+    c.asset.set_authorized(&user, &true);
+    assert_eq!(s.vault.claim(&id), tail + 1);
+    assert_eq!(s.vault.stranded(&id), None);
+    assert_eq!(outcome(s.vault.try_claim(&id)), Err(Error::NotStranded));
+    assert_eq!(s.vault.status().queued_total, owed);
+    s.vault.release(&10);
+    assert_eq!((s.balance(&user), s.balance(&relayer)), (10 * XLM, XLM));
+    assert_eq!(s.vault.status().queued_total, owed - 11 * XLM);
+}
+
+#[test]
 fn a_claim_is_refused_while_halted_and_works_while_paused() {
     let c = classic();
     let s = &c.s;
