@@ -297,6 +297,29 @@ fn the_daily_outflow_counts_payouts_and_fees_and_resets_at_midnight() {
 }
 
 #[test]
+fn one_exit_must_fit_a_single_days_outflow_window() {
+    let s = funded();
+    let relayer = s.account("relayer", 0);
+    let max = s.vault.limits().max_daily_outflow;
+    // The fee counts, and the check comes before the vault's value is.
+    for (payout, fee) in [
+        (max + 1, 0),
+        (max - XLM + 1, XLM),
+        (s.vault.status().tvl, 0),
+    ] {
+        let ext = s.ext(-payout, fee, &relayer, &relayer);
+        assert_eq!(
+            s.transact(&relayer, &ext),
+            Err(Error::ExceedsDailyOutflow),
+            "payout {payout} fee {fee}"
+        );
+    }
+    let ext = s.ext(-(max - XLM), XLM, &relayer, &relayer);
+    assert_eq!(s.transact(&relayer, &ext), Ok(()));
+    assert_eq!(s.vault.status().outflow, max);
+}
+
+#[test]
 fn more_than_the_vault_holds_can_never_leave() {
     // Only a forged proof could ask for this; the vault still refuses it.
     let s = Setup::new();

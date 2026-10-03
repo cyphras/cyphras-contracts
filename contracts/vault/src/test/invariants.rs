@@ -168,6 +168,9 @@ impl Model {
                     return Err(Error::BadFee);
                 }
                 let outflow = payout + fee;
+                if outflow > self.limits.max_daily_outflow {
+                    return Err(Error::ExceedsDailyOutflow);
+                }
                 let today = if self.status.outflow_day == day {
                     self.status.outflow
                 } else {

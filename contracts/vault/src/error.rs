@@ -46,4 +46,5 @@ pub enum Error {
     RefundTooEarly = 40,
     ExceedsAdmittedValue = 41,
     DepositTooSmall = 42,
+    ExceedsDailyOutflow = 43,
 }

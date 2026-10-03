@@ -622,6 +622,10 @@ fn delay(config: &Config, limits: &Limits, amount: i128) -> u64 {
 /// Today's outflow after paying out `outflow`, if the daily window and the vault's value allow
 /// it. Pending deposits stay claimable by their depositors, so only admitted value can leave.
 fn check_outflow(status: &Status, limits: &Limits, day: u64, outflow: i128) -> Result<i128, Error> {
+    // No day's window could pay a larger exit; clients split it.
+    if outflow > limits.max_daily_outflow {
+        return Err(Error::ExceedsDailyOutflow);
+    }
     let today = if status.outflow_day == day {
         status.outflow
     } else {
