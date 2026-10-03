@@ -89,6 +89,8 @@ export interface SpendIntent {
   readonly parts: number;
   // The caller agreed that a payout to the asset's issuer is burned.
   readonly burnToIssuer: boolean;
+  // Called with each plan as it is saved, before anything of it leaves the device.
+  readonly onPlan: ((plan: Plan) => void) | undefined;
 }
 
 interface Relay {
@@ -330,6 +332,13 @@ const view = (plan: Plan): Submission => ({
   fee: plan.fee,
 });
 
+// An error raised once a plan was saved names it: the plan keeps its notes until its fate is
+// known, whatever became of its submission.
+function naming(err: unknown, plan: Plan | undefined): unknown {
+  if (plan === undefined || !(err instanceof CyphrasError) || "planId" in err.details) return err;
+  return new CyphrasError(err.code, err.message, { ...err.details, planId: plan.id });
+}
+
 // One spend from the review to the submission, with a write-ahead plan saved before anything
 // leaves the device and the confirmed fee inside the proof.
 export async function spend(core: Core, intent: SpendIntent): Promise<Submission> {
@@ -373,143 +382,149 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
   let relay =
     intent.selfRelay === undefined ? await chooseRelay(core, intent.relayers, cap) : undefined;
   let retryOf = intent.retryOf;
-  for (;;) {
-    const fee = relay?.quote.fee ?? 0n;
-    const route: Route =
-      relay === undefined
-        ? { kind: "self", account: (intent.selfRelay as TransactionSigner).publicKey }
-        : { kind: "relayer", url: relay.client.url };
-    const relayerAddress =
-      relay === undefined ? (intent.selfRelay as TransactionSigner).publicKey : relay.feeAddress;
-    const outflow = intent.kind === "send" ? fee : intent.amount + fee;
-    const willQueue = checkOutflow(instance, outflow, core.now());
+  let saved: Plan | undefined;
+  try {
+    for (;;) {
+      const fee = relay?.quote.fee ?? 0n;
+      const route: Route =
+        relay === undefined
+          ? { kind: "self", account: (intent.selfRelay as TransactionSigner).publicKey }
+          : { kind: "relayer", url: relay.client.url };
+      const relayerAddress =
+        relay === undefined ? (intent.selfRelay as TransactionSigner).publicKey : relay.feeAddress;
+      const outflow = intent.kind === "send" ? fee : intent.amount + fee;
+      const willQueue = checkOutflow(instance, outflow, core.now());
 
-    const inputs = intent.inputs ?? selectNotes(spendableNotes(core.state), intent.amount + fee);
-    const total = inputs.reduce((s, n) => s + n.value, 0n);
-    if (total < intent.amount + fee) {
-      fail("insufficient_funds", "the notes of the stalled payment no longer cover the new fee");
-    }
+      const inputs = intent.inputs ?? selectNotes(spendableNotes(core.state), intent.amount + fee);
+      const total = inputs.reduce((s, n) => s + n.value, 0n);
+      if (total < intent.amount + fee) {
+        fail("insufficient_funds", "the notes of the stalled payment no longer cover the new fee");
+      }
 
-    let warnings: Warning[] = [];
-    if (intent.kind === "unshield") {
-      const spendable = spendableNotes(core.state).reduce((s, n) => s + n.value, 0n);
-      const stats = reads.stats;
-      warnings = unshieldWarnings({
-        to: intent.to,
+      let warnings: Warning[] = [];
+      if (intent.kind === "unshield") {
+        const spendable = spendableNotes(core.state).reduce((s, n) => s + n.value, 0n);
+        const stats = reads.stats;
+        warnings = unshieldWarnings({
+          to: intent.to,
+          amount: intent.amount,
+          fee,
+          spendable,
+          deposits: core.state.deposits,
+          notes: core.state.notes,
+          now: core.now(),
+          destinationCreatedLedger: destination?.createdLedger,
+          createsAccount: destination?.createsAccount ?? false,
+          latestLedger: destination?.latestLedger ?? 0,
+          admittedDeposits: stats?.admittedDeposits,
+          selfRelay: relay === undefined,
+          willQueue,
+        });
+      }
+      const review: SpendReview = {
+        kind: intent.kind,
         amount: intent.amount,
         fee,
-        spendable,
-        deposits: core.state.deposits,
-        notes: core.state.notes,
-        now: core.now(),
-        destinationCreatedLedger: destination?.createdLedger,
-        createsAccount: destination?.createsAccount ?? false,
-        latestLedger: destination?.latestLedger ?? 0,
-        admittedDeposits: stats?.admittedDeposits,
-        selfRelay: relay === undefined,
-        willQueue,
-      });
-    }
-    const review: SpendReview = {
-      kind: intent.kind,
-      amount: intent.amount,
-      fee,
-      to: intent.to,
-      relayer: relay?.client.url,
-      warnings,
-      parts: intent.parts,
-    };
-    const confirmed =
-      intent.confirm === undefined ? warnings.length === 0 : await intent.confirm(review);
-    if (!confirmed) {
-      fail("not_confirmed", "the spend was not confirmed", {
-        warnings: warnings.map((w) => w.code).join(","),
-      });
-    }
+        to: intent.to,
+        relayer: relay?.client.url,
+        warnings,
+        parts: intent.parts,
+      };
+      const confirmed =
+        intent.confirm === undefined ? warnings.length === 0 : await intent.confirm(review);
+      if (!confirmed) {
+        fail("not_confirmed", "the spend was not confirmed", {
+          warnings: warnings.map((w) => w.code).join(","),
+        });
+      }
 
-    const latest = reads.view.ledger;
-    const delay =
-      intent.notBefore === undefined
-        ? 0
-        : Math.ceil((intent.notBefore - Math.floor(core.now() / 1000)) / LEDGER_SECONDS) +
-          JITTER_LEDGERS;
-    const terms: ExtTerms = {
-      vault: core.deployment.vault,
-      networkId: hexToBytes(core.services.networkId),
-      deadline: latest + delay + DEADLINE_LEDGERS,
-      extAmount: intent.kind === "send" ? 0n : -intent.amount,
-      fee,
-      // A transfer names no party to the payment, only the relayer.
-      recipient: intent.kind === "send" ? relayerAddress : intent.to,
-      relayer: relayerAddress,
-    };
-    const change = total - intent.amount - fee;
-    const outputs =
-      intent.kind === "send"
-        ? ([
-            { address: recipient as AddressKey, value: intent.amount },
-            { address: core.self, value: change },
-          ] as const)
-        : ([
-            { address: core.self, value: change },
-            { address: core.self, value: 0n },
-          ] as const);
-    const spends = inputs.map((note) => {
-      const address = addressKeyFor(core.scan.incoming, note.d);
-      if (address === undefined) fail("invalid_argument", "a note has an invalid diversifier");
-      return spendNote(core.state, note, address);
-    });
-    const built = buildTransaction({
-      keys,
-      self: core.self,
-      root: check.root,
-      domain: core.deployment.domain,
-      inputs: spends,
-      outputs,
-      ext: terms,
-    });
-    const proof = await proveTransaction(built.witness, core.prover, core.artifacts);
-    const plan = planOf(
-      core,
-      { ...intent, retryOf },
-      route,
-      fee,
-      inputs,
-      built,
-      txProofToJson(proof),
-      destination?.createsAccount ?? false,
-    );
-    core.state.plans.push(plan);
-    await core.save();
-
-    if (relay === undefined) {
-      return await selfRelay(core, plan, intent.selfRelay as TransactionSigner);
-    }
-    const result = await relay.client.submit(plan.proof, plan.ext, intent.notBefore);
-    if (result.accepted) {
-      plan.state = "submitted";
-      plan.txHash = result.hash;
-      plan.heldId = result.heldId;
+      const latest = reads.view.ledger;
+      const delay =
+        intent.notBefore === undefined
+          ? 0
+          : Math.ceil((intent.notBefore - Math.floor(core.now() / 1000)) / LEDGER_SECONDS) +
+            JITTER_LEDGERS;
+      const terms: ExtTerms = {
+        vault: core.deployment.vault,
+        networkId: hexToBytes(core.services.networkId),
+        deadline: latest + delay + DEADLINE_LEDGERS,
+        extAmount: intent.kind === "send" ? 0n : -intent.amount,
+        fee,
+        // A transfer names no party to the payment, only the relayer.
+        recipient: intent.kind === "send" ? relayerAddress : intent.to,
+        relayer: relayerAddress,
+      };
+      const change = total - intent.amount - fee;
+      const outputs =
+        intent.kind === "send"
+          ? ([
+              { address: recipient as AddressKey, value: intent.amount },
+              { address: core.self, value: change },
+            ] as const)
+          : ([
+              { address: core.self, value: change },
+              { address: core.self, value: 0n },
+            ] as const);
+      const spends = inputs.map((note) => {
+        const address = addressKeyFor(core.scan.incoming, note.d);
+        if (address === undefined) fail("invalid_argument", "a note has an invalid diversifier");
+        return spendNote(core.state, note, address);
+      });
+      const built = buildTransaction({
+        keys,
+        self: core.self,
+        root: check.root,
+        domain: core.deployment.domain,
+        inputs: spends,
+        outputs,
+        ext: terms,
+      });
+      const proof = await proveTransaction(built.witness, core.prover, core.artifacts);
+      const plan = planOf(
+        core,
+        { ...intent, retryOf },
+        route,
+        fee,
+        inputs,
+        built,
+        txProofToJson(proof),
+        destination?.createsAccount ?? false,
+      );
+      core.state.plans.push(plan);
+      intent.onPlan?.(plan);
       await core.save();
-      return view(plan);
+      saved = plan;
+
+      if (relay === undefined) {
+        return await selfRelay(core, plan, intent.selfRelay as TransactionSigner);
+      }
+      const result = await relay.client.submit(plan.proof, plan.ext, intent.notBefore);
+      if (result.accepted) {
+        plan.state = "submitted";
+        plan.txHash = result.hash;
+        plan.heldId = result.heldId;
+        await core.save();
+        return view(plan);
+      }
+      plan.error = result.error;
+      await core.save();
+      // The relayer saw the proof and could still submit it, so the plan keeps its notes until
+      // its deadline; a new proof spends the same notes.
+      if (result.error === "fee_too_low" && attempt < FEE_RETRIES) {
+        attempt++;
+        relay = { ...relay, quote: await relay.client.quote() };
+        checkQuote(core, relay.quote, relay.feeAddress, cap);
+        intent = { ...intent, inputs };
+        retryOf = plan.id;
+        continue;
+      }
+      throw new CyphrasError("service_rejected", "the relayer refused the submission", {
+        code: result.error,
+        ...(result.reason === undefined ? {} : { reason: result.reason }),
+      });
     }
-    plan.error = result.error;
-    await core.save();
-    // The relayer saw the proof and could still submit it, so the plan keeps its notes until
-    // its deadline; a new proof spends the same notes.
-    if (result.error === "fee_too_low" && attempt < FEE_RETRIES) {
-      attempt++;
-      relay = { ...relay, quote: await relay.client.quote() };
-      checkQuote(core, relay.quote, relay.feeAddress, cap);
-      intent = { ...intent, inputs };
-      retryOf = plan.id;
-      continue;
-    }
-    throw new CyphrasError("service_rejected", "the relayer refused the submission", {
-      code: result.error,
-      ...(result.reason === undefined ? {} : { reason: result.reason }),
-      planId: plan.id,
-    });
+  } catch (err) {
+    throw naming(err, saved);
   }
 }
 

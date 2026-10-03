@@ -792,6 +792,7 @@ export class PrivateWallet {
         operationId: undefined,
         parts: 1,
         burnToIssuer: false,
+        onPlan: undefined,
       });
     });
   }
@@ -826,6 +827,7 @@ export class PrivateWallet {
         operationId: undefined,
         parts: 1,
         burnToIssuer,
+        onPlan: undefined,
       });
     });
   }
@@ -887,36 +889,28 @@ export class PrivateWallet {
     confirm?: ConfirmSpend,
   ): Promise<void> {
     const remaining = op.total - this.#sent(op);
-    let submission: Submission;
-    try {
-      submission = await spend(this.#core, {
-        kind: "unshield",
-        to: op.to,
-        amount: again?.amount ?? (remaining < op.partSize ? remaining : op.partSize),
-        maxFee: op.maxFee,
-        relayers: op.route.kind === "relayers" ? this.#relayerClients(op.route.urls) : [],
-        selfRelay: signer,
-        // Later parts were confirmed with the whole operation; their warnings cannot stop them.
-        confirm: confirm ?? (() => true),
-        notBefore: undefined,
-        inputs,
-        retryOf: again?.id,
-        operationId: op.id,
-        parts: Number((op.total + op.partSize - 1n) / op.partSize),
-        // The operation was agreed to as a whole, its destination included.
-        burnToIssuer: true,
-      });
-    } catch (err) {
-      // A part refused once it was saved is still the one whose fate the operation follows.
-      const planId = err instanceof CyphrasError ? err.details["planId"] : undefined;
-      if (typeof planId === "string") {
-        op.awaiting = planId;
-        await this.#core.save();
-      }
-      throw err;
-    }
-    op.awaiting = submission.planId;
-    await this.#core.save();
+    await spend(this.#core, {
+      kind: "unshield",
+      to: op.to,
+      amount: again?.amount ?? (remaining < op.partSize ? remaining : op.partSize),
+      maxFee: op.maxFee,
+      relayers: op.route.kind === "relayers" ? this.#relayerClients(op.route.urls) : [],
+      selfRelay: signer,
+      // Later parts were confirmed with the whole operation; their warnings cannot stop them.
+      confirm: confirm ?? (() => true),
+      notBefore: undefined,
+      inputs,
+      retryOf: again?.id,
+      operationId: op.id,
+      parts: Number((op.total + op.partSize - 1n) / op.partSize),
+      // The operation was agreed to as a whole, its destination included.
+      burnToIssuer: true,
+      // The operation follows the part from the moment it is saved, whatever then becomes of its
+      // submission, and sends nothing more until its fate is known.
+      onPlan: (plan) => {
+        op.awaiting = plan.id;
+      },
+    });
   }
 
   #operationView(op: Operation): OperationView {
@@ -1021,6 +1015,7 @@ export class PrivateWallet {
         parts: 1,
         // The plan's destination was agreed to when it was made.
         burnToIssuer: true,
+        onPlan: undefined,
       });
     });
   }

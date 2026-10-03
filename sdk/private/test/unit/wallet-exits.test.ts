@@ -199,6 +199,50 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal(owedTo(world, destination), 90n * XLM);
   });
 
+  it("follows a part whose submission reply was lost, and waits its gap before the next", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    let cut = false;
+    const cutting: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (cut && url.origin === "http://relayer.test" && url.pathname === "/v1/submit") {
+        cut = false;
+        // The relayer takes the part, but its reply never arrives.
+        await world.fetch(input, init);
+        throw new TypeError("the connection was lost");
+      }
+      return world.fetch(input, init);
+    };
+    const { alice } = await twoNotes(world, cutting);
+    const destination = world.signer("exchange").publicKey;
+    cut = true;
+    let named: unknown;
+    await assert.rejects(
+      alice.unshield({
+        to: destination,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+      (err: unknown) => {
+        named = err instanceof CyphrasError ? err.details["planId"] : undefined;
+        return isError("service_unavailable")(err);
+      },
+    );
+    const [part] = await alice.plans();
+    assert.equal(named, part?.planId);
+    let [view] = await alice.continueOperations();
+    assert.equal(view?.plans.length, 1);
+    assert.equal(view?.sent, 48n * XLM);
+    assert.ok((view?.nextAt as number) >= world.clock() + 3_600_000);
+    [view] = await alice.continueOperations();
+    assert.equal(view?.plans.length, 1);
+    view = await finish(world, alice);
+    assert.equal(view?.state, "done");
+    assert.equal(owedTo(world, destination), 90n * XLM);
+    assert.equal(world.relayer.submissions.length, 2);
+  });
+
   it("moves a self-relayed split along without its signer, and sends parts only with it", async () => {
     const world = await createWorld({ limits: SPLIT });
     const { alice } = await twoNotes(world);
