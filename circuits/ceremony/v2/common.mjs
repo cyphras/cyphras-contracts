@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { closeSync, createReadStream, openSync, readSync } from "node:fs";
 
 // Contributors run the kit on its own, so it repeats the pins of scripts/circom.mjs and
 // scripts/ptau.mjs instead of importing them. The key is only valid for this exact r1cs: the
@@ -36,12 +35,6 @@ export function run(usage, main) {
     console.log(usage);
     return;
   }
-  // snarkjs zkey verify leaves the ptau file open, and Node warns when garbage collection closes
-  // it; that warning is noise to a contributor, every other one is still printed.
-  process.removeAllListeners("warning");
-  process.on("warning", (w) => {
-    if (!w.message.includes("on garbage collection")) console.warn(`${w.name}: ${w.message}`);
-  });
   main(argv).then(
     () => finish(0),
     (e) => {
@@ -66,19 +59,20 @@ export async function step(label, work) {
   return out;
 }
 
-export async function hashFile(path, algorithm = "sha256") {
-  const hash = createHash(algorithm);
-  for await (const chunk of createReadStream(path)) hash.update(chunk);
-  return hash.digest("hex");
-}
+export const digest = (data, algorithm = "sha256") =>
+  createHash(algorithm).update(data).digest("hex");
 
-export async function expectHash(path, algorithm, expected, what) {
-  const actual = await hashFile(path, algorithm);
+export function expectHash(data, algorithm, expected, mismatch) {
+  const actual = digest(data, algorithm);
   if (actual !== expected) {
-    throw new Error(`${path} is not the ${what}: its ${algorithm} is ${actual}, not ${expected}`);
+    throw new Error(`${mismatch}: its ${algorithm} is ${actual}, not ${expected}`);
   }
   return actual;
 }
+
+// Every file is read once and snarkjs gets the same bytes in memory, so what is hashed and
+// parsed is exactly what is verified, contributed to or written out.
+export const mem = (data) => ({ type: "mem", data });
 
 export function parseHex(value, bytes, what) {
   const hex = String(value ?? "")
@@ -104,12 +98,6 @@ export function checkName(name) {
 }
 
 export const show = (name) => (name === undefined ? "(no name)" : JSON.stringify(name));
-
-function readAt(fd, position, length, path) {
-  const buf = Buffer.alloc(length);
-  if (readSync(fd, buf, 0, length, position) !== length) throw new Error(`${path} is truncated`);
-  return buf;
-}
 
 function cursor(buf, what) {
   let at = 0;
@@ -199,43 +187,34 @@ function readContribution(c) {
 
 // Reads what the ceremony tracks in a zkey: the circuit hash and every contribution in the order
 // they were made. It parses and hashes the points; snarkjs zkey verify is what checks them.
-export function readZkey(path) {
-  const fd = openSync(path, "r");
-  try {
-    const head = readAt(fd, 0, 12, path);
-    if (head.toString("latin1", 0, 4) !== "zkey" || head.readUInt32LE(4) !== 1) {
-      throw new Error(`${path} is not a version 1 zkey file`);
-    }
-    const sections = new Map();
-    let pos = 12;
-    for (let i = head.readUInt32LE(8); i > 0; i--) {
-      const h = readAt(fd, pos, 12, path);
-      const id = h.readUInt32LE(0);
-      const length = Number(h.readBigUInt64LE(4));
-      if (sections.has(id)) throw new Error(`${path} repeats section ${id}`);
-      sections.set(id, { pos: pos + 12, length });
-      pos += 12 + length;
-    }
-    const section = (id) => {
-      const s = sections.get(id);
-      if (!s) throw new Error(`${path} has no section ${id}`);
-      return readAt(fd, s.pos, s.length, path);
-    };
-
-    if (section(1).readUInt32LE(0) !== 1) throw new Error(`${path} is not a Groth16 zkey`);
-    const header = cursor(section(2), "zkey header");
-    const prime = () => (header.u32() === 32 ? littleEndian(header.take(32)) : 0n);
-    if (prime() !== Q || prime() !== R) throw new Error(`${path} is not over BN254`);
-
-    const mpc = cursor(section(10), "zkey contributions");
-    const csHash = Buffer.from(mpc.take(64));
-    const contributions = [];
-    for (let i = mpc.u32(); i > 0; i--) contributions.push(readContribution(mpc));
-    if (mpc.left !== 0) throw new Error(`${path} has trailing bytes after its contributions`);
-    return { csHash, contributions };
-  } finally {
-    closeSync(fd);
+export function readZkey(data, label) {
+  const file = cursor(data, label);
+  if (file.take(4).toString("latin1") !== "zkey" || file.u32() !== 1) {
+    throw new Error(`${label} is not a version 1 zkey file`);
   }
+  const sections = new Map();
+  for (let i = file.u32(); i > 0; i--) {
+    const id = file.u32();
+    const length = Number(file.take(8).readBigUInt64LE(0));
+    if (sections.has(id)) throw new Error(`${label} repeats section ${id}`);
+    sections.set(id, file.take(length));
+  }
+  const section = (id) => {
+    if (!sections.has(id)) throw new Error(`${label} has no section ${id}`);
+    return sections.get(id);
+  };
+
+  if (section(1).readUInt32LE(0) !== 1) throw new Error(`${label} is not a Groth16 zkey`);
+  const header = cursor(section(2), `${label} header`);
+  const prime = () => (header.u32() === 32 ? littleEndian(header.take(32)) : 0n);
+  if (prime() !== Q || prime() !== R) throw new Error(`${label} is not over BN254`);
+
+  const mpc = cursor(section(10), `${label} contributions`);
+  const csHash = Buffer.from(mpc.take(64));
+  const contributions = [];
+  for (let i = mpc.u32(); i > 0; i--) contributions.push(readContribution(mpc));
+  if (mpc.left !== 0) throw new Error(`${label} has trailing bytes after its contributions`);
+  return { csHash, contributions };
 }
 
 // A valid chain can also grow from an older zkey, which drops every contribution made after it.

@@ -1,11 +1,11 @@
 import { bn254 } from "@noble/curves/bn254.js";
 import * as snarkjs from "snarkjs";
-import { PUBLIC_INPUTS, quiet } from "./common.mjs";
+import { PUBLIC_INPUTS, mem, quiet } from "./common.mjs";
 
 // Byte for byte what `snarkjs zkey export verificationkey` writes: one-space indentation and no
 // trailing newline. The vault build pins the SHA-256 of exactly these bytes.
 export async function exportVerificationKey(zkey) {
-  const vk = await snarkjs.zKey.exportVerificationKey(zkey, quiet);
+  const vk = await snarkjs.zKey.exportVerificationKey(mem(zkey), quiet);
   return Buffer.from(JSON.stringify(vk, null, 1));
 }
 

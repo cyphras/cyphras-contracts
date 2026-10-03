@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, renameSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import * as snarkjs from "snarkjs";
 import {
@@ -7,8 +7,9 @@ import {
   PTAU_NAME,
   R1CS_SHA256,
   checkName,
+  digest,
   expectHash,
-  hashFile,
+  mem,
   newContribution,
   parseHex,
   quiet,
@@ -59,7 +60,8 @@ run(USAGE, async (argv) => {
   if (existsSync(output)) throw new Error(`${output} already exists; refusing to overwrite it`);
 
   console.log(`Contributor: ${name}\nInput:       ${input}\nOutput:      ${output}\n`);
-  const inputSha256 = await hashFile(input);
+  const inputData = readFileSync(input);
+  const inputSha256 = digest(inputData);
   if (inputSha256 !== expected) {
     throw new Error(
       `${input} has sha256 ${inputSha256}, not the announced ${expected}. ` +
@@ -69,12 +71,14 @@ run(USAGE, async (argv) => {
   console.log(`Input sha256 ${inputSha256} matches the announced value.`);
 
   if (values.r1cs) {
-    await expectHash(values.r1cs, "sha256", R1CS_SHA256, "frozen v2 r1cs");
-    await expectHash(values.ptau, "blake2b512", PTAU_BLAKE2B, PTAU_NAME);
+    const r1cs = readFileSync(values.r1cs);
+    const ptau = readFileSync(values.ptau);
+    expectHash(r1cs, "sha256", R1CS_SHA256, `${values.r1cs} is not the frozen v2 r1cs`);
+    expectHash(ptau, "blake2b512", PTAU_BLAKE2B, `${values.ptau} is not the ${PTAU_NAME}`);
     await step(
       "Verifying the input against the r1cs and the ptau (snarkjs zkey verify)",
       async () => {
-        if (!(await snarkjs.zKey.verifyFromR1cs(values.r1cs, values.ptau, input, quiet))) {
+        if (!(await snarkjs.zKey.verifyFromR1cs(mem(r1cs), mem(ptau), mem(inputData), quiet))) {
           throw new Error(`snarkjs zkey verify rejects ${input}. Do not contribute.`);
         }
       },
@@ -83,7 +87,7 @@ run(USAGE, async (argv) => {
     console.log("Skipping the chain check; pass --r1cs and --ptau to verify the input first.");
   }
 
-  const before = readZkey(input);
+  const before = readZkey(inputData, input);
   if (before.contributions.some((c) => c.type !== 0)) {
     throw new Error(`${input} already holds the final beacon`);
   }
@@ -94,20 +98,20 @@ run(USAGE, async (argv) => {
   if (before.contributions.length === 0) console.log("  none, you are the first");
 
   const extra = values["extra-entropy"] ? await readExtraEntropy() : Buffer.alloc(0);
+  console.log("");
+  const { hash, data } = await step("Contributing", () => contribute(inputData, name, extra));
+  const c = newContribution(before, readZkey(data, output));
+  if (c.type !== 0 || c.name !== name || c.hash !== hash) {
+    throw new Error("the new zkey does not hold the contribution just made");
+  }
   const part = `${output}.part`;
-  let hash;
   try {
-    console.log("");
-    hash = await step("Contributing", () => contribute(input, part, name, extra));
-    const c = newContribution(before, readZkey(part));
-    if (c.type !== 0 || c.name !== name || c.hash !== hash) {
-      throw new Error("the written contribution does not match the one just made");
-    }
+    writeFileSync(part, data);
     renameSync(part, output);
   } finally {
     rmSync(part, { force: true });
   }
-  const outputSha256 = await hashFile(output);
+  const outputSha256 = digest(data);
 
   console.log(`
 Contribution complete. Publish this attestation from your own account, signed:
@@ -128,16 +132,23 @@ Next:
 `);
 });
 
-async function contribute(input, part, name, extra) {
+async function contribute(input, name, extra) {
   const os = randomBytes(64);
   const entropy = createHash("blake2b512").update(os).update(extra).digest();
   os.fill(0);
   extra.fill(0);
+  const out = { type: "mem" };
   try {
     // snarkjs UTF-8 encodes the entropy it is given, so hex keeps every bit. It hashes it with 64
     // more bytes from the OS generator to seed the contribution's secret.
-    const hash = await snarkjs.zKey.contribute(input, part, name, entropy.toString("hex"), quiet);
-    return Buffer.from(hash).toString("hex");
+    const hash = await snarkjs.zKey.contribute(
+      mem(input),
+      out,
+      name,
+      entropy.toString("hex"),
+      quiet,
+    );
+    return { hash: Buffer.from(hash).toString("hex"), data: Buffer.from(out.data) };
   } finally {
     entropy.fill(0);
   }

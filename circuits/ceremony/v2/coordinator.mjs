@@ -1,13 +1,4 @@
-import { createHash } from "node:crypto";
-import {
-  copyFileSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import * as snarkjs from "snarkjs";
@@ -18,8 +9,9 @@ import {
   PTAU_NAME,
   R1CS_SHA256,
   checkName,
+  digest,
   expectHash,
-  hashFile,
+  mem,
   newContribution,
   parseHex,
   quiet,
@@ -93,7 +85,7 @@ run(USAGE, async (argv) => {
   } else if (command === "beacon") {
     await beacon(dir, args[0]);
   } else {
-    await report(dir, load(dir));
+    report(dir, load(dir));
   }
 });
 
@@ -109,62 +101,79 @@ function save(dir, state) {
   renameSync(`${path}.part`, path);
 }
 
-// Inputs are re-hashed before every step, so nothing an earlier step verified can change unseen.
-async function inputs(dir, state) {
-  await expectHash(state.r1cs.path, "sha256", state.r1cs.sha256, "recorded r1cs");
-  await expectHash(state.ptau.path, "sha256", state.ptau.sha256, "recorded ptau");
+// The recorded inputs are read and re-hashed before every step, so nothing an earlier step
+// verified can change unseen.
+function inputs(dir, state) {
+  const read = (path, sha256) => {
+    const data = readFileSync(path);
+    expectHash(data, "sha256", sha256, `${path} changed since it was recorded`);
+    return data;
+  };
   const last = state.zkeys.at(-1);
-  await expectHash(join(dir, last.file), "sha256", last.sha256, `recorded ${last.file}`);
-  return { r1cs: state.r1cs.path, ptau: state.ptau.path, last: join(dir, last.file) };
+  return {
+    r1cs: read(state.r1cs.path, state.r1cs.sha256),
+    ptau: read(state.ptau.path, state.ptau.sha256),
+    last: read(join(dir, last.file), last.sha256),
+    lastFile: last.file,
+  };
 }
 
-async function zkeyVerify(r1cs, ptau, zkey) {
-  await step(
-    `Verifying ${basename(zkey)} against the r1cs and the ptau (snarkjs zkey verify)`,
-    async () => {
-      if (!(await snarkjs.zKey.verifyFromR1cs(r1cs, ptau, zkey, quiet))) {
-        throw new Error(`snarkjs zkey verify rejects ${zkey}`);
-      }
-      console.log("  ZKey Ok!");
-    },
-  );
+async function zkeyVerify(r1cs, ptau, zkey, label) {
+  await step(`Verifying ${label} against the r1cs and the ptau (snarkjs zkey verify)`, async () => {
+    if (!(await snarkjs.zKey.verifyFromR1cs(mem(r1cs), mem(ptau), mem(zkey), quiet))) {
+      throw new Error(`snarkjs zkey verify rejects ${label}`);
+    }
+    console.log("  ZKey Ok!");
+  });
 }
 
-async function init(dir, r1cs, ptau) {
+function writeOut(path, data) {
+  const part = `${path}.part`;
+  try {
+    writeFileSync(part, data);
+    renameSync(part, path);
+  } finally {
+    rmSync(part, { force: true });
+  }
+}
+
+async function init(dir, r1csPath, ptauPath) {
   if (existsSync(join(dir, STATE))) throw new Error(`${dir} already holds a ceremony`);
   mkdirSync(dir, { recursive: true });
+  const r1cs = readFileSync(r1csPath);
+  const ptau = readFileSync(ptauPath);
   const state = {
-    r1cs: { path: r1cs, sha256: await expectHash(r1cs, "sha256", R1CS_SHA256, "frozen v2 r1cs") },
+    r1cs: {
+      path: r1csPath,
+      sha256: expectHash(r1cs, "sha256", R1CS_SHA256, `${r1csPath} is not the frozen v2 r1cs`),
+    },
     ptau: {
-      path: ptau,
-      blake2b: await expectHash(ptau, "blake2b512", PTAU_BLAKE2B, PTAU_NAME),
-      sha256: await hashFile(ptau),
+      path: ptauPath,
+      blake2b: expectHash(ptau, "blake2b512", PTAU_BLAKE2B, `${ptauPath} is not the ${PTAU_NAME}`),
+      sha256: digest(ptau),
     },
   };
   console.log(`r1cs sha256 matches the frozen circuit; ptau blake2b matches the published value.`);
   await step("Verifying the ptau (snarkjs powersoftau verify, about 20 minutes)", async () => {
-    if (!(await snarkjs.powersOfTau.verify(ptau, quiet))) {
+    if (!(await snarkjs.powersOfTau.verify(mem(ptau), quiet))) {
       throw new Error("snarkjs powersoftau verify rejects the ptau");
     }
     console.log("  Powers of Tau Ok!");
   });
 
   const file = zkeyFile(0);
-  const part = join(dir, `${file}.part`);
-  try {
-    const csHash = await step(`Creating ${file} (snarkjs groth16 setup)`, () =>
-      snarkjs.zKey.newZKey(r1cs, ptau, part, quiet),
-    );
-    if (!(csHash instanceof Uint8Array)) throw new Error("snarkjs groth16 setup failed");
-    await zkeyVerify(r1cs, ptau, part);
-    renameSync(part, join(dir, file));
-    state.circuitHash = Buffer.from(csHash).toString("hex");
-  } finally {
-    rmSync(part, { force: true });
-  }
-  state.zkeys = [{ file, sha256: await hashFile(join(dir, file)) }];
+  const out = { type: "mem" };
+  const csHash = await step(`Creating ${file} (snarkjs groth16 setup)`, () =>
+    snarkjs.zKey.newZKey(mem(r1cs), mem(ptau), out, quiet),
+  );
+  if (!(csHash instanceof Uint8Array)) throw new Error("snarkjs groth16 setup failed");
+  const zkey = Buffer.from(out.data);
+  await zkeyVerify(r1cs, ptau, zkey, file);
+  writeOut(join(dir, file), zkey);
+  state.circuitHash = Buffer.from(csHash).toString("hex");
+  state.zkeys = [{ file, sha256: digest(zkey) }];
   save(dir, state);
-  await report(dir, state);
+  report(dir, state);
 }
 
 async function receive(dir, incoming, name, attested) {
@@ -172,36 +181,24 @@ async function receive(dir, incoming, name, attested) {
   const claimed = parseHex(attested, 64, "the attested contribution hash");
   const state = load(dir);
   if (state.final) throw new Error("the ceremony is finalized");
-  const { r1cs, ptau, last } = await inputs(dir, state);
-  const file = zkeyFile(state.zkeys.length);
-  const dest = join(dir, file);
-  const part = `${dest}.part`;
-  try {
-    // Everything is checked on a private copy, so the file filed is the file verified.
-    copyFileSync(incoming, part);
-    const c = newContribution(readZkey(last), readZkey(part));
-    if (c.type !== 0) throw new Error("the new contribution is a beacon");
-    if (c.name !== name) {
-      throw new Error(`the contribution is named ${show(c.name)}, not ${show(name)}`);
-    }
-    if (c.hash !== claimed) {
-      throw new Error(`the contribution hash is ${c.hash}, not the attested ${claimed}`);
-    }
-    console.log(`${basename(incoming)} extends ${basename(last)} by one contribution,`);
-    console.log(`named ${show(name)}, with the attested hash ${c.hash}.`);
-    await zkeyVerify(r1cs, ptau, part);
-    renameSync(part, dest);
-    state.zkeys.push({
-      file,
-      contributor: name,
-      contributionHash: c.hash,
-      sha256: await hashFile(dest),
-    });
-  } finally {
-    rmSync(part, { force: true });
+  const { r1cs, ptau, last, lastFile } = inputs(dir, state);
+  const data = readFileSync(incoming);
+  const c = newContribution(readZkey(last, lastFile), readZkey(data, incoming));
+  if (c.type !== 0) throw new Error("the new contribution is a beacon");
+  if (c.name !== name) {
+    throw new Error(`the contribution is named ${show(c.name)}, not ${show(name)}`);
   }
+  if (c.hash !== claimed) {
+    throw new Error(`the contribution hash is ${c.hash}, not the attested ${claimed}`);
+  }
+  console.log(`${basename(incoming)} extends ${lastFile} by one contribution,`);
+  console.log(`named ${show(name)}, with the attested hash ${c.hash}.`);
+  await zkeyVerify(r1cs, ptau, data, basename(incoming));
+  const file = zkeyFile(state.zkeys.length);
+  writeOut(join(dir, file), data);
+  state.zkeys.push({ file, contributor: name, contributionHash: c.hash, sha256: digest(data) });
   save(dir, state);
-  await report(dir, state);
+  report(dir, state);
 }
 
 function announce(time) {
@@ -236,63 +233,62 @@ async function beacon(dir, roundArg) {
       `the beacon needs ${MIN_CONTRIBUTIONS} contributions first, there are ${contributions}`,
     );
   }
-  const { r1cs, ptau, last } = await inputs(dir, state);
+  const { r1cs, ptau, last, lastFile } = inputs(dir, state);
   const drand = await step(`Fetching drand quicknet round ${round}`, () => fetchRound(round));
   console.log(`  produced at ${drand.time}, agreed by ${drand.relays.join(", ")}`);
   console.log(`  signature verified under the quicknet key; randomness ${drand.randomness}`);
 
-  const finalPath = join(dir, FINAL);
-  const part = `${finalPath}.part`;
-  try {
-    const hash = await step(`Applying the beacon to ${basename(last)} (snarkjs zkey beacon)`, () =>
-      snarkjs.zKey.beacon(
-        last,
-        part,
-        `drand quicknet round ${round}`,
-        drand.randomness,
-        BEACON_ITERATIONS_EXP,
-        quiet,
-      ),
-    );
-    if (!(hash instanceof Uint8Array)) throw new Error("snarkjs zkey beacon failed");
-    const c = newContribution(readZkey(last), readZkey(part));
-    if (
-      c.type !== 1 ||
-      c.beaconHash !== drand.randomness ||
-      c.iterationsExp !== BEACON_ITERATIONS_EXP ||
-      c.hash !== Buffer.from(hash).toString("hex")
-    ) {
-      throw new Error("the written beacon contribution does not match the one just made");
-    }
-    await zkeyVerify(r1cs, ptau, part);
-    const vk = await exportVerificationKey(part);
-    checkVerificationKey(vk);
-    console.log(`${VK} passes the vault build's key checks.`);
-    renameSync(part, finalPath);
-    writeFileSync(join(dir, VK), vk);
-    state.beacon = {
-      ...drand,
-      chain: QUICKNET.hash,
-      iterationsExp: BEACON_ITERATIONS_EXP,
-      contributionHash: c.hash,
-    };
-    state.final = { file: FINAL, sha256: await hashFile(finalPath) };
-    state.verificationKey = { file: VK, sha256: createHash("sha256").update(vk).digest("hex") };
-  } finally {
-    rmSync(part, { force: true });
+  const out = { type: "mem" };
+  const hash = await step(`Applying the beacon to ${lastFile} (snarkjs zkey beacon)`, () =>
+    snarkjs.zKey.beacon(
+      mem(last),
+      out,
+      `drand quicknet round ${round}`,
+      drand.randomness,
+      BEACON_ITERATIONS_EXP,
+      quiet,
+    ),
+  );
+  if (!(hash instanceof Uint8Array)) throw new Error("snarkjs zkey beacon failed");
+  const final = Buffer.from(out.data);
+  const c = newContribution(readZkey(last, lastFile), readZkey(final, FINAL));
+  if (
+    c.type !== 1 ||
+    c.beaconHash !== drand.randomness ||
+    c.iterationsExp !== BEACON_ITERATIONS_EXP ||
+    c.hash !== Buffer.from(hash).toString("hex")
+  ) {
+    throw new Error("the new zkey does not hold the beacon contribution just made");
   }
+  await zkeyVerify(r1cs, ptau, final, FINAL);
+  const vk = await exportVerificationKey(final);
+  checkVerificationKey(vk);
+  console.log(`${VK} passes the vault build's key checks.`);
+  writeOut(join(dir, FINAL), final);
+  writeOut(join(dir, VK), vk);
+  state.beacon = {
+    ...drand,
+    chain: QUICKNET.hash,
+    iterationsExp: BEACON_ITERATIONS_EXP,
+    contributionHash: c.hash,
+  };
+  state.final = { file: FINAL, sha256: digest(final) };
+  state.verificationKey = { file: VK, sha256: digest(vk) };
   save(dir, state);
-  await report(dir, state);
+  report(dir, state);
 }
 
 // The record to copy into the transcript. Every file hash is recomputed, not read back.
-async function report(dir, state) {
+function report(dir, state) {
   const files = [...state.zkeys, state.final, state.verificationKey].filter(Boolean);
-  for (const f of files) {
-    await expectHash(join(dir, f.file), "sha256", f.sha256, `recorded ${f.file}`);
+  const paths = [
+    ...files.map((f) => [join(dir, f.file), f.sha256]),
+    [state.r1cs.path, state.r1cs.sha256],
+    [state.ptau.path, state.ptau.sha256],
+  ];
+  for (const [path, sha256] of paths) {
+    expectHash(readFileSync(path), "sha256", sha256, `${path} changed since it was recorded`);
   }
-  await expectHash(state.r1cs.path, "sha256", state.r1cs.sha256, "recorded r1cs");
-  await expectHash(state.ptau.path, "sha256", state.ptau.sha256, "recorded ptau");
 
   const out = [`\nCeremony record (${dir}), every hash recomputed:\n`];
   out.push(`r1cs ${state.r1cs.path}`, `  sha256 ${state.r1cs.sha256}`);

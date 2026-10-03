@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import * as snarkjs from "snarkjs";
@@ -8,8 +7,9 @@ import {
   PTAU_BLAKE2B,
   PTAU_NAME,
   R1CS_SHA256,
+  digest,
   expectHash,
-  hashFile,
+  mem,
   parseHex,
   quiet,
   readZkey,
@@ -80,17 +80,29 @@ run(USAGE, async (argv) => {
   if (positionals.length !== 3 || !values.contributions || !values.vk || !beaconGiven) {
     throw new Error("missing arguments; run with --help");
   }
-  const [r1cs, ptau, zkey] = positionals;
+  const [r1csPath, ptauPath, zkeyPath] = positionals;
+  const [r1cs, ptau, zkey] = positionals.map((path) => readFileSync(path));
+  const published = readFileSync(values.vk);
   const attested = readAttested(values.contributions);
   let beacon = values.beacon && parseHex(values.beacon, 32, "--beacon");
   const pin = values["vk-sha256"] && parseHex(values["vk-sha256"], 32, "--vk-sha256");
 
-  const r1csSha256 = await expectHash(r1cs, "sha256", R1CS_SHA256, "frozen v2 r1cs");
-  const ptauBlake2b = await expectHash(ptau, "blake2b512", PTAU_BLAKE2B, PTAU_NAME);
-  console.log(`r1cs ${r1cs}\n  sha256 ${r1csSha256}, the frozen circuit`);
-  console.log(`ptau ${ptau}\n  blake2b ${ptauBlake2b}, the published value`);
-  console.log(`  sha256 ${await hashFile(ptau)}`);
-  console.log(`zkey ${zkey}\n  sha256 ${await hashFile(zkey)}`);
+  const r1csSha256 = expectHash(
+    r1cs,
+    "sha256",
+    R1CS_SHA256,
+    `${r1csPath} is not the frozen v2 r1cs`,
+  );
+  const ptauBlake2b = expectHash(
+    ptau,
+    "blake2b512",
+    PTAU_BLAKE2B,
+    `${ptauPath} is not the ${PTAU_NAME}`,
+  );
+  console.log(`r1cs ${r1csPath}\n  sha256 ${r1csSha256}, the frozen circuit`);
+  console.log(`ptau ${ptauPath}\n  blake2b ${ptauBlake2b}, the published value`);
+  console.log(`  sha256 ${digest(ptau)}`);
+  console.log(`zkey ${zkeyPath}\n  sha256 ${digest(zkey)}`);
 
   if (values["drand-round"] !== undefined) {
     const round = parseRound(values["drand-round"]);
@@ -104,7 +116,7 @@ run(USAGE, async (argv) => {
     console.log(`  signature verified, the same from ${drand.relays.join(", ")}`);
   }
 
-  const { contributions } = readZkey(zkey);
+  const { contributions } = readZkey(zkey, zkeyPath);
   console.log("\nContributions in the zkey:");
   contributions.forEach((c, i) => {
     const beaconParams = c.type === 1 ? `, beacon ${c.beaconHash} (2^${c.iterationsExp})` : "";
@@ -143,7 +155,7 @@ run(USAGE, async (argv) => {
   await step(
     "Re-deriving the chain and the beacon from the r1cs and the ptau (snarkjs zkey verify)",
     async () => {
-      if (!(await snarkjs.zKey.verifyFromR1cs(r1cs, ptau, zkey, quiet))) {
+      if (!(await snarkjs.zKey.verifyFromR1cs(mem(r1cs), mem(ptau), mem(zkey), quiet))) {
         throw new Error("snarkjs zkey verify rejects the final zkey");
       }
       console.log("  ZKey Ok!");
@@ -153,7 +165,6 @@ run(USAGE, async (argv) => {
   const exported = await exportVerificationKey(zkey);
   checkVerificationKey(exported);
   console.log("\nThe exported verification key passes the vault build's key checks.");
-  const published = readFileSync(values.vk);
   if (!exported.equals(published)) {
     const at = firstDifference(exported, published);
     throw new Error(
@@ -161,7 +172,7 @@ run(USAGE, async (argv) => {
         `(${exported.length} bytes exported, ${published.length} published)`,
     );
   }
-  const sha256 = createHash("sha256").update(exported).digest("hex");
+  const sha256 = digest(exported);
   console.log(`${values.vk} equals the exported key byte for byte.`);
   console.log(`  sha256 ${sha256}`);
   if (pin && pin !== sha256) throw new Error(`the vault build pins ${pin}, not ${sha256}`);

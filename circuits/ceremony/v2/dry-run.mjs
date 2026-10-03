@@ -18,7 +18,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import * as snarkjs from "snarkjs";
-import { BEACON_ITERATIONS_EXP, PTAU_NAME, quiet, readZkey, run } from "./common.mjs";
+import { BEACON_ITERATIONS_EXP, PTAU_NAME, mem, quiet, readZkey, run } from "./common.mjs";
 import { fetchRound, firstRoundAt, parseRound, roundTime } from "./drand.mjs";
 import { checkVerificationKey } from "./vk.mjs";
 
@@ -265,7 +265,8 @@ async function dryRun(root, r1cs, ptau, round) {
   const final = join(verifier, FINAL);
   flipByte(final, join(verifier, "h.zkey"), sectionOffset(final, 9) + 1000);
   refuse("verify: final zkey with one byte flipped in its H section", verifier, online("h.zkey"));
-  const second = sectionOffset(final, 10) + 68 + readZkey(final).contributions[0].raw.length;
+  const first = readZkey(readFileSync(final), final).contributions[0];
+  const second = sectionOffset(final, 10) + 68 + first.raw.length;
   flipByte(final, join(verifier, "c2.zkey"), second + 74);
   refuse(
     "verify: final zkey with one byte flipped in contribution #2",
@@ -273,18 +274,27 @@ async function dryRun(root, r1cs, ptau, round) {
     online("c2.zkey"),
   );
 
-  const beacon = (from, to, value) =>
-    snarkjs.zKey.beacon(
-      from,
-      join(verifier, to),
-      `drand quicknet round ${round}`,
+  const beacon = async (from, to, value) => {
+    const out = { type: "mem" };
+    const label = `drand quicknet round ${round}`;
+    await snarkjs.zKey.beacon(
+      mem(readFileSync(from)),
+      out,
+      label,
       value,
       BEACON_ITERATIONS_EXP,
       quiet,
     );
+    writeFileSync(join(verifier, to), out.data);
+  };
   await beacon(join(mallory, "skip.zkey"), "skip.zkey", randomness);
   const alone = await timed("snarkjs zkey verify alone, on the chain that skips #2", () =>
-    snarkjs.zKey.verifyFromR1cs(r1cs, ptau, join(verifier, "skip.zkey"), quiet),
+    snarkjs.zKey.verifyFromR1cs(
+      mem(readFileSync(r1cs)),
+      mem(readFileSync(ptau)),
+      mem(readFileSync(join(verifier, "skip.zkey"))),
+      quiet,
+    ),
   );
   console.log(
     `\nsnarkjs zkey verify alone, on the chain that skips #2: ${alone ? "ZKey Ok!" : "rejected"}`,
