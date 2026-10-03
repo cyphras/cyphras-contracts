@@ -143,6 +143,9 @@ func (a *LedgerArchive) load(ctx context.Context) (archiveSchema, error) {
 
 // Events implements Source.
 func (a *LedgerArchive) Events(ctx context.Context, from, to uint32) ([]vault.RawEvent, error) {
+	if from > to {
+		return nil, fmt.Errorf("%w: ledgers %d to %d", ErrRange, from, to)
+	}
 	schema, err := a.load(ctx)
 	if err != nil {
 		return nil, err

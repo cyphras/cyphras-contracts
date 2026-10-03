@@ -439,6 +439,9 @@ func (ix *Indexer) keep(raw []vault.RawEvent, from, to uint32) error {
 	if ix.archive == nil {
 		return nil
 	}
+	if from > to {
+		return fmt.Errorf("%w: ledgers %d to %d", archive.ErrRange, from, to)
+	}
 	ix.archiveMu.Lock()
 	defer ix.archiveMu.Unlock()
 	if to <= ix.archivedTo {
@@ -474,6 +477,9 @@ const maxArchivedDigests = 200_000
 func (ix *Indexer) confirm(ctx context.Context, raw []vault.RawEvent, from, to uint32) error {
 	if ix.archive == nil {
 		return nil
+	}
+	if from > to {
+		return fmt.Errorf("%w: ledgers %d to %d", archive.ErrRange, from, to)
 	}
 	ix.archiveMu.Lock()
 	defer ix.archiveMu.Unlock()
@@ -516,17 +522,15 @@ func digests(raw []vault.RawEvent, from, to uint32) map[uint32][32]byte {
 		b, _ := json.Marshal(e)
 		h.Write(append(b, '\n'))
 	}
-	out := make(map[uint32][32]byte, int(to-from)+1)
-	for l := from; ; l++ {
+	out := map[uint32][32]byte{}
+	for l := uint64(from); l <= uint64(to); l++ {
 		var d [32]byte
-		if h, ok := sums[l]; ok {
+		if h, ok := sums[uint32(l)]; ok {
 			copy(d[:], h.Sum(nil))
 		}
-		out[l] = d
-		if l == to {
-			return out
-		}
+		out[uint32(l)] = d
 	}
+	return out
 }
 
 // ArchiveStep copies the next window of the vault's raw events from RPC into the archive, whether
@@ -536,6 +540,9 @@ func (ix *Indexer) ArchiveStep(ctx context.Context, src follow.Source) (bool, er
 	h, err := ix.rpc.GetHealth(ctx)
 	if err != nil {
 		return false, err
+	}
+	if h.OldestLedger > h.LatestLedger {
+		return false, fmt.Errorf("the RPC reports its oldest ledger %d past its latest %d", h.OldestLedger, h.LatestLedger)
 	}
 	ix.archiveMu.Lock()
 	next := max(ix.archivedTo+1, ix.cfg.DeployLedger)

@@ -178,3 +178,13 @@ func TestALaterWriteReplacesAnEarlierOneAndAnUnfinishedWriteIsIgnored(t *testing
 		t.Fatalf("last covered %d, %v", last, err)
 	}
 }
+
+func TestARangeThatEndsBeforeItStartsIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	if err := (Writer{Dir: dir}).Append(nil, 11, 10); !errors.Is(err, ErrRange) {
+		t.Fatalf("append: %v", err)
+	}
+	if _, err := (Reader{Dir: dir, Vault: "CVAULT"}).Events(context.Background(), 11, 10); !errors.Is(err, ErrRange) {
+		t.Fatalf("read: %v", err)
+	}
+}

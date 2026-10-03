@@ -24,6 +24,9 @@ var (
 	ErrRetention = errors.New("follow: ledgers older than the source keeps")
 	// ErrStalled reports a source that stopped short of the requested range.
 	ErrStalled = errors.New("follow: source stopped before the end of the range")
+	// ErrRange reports a range whose first ledger comes after its last, or an RPC whose oldest
+	// ledger comes after its latest.
+	ErrRange = errors.New("follow: a ledger range that ends before it starts")
 )
 
 // RPCSource reads getEvents, following the cursor inside each range, so a full page only means
@@ -41,6 +44,9 @@ type RPCSource struct {
 
 // Events implements Source.
 func (s RPCSource) Events(ctx context.Context, from, to uint32) ([]vault.RawEvent, error) {
+	if from > to {
+		return nil, fmt.Errorf("%w: ledgers %d to %d", ErrRange, from, to)
+	}
 	limit := s.PageLimit
 	if limit == 0 {
 		limit = 1000

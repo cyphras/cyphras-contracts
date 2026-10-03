@@ -29,6 +29,9 @@ const WindowLedgers = 17_280
 // ErrNotCovered reports a ledger range the archive does not hold.
 var ErrNotCovered = errors.New("archive: range not covered")
 
+// ErrRange reports a range whose first ledger comes after its last.
+var ErrRange = errors.New("archive: a range that ends before it starts")
+
 // ErrDamaged reports a file with a line that is neither part of a sound write nor the torn end of
 // a write a crash cut short. It is malformed data, as an ingest fault is.
 var ErrDamaged = fmt.Errorf("archive: damaged file: %w", vault.ErrMalformed)
@@ -60,6 +63,9 @@ type Writer struct {
 // Append records the events of ledgers [from, to] and that the range is complete. It returns
 // only once the data is on disk. A later write of the same ledgers replaces an earlier one.
 func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
+	if from > to {
+		return fmt.Errorf("%w: ledgers %d to %d", ErrRange, from, to)
+	}
 	if err := os.MkdirAll(w.Dir, 0o700); err != nil {
 		return err
 	}
@@ -168,6 +174,9 @@ type finished struct {
 // Events returns the archived events of ledgers [from, to] in chain order. Each ledger is read
 // from the last finished write that covers it.
 func (r Reader) Events(ctx context.Context, from, to uint32) ([]vault.RawEvent, error) {
+	if from > to {
+		return nil, fmt.Errorf("%w: ledgers %d to %d", ErrRange, from, to)
+	}
 	var writes []finished
 	for start := windowStart(from); start <= to; start += WindowLedgers {
 		if err := ctx.Err(); err != nil {

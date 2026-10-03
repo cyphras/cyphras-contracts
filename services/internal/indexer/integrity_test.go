@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
 	"github.com/cyphras/cyphras-contracts/services/internal/follow"
@@ -250,4 +251,43 @@ func sumPlan(node map[string]any, field string) float64 {
 		}
 	}
 	return total
+}
+
+// lyingSource answers any range with no events and no error.
+type lyingSource struct{}
+
+func (lyingSource) Events(context.Context, uint32, uint32) ([]vault.RawEvent, error) { return nil, nil }
+
+func TestAnRPCWhoseOldestLedgerIsPastItsLatestIsRefused(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.ready()
+	archivedTo := h.ix.archivedTo
+	h.fake.SetLatest(archivedTo + 2)
+	h.fake.Oldest = h.fake.Latest + 3
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.ix.ArchiveStep(context.Background(), lyingSource{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("an inverted RPC range was archived")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the archive copy never returned")
+	}
+	if _, err := h.f.Step(context.Background()); !errors.Is(err, follow.ErrRange) {
+		t.Fatalf("ingest from an inverted RPC: %v", err)
+	}
+	if _, err := (archive.Reader{Dir: h.cfg.ArchiveDir, Vault: vaulttest.Vault}).Events(context.Background(), 10, h.chain.Ledger); err != nil {
+		t.Fatalf("the archive was damaged: %v", err)
+	}
+	if err := h.ix.keep(nil, 20, 19); !errors.Is(err, archive.ErrRange) {
+		t.Fatalf("an inverted window was kept: %v", err)
+	}
+	if got := digests(nil, 4_294_967_294, 4_294_967_295); len(got) != 2 {
+		t.Fatalf("digests at the end of the ledger range: %d", len(got))
+	}
 }
