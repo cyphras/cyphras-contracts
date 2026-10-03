@@ -367,9 +367,31 @@ describe("unchecked ranges", () => {
     ),
   });
 
-  // An RPC whose getEvents shows the vault adding these leaves, up to the ledger `latest`.
-  function showing(leaves: readonly Leaf[], latest = 70): SorobanRpc {
-    const events = leaves.map((l, i) => ({
+  // A deposit the vault took into its entry queue at a ledger, as getEvents shows it.
+  const depositAt = (ledger: number, id: number) => ({
+    type: "contract",
+    ledger,
+    ledgerClosedAt: "2026-10-04T00:00:00Z",
+    contractId: VAULT,
+    id: `${String(ledger).padStart(12, "0")}-${String(900).padStart(8, "0")}`,
+    txHash: TX,
+    inSuccessfulContractCall: true,
+    topic: [xdr.ScVal.scvSymbol("deposit_pending").toXDR("base64")],
+    value: map([
+      ["id", xdr.ScVal.scvU64(new xdr.Uint64(BigInt(id)))],
+      ["commitment0", nativeToScVal(1n, { type: "u256" })],
+      ["commitment1", nativeToScVal(2n, { type: "u256" })],
+    ]).toXDR("base64"),
+  });
+
+  // An RPC whose getEvents shows the vault adding these leaves, and any other events, up to the
+  // ledger `latest`.
+  function showing(
+    leaves: readonly Leaf[],
+    latest = 70,
+    others: readonly object[] = [],
+  ): SorobanRpc {
+    const added = leaves.map((l, i) => ({
       type: "contract",
       ledger: l.ledger,
       ledgerClosedAt: "2026-10-04T00:00:00Z",
@@ -384,6 +406,7 @@ describe("unchecked ranges", () => {
         ["encrypted_output", xdr.ScVal.scvBytes(Buffer.from(l.ciphertext))],
       ]).toXDR("base64"),
     }));
+    const events = [...added, ...others];
     return new SorobanRpc("http://rpc", async (_input, init) => {
       const { id } = JSON.parse(String(init?.body));
       const result = { events, latestLedger: latest, oldestLedger: 1 };
@@ -532,6 +555,31 @@ describe("unchecked ranges", () => {
       state.unchecked.map((r) => [r.leaves?.first, r.leaves?.end, r.status]),
       [[4, 8, "open"]],
     );
+  });
+
+  it("clears a range only when every RPC provider shows the vault's exits and deposits in it alike", async () => {
+    const spends = (): WalletState => {
+      const state = emptyState(1);
+      state.nullifierSince = 120;
+      state.unchecked = [{ from: 60, to: 100, leaves: undefined, status: "open" }];
+      return state;
+    };
+    await assert.rejects(
+      recheck(spends(), [showing([], 110), showing([], 110, [depositAt(80, 3)])], VAULT, 1),
+      isFault,
+    );
+    const state = spends();
+    const both = showing([], 110, [depositAt(80, 3)]);
+    const events = await recheck(state, [both, both], VAULT, 1);
+    assert.deepEqual(state.unchecked, []);
+    assert.deepEqual(
+      events?.deposits.map((d) => d.id),
+      [3],
+    );
+    assert.equal(events?.from, 60);
+    // The events of a range of leaves alone cover no ledger's exits or deposits.
+    const leavesOnly = await recheck(walletAfter(four), [showing(four), showing(four)], VAULT, 1);
+    assert.ok((leavesOnly?.from as number) > (leavesOnly?.latest as number));
   });
 
   it("checks a range against the RPC providers that still hold it when another no longer does", async () => {

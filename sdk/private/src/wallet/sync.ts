@@ -124,6 +124,21 @@ const leafKey = (l: Leaf): string =>
   `${l.index}/${l.commitment}/${bytesToHex(l.ciphertext)}/${l.ledger}/${l.txHash}`;
 const nfKey = (n: SpentNullifier): string => `${n.nullifier}/${n.ledger}/${n.txHash}`;
 
+// Fails unless every provider's events show the vault's exits and deposits from `from` to `to`
+// alike: providers that differ there cannot all be right.
+export function sameRecords(all: readonly VaultEvents[], from: number, to: number): void {
+  const records = (e: VaultEvents): string =>
+    [...e.exits, ...e.deposits]
+      .filter((x) => x.ledger >= from && x.ledger <= to)
+      .map((x) => JSON.stringify(x, (_key, v: unknown) => (typeof v === "bigint" ? `${v}` : v)))
+      .sort()
+      .join("\n");
+  const [first, ...rest] = all;
+  if (first !== undefined && rest.some((e) => records(e) !== records(first))) {
+    fail("indexer_fault", "the RPC providers show the vault's exits or deposits differently");
+  }
+}
+
 // Leaves a sync takes unchecked are kept as digests of runs of at most this many, for a recheck to
 // compare with the vault's events once RPC holds them.
 const CHUNK_LEAVES = 1024;
@@ -502,9 +517,10 @@ function confirmedRuns(
 // the digests of runs of them, and the spends of the wallet's notes in the range's ledgers. A
 // difference is the indexer's. Nothing moves while a provider is busy. What every provider shows
 // alike is cleared, the ledgers of its leaves become the vault's own, and the first provider's
-// events of the ledgers whose spends were cleared are returned. A range some provider no longer
-// holds can never be confirmed by every one: what every other provider shows alike is kept as
-// partial, and a range none of them holds is kept as lost.
+// events of the ledgers whose spends were cleared are returned, once every provider shows the
+// vault's exits and deposits in them alike. A range some provider no longer holds can never be
+// confirmed by every one: what every other provider shows alike is kept as partial, and a range
+// none of them holds is kept as lost.
 export async function recheck(
   state: WalletState,
   rpcs: readonly SorobanRpc[],
@@ -598,6 +614,7 @@ export async function recheck(
     );
     return undefined;
   }
+  sameRecords(held, range.from, to);
   state.unchecked.splice(at, 1, ...kept);
   return {
     ...events,
@@ -605,6 +622,7 @@ export async function recheck(
     nullifiers: within(events.nullifiers, to),
     deposits: within(events.deposits, to),
     exits: within(events.exits, to),
+    from: range.from,
     latest: to,
   };
 }

@@ -97,6 +97,7 @@ import {
   recheck,
   recordEvents,
   resetEvidence,
+  sameRecords,
   stageDownload,
 } from "./sync.ts";
 
@@ -681,8 +682,9 @@ export class PrivateWallet {
     // The new data counts as the vault's own: cross-checked, or from the only RPC provider.
     let checked: boolean;
     // The vault's own events, from the first RPC provider, for the ledgers of this sync, when it
-    // held them.
+    // held them, and the other providers' for the same ledgers.
     let events: VaultEvents | undefined;
+    let others: VaultEvents[];
     if (source.kind === "indexer") {
       const matches = [];
       for (const rpc of rpcs) matches.push(await crossCheck(rpc, vault, data, limits.eventPages));
@@ -693,13 +695,21 @@ export class PrivateWallet {
       crossChecked = matches.every((m) => m.verified);
       checked = crossChecked;
       events = matches[0]?.events;
+      others = matches.slice(1).flatMap((m) => (m.events === undefined ? [] : [m.events]));
     } else {
       events = await source.events();
-      crossChecked =
-        second !== undefined &&
-        (await crossCheck(second.rpc, vault, data, limits.eventPages)).verified;
+      const match =
+        second === undefined
+          ? undefined
+          : await crossCheck(second.rpc, vault, data, limits.eventPages);
+      crossChecked = match?.verified === true;
       checked = second === undefined || crossChecked;
+      others = match?.events === undefined ? [] : [match.events];
     }
+    // The vault's exits and deposits of this sync's ledgers count only where its data counts as
+    // the vault's own, and every provider shows them alike.
+    const shown = checked ? events : undefined;
+    if (shown !== undefined) sameRecords([shown, ...others], data.since, data.horizon);
     const checks = views.map((v) => (v === undefined ? undefined : checkRoot(data.tree, v.roots)));
     if (checks.some((c) => c?.state === "mismatch")) {
       fail(
@@ -731,15 +741,23 @@ export class PrivateWallet {
     const pace = updatePace(core.state, events?.times ?? []);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
     onReads({ view, stats: await live?.stats().catch(() => undefined), pace });
+    const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
+      xs.filter((x) => x.ledger >= data.since && x.ledger <= data.horizon);
+    // What a recheck cleared is older than this sync's ledgers, and goes first.
     await trackDeposits(core, await live?.deposits().catch(() => undefined), [
-      ...(events?.deposits ?? []),
       ...(rechecked?.deposits ?? []),
+      ...within(shown?.deposits ?? []),
     ]);
     applyExits(
       core.state,
-      events === undefined
-        ? undefined
-        : { from: events.from, to: events.latest, events: events.exits },
+      [
+        ...(rechecked === undefined
+          ? []
+          : [{ from: rechecked.from, to: rechecked.latest, events: rechecked.exits }]),
+        ...(shown === undefined
+          ? []
+          : [{ from: data.since, to: data.horizon, events: within(shown.exits) }]),
+      ],
       await live?.exits().catch(() => undefined),
       view.ledger,
     );

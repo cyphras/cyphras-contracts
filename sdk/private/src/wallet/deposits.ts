@@ -282,10 +282,33 @@ export async function refundDeposit(
   return result.hash;
 }
 
+// The ID of the deposit a transaction made, or its failure, as every RPC provider reports it; none
+// while they differ, cannot answer or do not hold the transaction yet.
+async function depositOutcome(core: Core, hash: string): Promise<number | "failed" | undefined> {
+  const { rpc, second } = core.services;
+  const outcomes: (number | "failed" | undefined)[] = [];
+  for (const provider of second === undefined ? [rpc] : [rpc, second.rpc]) {
+    const status = await provider.getTransaction(hash).catch((err: unknown) => {
+      if (err instanceof CyphrasError) return undefined;
+      throw err;
+    });
+    outcomes.push(
+      status?.status === "FAILED"
+        ? "failed"
+        : status?.status === "SUCCESS" && status.returnValue?.switch().name === "scvU64"
+          ? Number(scValToBigInt(status.returnValue))
+          : undefined,
+    );
+  }
+  return outcomes.every((o) => o === outcomes[0]) ? outcomes[0] : undefined;
+}
+
 // Follows this wallet's deposits through the entry queue. A deposit still being submitted is found
-// by its commitments in the vault's deposit_pending events, even when this wallet never learned its
-// transaction; one that cannot land any more, with every ledger up to its deadline checked, failed.
-// A deposit's notes are spendable only once admitted, which is when their leaves appear.
+// by its commitments in the vault's deposit_pending events, of ledgers every RPC provider showed
+// alike, even when this wallet never learned its transaction, or by its transaction as every
+// provider reports it; one that cannot land any more, with every ledger up to its deadline
+// checked, failed. A deposit's notes are spendable only once admitted, which is when their leaves
+// appear.
 export async function trackDeposits(
   core: Core,
   queue: DepositQueue | undefined,
@@ -304,12 +327,12 @@ export async function trackDeposits(
         deposit.txHash = pending.txHash;
         deposit.state = "pending";
       } else if (deposit.txHash !== undefined) {
-        const status = await core.services.rpc.getTransaction(deposit.txHash);
-        if (status.status === "SUCCESS" && status.returnValue?.switch().name === "scvU64") {
-          deposit.id = Number(scValToBigInt(status.returnValue));
-          deposit.state = "pending";
-        } else if (status.status === "FAILED") {
+        const outcome = await depositOutcome(core, deposit.txHash);
+        if (outcome === "failed") {
           deposit.state = "failed";
+        } else if (outcome !== undefined) {
+          deposit.id = outcome;
+          deposit.state = "pending";
         }
       }
       if (

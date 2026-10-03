@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { xdr } from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
 import type { ExitEntry, ExitQueue } from "../../src/net/indexer.ts";
@@ -14,7 +15,7 @@ import {
   saveState,
 } from "../../src/wallet/state.ts";
 import type { OperationView, PrivateWallet } from "../../src/wallet/wallet.ts";
-import { RPC, XLM, createWorld } from "../support/network.ts";
+import { INDEXER, RPC, XLM, createWorld } from "../support/network.ts";
 import { keypairFor } from "../support/rpc.ts";
 import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
 
@@ -976,6 +977,119 @@ describe("the exit queue: sources", () => {
     );
   });
 
+  // A wallet of 100 XLM that reads the vault from a second RPC provider too, whose getEvents
+  // fails while `busy` is set, and whose first provider passes its getEvents replies through
+  // `rewrite`.
+  async function withTwoProviders(rewrite: (events: { topic: string[] }[]) => unknown[]) {
+    const world = await createWorld({ limits: SMALL });
+    const second = "http://rpc2.test";
+    const control = { busy: false, rewriting: false };
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (url.origin === second) {
+        if (control.busy && body?.method === "getEvents") {
+          const error = { code: -32603, message: "busy" };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+        }
+        return world.fetch(RPC, init);
+      }
+      const res = await world.fetch(input, init);
+      if (!control.rewriting || url.origin !== RPC || body?.method !== "getEvents") return res;
+      const reply = await res.json();
+      reply.result.events = rewrite(reply.result.events);
+      return new Response(JSON.stringify(reply), { status: 200 });
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    return { world, alice, control };
+  }
+
+  it("follows a payout only on the events every RPC provider shows", async () => {
+    const { world, alice, control } = await withTwoProviders((events) => events);
+    fillWindow(world);
+    const sub = await alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    assert.ok("planId" in sub);
+    // The indexer's account of the queue would show the payout too.
+    world.indexer.down = true;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "queued");
+    world.advance(86_400);
+    await alice.releaseExits(world.signer("anyone"));
+    control.busy = true;
+    assert.equal((await alice.sync()).crossChecked, false);
+    assert.equal((await alice.plans())[0]?.state, "queued");
+    control.busy = false;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+  });
+
+  it("refuses a payout's events that the RPC providers show differently", async () => {
+    const settled = xdr.ScVal.scvSymbol("settled").toXDR("base64");
+    const { world, alice, control } = await withTwoProviders((events) =>
+      events.filter((e) => e.topic[0] !== settled),
+    );
+    fillWindow(world);
+    await alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    await alice.sync();
+    world.advance(86_400);
+    await alice.releaseExits(world.signer("anyone"));
+    control.rewriting = true;
+    await assert.rejects(alice.sync(), isError("indexer_fault"));
+    assert.equal((await alice.plans())[0]?.state, "queued");
+  });
+
+  it("follows a payout only on the events of ledgers the sync checked", async () => {
+    const world = await createWorld({ limits: SMALL });
+    // The indexer keeps no account of the queue, which would show the payout too.
+    const noQueue: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (url.origin === INDEXER && url.pathname === "/v1/exits") {
+        return new Response("{}", { status: 503 });
+      }
+      return world.fetch(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch: noQueue }, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    fillWindow(world);
+    await alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "queued");
+    world.advance(86_400);
+    await alice.releaseExits(world.signer("anyone"));
+    // The indexer is complete only up to the ledger before the release.
+    world.indexer.completeTo = world.vault.ledger - 1;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "queued");
+    world.indexer.completeTo = undefined;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+  });
+
   it("counts a split part that waits in the queue as sent", async () => {
     const { world, alice } = await funded();
     await alice.unshield({
@@ -1231,7 +1345,7 @@ describe("following an exit from the vault's events and the indexer's account", 
   // The plan's payout stranded in exit 1, as the events of ledgers 5 to 30 show.
   function strandedPlan(): { state: WalletState; plan: Plan } {
     const fixture = withUnshield();
-    applyExits(fixture.state, events(5, 30, [queued(10), stranded(20)]), undefined, 30);
+    applyExits(fixture.state, [events(5, 30, [queued(10), stranded(20)])], undefined, 30);
     assert.equal(fixture.plan.state, "stranded");
     return fixture;
   }
@@ -1240,26 +1354,26 @@ describe("following an exit from the vault's events and the indexer's account", 
     const { state, plan } = withUnshield();
     // The relayer still cannot receive, so its fee stays stranded and the claim moves the payout.
     const once = [queued(10), stranded(20, 1n), requeued(25)];
-    applyExits(state, events(5, 30, once), undefined, 30);
-    applyExits(state, events(5, 40, once), undefined, 40);
+    applyExits(state, [events(5, 30, once)], undefined, 30);
+    applyExits(state, [events(5, 40, once)], undefined, 40);
     assert.equal(plan.state, "queued");
     assert.deepEqual(plan.exit?.parts, [
       { id: 1, payoutLeft: 0n, feeLeft: 1n, stranded: true },
       { id: 2, payoutLeft: 10n, feeLeft: 0n, stranded: false },
     ]);
-    applyExits(state, events(41, 50, [{ kind: "settled", exitId: 2, ...at(45) }]), undefined, 50);
+    applyExits(state, [events(41, 50, [{ kind: "settled", exitId: 2, ...at(45) }])], undefined, 50);
     assert.equal(plan.state, "settled");
   });
 
   it("takes the indexer's account only when it is newer than the events and no newer than the vault read", () => {
     const { state, plan } = withUnshield();
-    applyExits(state, events(5, 30, [queued(10)]), undefined, 30);
+    applyExits(state, [events(5, 30, [queued(10)])], undefined, 30);
     const paid = (completeTo: number) => account(completeTo, [entry(1, "settled", 0n)]);
-    applyExits(state, undefined, paid(30), 40);
+    applyExits(state, [], paid(30), 40);
     assert.equal(plan.state, "queued");
-    applyExits(state, undefined, paid(50), 40);
+    applyExits(state, [], paid(50), 40);
     assert.equal(plan.state, "queued");
-    applyExits(state, undefined, paid(50), 50);
+    applyExits(state, [], paid(50), 50);
     assert.equal(plan.state, "settled");
   });
 
@@ -1269,7 +1383,7 @@ describe("following an exit from the vault's events and the indexer's account", 
       [entry(2, "queued", 10n, { position: 0, requeuedFrom: 1 })],
     ]) {
       const { state, plan } = strandedPlan();
-      applyExits(state, undefined, account(40, exits), 40);
+      applyExits(state, [], account(40, exits), 40);
       assert.equal(plan.state, "queued");
       assert.deepEqual(plan.exit?.parts, [
         { id: 2, payoutLeft: 10n, feeLeft: 0n, stranded: false },
@@ -1287,7 +1401,7 @@ describe("following an exit from the vault's events and the indexer's account", 
       [entry(1, "requeued", 0n), entry(2, "queued", 15n, { position: 0, requeuedFrom: 1 })],
     ]) {
       const { state, plan } = strandedPlan();
-      applyExits(state, undefined, account(40, exits), 40);
+      applyExits(state, [], account(40, exits), 40);
       assert.equal(plan.state, "stranded");
       assert.deepEqual(plan.exit?.parts, [{ id: 1, payoutLeft: 10n, feeLeft: 0n, stranded: true }]);
     }
