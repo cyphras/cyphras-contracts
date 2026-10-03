@@ -31,6 +31,7 @@ export type ErrorCode =
   | "quote_invalid"
   | "not_confirmed"
   | "destination_invalid"
+  | "destination_is_issuer"
   | "signer_mismatch"
   | "transaction_failed"
   | "view_only"

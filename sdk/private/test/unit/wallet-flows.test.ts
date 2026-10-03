@@ -566,6 +566,44 @@ describe("wallet: a pool of an issued asset", () => {
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "settled");
   });
+
+  it("burns a payout to the asset's issuer only when the caller agrees to it", async () => {
+    const issuer = keypairFor("issuer").publicKey();
+    const world = await createWorld({ asset: `USDC:${issuer}` });
+    world.signer("issuer");
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const burned = (err: unknown) =>
+      err instanceof CyphrasError &&
+      err.code === "destination_is_issuer" &&
+      err.details["payout"] === "burned";
+    const unshield = (to: string, burnToIssuer?: boolean) =>
+      alice.unshield({
+        to,
+        amount: 5n * XLM,
+        maxFee: 2n * XLM,
+        confirm: confirmAll,
+        ...(burnToIssuer === undefined ? {} : { burnToIssuer }),
+      });
+    await assert.rejects(unshield(issuer), burned);
+    // Nor through a muxed address on the issuer's account.
+    await assert.rejects(
+      unshield(new MuxedAccount(new Account(issuer, "0"), "3").accountId()),
+      burned,
+    );
+    assert.deepEqual(await alice.plans(), []);
+    // The issuer holds no trustline for its own asset, so none is asked for.
+    assert.ok("planId" in (await unshield(issuer, true)));
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+    assert.deepEqual(
+      world.vault.transfers.filter((t) => t.to === issuer).map((t) => t.amount),
+      [5n * XLM],
+    );
+  });
 });
 
 describe("wallet: keys and state", () => {

@@ -61,7 +61,14 @@ import {
   type SyncLimits,
   type VaultEvents,
 } from "./sources.ts";
-import { type ConfirmSpend, type Submission, followHeld, spend, submissionOf } from "./spend.ts";
+import {
+  type ConfirmSpend,
+  type Submission,
+  checkIssuer,
+  followHeld,
+  spend,
+  submissionOf,
+} from "./spend.ts";
 import {
   type ExitPart,
   LANDED_STATES,
@@ -167,6 +174,9 @@ export interface UnshieldRequest {
   readonly notBefore?: number;
   // Splits an amount above the vault's single-exit cap into transactions spread over time.
   readonly split?: boolean;
+  // Pays the asset's issuer, which burns the payout as a classic payment to it would. Refused
+  // with destination_is_issuer unless set.
+  readonly burnToIssuer?: boolean;
 }
 
 /** A stalled payment proved again, with the same notes. */
@@ -769,6 +779,7 @@ export class PrivateWallet {
         retryOf: undefined,
         operationId: undefined,
         parts: 1,
+        burnToIssuer: false,
       });
     });
   }
@@ -784,7 +795,9 @@ export class PrivateWallet {
       const maxFee = request.selfRelay === undefined ? request.maxFee : 0n;
       if (maxFee === undefined) fail("invalid_argument", "a relayed unshield needs maxFee");
       const { limits } = chainReads(this.#core).view.instance;
+      const burnToIssuer = request.burnToIssuer === true;
       if (request.split === true && request.amount + maxFee > limits.maxDailyOutflow) {
+        checkIssuer(this.#core.deployment.asset.name, request.to, burnToIssuer);
         return this.#startSplit(request, maxFee, limits.maxDailyOutflow - maxFee);
       }
       return spend(this.#core, {
@@ -800,6 +813,7 @@ export class PrivateWallet {
         retryOf: undefined,
         operationId: undefined,
         parts: 1,
+        burnToIssuer,
       });
     });
   }
@@ -877,6 +891,8 @@ export class PrivateWallet {
         retryOf: again?.id,
         operationId: op.id,
         parts: Number((op.total + op.partSize - 1n) / op.partSize),
+        // The operation was agreed to as a whole, its destination included.
+        burnToIssuer: true,
       });
     } catch (err) {
       // A part refused once it was saved is still the one whose fate the operation follows.
@@ -990,6 +1006,8 @@ export class PrivateWallet {
         retryOf: plan.id,
         operationId: plan.operationId,
         parts: 1,
+        // The plan's destination was agreed to when it was made.
+        burnToIssuer: true,
       });
     });
   }

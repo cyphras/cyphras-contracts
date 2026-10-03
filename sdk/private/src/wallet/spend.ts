@@ -1,4 +1,4 @@
-import { Address } from "@stellar/stellar-base";
+import { Address, MuxedAccount } from "@stellar/stellar-base";
 import { decodeAddress, encodeAddress } from "../address.ts";
 import { hexToBytes, randomBytes } from "../bytes.ts";
 import { CyphrasError, fail } from "../errors.ts";
@@ -87,6 +87,8 @@ export interface SpendIntent {
   readonly retryOf: string | undefined;
   readonly operationId: string | undefined;
   readonly parts: number;
+  // The caller agreed that a payout to the asset's issuer is burned.
+  readonly burnToIssuer: boolean;
 }
 
 interface Relay {
@@ -160,8 +162,32 @@ interface Destination {
   readonly createsAccount: boolean;
 }
 
+// The issuer of an issued asset, which burns what it receives of its own asset.
+function issuerOf(assetName: string, to: string): boolean {
+  const issuer = assetName.split(":")[1];
+  const account = isMuxedAccountId(to)
+    ? MuxedAccount.fromAddress(to, "0").baseAccount().accountId()
+    : to;
+  return issuer !== undefined && account === issuer;
+}
+
+// A payout to the asset's own issuer is burned, as a classic payment to it would be; the vault
+// takes it, so the caller must agree to it.
+export function checkIssuer(assetName: string, to: string, burn: boolean): void {
+  if (issuerOf(assetName, to) && !burn) {
+    fail("destination_is_issuer", "the destination is the asset's issuer, which burns the payout", {
+      payout: "burned",
+    });
+  }
+}
+
 // The destination must be able to receive before anything is proved.
-async function checkDestination(core: Core, to: string, amount: bigint): Promise<Destination> {
+async function checkDestination(
+  core: Core,
+  to: string,
+  amount: bigint,
+  burnToIssuer: boolean,
+): Promise<Destination> {
   const { deployment } = core;
   if (!isAccountId(to) && !isContractId(to) && !isMuxedAccountId(to)) {
     fail(
@@ -170,6 +196,7 @@ async function checkDestination(core: Core, to: string, amount: bigint): Promise
     );
   }
   if (to === deployment.vault) fail("destination_invalid", "the vault cannot be the destination");
+  checkIssuer(deployment.asset.name, to, burnToIssuer);
   const dest = await core.services.vault.destination(to, deployment.asset.name);
   if (!dest.exists) {
     if (deployment.asset.name !== "native" || isContractId(to)) {
@@ -184,7 +211,12 @@ async function checkDestination(core: Core, to: string, amount: bigint): Promise
     }
     return { createdLedger: undefined, latestLedger: dest.latestLedger, createsAccount: true };
   }
-  if (deployment.asset.name !== "native" && !isContractId(to)) {
+  // The issuer holds no trustline for its own asset.
+  if (
+    deployment.asset.name !== "native" &&
+    !isContractId(to) &&
+    !issuerOf(deployment.asset.name, to)
+  ) {
     if (dest.trustline === undefined || !dest.trustline.authorized) {
       fail("destination_invalid", "the destination has no authorized trustline for the asset");
     }
@@ -334,7 +366,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
   if (intent.kind === "send") {
     recipient = decodeAddress(core.deployment.network, intent.to);
   } else {
-    destination = await checkDestination(core, intent.to, intent.amount);
+    destination = await checkDestination(core, intent.to, intent.amount, intent.burnToIssuer);
   }
 
   let attempt = 0;
