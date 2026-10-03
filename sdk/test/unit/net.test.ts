@@ -8,6 +8,7 @@ import { Fields, type FetchLike } from "../../src/net/http.ts";
 import { IndexerClient } from "../../src/net/indexer.ts";
 import { RelayerClient } from "../../src/net/relayer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
+import { IndexerSource } from "../../src/wallet/sources.ts";
 import { vaultErrorName } from "../../src/vault/errors.ts";
 import { parseVaultErrors } from "../../scripts/vault-errors.ts";
 import { SDK_ROOT } from "../helpers.ts";
@@ -109,8 +110,8 @@ describe("indexer client", () => {
     });
     const unordered = reply(200, {
       nullifiers: [n(9), n(8)],
-      cursor: null,
-      complete_to_ledger: 10,
+      next_cursor: null,
+      complete_to: 10,
     });
     await assert.rejects(
       new IndexerClient("http://i", unordered).nullifiers(5),
@@ -126,6 +127,67 @@ describe("indexer client", () => {
       }).leaves(0),
       (err: unknown) =>
         isCode("service_unavailable")(err) && !(err as Error).message.includes("http://i"),
+    );
+  });
+
+  it("leaves nullifiers past the complete-to ledger for the next sync", async () => {
+    const n = (ledger: number, byte: string) => ({
+      nullifier: byte.repeat(32),
+      ledger,
+      tx_hash: "bb".repeat(32),
+    });
+    const indexer = new IndexerClient(
+      "http://i",
+      reply(200, { nullifiers: [n(9, "01"), n(12, "02")], next_cursor: null, complete_to: 10 }),
+    );
+    const set = await new IndexerSource(indexer).nullifiers(5);
+    assert.deepEqual(
+      set.nullifiers.map((x) => x.ledger),
+      [9],
+    );
+    assert.equal(set.completeToLedger, 10);
+  });
+
+  it("reads the entry queue with null for absent values", async () => {
+    const depositor = "GA53HZCSOZI5ZUDYCMYXXUGHO7XEZSM3BYW4M5FGSTYGKWMGVL7QLFB3";
+    const pending = {
+      id: 3,
+      depositor,
+      amount: "50000000",
+      created_at: 1_759_000_000,
+      earliest_admission: null,
+      attested: false,
+      flag_reason: 2,
+      flagged_at: 1_759_000_100,
+    };
+    const resolved = {
+      id: 2,
+      depositor,
+      amount: "10000000",
+      created_at: 1_758_990_000,
+      outcome: "admitted",
+      reason: 0,
+      resolved_at: 1_758_999_000,
+      leaf_index0: 6,
+      leaf_index1: 7,
+    };
+    const body = { pending: [pending], resolved: [resolved], attested_up_to: 2, complete_to: 90 };
+    const queue = await new IndexerClient("http://i", reply(200, body)).deposits();
+    assert.equal(queue.pending[0]?.earliestAdmission, undefined);
+    assert.deepEqual(queue.pending[0]?.flag, { reason: 2, flaggedAt: 1_759_000_100 });
+    assert.deepEqual(queue.resolved[0]?.leafIndices, [6, 7]);
+    const unflagged = { ...pending, flag_reason: null, flagged_at: null };
+    const plain = await new IndexerClient(
+      "http://i",
+      reply(200, { ...body, pending: [unflagged] }),
+    ).deposits();
+    assert.equal(plain.pending[0]?.flag, undefined);
+    await assert.rejects(
+      new IndexerClient(
+        "http://i",
+        reply(200, { ...body, resolved: [{ ...resolved, leaf_index1: null }] }),
+      ).deposits(),
+      isCode("indexer_fault"),
     );
   });
 });

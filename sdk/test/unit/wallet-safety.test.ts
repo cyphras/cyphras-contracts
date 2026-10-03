@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Address, TransactionBuilder, type Transaction, xdr } from "@stellar/stellar-base";
-import { toHex32 } from "../../src/bytes.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import { MemoryStore } from "../../src/storage.ts";
 import { XLM, createWorld, type World } from "../support/network.ts";
 import { confirmAll, isError, openWallet } from "../support/wallets.ts";
 import { TrapdoorProver } from "../support/trapdoor.ts";
 import { MNEMONIC } from "../helpers.ts";
+
+// A commitment as the indexer serves it, with its lowest bit flipped.
+const flipLowBit = (cm: string): string => (BigInt("0x" + cm) ^ 1n).toString(16).padStart(64, "0");
 
 async function funded(world?: World) {
   const w = world ?? (await createWorld());
@@ -22,14 +24,14 @@ async function funded(world?: World) {
 describe("wallet safety: services that lie", () => {
   it("stops when the indexer changes a leaf it served before", async () => {
     const { world, alice } = await funded();
-    world.indexer.tamperLeaf = (index, cm) => (index === 0 ? toHex32(BigInt(cm) ^ 1n) : cm);
+    world.indexer.tamperLeaf = (index, cm) => (index === 0 ? flipLowBit(cm) : cm);
     await assert.rejects(alice.sync(), isError("indexer_fault"));
   });
 
   it("refuses to spend from a tree the vault's root history does not contain", async () => {
     const world = await createWorld();
     await funded(world);
-    world.indexer.tamperLeaf = (index, cm) => (index === 1 ? toHex32(BigInt(cm) ^ 1n) : cm);
+    world.indexer.tamperLeaf = (index, cm) => (index === 1 ? flipLowBit(cm) : cm);
     await assert.rejects((await openWallet(world, 0)).sync(), isError("indexer_fault"));
     // Past the RPC's window no cross-check is possible; the root check still catches it.
     world.rpc.oldestLedger = world.vault.ledger;
@@ -188,7 +190,7 @@ describe("wallet safety: cross-checks with RPC events", () => {
         page: 0,
         leaves: world.vault.leaves.slice(0, served).map((l) => ({
           index: l.index,
-          commitment: toHex32(l.cm),
+          commitment: l.cm.toString(16).padStart(64, "0"),
           ciphertext: Buffer.from(l.ciphertext).toString("hex"),
           ledger: l.ledger,
           tx_hash: l.txHash,
@@ -246,6 +248,18 @@ describe("wallet safety: availability", () => {
     await restored.sync();
     assert.equal((await restored.balance()).spendable, 100n * XLM - 3n * (2n * XLM));
     assert.ok(world.indexer.requests.filter((r) => r.startsWith("/v1/nullifiers")).length > 8);
+  });
+
+  it("takes a nullifier listed past the indexer's complete-to ledger in the next sync", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    world.indexer.completeTo = world.vault.ledger - 1;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "submitted");
+    world.indexer.completeTo = undefined;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
   });
 });
 

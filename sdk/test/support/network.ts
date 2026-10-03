@@ -1,5 +1,5 @@
-// An indexer and a relayer that follow services.md, as this SDK reads it, over the vault model,
-// and a fetch that routes the SDK's requests to them and to the mock RPC.
+// An indexer and a relayer that answer as the services do, over the vault model, and a fetch that
+// routes the SDK's requests to them and to the mock RPC.
 import { createHash } from "node:crypto";
 import {
   Asset,
@@ -8,7 +8,7 @@ import {
   type Transaction,
   TransactionBuilder,
 } from "@stellar/stellar-base";
-import { bytesToHex, toHex32 } from "../../src/bytes.ts";
+import { bigIntToBytesBE, bytesToHex } from "../../src/bytes.ts";
 import type { Deployment } from "../../src/deployments.ts";
 import { computeDomain } from "../../src/domain.ts";
 import {
@@ -39,6 +39,9 @@ export const DEFAULT_LIMITS: Limits = {
   maxFee: 5n * XLM,
   largeDepositThreshold: 500n * XLM,
 };
+
+// Field elements as the indexer serves them: 32 bytes of hex with no prefix.
+const fieldHex = (x: bigint): string => bytesToHex(bigIntToBytesBE(x, 32));
 
 const json = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -115,6 +118,8 @@ export class MockIndexer {
   // Test hooks: change what the indexer serves.
   tamperLeaf: ((index: number, cm: string) => string) | undefined;
   hideNullifiers = false;
+  // The ledger the nullifiers reply claims to be complete to, when it lags the listed ones.
+  completeTo: number | undefined;
   down = false;
   requests: string[] = [];
 
@@ -142,14 +147,14 @@ export class MockIndexer {
           ingested_ledger: v.ledger,
           reconciled_ledger: v.ledger,
           leaf_count: v.tree.leafCount,
-          root: toHex32(v.tree.root()),
+          root: fieldHex(v.tree.root()),
           nullifier_count: v.nullifiers.size,
           pending_count: v.pending.size,
         });
       case "/v1/leaves": {
         const page = Number(url.searchParams.get("page"));
         const leaves = v.leaves.slice(page * 1024, page * 1024 + 1024).map((l) => {
-          const cm = toHex32(l.cm);
+          const cm = fieldHex(l.cm);
           return {
             index: l.index,
             commitment: this.tamperLeaf?.(l.index, cm) ?? cm,
@@ -158,7 +163,12 @@ export class MockIndexer {
             tx_hash: l.txHash,
           };
         });
-        return json(200, { page, leaves });
+        return json(200, {
+          page,
+          leaves,
+          complete: leaves.length === 1024,
+          ingested_ledger: v.ledger,
+        });
       }
       case "/v1/nullifiers": {
         const since = Number(url.searchParams.get("since_ledger"));
@@ -170,12 +180,12 @@ export class MockIndexer {
         const more = offset + slice.length < all.length;
         return json(200, {
           nullifiers: slice.map(([nf, n]) => ({
-            nullifier: toHex32(nf),
+            nullifier: fieldHex(nf),
             ledger: n.ledger,
             tx_hash: n.txHash,
           })),
-          cursor: more ? String(offset + slice.length) : null,
-          complete_to_ledger: v.ledger,
+          next_cursor: more ? String(offset + slice.length) : null,
+          complete_to: this.completeTo ?? v.ledger,
         });
       }
       case "/v1/deposits":
@@ -187,16 +197,22 @@ export class MockIndexer {
             created_at: Number(d.createdAt),
             earliest_admission: Number(d.createdAt + d.delay),
             attested: id <= v.attestedUpTo,
-            flag: d.flag === undefined ? null : { reason: d.flag, flagged_at: Number(d.flaggedAt) },
+            flag_reason: d.flag ?? null,
+            flagged_at: d.flag === undefined ? null : Number(d.flaggedAt),
           })),
           resolved: v.resolved.map((r) => ({
             id: r.id,
             depositor: r.depositor,
             amount: r.amount.toString(),
+            created_at: Number(r.createdAt),
             outcome: r.outcome,
-            reason: r.reason ?? null,
-            leaf_indices: r.leafIndices ?? null,
+            reason: r.reason ?? 0,
+            resolved_at: Number(r.resolvedAt),
+            leaf_index0: r.leafIndices?.[0] ?? null,
+            leaf_index1: r.leafIndices?.[1] ?? null,
           })),
+          attested_up_to: v.attestedUpTo,
+          complete_to: v.ledger,
         });
       case "/v1/stats":
         return json(200, {

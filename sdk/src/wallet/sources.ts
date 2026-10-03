@@ -56,10 +56,9 @@ export class IndexerSource implements ChainSource {
       if (page.cursor === undefined) break;
       cursor = page.cursor;
     }
-    if (nullifiers.some((n) => n.ledger > completeToLedger)) {
-      fail("indexer_fault", "a nullifier lies beyond the ledger the answer is complete to");
-    }
-    return { nullifiers, completeToLedger };
+    // A nullifier ingested after the indexer read its complete-to ledger may already be listed;
+    // the next sync, which asks from the ledger after, receives it again.
+    return { nullifiers: nullifiers.filter((n) => n.ledger <= completeToLedger), completeToLedger };
   }
 }
 

@@ -4,8 +4,9 @@ import { isAccountId, isContractId } from "../extdata.ts";
 import { PAGE_SIZE } from "../merkle.ts";
 import { type FetchLike, Fields, joinUrl, requestJson } from "./http.ts";
 
-// The indexer API of services.md. The JSON shapes below are this SDK's reading of it: binary
-// values are lowercase hex, field elements may carry a 0x prefix, and amounts are decimal strings.
+// The indexer API of services.md, with the field names the services serve: binary values are
+// lowercase hex, field elements may carry a 0x prefix, amounts are decimal strings and absent
+// values are null.
 
 export interface ServiceIdentity {
   readonly ready: boolean;
@@ -45,7 +46,8 @@ export interface QueuedDeposit {
   readonly depositor: string;
   readonly amount: bigint;
   readonly createdAt: number;
-  readonly earliestAdmission: number;
+  // Unknown until the indexer has read the deposit's delay.
+  readonly earliestAdmission: number | undefined;
   readonly attested: boolean;
   readonly flag: { readonly reason: number; readonly flaggedAt: number | undefined } | undefined;
 }
@@ -179,11 +181,11 @@ export class IndexerClient {
       return { nullifier: n.field("nullifier"), ledger, txHash: n.hash("tx_hash") };
     });
     if (nullifiers.length > 4096) f.fault("more than 4096 nullifiers in one reply");
-    const next = f.has("cursor") ? f.string("cursor") : undefined;
+    const next = f.has("next_cursor") ? f.string("next_cursor") : undefined;
     return {
       nullifiers,
       cursor: next === "" ? undefined : next,
-      completeToLedger: f.integer("complete_to_ledger"),
+      completeToLedger: f.integer("complete_to"),
     };
   }
 
@@ -193,19 +195,16 @@ export class IndexerClient {
       const d = f.item(raw, i, "pending");
       const depositor = d.string("depositor");
       if (!isAccountId(depositor) && !isContractId(depositor)) d.fault("bad depositor");
-      let flag: QueuedDeposit["flag"];
-      if (d.has("flag")) {
-        const fl = d.object("flag");
-        flag = { reason: fl.integer("reason", 1), flaggedAt: optionalInt(fl, "flagged_at") };
-      }
       return {
         id: d.integer("id", 1),
         depositor,
         amount: d.amount("amount"),
         createdAt: d.integer("created_at"),
-        earliestAdmission: d.integer("earliest_admission"),
+        earliestAdmission: optionalInt(d, "earliest_admission"),
         attested: d.boolean("attested"),
-        flag,
+        flag: d.has("flag_reason")
+          ? { reason: d.integer("flag_reason", 1), flaggedAt: optionalInt(d, "flagged_at") }
+          : undefined,
       };
     });
     const resolved = f.array("resolved").map((raw, i): ResolvedDeposit => {
@@ -214,20 +213,17 @@ export class IndexerClient {
       if (outcome !== "admitted" && outcome !== "cancelled" && outcome !== "refunded") {
         d.fault("unknown outcome");
       }
-      let leafIndices: ResolvedDeposit["leafIndices"];
-      if (d.has("leaf_indices")) {
-        const pair = d.array("leaf_indices");
-        if (pair.length !== 2 || !pair.every((x) => Number.isSafeInteger(x)))
-          d.fault("bad leaf indices");
-        leafIndices = [pair[0] as number, pair[1] as number];
-      }
+      const first = optionalInt(d, "leaf_index0");
+      const second = optionalInt(d, "leaf_index1");
+      if ((first === undefined) !== (second === undefined))
+        d.fault("one leaf index without the other");
       return {
         id: d.integer("id", 1),
         depositor: d.string("depositor"),
         amount: d.amount("amount"),
         outcome,
         reason: optionalInt(d, "reason"),
-        leafIndices,
+        leafIndices: first === undefined ? undefined : [first, second as number],
       };
     });
     return { pending, resolved };

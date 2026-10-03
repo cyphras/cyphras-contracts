@@ -168,6 +168,8 @@ export class MockVault {
     id: number;
     depositor: string;
     amount: bigint;
+    createdAt: bigint;
+    resolvedAt: bigint;
     outcome: string;
     reason: number | undefined;
     leafIndices: [number, number] | undefined;
@@ -514,6 +516,8 @@ export class MockVault {
         id,
         depositor: deposit.depositor,
         amount: deposit.amount,
+        createdAt: deposit.createdAt,
+        resolvedAt: this.timestamp,
         outcome: "admitted",
         reason: undefined,
         leafIndices: [index, index + 1],
@@ -535,6 +539,8 @@ export class MockVault {
       id,
       depositor: deposit.depositor,
       amount: deposit.amount,
+      createdAt: deposit.createdAt,
+      resolvedAt: this.timestamp,
       outcome,
       reason,
       leafIndices: undefined,
