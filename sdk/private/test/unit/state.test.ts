@@ -46,11 +46,12 @@ describe("stored state", () => {
     const loaded = await loadState(store);
     assert.deepEqual(loaded?.ledgerTimes, []);
     assert.equal(loaded?.checkedLeafLedger, 0);
-    // Ranges keep whether they were lost; leaves kept without the digests a recheck compares can
-    // no longer be checked, and leaves staged without them are taken again.
+    // A range kept as lost on the first provider's word is open again; leaves kept without the
+    // digests a recheck compares can no longer be checked, and leaves staged without them are
+    // taken again.
     assert.deepEqual(
       loaded?.unchecked.map((r) => r.status),
-      ["lost", "lost", "open"],
+      ["lost", "open", "open"],
     );
     assert.equal(
       loaded?.unchecked.some((r) => "lost" in r),

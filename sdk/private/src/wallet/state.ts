@@ -345,14 +345,15 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
   // A state need not hold close times yet, nor a checked leaf's ledger; its next syncs record them.
   // Leaves it took unchecked without the digests a recheck compares can no longer be checked, and
-  // leaves it staged without them the next sync takes again.
+  // leaves it staged without them the next sync takes again. A range kept as lost without a status
+  // was given up on the first RPC provider's word alone, and is open again for every provider to be
+  // asked.
   state.ledgerTimes ??= [];
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {
-    const { lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };
+    const { lost: _lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };
     const undigested = range.leaves !== undefined && range.leaves.chunks === undefined;
-    const status = range.status ?? (lost === true ? "lost" : "open");
-    return { ...range, status: undigested ? "lost" : status };
+    return { ...range, status: undigested ? "lost" : (range.status ?? "open") };
   });
   if (state.staging?.unchecked !== undefined && state.staging.unchecked.chunks === undefined) {
     state.staging = undefined;
