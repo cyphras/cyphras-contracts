@@ -16,6 +16,8 @@ import (
 	"github.com/stellar/go-stellar-sdk/keypair"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 )
 
 func TestAttestationNeverCoversADepositUnderReview(t *testing.T) {
@@ -256,4 +258,54 @@ func TestPublicBudgetsAreSpentOnlyPastTheFreeChecks(t *testing.T) {
 
 func encodeB64(b []byte) string {
 	return base64.StdEncoding.EncodeToString(b)
+}
+
+func TestALiftWaitsForAReviewOfWhatTheCheckFoundSince(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	big := h.shield(clean, 6_000_000_000)
+	h.tick()
+	h.now = h.now.Add(23*time.Hour + 30*time.Minute)
+	h.chain.ClosedAt = h.now.Unix()
+	small := h.shield(keypair.MustRandom().Address(), 10_000_000)
+	h.tick()
+	// The large deposit's final window opens with its review unfinished: it is flagged with reason 5.
+	h.now = h.now.Add(21 * time.Minute)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 5"}) {
+		t.Fatalf("at the review deadline: %v", got)
+	}
+	five := uint32(5)
+	h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, big)), vaulttest.Pending(big, clean, 6_000_000_000, 1_728_000_000, 86400, &five, uint64(h.now.Unix())), h.chain.Ledger, nil)
+	// The small deposit is attested past the flagged large one.
+	h.now = h.now.Add(45 * time.Minute)
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "3", h.now)
+	h.tick()
+	if h.attest < small {
+		t.Fatalf("attested up to %d, sent %v", h.attest, h.sent())
+	}
+	h.sent()
+	// A funder of the large deposit's depositor is listed since, a finding the review never saw.
+	h.funders[clean] = []string{funder}
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}, funder: {Source: "exploits", Reason: ReasonSanctions}}, "4", h.now)
+	if err := h.s.DecideReview(ctx, big, "reviewer", true); err != nil {
+		t.Fatal(err)
+	}
+	h.tick()
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("a new finding lifted the flag: %v", got)
+	}
+	reviews, err := h.s.Reviews(ctx)
+	if err != nil || len(reviews) != 1 || reviews[0].ID != big {
+		t.Fatalf("not back for review: %v, %v", reviews, err)
+	}
+	// A review that clears what was found lifts it.
+	if err := h.s.DecideReview(ctx, big, "reviewer", true); err != nil {
+		t.Fatal(err)
+	}
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"unflag 1"}) {
+		t.Fatalf("after the second review: %v", got)
+	}
 }

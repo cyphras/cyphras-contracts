@@ -616,16 +616,26 @@ func subset(found, cleared []string) bool {
 }
 
 // lift unflags a deposit whose review came after its review deadline flagged it, once the review
-// cleared it and the automated checks still pass. It then needs its final check again before it
-// can be attested.
+// cleared it and a new check finds nothing the review did not see. It then needs its final check
+// again before it can be attested. A check that finds something new sends the deposit back to
+// review, still flagged, with what it found; a check that refuses keeps the flag for good.
 func (s *Screener) lift(ctx context.Context, v vaultView, r *row) error {
 	since := time.Unix(int64(r.createdAt), 0).Add(-FunderWindow)
 	verdict, err := s.check.Check(ctx, r.depositor, s.hops(*r, v.inst.Limits), since)
 	if err != nil {
 		return err
 	}
-	if verdict.Refused {
-		return s.db.update(ctx, r.id, "flag_kind", "review_lift_refused")
+	id := r.id
+	switch {
+	case verdict.Refused:
+		return s.db.update(ctx, id, "flag_kind", "review_lift_refused")
+	case !verdict.Clear() && !subset(verdict.Findings, r.firstFindings):
+		s.record(ctx, Decision{Kind: "lift", DepositID: &id, Address: r.depositor, Amount: r.amount, Outcome: "refer",
+			Detail: "found since the review: " + verdict.Detail, Sources: verdict.Sources})
+		if err := s.db.update(ctx, id, "first_findings", strings.Join(verdict.Findings, "\n")); err != nil {
+			return err
+		}
+		return s.db.update(ctx, id, "review", "needed")
 	}
 	res, err := s.send(ctx, "unflag", vault.U64(r.id))
 	if err != nil {
@@ -636,7 +646,6 @@ func (s *Screener) lift(ctx context.Context, v vaultView, r *row) error {
 			return err
 		}
 	}
-	id := r.id
 	s.record(ctx, Decision{Kind: "unflag", DepositID: &id, Address: r.depositor, Amount: r.amount, Outcome: "unflag", Reason: r.flag,
 		Detail: "the review cleared the deposit after its deadline flagged it", TxHash: res.Hash})
 	return nil
