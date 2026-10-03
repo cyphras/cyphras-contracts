@@ -304,16 +304,19 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 2);
     assert.deepEqual(again?.proof, first?.proof);
     assert.equal(again?.notBefore, notBefore);
-    // Once sent, the request has a hash, which the plan takes before the chain shows it landed.
+    // Once sent, the request has a hash, which the plan takes before the wallet sees it land: the
+    // indexer has not served its leaves yet, and RPC is behind on events.
     world.advance(3_700);
+    world.indexer.leafLimit = world.vault.leaves.length;
     world.relayer.releaseHeld();
-    world.indexer.completeTo = world.vault.ledger - 1;
+    world.rpc.oldestLedger = world.vault.ledger + 1;
     await alice.sync();
     [plan] = await alice.plans();
     assert.equal(plan?.state, "submitted");
     assert.equal(plan?.relayerStatus, "success");
     assert.match(plan?.txHash ?? "", /^[0-9a-f]{64}$/);
-    world.indexer.completeTo = undefined;
+    world.indexer.leafLimit = undefined;
+    world.rpc.oldestLedger = 1;
     await alice.sync();
     [plan] = await alice.plans();
     assert.equal(plan?.state, "settled");
@@ -326,10 +329,12 @@ describe("wallet: spends", () => {
     const notBefore = Number(world.vault.timestamp) + 600;
     await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
     world.relayer.restart();
-    // Past the deadline the vault refuses the proof, so it goes nowhere again. RPC no longer holds
-    // the ledgers since, so the plan stays open, and a sync still asks about it.
+    // Past the deadline the vault refuses the proof, so it goes nowhere again. The indexer has not
+    // served the latest leaves, so the plan stays open, and a sync still asks about it.
     world.vault.ledger = (world.relayer.submissions[0]?.ext.deadline as number) + 1;
-    world.rpc.oldestLedger = world.vault.ledger;
+    world.indexer.leafLimit = world.vault.leaves.length;
+    world.indexer.completeTo = world.vault.ledger;
+    world.fill(1);
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "submitted");
     assert.equal(world.relayer.submissions.length, 1);

@@ -8,10 +8,12 @@ import type { Leaf, SpentNullifier } from "../net/indexer.ts";
 import type { SorobanRpc } from "../net/rpc.ts";
 import { nullifier } from "../notes.ts";
 import type { ChainView, RootHistory, VaultReader } from "../vault/state.ts";
-import { type ChainSource, type DepositEvent, type ExitEvents, RpcEventSource } from "./sources.ts";
+import { type ChainSource, RpcEventSource, type VaultEvents } from "./sources.ts";
 import {
   ACTIVE_STATES,
   type Evidence,
+  type FoundLeaf,
+  LANDED_STATES,
   type OwnedNote,
   type Plan,
   type PlanState,
@@ -101,9 +103,8 @@ export async function downloadChain(
 export interface CrossCheck {
   // RPC covered the range and agreed with the indexer.
   readonly verified: boolean;
-  // The exit and deposit events RPC returned for the range and after it, if it held them.
-  readonly exits: ExitEvents | undefined;
-  readonly deposits: readonly DepositEvent[];
+  // The vault's events RPC returned for the range and after it, if it held them.
+  readonly events: VaultEvents | undefined;
 }
 
 const leafKey = (l: Leaf): string =>
@@ -125,17 +126,14 @@ export async function crossCheck(
   try {
     events = await new RpcEventSource(rpc, vault, data.since, maxPages).events();
   } catch (err) {
-    if (err instanceof CyphrasError) return { verified: false, exits: undefined, deposits: [] };
+    if (err instanceof CyphrasError) return { verified: false, events: undefined };
     throw err;
   }
   if (data.completeTo > Math.max(events.head, data.horizon)) {
     fail("indexer_fault", "the indexer claims to be complete past the chain's latest ledger");
   }
   // RPC stopped short of the horizon, at its page cap or behind the indexer: nothing is proven.
-  const exits = { from: events.from, to: events.latest, events: events.exits };
-  if (events.latest < data.horizon) {
-    return { verified: false, exits, deposits: events.deposits };
-  }
+  if (events.latest < data.horizon) return { verified: false, events };
   const differ = (): never =>
     fail("indexer_fault", "the indexer's leaves or nullifiers differ from the vault's events");
   const onChain = new Map(events.leaves.map((l) => [l.index, l]));
@@ -152,7 +150,7 @@ export async function crossCheck(
   const served = new Set(data.nullifiers.map(nfKey));
   const chainNfs = new Set(events.nullifiers.filter(within).map(nfKey));
   if (served.size !== chainNfs.size || [...served].some((k) => !chainNfs.has(k))) differ();
-  return { verified: true, exits, deposits: events.deposits };
+  return { verified: true, events };
 }
 
 // The local root must be one of the vault's last 256 roots, read from the ledger.
@@ -218,27 +216,61 @@ function scanLeaf(state: WalletState, leaf: Leaf, keys: ScanKeys, cache: Address
 function evidenceOf(plan: Plan, txHash: string, ledger: number): Evidence {
   let e = plan.evidence.find((x) => x.txHash === txHash);
   if (e === undefined) {
-    e = { txHash, ledger, nullifiers: [false, false], outputs: [undefined, undefined] };
+    e = {
+      txHash,
+      ledger,
+      outputs: [undefined, undefined],
+      nullifiers: [false, false],
+      foreign: false,
+      checked: false,
+    };
     plan.evidence.push(e);
   }
   return e;
 }
 
-// Records, per transaction, which of a plan's commitments the new leaves add and which of its
-// nullifiers the new nullifiers spend.
-function recordEvidence(
-  plans: readonly Plan[],
-  leaves: readonly Leaf[],
-  nullifiers: readonly { readonly nf: bigint; readonly ledger: number; readonly txHash: string }[],
-): void {
-  for (const plan of plans) {
-    for (const leaf of leaves) {
+const undecided = (plans: readonly Plan[]): Plan[] =>
+  plans.filter((p) => !LANDED_STATES.includes(p.state));
+
+// Records where the plans' output commitments landed, among leaves the vault's root confirmed:
+// those positions hold the commitments whatever transaction the source names for them.
+function recordOutputs(plans: readonly Plan[], found: readonly FoundLeaf[]): void {
+  for (const plan of undecided(plans)) {
+    for (const leaf of found) {
       const slot = plan.commitments.indexOf(leaf.commitment);
       if (slot >= 0) evidenceOf(plan, leaf.txHash, leaf.ledger).outputs[slot] = leaf.index;
     }
-    for (const n of nullifiers) {
-      const slot = plan.nullifiers.indexOf(n.nf);
-      if (slot >= 0) evidenceOf(plan, n.txHash, n.ledger).nullifiers[slot] = true;
+  }
+}
+
+// Records what the vault's own events show of each plan, transaction by transaction: which of its
+// nullifiers a transaction spent, where it added the plan's commitments, and whether it added a
+// leaf that is not the plan's.
+export function recordEvents(
+  plans: readonly Plan[],
+  events: Pick<VaultEvents, "leaves" | "nullifiers">,
+): void {
+  const txs = new Map<string, { ledger: number; leaves: FoundLeaf[]; nullifiers: bigint[] }>();
+  const tx = (hash: string, ledger: number) => {
+    let t = txs.get(hash);
+    if (t === undefined) {
+      t = { ledger, leaves: [], nullifiers: [] };
+      txs.set(hash, t);
+    }
+    return t;
+  };
+  for (const leaf of events.leaves) tx(leaf.txHash, leaf.ledger).leaves.push(leaf);
+  for (const n of events.nullifiers) tx(n.txHash, n.ledger).nullifiers.push(n.nullifier);
+  for (const plan of undecided(plans)) {
+    for (const [hash, t] of txs) {
+      const spends = plan.nullifiers.map((nf) => t.nullifiers.includes(nf));
+      const outputs = plan.commitments.map((cm) => t.leaves.find((l) => l.commitment === cm));
+      if (!spends.some(Boolean) && outputs.every((o) => o === undefined)) continue;
+      const e = evidenceOf(plan, hash, t.ledger);
+      e.checked = true;
+      e.nullifiers = [e.nullifiers[0] || spends[0] === true, e.nullifiers[1] || spends[1] === true];
+      e.outputs = [e.outputs[0] ?? outputs[0]?.index, e.outputs[1] ?? outputs[1]?.index];
+      e.foreign ||= t.leaves.some((l) => !plan.commitments.includes(l.commitment));
     }
   }
 }
@@ -262,6 +294,10 @@ function scanDownload(
     if (state.notes.some((n) => n.pos === leaf.index)) continue;
     if (scanLeaf(found, leaf, keys, cache)) newNotes++;
   }
+  const commitments = new Set(undecided(state.plans).flatMap((p) => p.commitments));
+  const planLeaves = data.leaves
+    .filter((l) => commitments.has(l.commitment))
+    .map((l) => ({ index: l.index, commitment: l.commitment, ledger: l.ledger, txHash: l.txHash }));
   const paths = [...(staged?.paths ?? [])];
   for (const page of data.pages) {
     const start = page.page * PAGE_SIZE;
@@ -287,6 +323,7 @@ function scanDownload(
       notes: found.notes,
       sent: found.sent,
       paths,
+      found: [...(staged?.found ?? []), ...planLeaves],
     },
     newNotes,
   };
@@ -299,9 +336,9 @@ export function stageDownload(state: WalletState, keys: ScanKeys, data: Download
 }
 
 // Applies a download whose tree the vault's root history has confirmed, with anything staged
-// before it: the notes found count from now, spent notes are marked, and the evidence of plans is
-// recorded, only from data the cross-check confirmed, since it decides whether a payment failed.
-// Returns how many notes this sync found.
+// before it: the notes found count from now, spent notes are marked, and where plans' commitments
+// landed is recorded. Spends the cross-check did not confirm leave their ledgers unchecked. Returns
+// how many notes this sync found.
 export function applyDownload(
   state: WalletState,
   keys: ScanKeys,
@@ -329,52 +366,86 @@ export function applyDownload(
     const hit = spent.get(note.nf);
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
-  if (checked) recordEvidence(state.plans, data.leaves, buffer);
-  else state.checkedFrom = data.horizon + 1;
+  recordOutputs(state.plans, staging.found);
+  if (!checked && data.horizon >= data.since) addUnchecked(state, data.since, data.horizon);
   state.nullifierSince = data.horizon + 1;
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
   state.nullifierBuffer = buffer.filter((n) => n.ledger >= state.lastLeafLedger);
   return newNotes;
 }
 
+// Joins a range to the last one when they touch, so a run of unchecked syncs is one range.
+function addUnchecked(state: WalletState, from: number, to: number): void {
+  const last = state.unchecked[state.unchecked.length - 1];
+  if (last !== undefined && last.to + 1 >= from) {
+    state.unchecked[state.unchecked.length - 1] = { from: last.from, to: Math.max(last.to, to) };
+  } else {
+    state.unchecked.push({ from, to });
+  }
+}
+
+// Whether every spend of the ledgers from `from` to `to` was cross-checked.
+export function checkedBetween(state: WalletState, from: number, to: number): boolean {
+  return to < state.nullifierSince && !state.unchecked.some((r) => r.from <= to && r.to >= from);
+}
+
 export function isActive(plan: Plan): boolean {
   return ACTIVE_STATES.includes(plan.state);
 }
 
-// Moves each plan that has not landed along the submission state machine, with data the root
-// check and the cross-check both confirmed. `horizon` is the ledger up to which the cross-checked
-// nullifiers are complete; it is never past the ledger the vault was read at. A dead plan is
-// reconsidered too: if its own transaction turns out to have landed, it is confirmed.
-export function advancePlans(state: WalletState, horizon: number, view: ChainView): void {
-  for (const plan of state.plans) {
-    if (!isActive(plan) && plan.state !== "dead") continue;
-    const landed = plan.evidence.find(
-      (e) => e.nullifiers.every(Boolean) && e.outputs.every((pos) => pos !== undefined),
-    );
-    if (landed !== undefined) {
-      plan.state = "confirmed";
-      plan.txHash = landed.txHash;
-      plan.ledger = landed.ledger;
-      continue;
-    }
-    // A nullifier spent by a transaction that did not add this plan's outputs: another plan won.
-    if (plan.evidence.some((e) => e.nullifiers.some(Boolean))) {
+// Each of the plan's two commitments is in the vault's tree, in whatever transaction.
+const landed = (plan: Plan): boolean =>
+  [0, 1].every((slot) => plan.evidence.some((e) => e.outputs[slot] !== undefined));
+
+// The transaction the plan landed in: by the vault's events where they show it.
+function landing(plan: Plan): Evidence {
+  const both = plan.evidence.filter((e) => e.outputs.every((pos) => pos !== undefined));
+  return (both.find((e) => e.checked) ??
+    both[0] ??
+    plan.evidence.find((e) => e.outputs[0] !== undefined)) as Evidence;
+}
+
+// The vault's events show a transaction that spent one of the plan's notes and added outputs that
+// are not the plan's, or a plan of this wallet that spends the same notes has landed.
+function superseded(plans: readonly Plan[], plan: Plan): boolean {
+  return (
+    plan.evidence.some((e) => e.checked && e.foreign && e.nullifiers.some(Boolean)) ||
+    plans.some(
+      (q) =>
+        q !== plan &&
+        LANDED_STATES.includes(q.state) &&
+        q.nullifiers.some((nf) => plan.nullifiers.includes(nf)),
+    )
+  );
+}
+
+// Moves each plan that has not landed along the submission state machine. A plan landed once both
+// its commitments are in the vault's tree. It is superseded once the vault's events show another
+// transaction spending one of its notes, or another plan of this wallet that spends the same notes
+// landed. It is dead once the wallet holds the vault's whole tree, as read at `view`, without the
+// plan's commitments in it, at or past the plan's deadline or once the plan's root has left the
+// vault's history: from then on the vault refuses its proof. A dead or superseded plan whose
+// commitments turn up is confirmed all the same.
+export function advancePlans(state: WalletState, view: ChainView): void {
+  const open = state.plans.filter(
+    (p) => isActive(p) || p.state === "dead" || p.state === "superseded",
+  );
+  for (const plan of open) {
+    if (!landed(plan)) continue;
+    const e = landing(plan);
+    plan.state = "confirmed";
+    plan.txHash = e.txHash;
+    plan.ledger = e.ledger;
+  }
+  const whole = view.roots.nextLeaf === state.tree.leafCount;
+  for (const plan of open) {
+    if (plan.state === "confirmed" || plan.state === "superseded") continue;
+    if (superseded(state.plans, plan)) {
       plan.state = "superseded";
-      continue;
-    }
-    // A plan is declared dead only when every spend since it was built is known and checked.
-    if (plan.state === "dead" || state.checkedFrom > plan.builtAt) continue;
-    // The vault refuses the proof after its deadline.
-    if (horizon >= plan.deadline) {
-      plan.state = "dead";
-      continue;
-    }
-    // The root left the vault's history, as read at or after the ledger the plan was built at.
-    const roots = view.roots;
-    if (
-      roots.ledger >= plan.builtAt &&
-      horizon >= roots.ledger &&
-      !roots.roots.includes(plan.root)
+    } else if (
+      isActive(plan) &&
+      whole &&
+      (view.roots.ledger >= plan.deadline || !view.roots.roots.includes(plan.root))
     ) {
       plan.state = "dead";
     }

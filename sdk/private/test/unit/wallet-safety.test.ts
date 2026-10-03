@@ -38,14 +38,33 @@ function forgedPayment(to: string, value: bigint): Record<string, string>[] {
   ];
 }
 
-async function funded(world?: World) {
+async function funded(world?: World, store = new MemoryStore()) {
   const w = world ?? (await createWorld());
-  const alice = await openWallet(w, 0);
+  const alice = await openWallet(w, 0, store);
   await alice.shield({ amount: 100n * XLM, signer: w.signer("alice depositor") });
   w.advance(3_601);
   w.admitAll();
   await alice.sync();
-  return { world: w, alice };
+  return { world: w, alice, store };
+}
+
+// A fetch whose RPC answers getEvents with an error while `down` is set, as a busy node does.
+function flakyEvents(world: World): { fetch: FetchLike; down: boolean } {
+  const control = {
+    down: false,
+    fetch: (async (input, init) => {
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (control.down && new URL(input).origin === RPC && body?.method === "getEvents") {
+        const error = { code: -32603, message: "busy" };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }), {
+          status: 200,
+        });
+      }
+      return world.fetch(input, init);
+    }) as FetchLike,
+  };
+  return control;
 }
 
 describe("wallet safety: services that lie", () => {
@@ -422,6 +441,8 @@ describe("wallet safety: syncs that fail", () => {
         ledger: 1,
         nullifiers: [true, false],
         outputs: [undefined, undefined],
+        foreign: true,
+        checked: true,
       },
     ];
     await saveState(sealed, state);
@@ -468,16 +489,17 @@ describe("wallet safety: availability", () => {
     assert.ok(world.indexer.requests.filter((r) => r.startsWith("/v1/nullifiers")).length > 8);
   });
 
-  it("takes a nullifier listed past the indexer's complete-to ledger in the next sync", async () => {
+  it("confirms a payment from its leaves before the indexer lists its spends", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
     await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
     world.indexer.completeTo = world.vault.ledger - 1;
     await alice.sync();
-    assert.equal((await alice.plans())[0]?.state, "submitted");
+    assert.equal((await alice.plans())[0]?.state, "settled");
+    assert.equal((await alice.balance()).spendable, 89n * XLM);
     world.indexer.completeTo = undefined;
     await alice.sync();
-    assert.equal((await alice.plans())[0]?.state, "settled");
+    assert.equal((await alice.balance()).spendable, 89n * XLM);
   });
 });
 
@@ -682,7 +704,7 @@ describe("wallet safety: when a payment is dead", () => {
     assert.equal((await bob.balance()).spendable, 10n * XLM);
   });
 
-  it("keeps a payment alive when RPC could not cross-check the ledgers up to its deadline", async () => {
+  it("declares a payment dead from the vault's whole tree past its deadline, though RPC could not cross-check it", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
     world.relayer.failures.push({ error: "unavailable" });
@@ -692,13 +714,33 @@ describe("wallet safety: when a payment is dead", () => {
     world.advance(121 * 5);
     world.rpc.oldestLedger = world.vault.ledger + 1;
     assert.equal((await alice.sync()).crossChecked, false);
-    world.rpc.oldestLedger = 1;
-    assert.equal((await alice.sync()).crossChecked, true);
-    // Its spends up to the deadline went unchecked, so it stays open; paying again needs retry.
+    // The vault's tree, confirmed by its root, holds every transaction up to the read, and the
+    // payment's commitments are not among them: it never landed and now never will.
     const [plan] = await alice.plans();
-    assert.equal(plan?.state, "prepared");
+    assert.equal(plan?.state, "dead");
     assert.equal(plan?.mustRetry, true);
-    assert.equal((await alice.balance()).spendable, 0n);
+    assert.equal((await alice.balance()).spendable, 100n * XLM);
+  });
+
+  it("keeps a payment open past its deadline while the wallet lacks part of the vault's tree", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
+    );
+    // Other users' leaves, past the deadline, which a lagging indexer has not taken in yet.
+    world.advance(121 * 5);
+    world.indexer.leafLimit = world.vault.leaves.length;
+    world.indexer.completeTo = world.vault.ledger;
+    world.fill(2);
+    const summary = await alice.sync();
+    assert.equal(summary.rootVerified, true);
+    assert.equal((await alice.plans())[0]?.state, "prepared");
+    world.indexer.leafLimit = undefined;
+    world.indexer.completeTo = undefined;
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "dead");
   });
 
   it("declares a payment dead once its root has left the vault's history", async () => {
@@ -761,6 +803,113 @@ describe("wallet safety: when a payment is dead", () => {
     const states = Object.fromEntries((await alice.plans()).map((p) => [p.planId, p.state]));
     assert.equal(states[retried.planId], "settled");
     assert.equal(states[dead?.planId as string], "superseded");
+  });
+});
+
+describe("wallet safety: payments seen through held-back or unchecked syncs", () => {
+  it("confirms a payment whose leaves first arrive in a batch held aside at the page cap", async () => {
+    const { world, alice, store } = await funded();
+    const bob = await openWallet(world, 1);
+    const sent = await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+    });
+    assert.equal(sent.state, "submitted");
+    // Other users add enough leaves that one page of them leaves the tree too far behind for the
+    // vault's root history, so the payment's leaves wait in a held-back batch.
+    world.fill(800);
+    const later = await openWallet(world, 0, store, undefined, { syncLimits: { leafPages: 1 } });
+    assert.equal((await later.sync()).rootVerified, false);
+    assert.equal((await later.plans())[0]?.state, "submitted");
+    assert.equal((await later.sync()).rootVerified, true);
+    const [plan] = await later.plans();
+    assert.equal(plan?.state, "settled");
+    assert.equal(plan?.mustRetry, false);
+    assert.equal((await later.balance()).spendable, 89n * XLM);
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 10n * XLM);
+  });
+
+  it("confirms payments synced while RPC could not cross-check, the last one or not", async () => {
+    const { world, store } = await funded();
+    const rpc = flakyEvents(world);
+    const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, store);
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    rpc.down = true;
+    assert.equal((await alice.sync()).crossChecked, false);
+    rpc.down = false;
+    assert.deepEqual(
+      (await alice.plans()).map((p) => p.state),
+      ["settled"],
+    );
+    // Another transaction follows the payment before the unchecked sync.
+    await alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM });
+    world.fill(3);
+    rpc.down = true;
+    assert.equal((await alice.sync()).crossChecked, false);
+    rpc.down = false;
+    world.advance(3600);
+    world.fill(3);
+    await alice.sync();
+    const plans = await alice.plans();
+    assert.deepEqual(
+      plans.map((p) => [p.state, p.mustRetry]),
+      [
+        ["settled", false],
+        ["settled", false],
+      ],
+    );
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 15n * XLM);
+  });
+
+  it("frees a refused payment's notes after one sync RPC could not cross-check", async () => {
+    const { world, store } = await funded();
+    const rpc = flakyEvents(world);
+    const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, store);
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    world.fill(2);
+    rpc.down = true;
+    await alice.sync();
+    rpc.down = false;
+    assert.equal((await alice.plans())[0]?.state, "prepared");
+    world.advance(86_400);
+    world.fill(2);
+    await alice.sync();
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "dead");
+    const balance = await alice.balance();
+    assert.equal(balance.spendable, 100n * XLM);
+    assert.equal(balance.locked, 0n);
+  });
+
+  it("frees a refused payment's notes after a rescan past RPC's history", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    world.advance(3600);
+    world.fill(2);
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "dead");
+    // RPC keeps about a week of events: the vault's early ledgers are gone.
+    world.rpc.oldestLedger = world.vault.ledger - 5;
+    const summary = await alice.rescan();
+    assert.equal(summary.crossChecked, false);
+    const [plan] = await alice.plans();
+    assert.equal(plan?.state, "dead");
+    assert.equal(plan?.mustRetry, true);
+    const balance = await alice.balance();
+    assert.equal(balance.spendable, 100n * XLM);
+    assert.equal(balance.locked, 0n);
   });
 });
 

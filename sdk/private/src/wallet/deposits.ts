@@ -11,6 +11,7 @@ import type { VaultInstance } from "../vault/state.ts";
 import { type Core, invokeContext, spendingKeys } from "./core.ts";
 import { DEADLINE_LEDGERS } from "./spend.ts";
 import type { DepositEvent } from "./sources.ts";
+import { checkedBetween } from "./sync.ts";
 import type { Deposit, WalletState } from "./state.ts";
 
 /** A deposit made by this wallet, as it moves through the vault's entry queue. */
@@ -250,7 +251,6 @@ export async function trackDeposits(
   core: Core,
   queue: DepositQueue | undefined,
   events: readonly DepositEvent[],
-  checkedTo: number | undefined,
 ): Promise<void> {
   const state: WalletState = core.state;
   for (const deposit of state.deposits) {
@@ -275,9 +275,7 @@ export async function trackDeposits(
       }
       if (
         deposit.state === "submitting" &&
-        checkedTo !== undefined &&
-        state.checkedFrom <= deposit.builtAt &&
-        checkedTo >= deposit.deadline
+        checkedBetween(state, deposit.builtAt, deposit.deadline)
       ) {
         deposit.state = "failed";
       }

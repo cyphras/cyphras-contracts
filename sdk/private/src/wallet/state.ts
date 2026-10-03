@@ -9,13 +9,17 @@ export interface SpentBy {
   readonly ledger: number;
 }
 
-// What one transaction showed of a plan: which of the plan's two nullifiers it spent, and the leaf
-// positions at which it added the plan's two output commitments.
+// What one transaction showed of a plan: the leaf positions at which it added the plan's two output
+// commitments, which of the plan's two nullifiers it spent, and whether it added a leaf that is not
+// the plan's. Positions come from leaves the vault's root confirmed, or from the vault's own events;
+// the spends and the other leaves only from those events, when `checked`.
 export interface Evidence {
   readonly txHash: string;
   readonly ledger: number;
-  readonly nullifiers: [boolean, boolean];
-  readonly outputs: [number | undefined, number | undefined];
+  outputs: [number | undefined, number | undefined];
+  nullifiers: [boolean, boolean];
+  foreign: boolean;
+  checked: boolean;
 }
 
 // A note of this wallet that is in the tree.
@@ -59,6 +63,7 @@ export type PlanState =
   | "dead";
 
 export const ACTIVE_STATES: readonly PlanState[] = ["prepared", "submitted"];
+export const LANDED_STATES: readonly PlanState[] = ["confirmed", "queued", "settled", "stranded"];
 
 export interface PlanOutput {
   readonly cm: bigint;
@@ -184,6 +189,21 @@ export interface Staging {
   readonly sent: SentNote[];
   // Paths of confirmed notes whose page the staged leaves completed.
   readonly paths: { readonly pos: number; readonly pagePath: bigint[] }[];
+  // The staged leaves that hold a plan's output commitment.
+  readonly found: readonly FoundLeaf[];
+}
+
+export interface FoundLeaf {
+  readonly index: number;
+  readonly commitment: bigint;
+  readonly ledger: number;
+  readonly txHash: string;
+}
+
+// Ledgers whose spends a sync took from the indexer while RPC could not confirm them.
+export interface LedgerRange {
+  readonly from: number;
+  readonly to: number;
 }
 
 export interface RootCheck {
@@ -201,8 +221,8 @@ export interface WalletState {
   lastLeafLedger: number;
   staging: Staging | undefined;
   nullifierSince: number;
-  // Every spend from this ledger up to nullifierSince was confirmed by the cross-check.
-  checkedFrom: number;
+  // Every other ledger before nullifierSince, since the wallet started, was cross-checked.
+  unchecked: LedgerRange[];
   nullifierBuffer: { readonly nf: bigint; readonly ledger: number; readonly txHash: string }[];
   notes: OwnedNote[];
   sent: SentNote[];
@@ -220,7 +240,7 @@ export function emptyState(deployLedger: number): WalletState {
     lastLeafLedger: 0,
     staging: undefined,
     nullifierSince: deployLedger,
-    checkedFrom: deployLedger,
+    unchecked: [],
     nullifierBuffer: [],
     notes: [],
     sent: [],

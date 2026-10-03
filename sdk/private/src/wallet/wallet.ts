@@ -56,15 +56,15 @@ import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history
 import { type Verification, createServices, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
-  type DepositEvent,
-  type ExitEvents,
   IndexerSource,
   RpcEventSource,
   type SyncLimits,
+  type VaultEvents,
 } from "./sources.ts";
 import { type ConfirmSpend, type Submission, followHeld, spend, submissionOf } from "./spend.ts";
 import {
   type ExitPart,
+  LANDED_STATES,
   type Operation,
   type Plan,
   StateStore,
@@ -79,6 +79,7 @@ import {
   crossCheck,
   downloadChain,
   isActive,
+  recordEvents,
   resetUnlanded,
   stageDownload,
 } from "./sync.ts";
@@ -204,8 +205,6 @@ const VIEWING_KEY_WARNING =
 
 // Parts of a split unshield follow the previous part's landing by one to six hours, at random.
 const SPLIT_GAP_MS = { min: 3_600_000, max: 21_600_000 };
-
-const LANDED: readonly Plan["state"][] = ["confirmed", "queued", "settled", "stranded"];
 
 function randomGap(): number {
   const r = new DataView(randomBytes(4).buffer).getUint32(0) / 2 ** 32;
@@ -559,10 +558,8 @@ export class PrivateWallet {
     }
     const { view, data } = download;
     let crossChecked = false;
-    let events: {
-      readonly exits: ExitEvents | undefined;
-      readonly deposits: readonly DepositEvent[];
-    };
+    // The vault's own events, from RPC, for the ledgers of this sync, when RPC held them.
+    let events: VaultEvents | undefined;
     if (source.kind === "indexer") {
       const check = await crossCheck(
         core.services.rpc,
@@ -571,13 +568,9 @@ export class PrivateWallet {
         limits.eventPages,
       );
       crossChecked = check.verified;
-      events = check;
+      events = check.events;
     } else {
-      const all = await source.events();
-      events = {
-        exits: { from: all.from, to: all.latest, events: all.exits },
-        deposits: all.deposits,
-      };
+      events = await source.events();
     }
     const check = checkRoot(data.tree, view.roots);
     if (check.state === "mismatch") {
@@ -587,27 +580,33 @@ export class PrivateWallet {
       );
     }
     let newNotes = 0;
-    // A plan or a deposit moves only on data the cross-check confirmed, or that RPC itself served.
-    const checked = check.state === "verified" && (source.kind === "rpc" || crossChecked);
     if (check.state === "verified") {
       // Only leaves under a root the vault confirms count: notes at them, and spends of notes.
+      const checked = source.kind === "rpc" || crossChecked;
       newNotes = applyDownload(core.state, core.scan, data, checked);
       core.state.rootCheck = check;
-      if (checked) advancePlans(core.state, data.horizon, view);
     } else {
       stageDownload(core.state, core.scan, data);
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
+    if (events !== undefined) recordEvents(core.state.plans, events);
+    if (check.state === "verified") advancePlans(core.state, view);
     const live = source.kind === "indexer" ? indexer : undefined;
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
     onReads({ view, stats: await live?.stats().catch(() => undefined) });
     await trackDeposits(
       core,
       await live?.deposits().catch(() => undefined),
-      events.deposits,
-      checked ? data.horizon : undefined,
+      events?.deposits ?? [],
     );
-    applyExits(core.state, events.exits, await live?.exits().catch(() => undefined), view.ledger);
+    applyExits(
+      core.state,
+      events === undefined
+        ? undefined
+        : { from: events.from, to: events.latest, events: events.exits },
+      await live?.exits().catch(() => undefined),
+      view.ledger,
+    );
     await this.#pollRelayers(core, view.ledger);
     return {
       leafCount: core.state.tree.leafCount,
@@ -817,7 +816,7 @@ export class PrivateWallet {
 
   #sent(op: Operation): bigint {
     return this.#core.state.plans
-      .filter((p) => p.operationId === op.id && LANDED.includes(p.state))
+      .filter((p) => p.operationId === op.id && LANDED_STATES.includes(p.state))
       .reduce((s, p) => s + p.amount, 0n);
   }
 
@@ -873,7 +872,7 @@ export class PrivateWallet {
         if (awaiting !== undefined) {
           op.awaiting = undefined;
           // A part that never landed goes again at once; one that landed starts the gap.
-          op.nextAt = LANDED.includes(awaiting.state)
+          op.nextAt = LANDED_STATES.includes(awaiting.state)
             ? this.#core.now() + randomGap()
             : this.#core.now();
         }
