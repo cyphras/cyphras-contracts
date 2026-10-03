@@ -21,7 +21,7 @@ func (r *Relayer) Handler() http.Handler {
 		body := map[string]any{
 			"ready": inst != nil && r.channels.ready() > 0 && !paused, "vault": r.cfg.Vault, "network_id": hex.EncodeToString(r.cfg.NetworkID[:]),
 			"fee_address": r.cfg.FeeAddress, "ready_channels": r.channels.ready(), "channels": r.channels.total, "paused": paused,
-			"guarded": r.guarded(),
+			"guarded": r.guarded(), "alert_lanes": r.alerts.Lanes(r.now()),
 		}
 		status := http.StatusOK
 		if inst == nil {

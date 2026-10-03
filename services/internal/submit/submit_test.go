@@ -1,8 +1,11 @@
 package submit
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -528,11 +531,13 @@ func TestAnotherPathsEntriesAndResourcesArePaidFor(t *testing.T) {
 	if got := p.ResourceFee - 100_000 - perKB(3*2048, 447) - perKB(2*2048, 875); got != want {
 		t.Fatalf("the other path adds %d, want %d", got, want)
 	}
-	// The network's limit on written entries stops the additions in their order.
+	// The network's limit on written entries stops the additions in their order, and says so.
 	limited := rpctest.Mainnet
 	limited.MaxWriteEntries = 3
 	h.fake.SetSettings(limited)
 	h.engine.costs = ledgerCosts{}
+	var logs bytes.Buffer
+	h.engine.Log = slog.New(slog.NewTextHandler(&logs, nil))
 	if p, err = h.engine.PrepareUntil(context.Background(), h.account, invoke(), 0, func(context.Context, xdr.LedgerFootprint) (Extra, error) {
 		return extra, nil
 	}); err != nil {
@@ -540,6 +545,18 @@ func TestAnotherPathsEntriesAndResourcesArePaidFor(t *testing.T) {
 	}
 	if got := sorobanData(t, p).Resources.Footprint.ReadWrite; !equalStrings(names(got), names([]xdr.LedgerKey{exit, next, account})) {
 		t.Fatalf("%d written entries past the limit", len(got))
+	}
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "asked=4 left_out=2") {
+		t.Fatalf("logs %q", logs.String())
+	}
+	// Room within the limits says nothing.
+	logs.Reset()
+	h.fake.SetSettings(rpctest.Mainnet)
+	h.engine.costs = ledgerCosts{}
+	if _, err = h.engine.PrepareUntil(context.Background(), h.account, invoke(), 0, func(context.Context, xdr.LedgerFootprint) (Extra, error) {
+		return extra, nil
+	}); err != nil || logs.Len() != 0 {
+		t.Fatalf("logs %q, %v", logs.String(), err)
 	}
 	// The cap bounds the fee with its padding.
 	h.engine.MaxResourceFee = 1_000_000

@@ -1,16 +1,19 @@
 // Command keeper keeps one vault's entries alive, admits eligible deposits, refunds deposits that
 // stayed flagged, pays the exit queue and queues stranded exits again, from its own funded
-// account. It serves no API.
+// account. It serves only its health, and asks the screening service which refunds wait for an
+// operator.
 package main
 
 import (
 	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/chainstate"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
+	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/keeper"
 	"github.com/cyphras/cyphras-contracts/services/internal/service"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
@@ -40,7 +43,7 @@ func main() {
 	if err := base.StartAlerts(ctx, pool); err != nil {
 		service.Fatal(log, "alerts", err)
 	}
-	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase)
+	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase, base.Log)
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
@@ -63,9 +66,19 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
+	// Refunds wait for the operators' queued corrections, which the screening service holds.
+	screenURL, err := config.Required("SCREENING_URL")
+	if err != nil {
+		service.Fatal(log, "config", err)
+	}
+	screenToken, err := config.SecretString("SCREEN_TOKEN")
+	if err != nil {
+		service.Fatal(log, "config", err)
+	}
 	k, err := keeper.New(ctx, keeper.Config{
 		Vault: base.Vault.Vault, DeployLedger: base.Vault.DeployLedger, Asset: base.Vault.Asset, MaxAdmissions: 16, MaxExtensions: 50,
 		MaxReleases: int(releases), RefundDelay: 24 * time.Hour, HoldReasons: hold, BalanceFloor: floor, ExitKeys: exitKeys,
+		Unflags: keeper.UnflagsFrom(screenURL, screenToken, &http.Client{Timeout: 10 * time.Second}),
 	}, base.RPC, &chainstate.Store{Pool: pool}, engine, submit.NewAccount(key.Address(), key), base.Alerts, log)
 	if err != nil {
 		service.Fatal(log, "load", err)
@@ -74,6 +87,12 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
+	go func() {
+		addr := config.Env("LISTEN_ADDR", "127.0.0.1:8082")
+		if err := httpapi.Serve(ctx, addr, k.Handler()); err != nil && ctx.Err() == nil {
+			service.Fatal(log, "serve", err)
+		}
+	}()
 	log.Info("running", "vault", base.Vault.Vault, "account", key.Address())
 	k.Run(ctx, f, time.Second)
 }

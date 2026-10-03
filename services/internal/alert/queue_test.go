@@ -564,7 +564,7 @@ func (h *hook) got(s string) int {
 	return n
 }
 
-func TestARefusedCriticalGoesToTheOtherChannelsAndATestClearsTheRefusal(t *testing.T) {
+func TestARefusedCriticalGoesToTheOtherChannelsAndTestsGoOnUntilAnAlertIsTaken(t *testing.T) {
 	ctx := context.Background()
 	telegram, discord := &hook{status: http.StatusBadRequest, refusals: 1}, &hook{}
 	st, sd := httptest.NewServer(telegram), httptest.NewServer(discord)
@@ -585,19 +585,29 @@ func TestARefusedCriticalGoesToTheOtherChannelsAndATestClearsTheRefusal(t *testi
 	if telegram.got("channel_test") != 0 {
 		t.Fatal("tested right after the refusal")
 	}
-	// Nothing else comes: a test of the refusing channel, which takes it, clears its refusal.
+	// Nothing else comes: a test the refusing channel takes clears its failing, so the heartbeat
+	// goes on, but not its refusal, so it is tested again until it takes an alert.
 	for range 20 {
 		now = now.Add(time.Minute)
 		q.Flush(ctx)
 	}
-	if telegram.got("channel_test") != 1 || q.Stalled(now, 10*time.Minute) {
+	if telegram.got("channel_test") != 4 || q.Stalled(now, 10*time.Minute) || !q.lane(0).refusing {
 		t.Fatalf("%d tests, stalled %v", telegram.got("channel_test"), q.Stalled(now, 10*time.Minute))
+	}
+	q.Put(Alert{Service: "watcher", Severity: Warning, Code: "hot_balance_low", Time: now})
+	q.Flush(ctx)
+	for range 20 {
+		now = now.Add(time.Minute)
+		q.Flush(ctx)
+	}
+	if telegram.got("hot_balance_low") != 1 || telegram.got("channel_test") != 4 || q.lane(0).refusing {
+		t.Fatalf("after an alert it took: %d tests", telegram.got("channel_test"))
 	}
 	// A channel that keeps refusing, as a deleted webhook does, stays stalled though tested.
 	telegram.mu.Lock()
 	telegram.status, telegram.refusals = http.StatusNotFound, -1
 	telegram.mu.Unlock()
-	q.Put(Alert{Service: "watcher", Severity: Warning, Code: "hot_balance_low", Time: now})
+	q.Put(Alert{Service: "watcher", Severity: Warning, Code: "hot_balance_low_again", Time: now})
 	for range 20 {
 		q.Flush(ctx)
 		now = now.Add(time.Minute)
@@ -655,5 +665,102 @@ func TestStoredCopiesFollowTheirChannelWhereverTheConfigurationPutsIt(t *testing
 	upgraded.Flush(ctx)
 	if len(c.sent) != 2 || c.sent[1].Code != "old" {
 		t.Fatalf("the old copy went to %+v", c.sent)
+	}
+}
+
+func TestAStoredRerouteIsKeptBeforeTheRefusedCopyGoes(t *testing.T) {
+	ctx := context.Background()
+	store := outboxStore(t)
+	now := time.Unix(1_728_000_000, 0)
+	refusing, other := &hook{status: http.StatusBadRequest, refusals: -1}, &hook{status: http.StatusServiceUnavailable, refusals: -1}
+	sr, so := httptest.NewServer(refusing), httptest.NewServer(other)
+	defer sr.Close()
+	defer so.Close()
+	channels := []Channel{Webhook{Format: "discord", URL: sr.URL, HTTP: sr.Client()}, Webhook{Format: "discord", URL: so.URL, HTTP: so.Client()}}
+	q := &Queue{Name: "operator", Store: store, Now: func() time.Time { return now }, Channels: channels}
+	codes := func() map[string]int {
+		rows, err := store.Pool.Query(ctx, `SELECT name, alert->>'code' FROM alert_outbox`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		out := map[string]int{}
+		for rows.Next() {
+			var name, code string
+			if err := rows.Scan(&name, &code); err != nil {
+				t.Fatal(err)
+			}
+			out[name+" "+code]++
+		}
+		return out
+	}
+	q.Put(Alert{Severity: Critical, Code: "invariant", Time: now})
+	q.flushLane(ctx, 0)
+	// The refused copy is gone and the other channel holds the reroute beside its own copy, which
+	// it could not take yet.
+	got := codes()
+	if len(got) != 2 || got[q.channelName(1)+" invariant"] != 1 || got[q.channelName(1)+" invariant_rerouted"] != 1 {
+		t.Fatalf("outbox %v", got)
+	}
+	// When the store cannot keep the reroute, it waits in memory and the refused copy still goes.
+	if _, err := store.Pool.Exec(ctx, `DELETE FROM alert_outbox`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Pool.Exec(ctx, `ALTER TABLE alert_outbox ADD CONSTRAINT no_reroutes CHECK (alert->>'code' NOT LIKE '%_rerouted')`); err != nil {
+		t.Fatal(err)
+	}
+	q.Put(Alert{Severity: Critical, Code: "invariant_2", Time: now})
+	q.flushLane(ctx, 0)
+	if got := codes(); got[q.channelName(0)+" invariant_2"] != 0 || got[q.channelName(1)+" invariant_2"] != 1 {
+		t.Fatalf("outbox %v", got)
+	}
+	q.mu.Lock()
+	kept := len(q.pending) == 1 && q.pending[0].channel == 1 && q.pending[0].alert.Code == "invariant_2_rerouted"
+	q.pending = nil
+	q.mu.Unlock()
+	if !kept {
+		t.Fatalf("in memory %+v", q.pending)
+	}
+	// The reroute and the drop are one transaction: a drop that fails takes the stored reroute
+	// back with it.
+	for _, stmt := range []string{
+		`DELETE FROM alert_outbox`, `ALTER TABLE alert_outbox DROP CONSTRAINT no_reroutes`,
+		`CREATE FUNCTION keep_rows() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'kept'; END $$`,
+		`CREATE TRIGGER keep_rows BEFORE DELETE ON alert_outbox FOR EACH ROW EXECUTE FUNCTION keep_rows()`,
+	} {
+		if _, err := store.Pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q.Put(Alert{Severity: Critical, Code: "invariant_3", Time: now})
+	q.flushLane(ctx, 0)
+	if got := codes(); got[q.channelName(1)+" invariant_3_rerouted"] != 0 {
+		t.Fatalf("a reroute outlived its failed drop: %v", got)
+	}
+}
+
+func TestTheLanesShowTheirChannelsByNameAndWhetherTheyTakeAlerts(t *testing.T) {
+	ctx := context.Background()
+	refusing := &hook{status: http.StatusNotFound, refusals: -1}
+	srv := httptest.NewServer(refusing)
+	defer srv.Close()
+	now := time.Unix(1_728_000_000, 0)
+	web := Webhook{Format: "discord", URL: srv.URL + "/api/webhooks/1/TOKEN", HTTP: srv.Client()}
+	q := &Queue{Name: "operator", Now: func() time.Time { return now }, Channels: []Channel{web, named{&recorder{}, "spare"}}}
+	if got := q.Lanes(now); len(got) != 2 || got[0] != (LaneState{Channel: web.Name()}) || got[1] != (LaneState{Channel: "spare"}) {
+		t.Fatalf("lanes %+v", got)
+	}
+	q.Put(Alert{Severity: Warning, Code: "hot_balance_low", Time: now})
+	q.Flush(ctx)
+	later := now.Add(StalledAfter + time.Second)
+	got := q.Lanes(later)
+	if got[0] != (LaneState{Channel: web.Name(), Failing: now.Unix(), Refusing: true, Stalled: true}) || got[1] != (LaneState{Channel: "spare"}) {
+		t.Fatalf("lanes %+v", got)
+	}
+	if body, _ := json.Marshal(got); strings.Contains(string(body), "TOKEN") {
+		t.Fatalf("a lane shows its URL: %s", body)
+	}
+	if (&Alerter{}).Lanes(now) == nil {
+		t.Fatal("an alerter without a queue shows no list")
 	}
 }

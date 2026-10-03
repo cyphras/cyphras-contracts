@@ -135,7 +135,7 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	if err := base.StartAlerts(ctx, pool); err != nil {
 		return nil, err
 	}
-	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase)
+	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase, base.Log)
 	if err != nil {
 		return nil, err
 	}

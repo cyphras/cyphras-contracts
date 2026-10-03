@@ -40,7 +40,7 @@ func TestTheSubcommandIsTheFirstArgument(t *testing.T) {
 
 func TestAServicePagesThroughAtLeastTwoChannels(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if _, err := Alerter("keeper", log); err == nil {
+	if _, err := Alerter("keeper", log, network.TestNetworkPassphrase); err == nil {
 		t.Fatal("started without webhooks")
 	}
 	dir := t.TempDir()
@@ -54,19 +54,22 @@ func TestAServicePagesThroughAtLeastTwoChannels(t *testing.T) {
 	}
 	hooks("# being rewritten\n")
 	t.Setenv("ALERT_DEV", "1")
-	if _, err := Alerter("keeper", log); err == nil {
+	if _, err := Alerter("keeper", log, network.TestNetworkPassphrase); err == nil {
 		t.Fatal("started with no channel")
 	}
 	hooks("slack https://hooks.example/a\n")
-	if a, err := Alerter("keeper", log); err != nil || len(a.Channels) != 1 {
+	if a, err := Alerter("keeper", log, network.TestNetworkPassphrase); err != nil || len(a.Channels) != 1 {
 		t.Fatalf("one channel for development: %v", err)
 	}
+	if _, err := Alerter("keeper", log, network.PublicNetworkPassphrase); err == nil {
+		t.Fatal("development alerting on the public network")
+	}
 	t.Setenv("ALERT_DEV", "")
-	if _, err := Alerter("keeper", log); err == nil {
+	if _, err := Alerter("keeper", log, network.TestNetworkPassphrase); err == nil {
 		t.Fatal("started with one channel")
 	}
 	hooks("slack https://hooks.example/a\ntext https://ntfy.example/b\n")
-	if a, err := Alerter("keeper", log); err != nil || len(a.Channels) != 2 {
+	if a, err := Alerter("keeper", log, network.TestNetworkPassphrase); err != nil || len(a.Channels) != 2 {
 		t.Fatalf("with two channels: %v", err)
 	}
 }

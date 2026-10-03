@@ -664,3 +664,38 @@ func TestAVaultTheIssuerDeauthorizesPages(t *testing.T) {
 		}
 	}
 }
+
+func TestAServiceWhoseAlertChannelsAllStalledPages(t *testing.T) {
+	var mu sync.Mutex
+	lanes := []alert.LaneState{{Channel: "discord-a", Stalled: true}, {Channel: "telegram-b"}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		// A service that is not ready still shows its lanes.
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ready": false, "alert_lanes": lanes})
+	}))
+	defer srv.Close()
+	h := newHarness(t, func(c *Config) { c.HealthURLs = []string{srv.URL + "/v1/health"} })
+	set := func(l []alert.LaneState) {
+		mu.Lock()
+		lanes = l
+		mu.Unlock()
+	}
+	if err := h.w.CheckHealth(context.Background()); err != nil || h.pages.has("alerts_stalled_0") {
+		t.Fatalf("one channel still taking alerts paged: %v", h.pages.codes())
+	}
+	set([]alert.LaneState{{Channel: "discord-a", Stalled: true}, {Channel: "telegram-b", Stalled: true}})
+	if err := h.w.CheckHealth(context.Background()); err != nil || !h.pages.has("alerts_stalled_0") {
+		t.Fatalf("every channel stalled: %v", h.pages.codes())
+	}
+	set([]alert.LaneState{{Channel: "discord-a", Stalled: true}, {Channel: "telegram-b", Refusing: true}})
+	if err := h.w.CheckHealth(context.Background()); err != nil || h.w.alerts.Open("alerts_stalled_0") {
+		t.Fatalf("after a channel took alerts again: %v", h.pages.codes())
+	}
+	// A health without lanes says nothing about them.
+	set(nil)
+	if err := h.w.CheckHealth(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

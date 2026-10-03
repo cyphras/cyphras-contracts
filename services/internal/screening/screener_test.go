@@ -412,7 +412,7 @@ func TestASelfReportBlocksTheAddress(t *testing.T) {
 func TestTheRelayerScreenNeedsItsTokenAndFailsClosed(t *testing.T) {
 	h := newHarness(t)
 	token := "relayer-token"
-	api := h.s.Internal(sha256.Sum256([]byte(token)))
+	api := h.s.Internal(sha256.Sum256([]byte(token)), sha256.Sum256([]byte("keeper")))
 	screen := func(auth, address string) (int, string) {
 		req := httptest.NewRequest(http.MethodPost, "/internal/v1/screen", strings.NewReader(`{"address":"`+address+`"}`))
 		req.Header.Set("Authorization", auth)
@@ -573,7 +573,7 @@ func TestRequestsCannotSpendTheLookupsDepositsNeed(t *testing.T) {
 		t.Fatalf("a public check cost %d lookups: %d %s", counter.calls, rec.Code, rec.Body.String())
 	}
 	token := "relayer-token"
-	api := h.s.Internal(sha256.Sum256([]byte(token)))
+	api := h.s.Internal(sha256.Sum256([]byte(token)), sha256.Sum256([]byte("keeper")))
 	screen := func() int {
 		req := httptest.NewRequest(http.MethodPost, "/internal/v1/screen", strings.NewReader(`{"address":"`+clean+`"}`))
 		req.Header.Set("Authorization", "Bearer "+token)

@@ -15,7 +15,9 @@
 # not secret are in env/<service>.env; secrets are files in secrets/<network>/<asset>/, each mode
 # 0400 and owned by the uid of the one service that mounts it (10001 to 10005 below, 999 for the
 # databases). Each service's alert webhooks file lists at least two channels, or the service does
-# not start. Testnet and mainnet run as separate projects and share nothing.
+# not start. Upgrade with each webhooks file unchanged: alerts an older release left waiting are
+# matched to channels by their place in the file. Testnet and mainnet run as separate projects and
+# share nothing.
 #
 # Docker rotates each container's log by size, keeping at most 7 files of 20 MB, so the days the
 # host holds depend on how much a service logs. The retention policy, 7 days and 30 for the
@@ -104,15 +106,19 @@ services:
       DATABASE_URL_FILE: /run/secrets/keeper_database_url
       ALERT_WEBHOOKS_FILE: /run/secrets/keeper_alert_webhooks
       KEEPER_KEY_FILE: /run/secrets/keeper_key
+      SCREEN_TOKEN_FILE: /run/secrets/keeper_screen_token
+      SCREENING_URL: http://screening-internal:8091/internal/v1/unflags
+      # Its health, for the watcher only, is not published.
+      LISTEN_ADDR: 0.0.0.0:8082
       ARCHIVE_DIR: /var/lib/cyphras/archive
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
       # The indexer's event archive, read only, lets a rebuild reach ledgers RPC has dropped where
       # no public ledger archive exists, as on testnet.
       - ./data/${NETWORK}/${ASSET}/archive:/var/lib/cyphras/archive:ro
-    secrets: [keeper_database_url, keeper_alert_webhooks, keeper_key]
-    networks: [egress, keeper_db]
-    depends_on: [keeper_db]
+    secrets: [keeper_database_url, keeper_alert_webhooks, keeper_key, keeper_screen_token]
+    networks: [egress, keeper_db, services, screen]
+    depends_on: [keeper_db, screening]
 
   screening:
     <<: *service
@@ -126,7 +132,7 @@ services:
       ASP_KEY_FILE: /run/secrets/screening_asp_key
       LISTEN_ADDR: 0.0.0.0:8090
       # The internal endpoint listens only on the address the name has on the screen network,
-      # which no service but the relayer joins, and is never reachable through nginx.
+      # which only the relayer and the keeper join, and is never reachable through nginx.
       INTERNAL_ADDR: screening-internal:8091
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
@@ -152,7 +158,7 @@ services:
       PUBLIC_WEBHOOKS_FILE: /run/secrets/watcher_public_webhooks
       HEARTBEAT_URL_FILE: /run/secrets/watcher_heartbeat_url
       INDEXER_URL: http://indexer:8080
-      HEALTH_URLS: http://indexer:8080/v1/health,http://relayer:8081/v1/health,http://screening:8090/v1/health
+      HEALTH_URLS: http://indexer:8080/v1/health,http://relayer:8081/v1/health,http://screening:8090/v1/health,http://keeper:8082/v1/health
       HOT_ACCOUNTS_FILE: /etc/cyphras/hot-accounts
     volumes:
       - ../../deployments/${NETWORK}.json:/etc/cyphras/deployment.json:ro
@@ -218,6 +224,7 @@ secrets:
   keeper_database_url: {file: "./secrets/${NETWORK}/${ASSET}/keeper_database_url"}
   keeper_alert_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/keeper_alert_webhooks"}
   keeper_key: {file: "./secrets/${NETWORK}/${ASSET}/keeper_key"}
+  keeper_screen_token: {file: "./secrets/${NETWORK}/${ASSET}/keeper_screen_token"}
   keeper_db_password: {file: "./secrets/${NETWORK}/${ASSET}/keeper_db_password"}
   screening_database_url: {file: "./secrets/${NETWORK}/${ASSET}/screening_database_url"}
   screening_alert_webhooks: {file: "./secrets/${NETWORK}/${ASSET}/screening_alert_webhooks"}

@@ -49,6 +49,9 @@ type Config struct {
 	// ExitKeys is how many exits queued, or released, ahead of a claim or release in the ledger it
 	// lands in still leave its footprint room; 4 when unset.
 	ExitKeys uint32
+	// Unflags, when set, names the deposits an operator's queued unflag waits to correct, each
+	// with when its final window ends: the keeper does not refund one before then.
+	Unflags func(ctx context.Context) (map[uint64]uint64, error)
 }
 
 // Keeper follows the vault and runs the upkeep.
@@ -277,9 +280,10 @@ func admittedAny(ret *xdr.ScVal) bool {
 	return !ok || v == nil || len(*v) > 0
 }
 
-// Refund returns deposits that stayed flagged past the correction window, except those held. A
-// refund that fails because the deposit left the queue first, as when its depositor cancels it,
-// does not page.
+// Refund returns deposits that stayed flagged past the correction window, except those held and
+// those an operator's queued unflag waits to correct, until it is carried out or the deposit's
+// final window ends. A refund that fails because the deposit left the queue first, as when its
+// depositor cancels it, does not page.
 func (k *Keeper) Refund(ctx context.Context) error {
 	now, _, err := k.chainTime(ctx)
 	if err != nil {
@@ -289,9 +293,21 @@ func (k *Keeper) Refund(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var unflags map[uint64]uint64
+	if k.cfg.Unflags != nil {
+		// Without the list no refund goes, as one could preempt an operator's correction.
+		if unflags, err = k.cfg.Unflags(ctx); err != nil {
+			k.alerts.Raise(ctx, alert.Warning, "refunds_wait", "refunds wait: the deposits with an unflag queued cannot be read from the screening service: %v", err)
+			return err
+		}
+		k.alerts.Clear(ctx, "refunds_wait", "refunds go again")
+	}
 	for _, p := range pending {
 		d := p.deposit
 		if d.Flag == nil || k.cfg.HoldReasons[*d.Flag] || now < d.FlaggedAt+uint64(k.cfg.RefundDelay.Seconds()) {
+			continue
+		}
+		if until, queued := unflags[p.id]; queued && now < until {
 			continue
 		}
 		id := p.id

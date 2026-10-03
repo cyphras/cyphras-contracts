@@ -649,6 +649,8 @@ type Health struct {
 	Root           string `json:"root"`
 	NullifierCount uint64 `json:"nullifier_count"`
 	PendingCount   int    `json:"pending_count"`
+	// AlertLanes are the indexer's alert channels, by name, and whether each takes alerts.
+	AlertLanes []alert.LaneState `json:"alert_lanes"`
 }
 
 // Health reports readiness. A failed or stale probe is never read as "no lag".
@@ -659,7 +661,7 @@ func (ix *Indexer) Health() Health {
 		Vault: ix.cfg.Vault, NetworkID: fmt.Sprintf("%x", ix.cfg.NetworkID), DeployLedger: ix.cfg.DeployLedger,
 		LatestLedger: ix.latest, IngestedLedger: ix.cursor, Reconciled: ix.reconciled,
 		LeafCount: ix.state.Tree.Len(), Root: ix.state.Tree.Root().Hex(), NullifierCount: ix.state.NullifierCount,
-		PendingCount: len(ix.state.Pending),
+		PendingCount: len(ix.state.Pending), AlertLanes: ix.alerts.Lanes(ix.now()),
 	}
 	switch {
 	case ix.mismatch:
