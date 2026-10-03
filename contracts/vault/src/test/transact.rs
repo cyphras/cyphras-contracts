@@ -204,6 +204,21 @@ fn ciphertexts_and_binding_are_checked_for_transact_too() {
 }
 
 #[test]
+fn a_transfer_names_its_relayer_as_the_recipient() {
+    let s = funded();
+    let relayer = s.account("relayer", 0);
+    let other = s.account("other", 0);
+    let muxed = MuxedAddress::new(relayer.clone(), 1);
+    let recipients: [MuxedAddress; 2] = [other.into(), muxed];
+    for recipient in recipients {
+        let ext = s.ext(0, XLM, recipient, &relayer);
+        assert_eq!(s.transact(&relayer, &ext), Err(Error::BadParties));
+    }
+    let ext = s.ext(0, XLM, &relayer, &relayer);
+    assert_eq!(s.transact(&relayer, &ext), Ok(()));
+}
+
+#[test]
 fn the_vault_never_pays_itself() {
     let s = funded();
     let vault = s.vault.address.clone();

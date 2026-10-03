@@ -229,6 +229,10 @@ impl Vault {
         if ext.fee < 0 || ext.fee > limits.max_fee {
             return Err(Error::BadFee);
         }
+        // A transfer pays only the relayer, so `settled` must not name anyone else.
+        if ext.ext_amount == 0 && ext.recipient != MuxedAddress::from(&ext.relayer) {
+            return Err(Error::BadParties);
+        }
         proof::check_binding(&env, &ext)?;
 
         let payout = ext.ext_amount.checked_neg().ok_or(Error::Overflow)?;
