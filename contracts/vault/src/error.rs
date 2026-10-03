@@ -20,7 +20,6 @@ pub enum Error {
     DepositTooLarge = 14,
     DepositorDailyLimit = 15,
     TvlCapExceeded = 16,
-    OutflowLimit = 17,
     BadArity = 18,
     NonCanonical = 19,
     DuplicateNullifier = 20,
@@ -48,4 +47,5 @@ pub enum Error {
     DepositTooSmall = 42,
     ExceedsDailyOutflow = 43,
     NotStranded = 44,
+    NothingClaimable = 45,
 }

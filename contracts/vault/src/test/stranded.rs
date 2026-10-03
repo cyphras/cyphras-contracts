@@ -85,8 +85,11 @@ fn an_exit_to_a_recipient_without_a_trustline_strands_and_the_queue_moves_on() {
     assert_eq!(s.vault.status(), released);
     assert_eq!(s.balance(&vault), released.tvl);
 
-    // While the recipient still cannot receive, a claim fails and changes nothing.
-    assert!(s.vault.try_claim(&stuck).is_err());
+    // While the recipient still cannot receive, a claim pays nothing, so it fails.
+    assert_eq!(
+        outcome(s.vault.try_claim(&stuck)),
+        Err(Error::NothingClaimable)
+    );
     assert_eq!(s.vault.status(), released);
     assert!(s.vault.stranded(&stuck).is_some());
 
@@ -183,7 +186,10 @@ fn a_deauthorized_recipient_strands_and_is_paid_once_authorized_again() {
     assert_eq!((stranded.payout, stranded.fee), (10 * XLM, 0));
     // Nothing was paid, so nothing was taken from the window.
     assert_eq!(used(s), 0);
-    assert!(s.vault.try_claim(&id).is_err());
+    assert_eq!(
+        outcome(s.vault.try_claim(&id)),
+        Err(Error::NothingClaimable)
+    );
     assert_eq!(s.vault.stranded(&id), Some(stranded));
 
     c.asset.set_authorized(&frozen, &true);
@@ -242,25 +248,117 @@ fn a_fee_its_relayer_cannot_receive_strands_alone() {
 }
 
 #[test]
-fn a_claim_needs_room_in_todays_window_and_takes_it() {
+fn a_claimed_part_is_paid_whole_within_what_is_left_of_todays_window() {
     let c = classic();
     let s = &c.s;
+    let window = s.vault.limits().max_daily_outflow;
     let filler = c.holder("filler", 0);
+    let relayer = c.holder("relayer", 0);
     let untrusting = s.account("untrusting", 0);
     fill_window(s, &filler);
-    let id = queue(s, 10 * XLM, 0, &untrusting, &untrusting);
+    let id = queue(s, 10 * XLM, XLM, &untrusting, &relayer);
+    c.asset.set_authorized(&relayer, &false);
     to_midnight(s);
     assert_eq!(s.vault.release(&1), 1);
     c.asset.trust(&untrusting);
+    c.asset.set_authorized(&relayer, &true);
 
-    // With no exit queued, an exit paid at once takes the rest of the day's window.
-    fill_window(s, &filler);
-    assert_eq!(outcome(s.vault.try_claim(&id)), Err(Error::OutflowLimit));
+    // With no exit queued, an exit paid at once leaves room for the fee but not the payout.
+    let ext = s.ext(-(window - 5 * XLM), 0, &filler, &filler);
+    assert_eq!(s.transact(&filler, &ext), Ok(()));
+    s.vault.claim(&id);
+    let vault = s.vault.address.clone();
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&vault),
+        std::vec![events::ExitPaid {
+            id,
+            payout_paid: 0,
+            fee_paid: XLM,
+            payout_left: 10 * XLM,
+            fee_left: 0
+        }
+        .to_xdr(&s.env, &vault)]
+    );
+    assert_eq!(used(s), window - 4 * XLM);
+    assert_eq!(
+        outcome(s.vault.try_claim(&id)),
+        Err(Error::NothingClaimable)
+    );
+
     to_midnight(s);
     s.vault.claim(&id);
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&vault),
+        std::vec![events::Settled {
+            ext_amount: -10 * XLM,
+            fee: 0,
+            recipient: untrusting.clone().into(),
+            relayer: relayer.clone(),
+            exit_id: Some(id)
+        }
+        .to_xdr(&s.env, &vault)]
+    );
     assert_eq!(used(s), 10 * XLM);
-    assert_eq!(s.balance(&untrusting), 10 * XLM);
+    assert_eq!(
+        (s.balance(&untrusting), s.balance(&relayer)),
+        (10 * XLM, XLM)
+    );
+    assert_eq!(s.vault.status().queued_total, 0);
     assert_eq!(outcome(s.vault.try_claim(&id)), Err(Error::NotStranded));
+}
+
+#[test]
+fn a_party_that_can_never_receive_cannot_hold_up_the_others_part() {
+    let c = classic();
+    let s = &c.s;
+    let filler = c.holder("filler", 0);
+    let relayer = c.holder("relayer", 0);
+    let untrusting = s.account("untrusting", 0);
+    fill_window(s, &filler);
+    let id = queue(s, 10 * XLM, XLM, &untrusting, &relayer);
+    let queued_at = s.now();
+    // The relayer loses the right to hold the asset for good.
+    c.asset.set_authorized(&relayer, &false);
+    to_midnight(s);
+    assert_eq!(s.vault.release(&1), 1);
+    let stranded = s.vault.stranded(&id).unwrap();
+    assert_eq!((stranded.payout, stranded.fee), (10 * XLM, XLM));
+    assert_eq!(
+        outcome(s.vault.try_claim(&id)),
+        Err(Error::NothingClaimable)
+    );
+
+    // Once the recipient can receive, its payout is claimed on its own.
+    c.asset.trust(&untrusting);
+    s.vault.claim(&id);
+    let vault = s.vault.address.clone();
+    assert_eq!(
+        s.env.events().all().filter_by_contract(&vault),
+        std::vec![events::ExitPaid {
+            id,
+            payout_paid: 10 * XLM,
+            fee_paid: 0,
+            payout_left: 0,
+            fee_left: XLM
+        }
+        .to_xdr(&s.env, &vault)]
+    );
+    assert_eq!(s.balance(&untrusting), 10 * XLM);
+    assert_eq!(
+        s.vault.stranded(&id),
+        Some(Exit {
+            recipient: untrusting.clone().into(),
+            payout: 0,
+            relayer: relayer.clone(),
+            fee: XLM,
+            queued_at,
+        })
+    );
+    assert_eq!(s.vault.status().queued_total, XLM);
+    assert_eq!(
+        outcome(s.vault.try_claim(&id)),
+        Err(Error::NothingClaimable)
+    );
 }
 
 #[test]

@@ -79,6 +79,14 @@ enum Done {
     Count(u32),
 }
 
+/// Which calls a run draws: every entry point, or mostly those around the exit queue, with the
+/// parties' right to hold the asset revoked as often as restored.
+#[derive(Clone, Copy, PartialEq)]
+enum Mix {
+    Everything,
+    Exits,
+}
+
 #[derive(Debug, PartialEq)]
 enum Fail {
     Refused(Error),
@@ -438,19 +446,37 @@ impl Model {
                 if self.halted(now) {
                     return Err(Error::Halted.into());
                 }
-                let owed = self.stranded.get(id).ok_or(Error::NotStranded)?.clone();
-                let outflow = owed.payout + owed.fee;
-                if self.outflow_today(day) + outflow > self.limits.max_daily_outflow {
-                    return Err(Error::OutflowLimit.into());
+                let mut owed = self.stranded.get(id).ok_or(Error::NotStranded)?.clone();
+                // Each part is paid whole if it fits the window and its party can receive.
+                let max = self.limits.max_daily_outflow;
+                let today = self.outflow_today(day);
+                let payout_paid = if today + owed.payout <= max && self.can_receive[owed.recipient]
+                {
+                    owed.payout
+                } else {
+                    0
+                };
+                let fee_paid =
+                    if today + payout_paid + owed.fee <= max && self.can_receive[owed.relayer] {
+                        owed.fee
+                    } else {
+                        0
+                    };
+                let paid = payout_paid + fee_paid;
+                if paid == 0 {
+                    return Err(Error::NothingClaimable.into());
                 }
-                if !self.can_pay(&owed) {
-                    return Err(Fail::Reverted);
+                self.received[owed.recipient] += payout_paid;
+                self.received[owed.relayer] += fee_paid;
+                owed.payout -= payout_paid;
+                owed.fee -= fee_paid;
+                self.status.queued_total -= paid;
+                self.pay(day, paid);
+                if owed.payout + owed.fee == 0 {
+                    self.stranded.remove(id);
+                } else {
+                    self.stranded.insert(*id, owed);
                 }
-                self.stranded.remove(id);
-                self.received[owed.recipient] += owed.payout;
-                self.received[owed.relayer] += owed.fee;
-                self.status.queued_total -= outflow;
-                self.pay(day, outflow);
                 Ok(Done::Unit)
             }
             Op::Authorize(party, authorized) => {
@@ -465,6 +491,7 @@ impl Model {
 struct Run {
     s: Setup,
     asset: StellarAssetClient<'static>,
+    mix: Mix,
     model: Model,
     depositors: std::vec::Vec<Address>,
     parties: std::vec::Vec<Address>,
@@ -474,7 +501,7 @@ struct Run {
 }
 
 impl Run {
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, mix: Mix) -> Self {
         let limits = Limits {
             min_deposit: XLM / 10,
             max_deposit: 100 * XLM,
@@ -516,6 +543,7 @@ impl Run {
         Run {
             s,
             asset,
+            mix,
             model,
             depositors,
             parties,
@@ -616,7 +644,40 @@ impl Run {
         }
     }
 
+    /// Exits, releases, claims, the issuer revoking and restoring the parties, and time passing,
+    /// with deposits now and then so that there are notes to spend.
+    fn exit_op(&self) -> Op {
+        let s = &self.s;
+        let m = &self.model;
+        let now = s.now();
+        // With the queue empty an exit may be paid at once, and its plain transfers fail when a
+        // party cannot receive.
+        if m.exits.is_empty() && s.below(3) == 0 {
+            return self.transact();
+        }
+        if let Some(&last) = m.pending.keys().last() {
+            if s.below(4) == 0 {
+                return if last > m.status.attested_up_to {
+                    Op::Attest(last)
+                } else {
+                    Op::Admit(m.pending.keys().copied().take(4).collect())
+                };
+            }
+        }
+        match s.below(20) {
+            0..=6 => self.transact(),
+            7..=9 => Op::Release(self.pick(&[1, 2, 50])),
+            10..=12 => Op::Claim(self.some_stranded()),
+            13..=15 => Op::Authorize(s.below(PARTIES as u64) as usize, s.below(2) == 0),
+            16 => Op::Shield(s.below(3) as usize, self.pick(&[10 * XLM, 49 * XLM])),
+            _ => Op::Advance(self.pick(&[3_600, 6 * 3_600, DAY - now % DAY])),
+        }
+    }
+
     fn random_op(&self) -> Op {
+        if self.mix == Mix::Exits {
+            return self.exit_op();
+        }
         let s = &self.s;
         let m = &self.model;
         let now = s.now();
@@ -831,7 +892,7 @@ impl Run {
             Op::ApplyLimits => refused(outcome(v.try_apply_limits()).map(|_| Done::Unit)),
             Op::CancelLimits => refused(outcome(v.try_cancel_limits()).map(|_| Done::Unit)),
             Op::Release(max) => refused(outcome(v.try_release(max)).map(Done::Count)),
-            Op::Claim(id) => paid(outcome(v.try_claim(id))),
+            Op::Claim(id) => refused(outcome(v.try_claim(id)).map(|_| Done::Unit)),
             Op::Authorize(party, authorized) => {
                 self.asset.set_authorized(&self.parties[*party], authorized);
                 Ok(Done::Unit)
@@ -943,8 +1004,8 @@ impl Run {
 
 /// Runs `steps` random calls and counts each entry point's outcomes, with the refusals of a spent
 /// nullifier counted per slot.
-fn run(seed: u64, steps: usize) -> BTreeMap<std::string::String, usize> {
-    let mut run = Run::new(seed);
+fn run(seed: u64, steps: usize, mix: Mix) -> BTreeMap<std::string::String, usize> {
+    let mut run = Run::new(seed, mix);
     let mut seen = BTreeMap::new();
     for _ in 0..steps {
         let op = run.random_op();
@@ -992,6 +1053,14 @@ fn run(seed: u64, steps: usize) -> BTreeMap<std::string::String, usize> {
                 *seen.entry("Release paid in part".into()).or_insert(0) += 1;
             }
         }
+        if let Op::Claim(id) = &op {
+            if actual.is_ok() && run.model.stranded.contains_key(id) {
+                *seen.entry("Claim paid in part".into()).or_insert(0) += 1;
+            }
+            if actual == Err(Fail::Refused(Error::NothingClaimable)) {
+                *seen.entry("Claim paid nothing".into()).or_insert(0) += 1;
+            }
+        }
     }
     seen
 }
@@ -1000,7 +1069,7 @@ fn run(seed: u64, steps: usize) -> BTreeMap<std::string::String, usize> {
 fn random_sequences_keep_the_vault_equal_to_the_spec_model() {
     let mut seen = BTreeMap::new();
     for seed in 0..4 {
-        for (k, n) in run(seed, 300) {
+        for (k, n) in run(seed, 300, Mix::Everything) {
             *seen.entry(k).or_insert(0) += n;
         }
     }
@@ -1031,14 +1100,11 @@ fn random_sequences_keep_the_vault_equal_to_the_spec_model() {
             "{op} never refused: {seen:?}"
         );
     }
-    // Exits queued, paid in part and stranded, and the asset contract refused a payment of each
-    // entry point that makes plain transfers.
+    // Exits queued, paid in part and stranded.
     for case in [
         "Transact queued",
         "Release paid in part",
         "Release stranded",
-        "Transact reverted",
-        "Claim reverted",
     ] {
         assert!(seen.contains_key(case), "never {case}: {seen:?}");
     }
@@ -1048,5 +1114,28 @@ fn random_sequences_keep_the_vault_equal_to_the_spec_model() {
             seen.contains_key(&std::format!("spent nullifier in slot {slot}")),
             "no spent nullifier refused in slot {slot}: {seen:?}"
         );
+    }
+}
+
+#[test]
+fn random_exit_sequences_keep_the_vault_equal_to_the_spec_model() {
+    let mut seen = BTreeMap::new();
+    for seed in 0..4 {
+        for (k, n) in run(seed, 150, Mix::Exits) {
+            *seen.entry(k).or_insert(0) += n;
+        }
+    }
+    // Exits queued, paid in part and stranded, claims that paid both parts, one or nothing, and
+    // the asset contract refusing the plain transfers of an exit paid at once.
+    for case in [
+        "Transact queued",
+        "Release paid in part",
+        "Release stranded",
+        "Claim ok",
+        "Claim paid in part",
+        "Claim paid nothing",
+        "Transact reverted",
+    ] {
+        assert!(seen.contains_key(case), "never {case}: {seen:?}");
     }
 }

@@ -81,7 +81,8 @@ pub struct ExitQueued {
     pub relayer: Address,
 }
 
-/// Part payment of an exit that is not yet paid in full. `payout_left` and `fee_left` stay owed.
+/// Part payment of an exit that is not yet paid in full, by `release` from the head of the queue or
+/// by `claim` of a stranded exit. `payout_left` and `fee_left` stay owed.
 #[contractevent]
 pub struct ExitPaid {
     pub id: u64,

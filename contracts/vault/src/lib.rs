@@ -431,10 +431,11 @@ impl Vault {
         Ok(count)
     }
 
-    /// Anyone pays the unpaid parts of a stranded exit to its recipient and relayer, within what
-    /// is left of today's outflow window. The transfers are plain ones: while a party still
-    /// cannot receive, the call fails and the exit stays stranded. Refused while halted; works
-    /// while paused.
+    /// Anyone pays the unpaid parts of a stranded exit, the payout to its recipient and the fee to
+    /// its relayer, each on its own: a part is paid whole when it fits what is left of today's
+    /// outflow window and the asset contract accepts it, and otherwise stays stranded. The call
+    /// fails only when it pays nothing, so a party that can never receive cannot hold up the
+    /// other's part. Refused while halted; works while paused.
     pub fn claim(env: Env, id: u64) -> Result<(), Error> {
         let mut status = storage::status(&env);
         let now = env.ledger().timestamp();
@@ -442,39 +443,65 @@ impl Vault {
             return Err(Error::Halted);
         }
         let exit = storage::stranded(&env, id).ok_or(Error::NotStranded)?;
-        let outflow = exit.payout.checked_add(exit.fee).ok_or(Error::Overflow)?;
+        let max_daily_outflow = storage::limits(&env).max_daily_outflow;
         let day = now / DAY;
-        let today = outflow_today(&status, day)
-            .checked_add(outflow)
-            .ok_or(Error::Overflow)?;
-        if today > storage::limits(&env).max_daily_outflow {
-            return Err(Error::OutflowLimit);
+        let mut today = outflow_today(&status, day);
+        let token = TokenClient::new(&env, &storage::config(&env).token);
+        let vault = env.current_contract_address();
+
+        let fits = |today: i128, part: i128| -> Result<bool, Error> {
+            Ok(today.checked_add(part).ok_or(Error::Overflow)? <= max_daily_outflow)
+        };
+        let payout_paid = if fits(today, exit.payout)? {
+            try_pay(&token, &vault, &exit.recipient, exit.payout)
+        } else {
+            0
+        };
+        today = today.checked_add(payout_paid).ok_or(Error::Overflow)?;
+        let fee_paid = if fits(today, exit.fee)? {
+            try_pay(&token, &vault, &MuxedAddress::from(&exit.relayer), exit.fee)
+        } else {
+            0
+        };
+        today = today.checked_add(fee_paid).ok_or(Error::Overflow)?;
+        let paid = payout_paid + fee_paid;
+        if paid == 0 {
+            return Err(Error::NothingClaimable);
         }
 
-        storage::remove_stranded(&env, id);
-        status.tvl = status.tvl.checked_sub(outflow).ok_or(Error::Overflow)?;
+        status.tvl = status.tvl.checked_sub(paid).ok_or(Error::Overflow)?;
         status.queued_total = status
             .queued_total
-            .checked_sub(outflow)
+            .checked_sub(paid)
             .ok_or(Error::Overflow)?;
         status.outflow_day = day;
         status.outflow = today;
         storage::set_status(&env, &status);
-        events::Settled {
-            ext_amount: -exit.payout,
-            fee: exit.fee,
-            recipient: exit.recipient.clone(),
-            relayer: exit.relayer.clone(),
-            exit_id: Some(id),
-        }
-        .publish(&env);
-        let token = TokenClient::new(&env, &storage::config(&env).token);
-        let vault = env.current_contract_address();
-        if exit.payout > 0 {
-            token.transfer(&vault, &exit.recipient, &exit.payout);
-        }
-        if exit.fee > 0 {
-            token.transfer(&vault, &exit.relayer, &exit.fee);
+        let left = Exit {
+            payout: exit.payout - payout_paid,
+            fee: exit.fee - fee_paid,
+            ..exit.clone()
+        };
+        if left.payout == 0 && left.fee == 0 {
+            storage::remove_stranded(&env, id);
+            events::Settled {
+                ext_amount: -payout_paid,
+                fee: fee_paid,
+                recipient: exit.recipient,
+                relayer: exit.relayer,
+                exit_id: Some(id),
+            }
+            .publish(&env);
+        } else {
+            storage::set_stranded(&env, id, &left);
+            events::ExitPaid {
+                id,
+                payout_paid,
+                fee_paid,
+                payout_left: left.payout,
+                fee_left: left.fee,
+            }
+            .publish(&env);
         }
         Ok(())
     }
