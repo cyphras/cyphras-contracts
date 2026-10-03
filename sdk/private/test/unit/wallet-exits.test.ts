@@ -421,6 +421,50 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal((await bob.balance()).spendable, 30n * XLM);
   });
 
+  it("goes on with a split past a payment of the wallet that every RPC provider saw land", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const second = "http://rpc2.test";
+    const fetch: FetchLike = (input, init) =>
+      new URL(input).origin === second ? world.fetch(RPC, init) : world.fetch(input, init);
+    const store = new MemoryStore();
+    const alice = await openWallet({ ...world, fetch }, 0, store, undefined, {
+      secondRpcUrl: second,
+    });
+    for (const amount of [50n * XLM, 60n * XLM, 70n * XLM]) {
+      await alice.shield({ amount, signer: world.signer("alice depositor") });
+    }
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const destination = world.signer("exchange").publicKey;
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: destination,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+    );
+    world.advance(3600);
+    world.fill(1);
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    await alice.send({
+      to: bob.generateAddress(),
+      amount: 30n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    let [view] = await alice.continueOperations();
+    assert.equal(view?.state, "active");
+    assert.equal(view?.plans.length, 2);
+    view = await finish(world, alice);
+    assert.equal(view?.state, "done");
+    assert.equal(owedTo(world, destination), 90n * XLM);
+  });
+
   it("blocks a split whose part's note a payment spent that not every RPC provider saw land", async () => {
     const world = await createWorld({ limits: SPLIT });
     const { alice, store } = await withNotes(world, undefined, [50n * XLM, 60n * XLM, 70n * XLM]);
