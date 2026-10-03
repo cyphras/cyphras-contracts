@@ -38,6 +38,9 @@ func (s *Screener) Reviews(ctx context.Context) ([]Review, error) {
 // ErrNotPending reports a deposit that is not waiting for the decision asked of it.
 var ErrNotPending = errors.New("screening: the deposit is not waiting for that decision")
 
+// ErrBeforeFinalWindow reports an unflag that must wait for the deposit's final window.
+var ErrBeforeFinalWindow = errors.New("screening: the deposit keeps its flag until its final window")
+
 func (s *Screener) pendingRow(ctx context.Context, id uint64) (row, error) {
 	rows, err := s.db.pending(ctx)
 	if err != nil {
@@ -102,7 +105,8 @@ func (s *Screener) QueueUnflag(ctx context.Context, id uint64, reviewer, note st
 	return s.db.queueOp(ctx, op{kind: "unflag", deposit: id, reviewer: reviewer, note: note}, s.now())
 }
 
-// runOps carries out the operators' queued decisions and records each result.
+// runOps carries out the operators' queued decisions and records each result. An unflag that
+// must wait for the deposit's final window stays queued until it opens.
 func (s *Screener) runOps(ctx context.Context) error {
 	ops, err := s.db.queuedOps(ctx)
 	if err != nil {
@@ -115,6 +119,9 @@ func (s *Screener) runOps(ctx context.Context) error {
 			err = s.FlagManually(ctx, o.deposit, *o.reason, o.reviewer, o.note)
 		case "unflag":
 			err = s.Unflag(ctx, o.deposit, o.reviewer, o.note)
+			if errors.Is(err, ErrBeforeFinalWindow) {
+				continue
+			}
 		default:
 			err = fmt.Errorf("unknown operation %q", o.kind)
 		}
@@ -161,7 +168,7 @@ func (s *Screener) Unflag(ctx context.Context, id uint64, reviewer, note string)
 		}
 		eligible := vault.PendingDeposit{Amount: r.amountInt(), CreatedAt: r.createdAt, Delay: *r.delay}.EligibleAt(inst.Config, inst.Limits)
 		if uint64(now.Add(s.cfg.RecheckWindow).Unix()) < eligible {
-			return fmt.Errorf("screening: deposit %d keeps its flag until its final window, which opens %s before it is eligible", id, s.cfg.RecheckWindow)
+			return fmt.Errorf("%w, which opens %s before deposit %d is eligible", ErrBeforeFinalWindow, s.cfg.RecheckWindow, id)
 		}
 	}
 	since := time.Unix(int64(r.createdAt), 0).Add(-FunderWindow)

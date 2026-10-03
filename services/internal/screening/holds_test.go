@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -484,5 +485,46 @@ func TestACorrectionInsideTheAttestedRangeWaitsForTheFinalWindow(t *testing.T) {
 	rows, err := h.s.db.pending(ctx)
 	if err != nil || rows[0].recheck != "pass" || rows[0].recheckAt == nil || *rows[0].recheckAt != uint64(h.now.Unix()) {
 		t.Fatalf("rows %+v %v", rows, err)
+	}
+}
+
+func TestAQueuedCorrectionWaitsForTheFinalWindow(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	dirty := h.shield(thief, 6_000_000_000)
+	h.tick()
+	h.land()
+	h.shield(keypair.MustRandom().Address(), 10_000_000)
+	h.tick()
+	h.now = h.now.Add(55 * time.Minute)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 2", "attest 2"}) {
+		t.Fatalf("sent %v", got)
+	}
+	// The flag was a mistake. Queued a day early, the correction waits.
+	h.now = h.now.Add(2 * time.Hour)
+	h.sources.set(map[string]Hit{}, "2", h.now)
+	id, err := h.s.QueueUnflag(ctx, dirty, "reviewer", "false positive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.tick()
+	var done *int64
+	if err := h.s.db.pool.QueryRow(ctx, `SELECT done_at FROM operator_ops WHERE id = $1`, id).Scan(&done); err != nil || done != nil || h.paged("operator_op_failed") {
+		t.Fatalf("a correction waiting for the window was finished: %v, pages %+v", err, h.pages)
+	}
+	if got := h.sent(); len(got) != 0 {
+		t.Fatalf("sent %v", got)
+	}
+	// Once the window opens, the service carries it out.
+	h.now = time.Unix(int64(h.deposits[dirty].createdAt), 0).Add(24*time.Hour - 9*time.Minute)
+	h.sources.set(map[string]Hit{}, "3", h.now)
+	h.tick()
+	var result string
+	if err := h.s.db.pool.QueryRow(ctx, `SELECT result FROM operator_ops WHERE id = $1`, id).Scan(&result); err != nil || result != "done" {
+		t.Fatalf("result %q, %v", result, err)
+	}
+	if got := h.sent(); !slices.Contains(got, "unflag 1") {
+		t.Fatalf("sent %v", got)
 	}
 }
