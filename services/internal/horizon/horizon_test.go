@@ -187,3 +187,25 @@ func TestOnlyPagesOfValueCountTowardThePagesRead(t *testing.T) {
 		t.Fatalf("gap %d after %v, %v", gap, reads, err)
 	}
 }
+
+func TestAPageThatCannotBeReadIsAGapNotAnError(t *testing.T) {
+	now := time.Now().UTC()
+	for name, body := range map[string]string{
+		"not json":  "<html>busy</html>",
+		"too large": `{"_embedded": {"records": [{"type": "payment", "from": "` + strings.Repeat("x", 9<<20) + `"}]}}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/payments") {
+				_, _ = w.Write([]byte(body))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"_embedded": map[string]any{"records": []any{}}})
+		}))
+		h := Client{URL: srv.URL, HTTP: srv.Client(), MaxPages: 3}
+		_, gap, err := h.Inflows(context.Background(), clean, now.Add(-time.Hour))
+		srv.Close()
+		if err != nil || gap != GapVolume {
+			t.Fatalf("%s: gap %d, %v", name, gap, err)
+		}
+	}
+}

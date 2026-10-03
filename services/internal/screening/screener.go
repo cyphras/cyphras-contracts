@@ -319,6 +319,7 @@ func (s *Screener) plan(v vaultView, r *row) plan {
 	}
 	inRecheck := v.now+uint64(s.cfg.RecheckWindow.Seconds()) >= p.eligibleAt
 	attested := r.id <= v.inst.Status.AttestedUpTo
+	passed := r.recheck == "pass" && (attested || s.fresh(v.now, r))
 	switch {
 	case r.firstCheck == "refuse":
 		return flag(refusal, "first_check", "refused at the first check")
@@ -326,6 +327,10 @@ func (s *Screener) plan(v vaultView, r *row) plan {
 		return flag(ReasonReview, "review", "refused by the reviewer")
 	case r.recheck == "refuse":
 		return flag(refusal, "recheck", "refused at the final check")
+	case !held && !passed && v.now+uint64(s.cfg.Cutoff.Seconds()) >= p.eligibleAt && s.failing(r.id):
+		// Its own checks keep failing: held, it is admitted on nothing and holds back no later
+		// deposit, and the hold is lifted once its final check passes.
+		return flag(ReasonHeld, "hold", "its checks could not run in time")
 	case r.firstCheck == "":
 		p.task = taskFirst
 	case r.review == "needed":
@@ -339,9 +344,7 @@ func (s *Screener) plan(v vaultView, r *row) plan {
 		p.task = taskLift
 	case held:
 		p.task = taskRecheck
-	case r.recheck == "pass" && (attested || s.fresh(v.now, r)):
-	case attested && v.now+uint64(s.cfg.Cutoff.Seconds()) >= p.eligibleAt && s.retrying(r.id):
-		return flag(ReasonHeld, "hold", "the final check could not run in time")
+	case passed:
 	default:
 		p.task = taskRecheck
 	}
@@ -354,11 +357,12 @@ func (s *Screener) fresh(now uint64, r *row) bool {
 	return r.recheckAt != nil && now <= *r.recheckAt+uint64(s.cfg.RecheckWindow.Seconds())
 }
 
-func (s *Screener) retrying(id uint64) bool {
+// failing reports a deposit whose last check failed and whose next try is not due yet.
+func (s *Screener) failing(id uint64) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	_, ok := s.retries[id]
-	return ok
+	r, ok := s.retries[id]
+	return ok && s.now().Before(r.next)
 }
 
 // due reports whether a deposit whose checks failed may be tried again, at a backoff from 30

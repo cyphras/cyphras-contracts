@@ -28,6 +28,10 @@ const pageSize = 200
 
 var errUnreachable = errors.New("horizon unreachable")
 
+// errUnreadable reports a page too large to read, or one that is not Horizon's JSON. A lookup
+// takes it as a history longer than it reads, not as an error that would stop the check.
+var errUnreadable = errors.New("horizon sent an unreadable page")
+
 // get reads one page into v; a 404 reports found false.
 func (c Client) get(ctx context.Context, target string, v any) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
@@ -50,7 +54,7 @@ func (c Client) get(ctx context.Context, target string, v any) (bool, error) {
 		return false, fmt.Errorf("horizon answered %d", resp.StatusCode)
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(v); err != nil {
-		return false, errors.New("horizon sent an unreadable page")
+		return false, errUnreadable
 	}
 	return true, nil
 }
@@ -171,7 +175,8 @@ const (
 // payments, and the claimable balances it claimed, the trades that paid it and its withdrawals
 // from liquidity pools from its effects. Only value counts: a transfer of nothing is left out,
 // and only pages that hold value for the account count toward MaxPages, so an account's own
-// activity does not cut its history short. A missing account received nothing.
+// activity does not cut its history short. A page that cannot be read is a gap, as a longer
+// history is. A missing account received nothing.
 func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([]Inflow, Gap, error) {
 	var out []Inflow
 	var gap Gap
@@ -188,6 +193,10 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 		}
 		var p paymentsPage
 		found, err := c.get(ctx, next, &p)
+		if errors.Is(err, errUnreadable) {
+			gap |= GapVolume
+			break
+		}
 		if err != nil {
 			return nil, 0, err
 		}
@@ -237,6 +246,10 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 		}
 		var p inflowEffectsPage
 		found, err := c.get(ctx, next, &p)
+		if errors.Is(err, errUnreadable) {
+			gap |= GapVolume
+			break
+		}
 		if err != nil {
 			return nil, 0, err
 		}
@@ -257,6 +270,10 @@ func (c Client) Inflows(ctx context.Context, account string, since time.Time) ([
 					continue
 				}
 				from, err := c.creator(ctx, r.BalanceID)
+				if errors.Is(err, errUnreadable) {
+					gap |= GapVolume
+					continue
+				}
 				if err != nil {
 					return nil, 0, err
 				}

@@ -180,7 +180,7 @@ func TestADepositEligibleMoreThanADayAwayIsNotHeld(t *testing.T) {
 	}
 }
 
-func TestADepositInItsFinalWindowIsNeverHeldPastAnother(t *testing.T) {
+func TestADepositWhoseChecksKeepFailingIsHeldAtItsCutoff(t *testing.T) {
 	h := newHarness(t)
 	first := h.shield(clean, 10_000_000)
 	h.tick()
@@ -188,16 +188,42 @@ func TestADepositInItsFinalWindowIsNeverHeldPastAnother(t *testing.T) {
 	h.chain.ClosedAt = h.now.Unix()
 	h.shield(keypair.MustRandom().Address(), 10_000_000)
 	h.tick()
-	// The first deposit's final check fails while the second one's passes: the first one ends the
-	// run, since its own window is open and a hold would only stand for a check that is due.
-	h.now = h.now.Add(56 * time.Minute)
+	// The first deposit's final window opens and its check fails: it is tried again, not held.
 	h.s.check.Inflows = failing{clean}
+	h.now = h.now.Add(49 * time.Minute)
 	h.tick()
 	if got := h.sent(); len(got) != 0 {
-		t.Fatalf("held a deposit whose final check is due: %v", got)
+		t.Fatalf("held before its cutoff: %v", got)
 	}
 	if r := h.s.retries[first]; r.attempts == 0 {
 		t.Fatal("the first deposit was not checked")
+	}
+	// At its cutoff its check still fails: it is held, and the deposit behind it is attested on time.
+	h.now = h.now.Add(3 * time.Minute)
+	h.tick()
+	if got := h.sent(); !equal(got, []string{"flag 1 6", "attest 2"}) {
+		t.Fatalf("at the cutoff: %v", got)
+	}
+}
+
+func TestADepositWhoseFirstCheckNeverRunsHoldsBackNothing(t *testing.T) {
+	h := newHarness(t)
+	bad := keypair.MustRandom().Address()
+	h.s.check.Inflows = failing{bad}
+	h.shield(bad, 10_000_000)
+	h.tick()
+	h.now = h.now.Add(5 * time.Minute)
+	h.chain.ClosedAt = h.now.Unix()
+	h.shield(keypair.MustRandom().Address(), 10_000_000)
+	h.tick()
+	var all []string
+	for _, step := range []time.Duration{45 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+		h.now = h.now.Add(step)
+		h.tick()
+		all = append(all, h.sent()...)
+	}
+	if !equal(all, []string{"flag 1 6", "attest 2"}) {
+		t.Fatalf("sent %v", all)
 	}
 }
 
