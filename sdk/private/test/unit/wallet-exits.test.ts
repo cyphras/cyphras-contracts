@@ -407,10 +407,13 @@ describe("split unshields whose parts do not plainly land", () => {
       maxFee: 2n * XLM,
       confirm: confirmAll,
     });
+    // The payment's leaves are in, though the indexer does not list its spend yet.
+    world.indexer.completeTo = world.vault.ledger - 1;
     let [view] = await alice.continueOperations();
     assert.equal((await alice.plans())[0]?.state, "superseded");
     assert.equal(view?.state, "active");
     assert.equal(view?.plans.length, 2);
+    world.indexer.completeTo = undefined;
     view = await finish(world, alice);
     assert.equal(view?.state, "done");
     assert.equal(owedTo(world, destination), 90n * XLM);
