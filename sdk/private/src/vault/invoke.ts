@@ -219,8 +219,9 @@ function dataWith(
 // Adds x to simulated transaction data and returns it with the fee it adds: the network's fee for
 // the entries, instructions, written bytes and transaction size it adds, all non-refundable, and
 // the rent and event fee the other path may need, which is refunded when it goes unused. Entries
-// are added in x's order while the network's limits allow; one already read-only moves to the
-// read-write entries after those added.
+// are added in x's order; one a network limit has no room for is left out, and the call goes with
+// less room than its other path may need. One already read-only moves to the read-write entries
+// after those added.
 function addExtra(
   data: xdr.SorobanTransactionData,
   x: Extra,
@@ -239,7 +240,8 @@ function addExtra(
   for (const key of x.readWrite) {
     const id = keyId(key);
     if (written.has(id)) continue;
-    if (readWrite.length + promoted.length >= c.maxWriteEntries) break;
+    written.add(id);
+    if (readWrite.length + promoted.length >= c.maxWriteEntries) continue;
     const at = read.get(id);
     if (at !== undefined) {
       promoted.push(at);
@@ -248,7 +250,7 @@ function addExtra(
         readOnly.length + readWrite.length >= c.maxFootprint ||
         (classic(key) && reads >= c.maxReadEntries)
       ) {
-        break;
+        continue;
       }
       readWrite.push(key);
       if (classic(key)) {
@@ -256,7 +258,6 @@ function addExtra(
         newReads++;
       }
     }
-    written.add(id);
     writes++;
   }
   promoted.sort((a, b) => a - b);

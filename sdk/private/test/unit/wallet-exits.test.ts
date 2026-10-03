@@ -1699,6 +1699,92 @@ describe("exits that other exits race in the same ledger", () => {
     await assert.rejects(invokeVault(capped, signer, call), isError("fee_above_cap"));
   });
 
+  it("leaves out a key a network limit has no room for and goes on, as the relayer's engine does, to the stroop", async () => {
+    const world = await createWorld({ limits: SMALL });
+    const vault = world.vault.address;
+    const [first, second, recipient] = [1, 2, 3].map((i) =>
+      accountOf(world.signer(`holder ${i}`).publicKey),
+    ) as [xdr.LedgerKey, xdr.LedgerKey, xdr.LedgerKey];
+    const instance = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(vault).toScAddress(),
+        key: xdr.ScVal.scvLedgerKeyContractInstance(),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    );
+    const balance = dataKey(vault, xdr.ScVal.scvSymbol("Balance"), new Address(vault).toScVal());
+    const room = (...readWrite: xdr.LedgerKey[]): Extra => ({
+      readWrite,
+      instructions: 1_000_000,
+      writeBytes: 656,
+      newBytes: 656,
+      rentLedgers: 519_120,
+      eventBytes: 512,
+    });
+    const simulated = (readOnly: xdr.LedgerKey[], readWrite: xdr.LedgerKey[]) => ({
+      readOnly,
+      readWrite,
+      instructions: 1_000_000,
+      readBytes: 500,
+      writeBytes: 300,
+      fee: 100_000,
+    });
+    const fees: bigint[] = [];
+    const anyone = world.signer("anyone");
+    const signer: TransactionSigner = {
+      publicKey: anyone.publicKey,
+      signTransaction: (x, p) => anyone.signTransaction(x, p),
+      confirmFee: (fee) => {
+        fees.push(fee.resource);
+        return true;
+      },
+    };
+    const context = {
+      rpc: new SorobanRpc(RPC, world.fetch),
+      networkPassphrase: world.deployment.networkPassphrase,
+      vault,
+      feeCaps: DEFAULT_NETWORK_FEE_CAPS,
+      sleep: async () => {},
+    };
+    const send = (extra: Extra) =>
+      invokeVault(context, signer, {
+        fn: "release",
+        args: [xdr.ScVal.scvU32(1)],
+        transfers: [],
+        extend: async () => extra,
+      });
+    // The footprint already reads as many entries from disk as the network allows: the recipient's
+    // account is left out, and both exits go in.
+    world.rpc.maxDiskReadEntries = 2;
+    world.rpc.simulated = simulated([first, second], []);
+    await send(room(recipient, exitAt(world, 5n), exitAt(world, 6n)));
+    let resources = lastData(world)?.resources();
+    assert.deepEqual(
+      ids(resources?.footprint().readWrite()),
+      ids([exitAt(world, 5n), exitAt(world, 6n)]),
+    );
+    assert.deepEqual(ids(resources?.footprint().readOnly()), ids([first, second]));
+    assert.equal(resources?.instructions(), 2_000_000);
+    assert.equal(resources?.diskReadBytes(), 4_596);
+    assert.equal(resources?.writeBytes(), 956);
+    // The Go engine's resource fee for this footprint: 100,000 simulated, 1,105,335 for the room it
+    // adds and 1,788 for the accounts' room to grow.
+    assert.equal(fees[0], 1_207_123n);
+    // A full footprint takes no new entry, but still moves a later one it only read to the written
+    // ones.
+    world.rpc.maxDiskReadEntries = 200;
+    world.rpc.maxFootprintEntries = 3;
+    world.rpc.simulated = simulated([instance, first], [exitAt(world, 5n)]);
+    await send(room(balance, first));
+    resources = lastData(world)?.resources();
+    assert.deepEqual(ids(resources?.footprint().readWrite()), ids([exitAt(world, 5n), first]));
+    assert.deepEqual(ids(resources?.footprint().readOnly()), ids([instance]));
+    assert.equal(resources?.diskReadBytes(), 2_548);
+    assert.equal(resources?.writeBytes(), 3_004);
+    // 100,000 simulated, 1,102,136 for the room and 2,644 for the account's room to grow
+    assert.equal(fees[1], 1_204_780n);
+  });
+
   it("sends a relayed payment again when its relayer reports a failure on the host's storage", async () => {
     const { world, alice } = await funded();
     world.relayer.conflictNext = 1;
