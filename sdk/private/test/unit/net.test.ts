@@ -8,7 +8,7 @@ import { Fields, type FetchLike, MAX_REPLY_BYTES } from "../../src/net/http.ts";
 import { IndexerClient } from "../../src/net/indexer.ts";
 import { RelayerClient } from "../../src/net/relayer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
-import { xdr } from "@stellar/stellar-base";
+import { StrKey, xdr } from "@stellar/stellar-base";
 import { IndexerSource } from "../../src/wallet/sources.ts";
 import { vaultErrorName } from "../../src/vault/errors.ts";
 import { parseVaultErrors } from "../../scripts/vault-errors.ts";
@@ -551,6 +551,42 @@ describe("relayer client", () => {
     ]) {
       await assert.rejects(held(200, body), isCode("service_rejected"));
     }
+  });
+});
+
+describe("relayer client: cancels and pauses", () => {
+  const HELD_ID = "0f".repeat(16);
+
+  it("cancels a held request by its ID with DELETE, and tells when the relayer holds none", async () => {
+    const methods: string[] = [];
+    const answer =
+      (status: number, body: unknown): FetchLike =>
+      async (input, init) => {
+        methods.push(`${init?.method} ${new URL(input).pathname}`);
+        return new Response(JSON.stringify(body), { status });
+      };
+    const cancel = (status: number, body: unknown) =>
+      new RelayerClient("http://r", answer(status, body)).cancelHeld(HELD_ID);
+    assert.equal(await cancel(200, { status: "cancelled" }), true);
+    assert.deepEqual(methods, [`DELETE /v1/held/${HELD_ID}`]);
+    assert.equal(await cancel(404, { error: "not_found" }), false);
+    await assert.rejects(cancel(200, { status: "held" }), isCode("service_rejected"));
+    await assert.rejects(cancel(503, { error: "unavailable" }), isCode("service_unavailable"));
+  });
+
+  it("reads whether relaying is paused from the relayer's health", async () => {
+    const health = {
+      ready: false,
+      vault: StrKey.encodeContract(Buffer.alloc(32, 1)),
+      network_id: "00".repeat(32),
+      fee_address: StrKey.encodeEd25519PublicKey(Buffer.alloc(32, 2)),
+      paused: true,
+    };
+    const paused = await new RelayerClient("http://r", reply(503, health)).health();
+    assert.equal(paused.paused, true);
+    assert.equal(paused.ready, false);
+    const { paused: _, ...plain } = health;
+    assert.equal((await new RelayerClient("http://r", reply(200, plain)).health()).paused, false);
   });
 });
 

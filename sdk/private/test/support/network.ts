@@ -331,6 +331,8 @@ export class MockRelayer {
   tier = 100_000n;
   asset = "native";
   ready = true;
+  // Test hook: relaying is paused, as after transactions that failed on chain.
+  paused = false;
   // Test hook: a fee address the quote names instead of the one the health reports.
   quoteFeeAddress: string | undefined;
   // Test hooks: errors to answer submissions with, in order.
@@ -362,17 +364,33 @@ export class MockRelayer {
     this.channel = keypairFor("relayer channel");
   }
 
-  handle(url: URL, body: unknown): Response {
+  handle(url: URL, body: unknown, method: string): Response {
     const v = this.vault;
     if (url.pathname === "/v1/health") {
-      return json(this.ready ? 200 : 503, {
-        ready: this.ready,
+      const ready = this.ready && !this.paused;
+      return json(ready ? 200 : 503, {
+        ready,
         vault: v.address,
         network_id: this.networkId,
         fee_address: this.feeAddress,
         max_fee: v.limits.maxFee.toString(),
         channels: 4,
+        paused: this.paused,
       });
+    }
+    if (method === "DELETE" && url.pathname.startsWith("/v1/held/")) {
+      const request = this.heldRequests.get(url.pathname.slice("/v1/held/".length));
+      if (
+        request === undefined ||
+        request.hash !== undefined ||
+        request.failure !== undefined ||
+        request.cancelled === true
+      ) {
+        return json(404, { error: "not_found" });
+      }
+      request.cancelled = true;
+      for (const nf of request.claimed ?? []) this.inFlight.delete(nf);
+      return json(200, { status: "cancelled" });
     }
     if (url.pathname === "/v1/quote") {
       if (this.fee > v.limits.maxFee) return json(503, { error: "unavailable" });
@@ -599,7 +617,7 @@ export async function createWorld(
       }
     }
     if (url.origin === INDEXER) return indexer.handle(url);
-    if (url.origin === RELAYER) return relayer.handle(url, body);
+    if (url.origin === RELAYER) return relayer.handle(url, body, init?.method ?? "GET");
     throw new TypeError(`no route to ${url.origin}`);
   };
   rpc.account(relayer.channel);

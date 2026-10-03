@@ -15,7 +15,7 @@ import {
   txProofToScVal,
 } from "../extdata.ts";
 import { addressKeyFor, type AddressKey } from "../keys.ts";
-import type { Quote, RelayerClient } from "../net/relayer.ts";
+import type { HeldRequest, Quote, RelayerClient } from "../net/relayer.ts";
 import { proveTransaction } from "../proving.ts";
 import { buildTransaction, type BuiltTransaction, type ExtTerms } from "../transaction.ts";
 import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
@@ -138,6 +138,13 @@ async function chooseRelay(
       }
       if (pinned !== undefined && health.feeAddress !== pinned.feeAddress) {
         fail("deployment_mismatch", "the relayer names another fee address");
+      }
+      if (health.paused) {
+        fail(
+          "service_unavailable",
+          "the relayer has paused relaying; another relayer, or self-relay for an unshield, can take the payment",
+          { service: "relayer", paused: true },
+        );
       }
       if (!health.ready)
         fail("service_unavailable", "the relayer is not ready", { service: "relayer" });
@@ -530,6 +537,40 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
   }
 }
 
+// What the relayer reports of a held request. One that was sent, failed or was cancelled is not
+// followed by its ID any more.
+function takeHeld(plan: Plan, held: HeldRequest): void {
+  plan.relayerStatus = held.status;
+  if (held.hash !== undefined) plan.txHash = held.hash;
+  if (held.status === "failed") plan.error = held.code ?? "unknown";
+  if (held.hash !== undefined || held.status === "failed" || held.status === "cancelled") {
+    plan.heldId = undefined;
+  }
+}
+
+// Asks the relayer not to send a request it holds until its not_before. Whatever it answers, the
+// wallet sends the request again no more: a relayer that cannot cancel it has sent it, refused it,
+// or lost it. True once the request is known not to be sent.
+export async function cancelHeld(
+  plan: Plan,
+  heldId: string,
+  client: RelayerClient,
+): Promise<boolean> {
+  if (await client.cancelHeld(heldId)) {
+    plan.relayerStatus = "cancelled";
+    plan.heldId = undefined;
+    return true;
+  }
+  const held = await client.held(heldId);
+  if (held === undefined) {
+    plan.relayerStatus = "unknown";
+    plan.heldId = undefined;
+    return false;
+  }
+  takeHeld(plan, held);
+  return held.status === "cancelled" || (held.status === "failed" && held.hash === undefined);
+}
+
 // A request the relayer holds until its not_before lives in the relayer's memory only. Once sent,
 // it has a hash, which the plan takes; the chain's evidence still decides whether it landed. A
 // relayer that restarted no longer knows the request, so the same proof goes to it again while
@@ -545,12 +586,7 @@ export async function followHeld(
 ): Promise<void> {
   const held = await client.held(heldId);
   if (held !== undefined) {
-    plan.relayerStatus = held.status;
-    if (held.hash !== undefined) plan.txHash = held.hash;
-    if (held.status === "failed") plan.error = held.code ?? "unknown";
-    if (held.hash !== undefined || held.status === "failed" || held.status === "cancelled") {
-      plan.heldId = undefined;
-    }
+    takeHeld(plan, held);
     return;
   }
   if (latest >= plan.deadline) return;

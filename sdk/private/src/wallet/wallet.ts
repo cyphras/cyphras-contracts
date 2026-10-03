@@ -65,6 +65,7 @@ import {
 import {
   type ConfirmSpend,
   type Submission,
+  cancelHeld,
   checkIssuer,
   followHeld,
   spend,
@@ -1137,6 +1138,30 @@ export class PrivateWallet {
         burnToIssuer: true,
         onPlan: undefined,
       });
+    });
+  }
+
+  /**
+   * Asks the relayer that holds a payment until its notBefore not to send it. True once the
+   * relayer confirms it will not, false when it no longer holds the payment, as when it has sent
+   * it already; either way the wallet does not send it again. The payment keeps its notes until
+   * the chain shows that it cannot land, since the relayer has seen its proof.
+   */
+  cancelHeld(planId: string): Promise<boolean> {
+    return this.#run(async () => {
+      const plan = this.#core.state.plans.find((p) => p.id === planId);
+      if (plan === undefined) fail("not_found", "no plan has that ID");
+      const { heldId, route } = plan;
+      if (plan.state !== "submitted" || heldId === undefined || route.kind !== "relayer") {
+        fail("invalid_argument", "only a payment a relayer holds can be cancelled");
+      }
+      const cancelled = await cancelHeld(
+        plan,
+        heldId,
+        this.#relayerClients(route.url)[0] as RelayerClient,
+      );
+      await this.#core.save();
+      return cancelled;
     });
   }
 

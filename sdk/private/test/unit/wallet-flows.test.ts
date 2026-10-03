@@ -494,6 +494,126 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 1);
   });
 
+  it("cancels a held payment, which no one sends then, and keeps its notes until its deadline", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    const sub = await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      notBefore,
+    });
+    assert.equal(await alice.cancelHeld(sub.planId), true);
+    let [plan] = await alice.plans();
+    assert.equal(plan?.relayerStatus, "cancelled");
+    assert.equal(plan?.mustRetry, true);
+    // Neither the relayer, once due, nor the wallet, after a restart of the relayer, sends it.
+    world.advance(700);
+    world.relayer.releaseHeld();
+    world.relayer.restart();
+    await alice.sync();
+    assert.equal(world.relayer.submissions.length, 1);
+    assert.equal((await alice.balance()).locked, 100n * XLM);
+    world.advance(86_400);
+    world.fill(1);
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "dead");
+    assert.equal((await alice.balance()).spendable, 100n * XLM);
+    await bob.sync();
+    assert.equal((await bob.balance()).spendable, 0n);
+    await assert.rejects(alice.cancelHeld(sub.planId), isError("invalid_argument"));
+    await assert.rejects(alice.cancelHeld("00".repeat(16)), isError("not_found"));
+  });
+
+  it("reports a held payment the relayer has sent already as not cancelled", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    const sub = await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      notBefore,
+    });
+    world.advance(700);
+    world.relayer.releaseHeld();
+    assert.equal(await alice.cancelHeld(sub.planId), false);
+    const [plan] = await alice.plans();
+    assert.equal(plan?.relayerStatus, "success");
+    assert.match(plan?.txHash ?? "", /^[0-9a-f]{64}$/);
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+  });
+
+  it("passes over a relayer that has paused relaying, for another one or for self-relay", async () => {
+    const { world, alice } = await funded();
+    const destination = keypairFor("payee").publicKey();
+    world.rpc.account(keypairFor("payee"));
+    world.relayer.paused = true;
+    await assert.rejects(
+      alice.unshield({ to: destination, amount: 5n * XLM, maxFee: 2n * XLM, confirm: confirmAll }),
+      (err: unknown) =>
+        isError("service_unavailable")(err) && (err as CyphrasError).details["paused"] === true,
+    );
+    // Another relayer takes the payment.
+    const second = "http://relayer2.test";
+    const both = await openWallet(
+      {
+        ...world,
+        fetch: async (input, init) => {
+          const url = new URL(input);
+          if (url.origin !== second) return world.fetch(input, init);
+          world.relayer.paused = false;
+          try {
+            return await world.fetch(`${RELAYER}${url.pathname}${url.search}`, init);
+          } finally {
+            world.relayer.paused = true;
+          }
+        },
+      },
+      0,
+      new MemoryStore(),
+      undefined,
+      { relayers: [RELAYER, second] },
+    );
+    await both.sync();
+    const relayed = await both.unshield({
+      to: destination,
+      amount: 5n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    assert.ok("planId" in relayed);
+    // A self-relayed unshield needs no relayer.
+    await alice.sync();
+    const own = await alice.unshield({
+      to: destination,
+      amount: 5n * XLM,
+      selfRelay: world.signer("my account"),
+      confirm: confirmAll,
+    });
+    assert.ok("planId" in own);
+    await alice.sync();
+    assert.deepEqual(
+      world.vault.transfers.filter((t) => t.to === destination).map((t) => t.amount),
+      [5n * XLM, 5n * XLM],
+    );
+  });
+
+  it("unshields less than 1 XLM to an account that exists", async () => {
+    const { world, alice } = await funded();
+    const payee = world.signer("small payee").publicKey;
+    await alice.unshield({ to: payee, amount: XLM / 2n, maxFee: 2n * XLM, confirm: confirmAll });
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "settled");
+    assert.deepEqual(
+      world.vault.transfers.filter((t) => t.to === payee).map((t) => t.amount),
+      [XLM / 2n],
+    );
+  });
+
   it("refuses a destination that does not exist unless the payout can create it, and the vault itself", async () => {
     const { world, alice } = await funded();
     const missing = keypairFor("nobody yet").publicKey();
