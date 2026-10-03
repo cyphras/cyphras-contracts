@@ -215,9 +215,11 @@ type Released struct {
 	PaidTx       string
 }
 
-// PartPaid is the exit at the head of the queue after a release paid part of it.
+// PartPaid is what an exit still owes after a part payment: by release of the exit at the head
+// of the queue, or by claim of a stranded exit.
 type PartPaid struct {
 	ID         uint64
+	Stranded   bool
 	PayoutLeft *big.Int
 	FeeLeft    *big.Int
 }
@@ -316,6 +318,9 @@ func (s *State) apply(tx vault.Tx, call any, d *Delta, spent map[fr.Element]bool
 		}
 		return s.release(tx, c.Settled, d)
 	case vault.ExitPaid:
+		if _, ok := s.Stranded[c.ID]; ok {
+			return s.claimPart(tx, c, d)
+		}
 		return s.payPart(tx, c, d)
 	case vault.ExitStranded:
 		return s.strand(tx, c, d)
@@ -548,6 +553,37 @@ func (s *State) payPart(tx vault.Tx, c vault.ExitPaid, d *Delta) error {
 	return nil
 }
 
+// claimPart pays one part of a stranded exit, as claim does when the other part does not fit
+// today's window or the asset contract refuses it. Each part is paid whole or not at all.
+func (s *State) claimPart(tx vault.Tx, c vault.ExitPaid, d *Delta) error {
+	now := uint64(tx.ClosedAt)
+	if s.halted(now) {
+		return inconsistent("a claim while halted")
+	}
+	e := s.Stranded[c.ID]
+	whole := func(paid, owed *big.Int) bool { return paid.Sign() == 0 || paid.Cmp(owed) == 0 }
+	if !whole(c.PayoutPaid, e.Payout) || !whole(c.FeePaid, e.Fee) ||
+		new(big.Int).Add(c.PayoutPaid, c.PayoutLeft).Cmp(e.Payout) != 0 || new(big.Int).Add(c.FeePaid, c.FeeLeft).Cmp(e.Fee) != 0 {
+		return inconsistent("stranded exit %d part claimed differently from what it owes", c.ID)
+	}
+	paid := new(big.Int).Add(c.PayoutPaid, c.FeePaid)
+	if !s.fits(now, paid) {
+		return inconsistent("stranded exit %d claimed beyond today's window", c.ID)
+	}
+	e.Payout, e.Fee = new(big.Int).Set(c.PayoutLeft), new(big.Int).Set(c.FeeLeft)
+	s.QueuedTotal.Sub(s.QueuedTotal, paid)
+	s.pay(now, paid)
+	if s.Tvl.Sign() < 0 || s.QueuedTotal.Sign() < 0 {
+		return inconsistent("stranded exit %d pays more than the vault holds", c.ID)
+	}
+	id := c.ID
+	part := vault.Settled{ExtAmount: new(big.Int).Neg(c.PayoutPaid), Fee: new(big.Int).Set(c.FeePaid), Recipient: e.Recipient, Relayer: e.Relayer, ExitID: &id}
+	d.PartPaid = append(d.PartPaid, PartPaid{ID: c.ID, Stranded: true, PayoutLeft: e.Payout, FeeLeft: e.Fee})
+	d.Settlements = append(d.Settlements, Settlement{Settled: part, Ledger: tx.Ledger, ClosedAt: tx.ClosedAt, TxHash: tx.Hash})
+	s.notice(tx, "exit_paid", c, d)
+	return nil
+}
+
 // strand releases the exit at the head of the queue with the parts the asset contract refused
 // left owed.
 func (s *State) strand(tx vault.Tx, c vault.ExitStranded, d *Delta) error {
@@ -601,7 +637,7 @@ func (s *State) takeOff(now uint64, id uint64, paid *big.Int) error {
 	return nil
 }
 
-// claim pays the unpaid parts of a stranded exit.
+// claim pays what a stranded exit still owes and completes it.
 func (s *State) claim(tx vault.Tx, settled vault.Settled, d *Delta) error {
 	now := uint64(tx.ClosedAt)
 	if s.halted(now) {

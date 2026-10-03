@@ -390,6 +390,11 @@ func TestAStrandedExitLeavesTheQueueAndIsClaimedLater(t *testing.T) {
 	if _, err := applyAt(s.Clone(), day2, release(1, -300, 5)); !errors.Is(err, ErrInconsistent) {
 		t.Fatalf("a claim of more than is owed: %v", err)
 	}
+	// A claim can pay a part on its own, and only a whole part.
+	half := vault.ExitPaid{ID: 1, PayoutPaid: big.NewInt(150), FeePaid: new(big.Int), PayoutLeft: big.NewInt(150), FeeLeft: new(big.Int)}
+	if _, err := applyAt(s.Clone(), day2, half); !errors.Is(err, ErrInconsistent) {
+		t.Fatalf("a claim of part of a part: %v", err)
+	}
 	d, err = applyAt(s, day2, release(1, -300, 0))
 	if err != nil {
 		t.Fatal(err)
@@ -471,5 +476,38 @@ func TestACloneIsIndependent(t *testing.T) {
 	}
 	if *s.Pending[1].Flag != 2 || len(s.Pending) != 1 || s.Tvl.Int64() != 5 {
 		t.Fatal("clone shares state with its original")
+	}
+}
+
+func TestAClaimPaysEachStrandedPartOnItsOwn(t *testing.T) {
+	const day1, day2 = 1_728_000_000, 1_728_000_000 + 86_400
+	big1 := big.NewInt(1_000_000)
+	limits := vault.Limits{
+		MinDeposit: big.NewInt(1), MaxDeposit: big1, MaxDailyPerDepositor: big1, TvlCap: big1,
+		MaxDailyOutflow: big.NewInt(600), MaxFee: big.NewInt(50), LargeDepositThreshold: big1,
+	}
+	s := New()
+	if _, err := applyAt(s, day1, shield(1, 1, 2000), vault.Attested{UpTo: 1}, admission(1, 0),
+		vault.LimitsApplied{LimitsChange: vault.LimitsChange{Limits: limits, ReadyAt: day1}},
+		paidAtOnce(10, 2, -550, 0), queued(20, 4, 1, -80, 20)); err != nil {
+		t.Fatal(err)
+	}
+	// Both parts refused: the whole exit is stranded.
+	if _, err := applyAt(s, day2, vault.ExitStranded{ID: 1, Payout: big.NewInt(80), Fee: big.NewInt(20)}); err != nil {
+		t.Fatal(err)
+	}
+	// The relayer can receive again, the recipient not yet.
+	d, err := applyAt(s, day2, vault.ExitPaid{ID: 1, PayoutPaid: new(big.Int), FeePaid: big.NewInt(20), PayoutLeft: big.NewInt(80), FeeLeft: new(big.Int)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Stranded[1].Fee.Sign() != 0 || s.Stranded[1].Payout.Int64() != 80 || s.QueuedTotal.Int64() != 80 || s.Outflow.Int64() != 20 || !d.PartPaid[0].Stranded {
+		t.Fatalf("after the fee: %+v, queued %v, outflow %v", s.Stranded[1], s.QueuedTotal, s.Outflow)
+	}
+	if _, err := applyAt(s, day2, release(1, -80, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Stranded) != 0 || s.QueuedTotal.Sign() != 0 || s.Outflow.Int64() != 100 {
+		t.Fatalf("after the payout: %+v, queued %v, outflow %v", s.Stranded, s.QueuedTotal, s.Outflow)
 	}
 }

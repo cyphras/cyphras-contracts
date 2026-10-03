@@ -106,8 +106,8 @@ type NewNullifier struct {
 }
 
 // Settled is emitted by transact when it pays at once. With the exit's ID it is emitted by release
-// for the step that completes a queued exit, and by claim for the unpaid parts of a stranded exit;
-// it then carries only what that step paid.
+// for the step that completes a queued exit, and by claim for the step that completes a stranded
+// one; it then carries only what that step paid.
 type Settled struct {
 	ExtAmount *big.Int
 	Fee       *big.Int
@@ -125,8 +125,9 @@ type ExitQueued struct {
 	Relayer   string
 }
 
-// ExitPaid is emitted by release for a part payment of the exit at the head of the queue, when
-// the day's window cannot pay all it owes; the rest stays at the head.
+// ExitPaid is emitted for a part payment of an exit: by release for the exit at the head of the
+// queue when the day's window cannot pay all it owes, the rest staying at the head, and by claim
+// for the parts of a stranded exit it could pay, the rest staying stranded.
 type ExitPaid struct {
 	ID         uint64
 	PayoutPaid *big.Int

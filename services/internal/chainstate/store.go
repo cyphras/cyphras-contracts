@@ -459,13 +459,17 @@ func (st *Store) Commit(ctx context.Context, from, to uint32, s *State, d Delta,
 		}
 	}
 	for _, p := range d.PartPaid {
-		tag, err := tx.Exec(ctx, `UPDATE exits SET payout_left = $2::numeric, fee_left = $3::numeric WHERE id = $1 AND released_ledger IS NULL`,
-			int64(p.ID), p.PayoutLeft.String(), p.FeeLeft.String())
+		query := `UPDATE exits SET payout_left = $2::numeric, fee_left = $3::numeric WHERE id = $1 AND released_ledger IS NULL`
+		if p.Stranded {
+			query = `UPDATE exits SET unpaid_payout = $2::numeric, unpaid_fee = $3::numeric
+				WHERE id = $1 AND unpaid_payout IS NOT NULL AND claimed_ledger IS NULL`
+		}
+		tag, err := tx.Exec(ctx, query, int64(p.ID), p.PayoutLeft.String(), p.FeeLeft.String())
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() != 1 {
-			return inconsistent("exit %d part paid while not queued", p.ID)
+			return inconsistent("exit %d part paid while neither queued nor stranded", p.ID)
 		}
 	}
 	for _, e := range d.Released {

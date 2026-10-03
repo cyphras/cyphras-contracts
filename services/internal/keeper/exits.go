@@ -124,41 +124,24 @@ func handledAny(ret *xdr.ScVal) bool {
 	return !ok || n > 0
 }
 
-// Claim pays stranded exits whose recipient and relayer can receive again, oldest first, while
-// they fit today's window. A claim that still cannot pay fails in simulation and costs nothing.
+// Claim pays stranded exits whose recipient or relayer can receive again, oldest first, while
+// today's window has room. A claim pays each part that fits on its own; one that would pay
+// nothing fails in simulation and costs nothing.
 func (k *Keeper) Claim(ctx context.Context) error {
 	k.mu.RLock()
 	ids := slices.Sorted(maps.Keys(k.state.Stranded))
 	k.mu.RUnlock()
-	if len(ids) == 0 {
-		return nil
-	}
-	_, room, open, err := k.window(ctx)
-	if err != nil || !open {
-		return err
-	}
 	for _, id := range ids {
-		exits, err := k.readExits(ctx, []uint64{id}, vault.StrandedKey)
-		if err != nil {
+		_, room, open, err := k.window(ctx)
+		if err != nil || !open || room.Sign() <= 0 {
 			return err
-		}
-		if len(exits) == 0 {
-			continue
-		}
-		outflow := new(big.Int).Add(exits[0].Payout, exits[0].Fee)
-		if outflow.Cmp(room) > 0 {
-			continue
 		}
 		_, err = k.call(ctx, fmt.Sprintf("claim of exit %d", id), func() (txnbuild.Operation, error) {
 			return k.invoke("claim", vault.U64(id))
 		})
-		if errors.Is(err, submit.ErrSimulation) {
-			continue
-		}
-		if err != nil {
+		if err != nil && !errors.Is(err, submit.ErrSimulation) {
 			return err
 		}
-		room.Sub(room, outflow)
 	}
 	return nil
 }
