@@ -3,7 +3,7 @@ use soroban_sdk::{
         Address as _, AuthorizedFunction, AuthorizedInvocation, Events as _, Ledger,
         MuxedAddress as _,
     },
-    Address, Event, IntoVal, MuxedAddress, Symbol,
+    Address, Event, IntoVal, InvokeError, MuxedAddress, Symbol,
 };
 
 use super::setup::{outcome, Setup, DAY, XLM};
@@ -375,8 +375,19 @@ fn a_transact_is_atomic_when_its_payout_fails() {
     let proof = s.prove(&ext);
     let leaf = s.vault.next_leaf_index();
     let status = s.vault.status();
-    assert!(s.vault.try_transact(&proof, &ext, &relayer).is_err());
+    // The asset contract refuses the payout with its own InsufficientAccountReserve, a code no
+    // vault error uses.
+    assert!(matches!(
+        s.vault.try_transact(&proof, &ext, &relayer),
+        Err(Err(InvokeError::Contract(14)))
+    ));
     assert!(!s.vault.is_spent(&proof.input_nullifiers.get_unchecked(0)));
     assert_eq!(s.vault.next_leaf_index(), leaf);
     assert_eq!(s.vault.status(), status);
+}
+
+#[test]
+fn the_vaults_error_codes_run_from_100_clear_of_the_asset_contracts() {
+    assert_eq!(Error::BadConfig as u32, 100);
+    assert_eq!(Error::NothingClaimable as u32, 143);
 }

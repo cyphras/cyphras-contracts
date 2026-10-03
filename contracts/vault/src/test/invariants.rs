@@ -6,7 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use soroban_sdk::{
-    testutils::MuxedAddress as _, token::StellarAssetClient, Address, MuxedAddress, Vec, U256,
+    testutils::MuxedAddress as _, token::StellarAssetClient, Address, InvokeError, MuxedAddress,
+    Vec, U256,
 };
 
 use super::setup::{outcome, Classic, Setup, DAY, DELAY_LARGE, DELAY_SMALL, XLM};
@@ -17,6 +18,9 @@ const WEEK: u64 = 7 * DAY;
 // The accounts exits pay, as recipients and as relayers.
 const PARTIES: usize = 3;
 const MUXED_ID: u64 = 77;
+// The asset contract's BalanceDeauthorizedError, with which it refuses a party that may not hold
+// the asset.
+const DEAUTHORIZED: u32 = 11;
 
 #[derive(Clone)]
 struct Deposit {
@@ -826,14 +830,6 @@ impl Run {
         let s = &self.s;
         let v = &s.vault;
         let ids = |list: &[u64]| Vec::from_slice(&s.env, list);
-        // The asset contract refuses a deauthorized party with its own error code 11, which
-        // reaches the caller unchanged and reads as the vault's `WrongVault`. No call in these
-        // runs can fail with the vault's own `WrongVault`.
-        let paid = |result: Result<(), Error>| match result {
-            Ok(()) => Ok(Done::Unit),
-            Err(Error::WrongVault) => Err(Fail::Reverted),
-            Err(e) => Err(Fail::Refused(e)),
-        };
         let refused = |result: Result<Done, Error>| result.map_err(Fail::Refused);
         match op {
             Op::Shield(d, amount) => {
@@ -871,7 +867,11 @@ impl Run {
                     };
                     proof = s.prove_with(&ext, proof.root, nullifiers, [s.field(), s.field()]);
                 }
-                let result = paid(outcome(v.try_transact(&proof, &ext, relayer)));
+                // A refused plain transfer fails the call with the asset contract's own code.
+                let result = match v.try_transact(&proof, &ext, relayer) {
+                    Err(Err(InvokeError::Contract(DEAUTHORIZED))) => Err(Fail::Reverted),
+                    result => refused(outcome(result).map(|_| Done::Unit)),
+                };
                 if result.is_ok() {
                     self.spent.extend(proof.input_nullifiers.iter());
                 }

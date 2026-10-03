@@ -1,6 +1,6 @@
 use soroban_sdk::{
     testutils::{AuthorizedFunction, AuthorizedInvocation, Events as _, MuxedAddress as _},
-    vec, Event, IntoVal, MuxedAddress, Symbol,
+    vec, Event, IntoVal, InvokeError, MuxedAddress, Symbol,
 };
 
 use super::setup::{outcome, Setup, DAY, DELAY_SMALL, XLM};
@@ -245,7 +245,11 @@ fn a_depositor_without_the_funds_cannot_shield() {
     let depositor = s.account("depositor", XLM);
     let ext = s.ext(2 * XLM, 0, &depositor, &depositor);
     let proof = s.prove(&ext);
-    assert!(s.vault.try_shield(&proof, &ext, &depositor).is_err());
+    // The asset contract refuses the pull with its own BalanceError, a code no vault error uses.
+    assert!(matches!(
+        s.vault.try_shield(&proof, &ext, &depositor),
+        Err(Err(InvokeError::Contract(10)))
+    ));
     // Nothing of the failed call remains.
     assert!(!s.vault.is_spent(&proof.input_nullifiers.get_unchecked(0)));
     assert_eq!(s.vault.status().next_deposit_id, 1);
