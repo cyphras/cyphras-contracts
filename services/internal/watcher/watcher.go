@@ -457,7 +457,7 @@ func (w *Watcher) judgeAttestation(ctx context.Context, c attestCheck) error {
 				id, c.upTo, c.ledger, eligible-600-uint64(c.closedAt))
 		}
 	}
-	return w.db.dropAttestCheck(ctx, c.upTo, c.ledger)
+	return w.db.dropAttestCheck(ctx, c)
 }
 
 // RetryAttestations judges the attestations whose check could not run when they were seen.

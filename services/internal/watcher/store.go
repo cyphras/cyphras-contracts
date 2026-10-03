@@ -182,9 +182,18 @@ func (s store) addAttestCheck(ctx context.Context, tx pgx.Tx, c attestCheck) err
 	return err
 }
 
-func (s store) dropAttestCheck(ctx context.Context, upTo uint64, ledger uint32) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM watch_attest_checks WHERE up_to = $1 AND ledger = $2`, int64(upTo), int64(ledger))
-	return err
+// dropAttestCheck forgets the deposits a check judged, and the stored check once none is left: an
+// attestation and an unflag in one ledger share it, and one may be judged before the other.
+func (s store) dropAttestCheck(ctx context.Context, c attestCheck) error {
+	judged := make([]int64, len(c.covered))
+	for i, id := range c.covered {
+		judged[i] = int64(id)
+	}
+	batch := &pgx.Batch{}
+	batch.Queue(`UPDATE watch_attest_checks SET covered = ARRAY(SELECT unnest(covered) EXCEPT SELECT unnest($3::bigint[]) ORDER BY 1)
+		WHERE up_to = $1 AND ledger = $2`, int64(c.upTo), int64(c.ledger), judged)
+	batch.Queue(`DELETE FROM watch_attest_checks WHERE up_to = $1 AND ledger = $2 AND cardinality(covered) = 0`, int64(c.upTo), int64(c.ledger))
+	return s.pool.SendBatch(ctx, batch).Close()
 }
 
 func (s store) attestChecks(ctx context.Context) ([]attestCheck, error) {
