@@ -359,12 +359,26 @@ describe("wallet: spends", () => {
     assert.equal(world.relayer.submissions.length, 1);
     let [plan] = await alice.plans();
     assert.equal(plan?.state, "submitted");
-    assert.notEqual(plan?.relayerStatus, "failed");
+    assert.equal(plan?.relayerStatus, "held");
     world.advance(700);
     world.relayer.releaseHeld();
     await alice.sync();
     [plan] = await alice.plans();
     assert.equal(plan?.state, "settled");
+  });
+
+  it("sends a forgotten held payment again in the next sync when the relayer is busy", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 600;
+    await alice.send({ to: bob.generateAddress(), amount: 1n * XLM, maxFee: 2n * XLM, notBefore });
+    world.relayer.restart();
+    world.relayer.failures.push({ error: "unavailable" });
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.relayerStatus, "unknown");
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.relayerStatus, "held");
+    assert.equal(world.relayer.submissions.length, 2);
   });
 
   it("stops following a held payment the relayer dropped when it was due", async () => {

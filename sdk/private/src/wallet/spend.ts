@@ -504,8 +504,13 @@ export async function followHeld(
     plan.txHash = result.hash;
     plan.heldId = result.heldId;
     plan.relayerStatus = result.hash === undefined ? "held" : "pending";
-  } else if (result.error !== "duplicate") {
-    // A duplicate is a request the relayer still holds after all.
+  } else if (result.error === "duplicate") {
+    // The relayer still holds the request after all.
+    plan.relayerStatus = "held";
+  } else if (result.error === "unavailable" || result.error === "rate_limited") {
+    // A busy relayer is asked again in the next sync.
+    plan.relayerStatus = "unknown";
+  } else {
     plan.relayerStatus = "failed";
     plan.error = result.error;
     plan.heldId = undefined;
