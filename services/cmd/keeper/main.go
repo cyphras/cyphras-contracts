@@ -40,7 +40,7 @@ func main() {
 	if err := base.StartAlerts(ctx, pool); err != nil {
 		service.Fatal(log, "alerts", err)
 	}
-	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase)
+	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase, base.Log)
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}

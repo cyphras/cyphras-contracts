@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/keypair"
@@ -98,7 +99,7 @@ func ExitKeys() (uint32, error) {
 
 // Engine builds the submission engine from INCLUSION_FEE_CAP and RESOURCE_FEE_CAP, in stroops,
 // and the defaults the services share.
-func Engine(c rpc.Client, passphrase string) (*submit.Engine, error) {
+func Engine(c rpc.Client, passphrase string, log *slog.Logger) (*submit.Engine, error) {
 	inclusionCap, err := config.Int("INCLUSION_FEE_CAP", 1_000_000)
 	if err != nil {
 		return nil, err
@@ -112,6 +113,6 @@ func Engine(c rpc.Client, passphrase string) (*submit.Engine, error) {
 	}
 	return &submit.Engine{
 		RPC: c, Passphrase: passphrase, MaxInclusionFee: inclusionCap, MaxResourceFee: resourceCap, ResourceMarginPct: 15,
-		Validity: 90 * time.Second, Poll: 2 * time.Second,
+		Validity: 90 * time.Second, Poll: 2 * time.Second, Log: log,
 	}, nil
 }

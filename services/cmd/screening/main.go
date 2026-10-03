@@ -129,7 +129,7 @@ func build(ctx context.Context, base *service.Base) (*built, error) {
 	if err := service.CheckHotSigner(ctx, base.RPC, inst.Config.ASP, hot); err != nil {
 		return nil, err
 	}
-	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase)
+	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase, base.Log)
 	if err != nil {
 		return nil, err
 	}

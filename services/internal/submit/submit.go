@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -67,6 +68,7 @@ type Engine struct {
 	// Poll is the interval between getTransaction calls.
 	Poll time.Duration
 	Now  func() time.Time
+	Log  *slog.Logger
 
 	costMu sync.Mutex
 	costs  ledgerCosts
@@ -213,7 +215,7 @@ func perKB(bytes uint64, rate int64) int64 {
 // and the instructions, written bytes, new persistent bytes and event bytes it may add.
 type Extra struct {
 	// ReadWrite are entries added to the footprint as read-write, or moved there from read-only,
-	// in the order they are added while the network's limits allow.
+	// in their order, as many as the network's limits allow.
 	ReadWrite    []xdr.LedgerKey
 	Instructions uint32
 	WriteBytes   uint32
@@ -262,20 +264,22 @@ func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData,
 		}
 	}
 	var promoted []int
-	writes, newReads := int64(0), int64(0)
+	writes, newReads, asked := int64(0), int64(0), 0
 	for _, k := range x.ReadWrite {
 		name := keyOf(k)
 		if written[name] {
 			continue
 		}
+		written[name] = true
+		asked++
 		if uint32(len(fp.ReadWrite)+len(promoted)) >= c.maxWriteEntries {
-			break
+			continue
 		}
 		if i, ok := read[name]; ok {
 			promoted = append(promoted, i)
 		} else {
 			if uint32(len(fp.ReadOnly)+len(fp.ReadWrite)) >= c.maxFootprint || (classic(k) && reads >= c.maxReadEntries) {
-				break
+				continue
 			}
 			fp.ReadWrite = append(fp.ReadWrite, k)
 			if classic(k) {
@@ -283,8 +287,11 @@ func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData,
 				newReads++
 			}
 		}
-		written[name] = true
 		writes++
+	}
+	if left := asked - int(writes); left > 0 && e.Log != nil {
+		// The call still goes, with less room than its other path may need.
+		e.Log.Warn("the network's limits left entries out of a call's footprint", "asked", asked, "left_out", left)
 	}
 	slices.Sort(promoted)
 	for j, i := range promoted {
