@@ -237,8 +237,9 @@ func TestFundersBelowBothTheShareAndTheFloorAreDust(t *testing.T) {
 		{From: grandpa, Asset: "native", Amount: n(99_000_000)},
 		// An asset without a floor always matters.
 		{From: clean, Asset: usdc, Amount: n(1)},
-		// So does an amount Horizon does not give.
+		// So does an amount Horizon does not give, even beside a known amount that is dust.
 		{From: contract, Asset: "native"},
+		{From: contract, Asset: "native", Amount: n(1)},
 		// Value out of a pool names nobody.
 		{Asset: "native", Amount: n(1_000)},
 	})

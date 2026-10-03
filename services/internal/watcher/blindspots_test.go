@@ -9,6 +9,7 @@ import (
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/alert"
 	"github.com/cyphras/cyphras-contracts/services/internal/follow"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc/rpctest"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
@@ -71,6 +72,11 @@ func TestAFollowerFaultPages(t *testing.T) {
 	}
 	if !errors.Is(err, follow.ErrFault) || !h.pages.has("ingest_fault") {
 		t.Fatalf("fault %v, pages %v", err, h.pages.codes())
+	}
+	for _, a := range h.pages.alerts {
+		if a.Code == "ingest_fault" && a.Severity != alert.Critical {
+			t.Fatalf("an ingest fault paged as %s", a.Severity)
+		}
 	}
 	beats := 0
 	h.w.SetHeartbeat(func(context.Context) error { beats++; return nil })

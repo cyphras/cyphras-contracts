@@ -309,3 +309,18 @@ func TestALiftWaitsForAReviewOfWhatTheCheckFoundSince(t *testing.T) {
 		t.Fatalf("after the second review: %v", got)
 	}
 }
+
+func TestAttestationIsWithheldWhenACoveredFinalCheckIsStale(t *testing.T) {
+	h := newHarness(t)
+	id := h.shield(clean, 10_000_000)
+	now := uint64(h.now.Unix())
+	stale, recent := now-11*60, now-60
+	rows := []row{{id: id, firstCheck: "pass", recheck: "pass", recheckAt: &stale}}
+	if err := h.s.chainAgrees(context.Background(), 0, id, now, rows); err == nil {
+		t.Fatal("a final check older than its window vouched for an unflagged deposit")
+	}
+	rows[0].recheckAt = &recent
+	if err := h.s.chainAgrees(context.Background(), 0, id, now, rows); err != nil {
+		t.Fatal(err)
+	}
+}
