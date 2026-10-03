@@ -464,6 +464,45 @@ describe("wallet safety: syncs that fail", () => {
       ["settled"],
     );
   });
+
+  it("rebuilds on rescan the fate of a plan that never landed but was taken for superseded", async () => {
+    const world = await createWorld();
+    const backend = new MemoryStore();
+    const alice = await openWallet(world, 0, backend);
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    // A state written by an older release that took a forged spend for another plan's.
+    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const state = (await loadState(sealed)) as WalletState;
+    const plan = state.plans[0] as Plan;
+    plan.state = "superseded";
+    plan.evidence = [
+      {
+        txHash: "ab".repeat(32),
+        ledger: 1,
+        nullifiers: [true, false],
+        outputs: [undefined, undefined],
+        foreign: true,
+        checked: true,
+      },
+    ];
+    await saveState(sealed, state);
+    world.advance(121 * 5);
+    const reopened = await openWallet(world, 0, backend);
+    await reopened.rescan();
+    // Rebuilt from the chain alone, it never landed, and its deadline has passed.
+    const [rebuilt] = await reopened.plans();
+    assert.equal(rebuilt?.state, "dead");
+    assert.equal(rebuilt?.mustRetry, true);
+    assert.equal((await reopened.balance()).spendable, 100n * XLM);
+  });
 });
 
 describe("wallet safety: availability", () => {
