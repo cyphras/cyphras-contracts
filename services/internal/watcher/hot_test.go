@@ -16,6 +16,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/follow"
 	"github.com/cyphras/cyphras-contracts/services/internal/horizon"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
@@ -366,5 +367,39 @@ func TestTwoHotAccountsDrainedInOneTransactionBothPage(t *testing.T) {
 	}
 	if len(got) != 2 || !strings.Contains(got[0], "channel-1") || !strings.Contains(got[1], "channel-2") {
 		t.Fatalf("pages %v", got)
+	}
+}
+
+// history serves the chain's vault events, as the archive would.
+type history struct{ h *harness }
+
+func (s history) Events(_ context.Context, from, to uint32) ([]vault.RawEvent, error) {
+	var out []vault.RawEvent
+	for _, e := range s.h.chain.Events {
+		if e.Contract == vaulttest.Vault && e.Ledger >= from && e.Ledger <= to {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func TestCatchingUpPastTheRPCsRetentionIsNotHeldBackByHotAccounts(t *testing.T) {
+	h := newHarness(t, func(c *Config) {
+		c.HotAccounts = []HotAccount{{Name: "channel-1", Address: hotAccount}}
+		c.Lumens = strkey.MustEncode(strkey.VersionByteContract, make([]byte, 32))
+	})
+	h.activity()
+	h.chain.NextLedger(5)
+	h.publish()
+	h.primary.Oldest = h.chain.Ledger - 1
+	h.second.Oldest = h.chain.Ledger - 1
+	h.f.History = []follow.Source{history{h}}
+	for range 10 {
+		if _, err := h.f.Step(context.Background()); err != nil {
+			t.Fatalf("catching up stopped at %d: %v", h.w.Cursor(), err)
+		}
+	}
+	if h.w.Cursor() != h.chain.Ledger {
+		t.Fatalf("caught up to %d of %d", h.w.Cursor(), h.chain.Ledger)
 	}
 }

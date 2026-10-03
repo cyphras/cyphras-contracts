@@ -65,6 +65,11 @@ func (s RPCSource) Events(ctx context.Context, from, to uint32) ([]vault.RawEven
 	for {
 		resp, err := s.Client.GetEvents(ctx, req)
 		if err != nil {
+			// An RPC refuses a start ledger it no longer keeps with an error worded its own way, so
+			// its health tells that apart from a failure.
+			if h, herr := s.Client.GetHealth(ctx); herr == nil && from < h.OldestLedger {
+				return nil, fmt.Errorf("%w: ledger %d, oldest %d", ErrRetention, from, h.OldestLedger)
+			}
 			return nil, err
 		}
 		if resp.OldestLedger > from {

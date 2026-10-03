@@ -87,6 +87,22 @@ func TestTheRPCSourceFollowsTheCursorThroughFullPages(t *testing.T) {
 	}
 }
 
+func TestARangeTheRPCNoLongerKeepsIsPastItsRetention(t *testing.T) {
+	c := activity()
+	f := rpctest.New(passphrase, 100)
+	load(f, c.Events)
+	f.Oldest = 50
+	src := RPCSource{Client: f, Contract: vaulttest.Vault, PageLimit: 7}
+	if _, err := src.Events(context.Background(), 10, 40); !errors.Is(err, ErrRetention) {
+		t.Fatalf("a range before the oldest ledger: %v", err)
+	}
+	// Any other refusal stays a failure.
+	f.Fail["getEvents"] = errors.New("rpc down")
+	if _, err := src.Events(context.Background(), 60, 70); err == nil || errors.Is(err, ErrRetention) {
+		t.Fatalf("a failure in range: %v", err)
+	}
+}
+
 type memSink struct {
 	cursor  uint32
 	batches []Batch
