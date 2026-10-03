@@ -696,7 +696,9 @@ func (w *Watcher) checkHotTransfers(ctx context.Context, b follow.Batch) error {
 				} else if t, err := vault.DecodeBurn(e); err == nil {
 					what = fmt.Sprintf("%v units of contract %s, burned", t.Amount, c.contract)
 				}
-				w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("hot_account_transfer_%.16s_%d", e.TxHash, e.Index),
+				// Two operations of one transaction may each drain a hot account, so the code names the
+				// event by its operation too.
+				w.alerts.Raise(ctx, alert.Critical, fmt.Sprintf("hot_account_transfer_%.16s_%d_%d", e.TxHash, e.Op, e.Index),
 					"the %s account %s sent %s in ledger %d, which only a stolen key does", h.Name, h.Address, what, e.Ledger)
 			}
 		}

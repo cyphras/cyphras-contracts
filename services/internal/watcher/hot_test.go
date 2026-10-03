@@ -334,3 +334,37 @@ func TestAHotAccountsBalanceOfTheVaultsAssetHasAFloor(t *testing.T) {
 		t.Fatalf("pages %v", h.pages.codes())
 	}
 }
+
+func TestTwoHotAccountsDrainedInOneTransactionBothPage(t *testing.T) {
+	lumens := strkey.MustEncode(strkey.VersionByteContract, make([]byte, 32))
+	other := keypair.MustRandom().Address()
+	h := newHarness(t, func(c *Config) {
+		c.HotAccounts = []HotAccount{{Name: "channel-1", Address: hotAccount}, {Name: "channel-2", Address: other}}
+		c.Lumens = lumens
+	})
+	h.activity()
+	h.sync()
+	native := xdr.ScString("native")
+	nativeTopic := xdr.ScVal{Type: xdr.ScValTypeScvString, Str: &native}
+	h.emit(lumens, "transfer", address(t, hotAccount), address(t, thief), nativeTopic)
+	// The second operation of the same transaction moves lumens out of the other account.
+	c := h.chain
+	second := c.Events[len(c.Events)-1]
+	second.Op = 1
+	topic, err := xdr.MarshalBase64(address(t, other))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Topics = []string{second.Topics[0], topic, second.Topics[2], second.Topics[3]}
+	c.Events = append(c.Events, second)
+	h.sync()
+	var got []string
+	for _, a := range h.pages.alerts {
+		if strings.HasPrefix(a.Code, "hot_account_transfer_") {
+			got = append(got, a.Message)
+		}
+	}
+	if len(got) != 2 || !strings.Contains(got[0], "channel-1") || !strings.Contains(got[1], "channel-2") {
+		t.Fatalf("pages %v", got)
+	}
+}
