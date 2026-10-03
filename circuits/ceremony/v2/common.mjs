@@ -228,6 +228,9 @@ export function readZkey(data, label) {
   for (let i = file.u32(); i > 0; i--) {
     const id = file.u32();
     const length = Number(file.take(8).readBigUInt64LE(0));
+    // A Groth16 zkey has sections 1 to 10. snarkjs skips any other, which would let unchecked
+    // bytes ride along in a published file.
+    if (id < 1 || id > 10) throw new Error(`${label} has an unknown section ${id}`);
     if (sections.has(id)) throw new Error(`${label} repeats section ${id}`);
     sections.set(id, file.take(length));
   }

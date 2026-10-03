@@ -26,7 +26,7 @@ recomputed here rather than read from a published hash, and any mismatch exits n
 Usage:
   node verify.mjs <transaction.r1cs> <${PTAU_NAME}> <transaction_final.zkey>
       --contributions <file> --vk <verification_key.json> (--drand-round <n> | --beacon <hex>)
-      [--vk-sha256 <hex>]
+      [--vk-sha256 <hex>] [--zkey-sha256 <hex>]
 
   --contributions <file>  the contribution hashes from the signed attestations, one per line in
                           contribution order, each optionally followed by the contributor's name;
@@ -39,6 +39,8 @@ Usage:
                           when both are given
   --vk-sha256 <hex>       the SHA-256 the vault build pins (MAINNET_SHA256 in the verifier's
                           build/check.rs), compared with the one recomputed here
+  --zkey-sha256 <hex>     the SHA-256 of the final zkey in the transcript, compared with the one
+                          recomputed here
 
 It checks that the r1cs is the frozen circuit and the ptau the published Hermez file; that the
 zkey holds exactly the attested contributions, in order, followed by the beacon; that snarkjs
@@ -74,6 +76,7 @@ run(USAGE, async (argv) => {
       "drand-round": { type: "string" },
       beacon: { type: "string" },
       "vk-sha256": { type: "string" },
+      "zkey-sha256": { type: "string" },
     },
   });
   const beaconGiven = values.beacon !== undefined || values["drand-round"] !== undefined;
@@ -86,6 +89,7 @@ run(USAGE, async (argv) => {
   const attested = readAttested(values.contributions);
   let beacon = values.beacon && parseHex(values.beacon, 32, "--beacon");
   const pin = values["vk-sha256"] && parseHex(values["vk-sha256"], 32, "--vk-sha256");
+  const zkeyPin = values["zkey-sha256"] && parseHex(values["zkey-sha256"], 32, "--zkey-sha256");
 
   const r1csSha256 = expectHash(
     r1cs,
@@ -103,6 +107,10 @@ run(USAGE, async (argv) => {
   console.log(`ptau ${ptauPath}\n  blake2b ${ptauBlake2b}, the published value`);
   console.log(`  sha256 ${digest(ptau)}`);
   console.log(`zkey ${zkeyPath}\n  sha256 ${digest(zkey)}`);
+  if (zkeyPin) {
+    expectHash(zkey, "sha256", zkeyPin, `${zkeyPath} is not the final zkey of the transcript`);
+    console.log("  equal to the transcript's value");
+  }
 
   if (values["drand-round"] !== undefined) {
     const round = parseRound(values["drand-round"]);
