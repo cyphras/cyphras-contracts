@@ -3,7 +3,7 @@ import { createCipheriv, createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import { mnemonicToSeedSync } from "@scure/bip39";
 import { decodeAddress } from "../../src/address.ts";
-import { L, packPoint, scalarMul } from "../../src/babyjub.ts";
+import { L, type Point, addPoints, packPoint, scalarMul } from "../../src/babyjub.ts";
 import { bigIntToBytesLE, bytesToHex, hexToBytes } from "../../src/bytes.ts";
 import {
   AddressCache,
@@ -13,6 +13,7 @@ import {
   ephemeralKey,
   recoverOutgoing,
 } from "../../src/encryption.ts";
+import { P } from "../../src/field.ts";
 import { defaultAddressKey, deriveSpendingKeys } from "../../src/keys.ts";
 import { noteCommitment, randomFieldElement, randomScalar } from "../../src/notes.ts";
 import { encryptionVectors } from "../../scripts/vectors.ts";
@@ -208,6 +209,64 @@ describe("note encryption", () => {
       assert.equal(found?.value, note.value);
       assert.deepEqual(ephemeralKey(blob), scalarMul(address.gd, esk));
     }
+  });
+
+  describe("crafted ciphertexts", () => {
+    const recipient = accounts[1] as typeof sender;
+    const address = defaultAddressKey(recipient);
+    const note = { ...address, value: 5_000_000n, rcm: randomFieldElement() };
+    const cm = noteCommitment(note);
+    const esk = randomScalar();
+
+    // A ciphertext laid out as the format says, from parts a test chooses: its ephemeral key, the
+    // shared point its keys come from and the commitment its outgoing key is bound to.
+    function craft(epk: Point, shared: Point, boundTo: bigint): Uint8Array {
+      const epkPacked = packPoint(epk);
+      const sharedPacked = packPoint(shared);
+      const tag = parseInt(sha256Hex("cyphras/v2/tag", sharedPacked, epkPacked).slice(0, 2), 16);
+      const kEnc = hexToBytes(sha256Hex("cyphras/v2/enc", sharedPacked, epkPacked));
+      const ock = hexToBytes(
+        sha256Hex("cyphras/v2/out", sender.ovk, bigIntToBytesLE(boundTo, 32), epkPacked),
+      );
+      const enc = Uint8Array.from([
+        0x02,
+        ...note.d,
+        ...bigIntToBytesLE(note.value, 8),
+        ...bigIntToBytesLE(note.rcm, 32),
+      ]);
+      const out = Uint8Array.from([...packPoint(note.pkd), ...bigIntToBytesLE(esk, 32)]);
+      return Uint8Array.from([
+        ...epkPacked,
+        tag,
+        ...hexToBytes(sealWithZeroNonce(kEnc, enc)),
+        ...hexToBytes(sealWithZeroNonce(ock, out)),
+      ]);
+    }
+
+    const epk = scalarMul(note.gd, esk);
+    const honest = craft(epk, scalarMul(note.pkd, esk), cm);
+
+    it("are read like encrypted outputs when every part is right", () => {
+      assert.equal(decryptIncoming(recipient, cm, honest)?.value, note.value);
+      assert.equal(recoverOutgoing(sender.ovk, cm, honest)?.esk, esk);
+    });
+
+    it("hold no note for the recipient when epk has a small-order part, though they decrypt", () => {
+      const twisted = addPoints(epk, [0n, P - 1n]);
+      const blob = craft(twisted, scalarMul(twisted, recipient.ivk), cm);
+      assert.equal(decryptIncoming(recipient, cm, blob), undefined);
+    });
+
+    it("hold no outgoing note when epk is not esk times g_d", () => {
+      const blob = craft(scalarMul(note.gd, esk + 1n), scalarMul(note.pkd, esk), cm);
+      assert.equal(recoverOutgoing(sender.ovk, cm, blob), undefined);
+    });
+
+    it("hold no outgoing note under a commitment that is not the note's", () => {
+      const other = cm ^ 1n;
+      const blob = craft(epk, scalarMul(note.pkd, esk), other);
+      assert.equal(recoverOutgoing(sender.ovk, other, blob), undefined);
+    });
   });
 
   it("refuses an esk outside [1, L)", () => {

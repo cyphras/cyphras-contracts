@@ -136,9 +136,8 @@ export class AddressCache {
   }
 }
 
-// Trial decryption with the incoming viewing key. The view tag is checked before anything else
-// that depends on the output being ours; the subgroup check of epk runs only on a tag match, which
-// rejects exactly the same outputs as checking it first, at a fraction of the cost.
+// Trial decryption with the incoming viewing key. epk is checked to be of prime order before the
+// view tag, so every output costs the same work up to the tag, whether or not it is ours.
 export function decryptIncoming(
   keys: IncomingKeys,
   cm: bigint,
@@ -149,9 +148,9 @@ export function decryptIncoming(
   const epkPacked = blob.subarray(...EPK);
   const epk = unpackPoint(epkPacked);
   if (epk === undefined || isIdentity(epk)) return undefined;
+  if (!isPrimeOrderPoint(epk)) return undefined;
   const sharedPacked = packPoint(scalarMul(epk, keys.ivk));
   if (viewTag(sharedPacked, epkPacked) !== blob[TAG_OFFSET]) return undefined;
-  if (!isPrimeOrderPoint(epk)) return undefined;
   const parsed = parsePlaintext(
     open(encryptionKey(sharedPacked, epkPacked), blob.subarray(...C_ENC)),
   );
