@@ -91,13 +91,14 @@ func paidBy(owed []*big.Int, now, haltedUntil uint64, maxDaily *big.Int) []*uint
 // so a client finds its own exit by the ID or the transaction hash its transaction gave it,
 // without asking for it.
 func (ix *Indexer) exits(w http.ResponseWriter, r *http.Request) {
-	h, ok := ix.serving(w)
-	if !ok {
+	if _, ok := ix.serving(w); !ok {
 		return
 	}
 	now := uint64(ix.now().Unix())
 	ix.mu.RLock()
-	s := ix.state
+	// The stored rows are cut at the ledger of the state in memory, so neither shows an exit the
+	// other has moved on.
+	s, upTo := ix.state, ix.cursor
 	var maxDaily *big.Int
 	switch {
 	case ix.instance != nil:
@@ -134,7 +135,7 @@ func (ix *Indexer) exits(w http.ResponseWriter, r *http.Request) {
 	for i, at := range paidBy(owed, now, haltedUntil, maxDaily) {
 		list[i].PaidBy = at
 	}
-	settled, err := ix.db.settledExits(r.Context(), ix.now().Add(-resolvedWindow).Unix(), h.IngestedLedger)
+	settled, err := ix.db.settledExits(r.Context(), ix.now().Add(-resolvedWindow).Unix(), upTo)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return
@@ -148,6 +149,6 @@ func (ix *Indexer) exits(w http.ResponseWriter, r *http.Request) {
 	httpapi.JSON(w, http.StatusOK, map[string]any{
 		"head": head, "tail": tail, "queued_total": queuedTotal, "max_daily_outflow": maxDaily.String(),
 		"window":       Window{Day: today, Used: used.String(), ResetsAt: (today + 1) * secondsPerDay},
-		"halted_until": haltedUntil, "exits": list, "complete_to": h.IngestedLedger,
+		"halted_until": haltedUntil, "exits": list, "complete_to": upTo,
 	})
 }

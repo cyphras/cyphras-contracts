@@ -111,11 +111,12 @@ func (ix *Indexer) nullifiers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (ix *Indexer) deposits(w http.ResponseWriter, r *http.Request) {
-	h, ok := ix.serving(w)
-	if !ok {
+	if _, ok := ix.serving(w); !ok {
 		return
 	}
 	ix.mu.RLock()
+	// The stored rows are cut at the ledger of the state read here.
+	upTo := ix.cursor
 	inst := ix.instance
 	attested := ix.state.AttestedUpTo
 	delays := make(map[uint64]uint64, len(ix.delays))
@@ -123,7 +124,7 @@ func (ix *Indexer) deposits(w http.ResponseWriter, r *http.Request) {
 		delays[id] = d
 	}
 	ix.mu.RUnlock()
-	rows, err := ix.db.pending(r.Context(), h.IngestedLedger)
+	rows, err := ix.db.pending(r.Context(), upTo)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return
@@ -146,13 +147,13 @@ func (ix *Indexer) deposits(w http.ResponseWriter, r *http.Request) {
 		}
 		pending = append(pending, p)
 	}
-	resolved, err := ix.db.resolved(r.Context(), ix.now().Add(-resolvedWindow).Unix(), h.IngestedLedger)
+	resolved, err := ix.db.resolved(r.Context(), ix.now().Add(-resolvedWindow).Unix(), upTo)
 	if err != nil {
 		httpapi.Fail(w, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
 	httpapi.JSON(w, http.StatusOK, map[string]any{
-		"pending": pending, "resolved": resolved, "attested_up_to": attested, "complete_to": h.IngestedLedger,
+		"pending": pending, "resolved": resolved, "attested_up_to": attested, "complete_to": upTo,
 	})
 }
 
