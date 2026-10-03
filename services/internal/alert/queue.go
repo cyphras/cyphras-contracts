@@ -223,7 +223,11 @@ func (q *Queue) flushLane(ctx context.Context, ch int) time.Duration {
 		}
 	}
 	if len(infos) > 0 && !now.Before(digestAt) {
-		if !q.attempt(ctx, l, ch, now, infos, digest(infos, now)) {
+		a := infos[0].alert
+		if len(infos) > 1 {
+			a = digest(infos, now)
+		}
+		if !q.attempt(ctx, l, ch, now, infos, a) {
 			return q.restLeft(l, now)
 		}
 		q.mu.Lock()
@@ -283,7 +287,8 @@ func (q *Queue) restLeft(l *lane, now time.Time) time.Duration {
 	return 5 * time.Second
 }
 
-// digest gathers Info alerts into one message, which names the first of them in full.
+// digest gathers Info alerts into one message, which names the first of them in full; a lone one
+// goes as itself.
 func digest(ds []delivery, now time.Time) Alert {
 	var parts []string
 	for _, d := range ds[:min(len(ds), digestShown)] {

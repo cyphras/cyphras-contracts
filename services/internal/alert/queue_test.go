@@ -257,6 +257,13 @@ func TestACriticalGoesFirstAndInfoIsDigested(t *testing.T) {
 	if n, _ := q.Waiting(ctx); n != 0 {
 		t.Fatalf("%d copies wait", n)
 	}
+	// A lone notice goes as itself once the digest is due.
+	now = now.Add(5 * time.Minute)
+	q.Put(Alert{Code: "governance_paused", Severity: Info, Message: "paused", Time: now})
+	q.Flush(ctx)
+	if last := ch.sent[len(ch.sent)-1]; last.Code != "governance_paused" || last.Message != "paused" {
+		t.Fatalf("a lone notice went as %+v", last)
+	}
 }
 
 func TestARateLimitedChannelRestsAsLongAsItAsks(t *testing.T) {
