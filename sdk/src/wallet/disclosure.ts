@@ -68,8 +68,9 @@ export interface DisclosureCheck {
   readonly leafIndex: number;
   // esk * g_d equals the output's ephemeral key: the discloser built the output.
   readonly senderProven: boolean;
-  // RPC still holds the transaction and its events show the commitment at that leaf.
-  readonly confirmedByRpc: boolean;
+  // Where the note was found at that leaf: in the transaction's own events from RPC, or, when
+  // RPC no longer holds the transaction and the caller accepts it, only in the indexer's leaves.
+  readonly confirmedBy: "chain" | "indexer";
 }
 
 const HEX64 = /^0x[0-9a-f]{64}$/;
@@ -111,46 +112,61 @@ function parse(doc: unknown, network: Network, vault: string) {
 }
 
 // Checks a disclosure without keys: the note's commitment must be the leaf at that index, added
-// by that transaction on that vault, and an esk must reproduce the output's ephemeral key.
+// by that transaction on that vault, and an esk must reproduce the output's ephemeral key. The
+// transaction's own events from RPC prove it; the indexer's word stands in only when RPC no
+// longer holds the transaction and the caller accepts that.
 export async function verifyDisclosure(
   doc: unknown,
   network: Network,
   vault: string,
-  indexer: IndexerClient,
-  rpc: SorobanRpc | undefined,
+  indexer: IndexerClient | undefined,
+  rpc: SorobanRpc,
+  acceptIndexerOnly: boolean,
 ): Promise<DisclosureCheck> {
   const p = parse(doc, network, vault);
   const cm = noteCommitment({ value: p.value, gd: p.address.gd, pkd: p.address.pkd, rcm: p.rcm });
-  const page = await indexer.leaves(Math.floor(p.leafIndex / PAGE_SIZE));
-  const leaf = page[p.leafIndex % PAGE_SIZE];
-  if (leaf === undefined || leaf.index !== p.leafIndex)
-    fail("not_found", "the leaf is not in the tree");
-  if (leaf.commitment !== cm) fail("invalid_argument", "the note is not the one at that leaf");
-  if (leaf.txHash !== p.txHash) fail("invalid_argument", "another transaction added that leaf");
+  let ciphertext: Uint8Array | undefined;
+  let confirmedBy: DisclosureCheck["confirmedBy"] = "chain";
+  const tx = await rpc.getTransaction(p.txHash).catch((err: unknown) => {
+    if (err instanceof CyphrasError) return undefined;
+    throw err;
+  });
+  if (tx?.status === "SUCCESS") {
+    for (const e of tx.events) {
+      if (e.contractId !== vault) continue;
+      const decoded = decodeVaultEvent(e);
+      if (decoded.kind === "new_commitment" && decoded.index === p.leafIndex) {
+        if (decoded.commitment !== cm) {
+          fail("invalid_argument", "the note is not the one at that leaf");
+        }
+        ciphertext = decoded.ciphertext;
+      }
+    }
+    if (ciphertext === undefined) fail("invalid_argument", "that transaction added no such leaf");
+  } else {
+    if (!acceptIndexerOnly || indexer === undefined) {
+      fail(
+        "history_unavailable",
+        "RPC no longer holds the transaction; the indexer's word can stand in only if accepted",
+      );
+    }
+    const page = await indexer.leaves(Math.floor(p.leafIndex / PAGE_SIZE));
+    const leaf = page[p.leafIndex % PAGE_SIZE];
+    if (leaf === undefined || leaf.index !== p.leafIndex) {
+      fail("not_found", "the leaf is not in the tree");
+    }
+    if (leaf.commitment !== cm) fail("invalid_argument", "the note is not the one at that leaf");
+    if (leaf.txHash !== p.txHash) fail("invalid_argument", "another transaction added that leaf");
+    ciphertext = leaf.ciphertext;
+    confirmedBy = "indexer";
+  }
   let senderProven = false;
   if (p.esk !== undefined) {
-    const epk = ephemeralKey(leaf.ciphertext);
+    const epk = ephemeralKey(ciphertext);
     if (epk === undefined || !equalPoints(epk, scalarMul(p.address.gd, p.esk))) {
       fail("invalid_argument", "esk does not match the output's ephemeral key");
     }
     senderProven = true;
-  }
-  let confirmedByRpc = false;
-  if (rpc !== undefined) {
-    try {
-      const tx = await rpc.getTransaction(p.txHash);
-      confirmedByRpc = tx.events.some((e) => {
-        if (e.contractId !== vault) return false;
-        const decoded = decodeVaultEvent(e);
-        return (
-          decoded.kind === "new_commitment" &&
-          decoded.index === p.leafIndex &&
-          decoded.commitment === cm
-        );
-      });
-    } catch (err) {
-      if (!(err instanceof CyphrasError)) throw err;
-    }
   }
   return {
     value: p.value,
@@ -158,6 +174,6 @@ export async function verifyDisclosure(
     txHash: p.txHash,
     leafIndex: p.leafIndex,
     senderProven,
-    confirmedByRpc,
+    confirmedBy,
   };
 }

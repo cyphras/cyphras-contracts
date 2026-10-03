@@ -438,7 +438,7 @@ describe("wallet: keys and state", () => {
     assert.equal(check.value, 30n * XLM);
     assert.equal(check.address, bob.generateAddress());
     assert.equal(check.senderProven, true);
-    assert.equal(check.confirmedByRpc, true);
+    assert.equal(check.confirmedBy, "chain");
     const fromRecipient = await bob.disclosePayment({
       txHash: sent.txHash as string,
       leafIndex: leaf,
@@ -455,5 +455,17 @@ describe("wallet: keys and state", () => {
       ),
       isError("invalid_argument"),
     );
+    // Once RPC no longer holds the transaction, only an explicit choice accepts the indexer.
+    world.rpc.records.delete(sent.txHash as string);
+    await assert.rejects(
+      PrivateWallet.verifyDisclosure(fromSender, options),
+      isError("history_unavailable"),
+    );
+    const indexerOnly = await PrivateWallet.verifyDisclosure(fromSender, {
+      ...options,
+      acceptIndexerOnly: true,
+    });
+    assert.equal(indexerOnly.confirmedBy, "indexer");
+    assert.equal(indexerOnly.senderProven, true);
   });
 });

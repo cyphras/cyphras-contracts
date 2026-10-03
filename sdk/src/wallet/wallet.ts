@@ -364,15 +364,16 @@ export class PrivateWallet {
   }
 
   /**
-   * Checks a payment disclosure against the chain without keys. The indexer serves the leaf and,
-   * while RPC still holds the transaction, RPC confirms its events.
+   * Checks a payment disclosure against the chain without keys, from the transaction's events in
+   * RPC. Once RPC no longer holds the transaction, the check succeeds on the indexer's word only
+   * with acceptIndexerOnly, and says so in confirmedBy.
    */
   static async verifyDisclosure(
     doc: unknown,
     options: Pick<
       ConnectionOptions,
       "deployment" | "allowUnpinnedDeployment" | "rpcUrl" | "fetch" | "indexers"
-    >,
+    > & { readonly acceptIndexerOnly?: boolean },
   ): Promise<DisclosureCheck> {
     const deployment = resolveDeployment(
       options.deployment,
@@ -385,11 +386,14 @@ export class PrivateWallet {
       options.indexers,
       [],
     );
-    const indexer = services.indexers[0];
-    if (indexer === undefined) {
-      fail("service_unavailable", "no indexer is configured", { service: "indexer" });
-    }
-    return verifyDisclosure(doc, deployment.network, deployment.vault, indexer, services.rpc);
+    return verifyDisclosure(
+      doc,
+      deployment.network,
+      deployment.vault,
+      services.indexers[0],
+      services.rpc,
+      options.acceptIndexerOnly ?? false,
+    );
   }
 
   // Runs one operation at a time: in this instance through its queue, and across the instances
