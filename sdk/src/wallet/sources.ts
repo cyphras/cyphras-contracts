@@ -67,7 +67,7 @@ const EVENT_PAGE = 1000;
 // A vault event that moves an exit along, with the transaction that emitted it.
 export type ExitEvent = Extract<
   VaultEvent,
-  { kind: "exit_queued" | "exit_stranded" | "settled" }
+  { kind: "exit_queued" | "exit_paid" | "exit_stranded" | "settled" }
 > & {
   readonly txHash: string;
 };
@@ -137,6 +137,7 @@ export class RpcEventSource implements ChainSource {
           });
         } else if (
           decoded.kind === "exit_queued" ||
+          decoded.kind === "exit_paid" ||
           decoded.kind === "exit_stranded" ||
           decoded.kind === "settled"
         ) {

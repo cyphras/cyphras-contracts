@@ -73,7 +73,7 @@ describe("exits above the single-exit cap", () => {
 });
 
 describe("the exit queue", () => {
-  it("queues a payout when the day's window is full and pays it by release", async () => {
+  it("queues a payout when the day's window is full and releases it in parts", async () => {
     const { world, alice } = await funded();
     world.vault.outflowDay = world.vault.timestamp / 86_400n;
     world.vault.outflow = 45n * XLM;
@@ -91,30 +91,35 @@ describe("the exit queue", () => {
     assert.ok(warnings.includes("exit_will_queue"));
     assert.ok("planId" in sub);
     await alice.sync();
-    const [plan] = await alice.plans();
+    let [plan] = await alice.plans();
     assert.equal(plan?.state, "queued");
     // exit IDs start at 1
     assert.equal(plan?.exitId, 1);
     assert.equal((await alice.balance()).awaitingPayout, 20n * XLM);
     const position = await alice.exitPosition(sub.planId);
     assert.equal(position?.ahead, 0);
-    assert.equal(position?.dueNow, false);
-    assert.equal(
-      position?.earliestRelease,
-      Number((world.vault.timestamp / 86_400n + 1n) * 86_400n),
-    );
-    assert.equal(
-      world.vault.transfers.some((t) => t.to === destination),
-      false,
-    );
+    assert.equal(position?.payoutLeft, 20n * XLM);
+    assert.equal(position?.feeLeft, 1n * XLM);
+    // paid in full by the end of tomorrow at the latest
+    assert.equal(position?.paidBy, Number((world.vault.timestamp / 86_400n + 2n) * 86_400n) - 1);
+
+    // What is left of today's window pays part of the payout now.
+    await alice.releaseExits(world.signer("anyone"));
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.payoutLeft, 15n * XLM);
+    assert.equal((await alice.balance()).awaitingPayout, 15n * XLM);
 
     world.advance(86_400);
     await alice.releaseExits(world.signer("anyone"));
     await alice.sync();
-    assert.equal((await alice.plans())[0]?.state, "settled");
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    assert.equal(plan?.payoutLeft, 0n);
     assert.deepEqual(
       world.vault.transfers.filter((t) => t.to === destination).map((t) => t.amount),
-      [20n * XLM],
+      [5n * XLM, 15n * XLM],
     );
   });
 
@@ -137,7 +142,15 @@ describe("the exit queue", () => {
     assert.equal((await alice.plans())[0]?.state, "stranded");
     // the relayer's fee was paid at release; only the payout waits
     assert.equal(world.vault.queuedTotal, 10n * XLM);
-    await assert.rejects(alice.claimExit(1, world.signer("anyone")), isError("transaction_failed"));
+    assert.equal((await alice.plans())[0]?.payoutLeft, 10n * XLM);
+    // A claim that can pay no part fails.
+    await assert.rejects(
+      alice.claimExit(1, world.signer("anyone")),
+      (err: unknown) =>
+        err instanceof CyphrasError &&
+        err.code === "transaction_failed" &&
+        err.details["vaultError"] === "NothingClaimable",
+    );
     world.vault.unpayable.delete(destination);
     await alice.claimExit(1, world.signer("anyone"));
     await alice.sync();
@@ -172,8 +185,8 @@ describe("the exit queue", () => {
     assert.equal(p1?.ahead, 0);
     assert.equal(p2?.ahead, 1);
     assert.equal(p2?.aheadAmount, 26n * XLM);
-    // 26 fits tomorrow's window of 30; the next 21 waits a further day
-    assert.equal(p2?.earliestRelease, (p1?.earliestRelease as number) + 86_400);
+    // 26 fits tomorrow's window of 30; the 47 owed up to the second needs a further day
+    assert.equal(p2?.paidBy, (p1?.paidBy as number) + 86_400);
   });
 });
 
@@ -214,7 +227,7 @@ describe("the exit queue: sources", () => {
     assert.equal(plan?.state, "claimed");
   });
 
-  it("recognizes a payout stranded between syncs from the indexer's queue alone", async () => {
+  it("finds a payout stranded between syncs by the indexer entry of its own transaction", async () => {
     const { world, alice } = await funded();
     fillWindow(world);
     const destination = world.signer("closed account").publicKey;

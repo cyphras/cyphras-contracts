@@ -40,27 +40,21 @@ export const DEFAULT_LIMITS: Limits = {
   largeDepositThreshold: 500n * XLM,
 };
 
-// When a release can first pay each queued exit, as the indexer computes it: in queue order, each
-// as soon as it fits what is left of a day's window, and nothing during a halt.
-function releaseSchedule(
-  outflows: readonly bigint[],
+// The end of the UTC day by which releases have paid each queued exit at the latest, as the
+// indexer computes it: from the day of max(now, haltedUntil), as many more days as the exits up to
+// and including it owe, in whole windows.
+function paidBy(
+  owed: readonly bigint[],
   now: number,
   haltedUntil: number,
-  usedToday: bigint,
   maxDaily: bigint,
 ): number[] {
-  const start = Math.max(now, haltedUntil);
-  let day = Math.floor(start / 86_400);
-  let used = day === Math.floor(now / 86_400) ? usedToday : 0n;
-  let at = start;
-  return outflows.map((outflow) => {
-    if (used + outflow > maxDaily) {
-      day++;
-      at = day * 86_400;
-      used = 0n;
-    }
-    used += outflow;
-    return at;
+  const day = Math.floor(Math.max(now, haltedUntil) / 86_400);
+  let total = 0n;
+  return owed.map((o) => {
+    total += o;
+    const days = Number((total + maxDaily - 1n) / maxDaily);
+    return (day + days + 1) * 86_400 - 1;
   });
 }
 
@@ -250,20 +244,26 @@ export class MockIndexer {
         const today = Math.floor(now / 86_400);
         const used = v.outflowDay === BigInt(today) ? v.outflow : 0n;
         const queued = [...v.exits.values()].sort((a, b) => a.id - b.id);
-        const releases = releaseSchedule(
+        const paid = paidBy(
           queued.map((e) => e.payout + e.fee),
           now,
           Number(v.haltedUntil),
-          used,
           v.limits.maxDailyOutflow,
         );
-        const parts = (e: Exit) => ({
+        const entry = (e: Exit, state: string) => ({
           id: e.id,
-          payout: e.payout.toString(),
-          fee: e.fee.toString(),
+          state,
+          payout: e.queuedPayout.toString(),
+          fee: e.queuedFee.toString(),
+          payout_paid: (e.queuedPayout - e.payout).toString(),
+          fee_paid: (e.queuedFee - e.fee).toString(),
+          payout_left: e.payout.toString(),
+          fee_left: e.fee.toString(),
           recipient: e.recipient,
           relayer: e.relayer,
           queued_at: Number(e.queuedAt),
+          queued_ledger: e.ledger,
+          tx_hash: e.txHash,
         });
         return json(200, {
           head: v.exitHead,
@@ -272,14 +272,20 @@ export class MockIndexer {
           max_daily_outflow: v.limits.maxDailyOutflow.toString(),
           window: { day: today, used: used.toString(), resets_at: (today + 1) * 86_400 },
           halted_until: Number(v.haltedUntil),
-          queued: queued.map((e, i) => ({
-            ...parts(e),
-            position: e.id - v.exitHead,
-            queued_ledger: e.ledger,
-            tx_hash: e.txHash,
-            earliest_release: releases[i],
-          })),
-          stranded: [...v.stranded.values()].sort((a, b) => a.id - b.id).map(parts),
+          exits: [
+            ...queued.map((e, i) => ({
+              ...entry(
+                e,
+                e.payout === e.queuedPayout && e.fee === e.queuedFee ? "queued" : "paid_in_part",
+              ),
+              position: e.id - v.exitHead,
+              paid_by: paid[i],
+            })),
+            ...[...v.stranded.values()]
+              .sort((a, b) => a.id - b.id)
+              .map((e) => entry(e, "stranded")),
+            ...v.settledExits.map((e) => entry(e, "settled")),
+          ],
           complete_to: v.ledger,
         });
       }

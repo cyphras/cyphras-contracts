@@ -27,9 +27,10 @@ describe("vault errors", () => {
     const errors = parseVaultErrors(source);
     assert.ok(errors.size >= 40);
     for (const [code, name] of errors) assert.equal(vaultErrorName(code), name);
-    assert.equal(vaultErrorName(4), "Halted");
-    assert.equal(vaultErrorName(42), "DepositTooSmall");
-    assert.equal(vaultErrorName(9999), undefined);
+    // Codes start at 100, clear of the Stellar Asset Contract's own small codes.
+    assert.equal(vaultErrorName(103), "Halted");
+    assert.equal(vaultErrorName(143), "NothingClaimable");
+    assert.equal(vaultErrorName(4), undefined);
   });
 
   it("agree with the codes the vault model refuses with", () => {
@@ -189,6 +190,52 @@ describe("indexer client", () => {
       ).deposits(),
       isCode("indexer_fault"),
     );
+  });
+});
+
+describe("indexer exit queue", () => {
+  const exit = (id: number, state: string, position?: number) => ({
+    id,
+    state,
+    ...(position === undefined ? {} : { position, paid_by: 1_759_100_000 }),
+    payout: "100",
+    fee: "1",
+    payout_paid: "0",
+    fee_paid: "0",
+    payout_left: "100",
+    fee_left: "1",
+    tx_hash: "cc".repeat(32),
+  });
+  const queue = (exits: unknown[], head = 3, tail = 5) =>
+    new IndexerClient("http://i", reply(200, { head, tail, exits, complete_to: 50 })).exits();
+
+  it("reads queued, stranded and settled exits around the head", async () => {
+    const q = await queue([
+      exit(3, "paid_in_part", 0),
+      exit(4, "queued", 1),
+      exit(1, "stranded"),
+      exit(2, "settled"),
+    ]);
+    assert.deepEqual(
+      q.exits.map((e) => [e.id, e.state, e.position]),
+      [
+        [3, "paid_in_part", 0],
+        [4, "queued", 1],
+        [1, "stranded", undefined],
+        [2, "settled", undefined],
+      ],
+    );
+  });
+
+  it("refuses a queue with a gap, a misplaced exit or an unknown state", async () => {
+    for (const exits of [
+      [exit(3, "queued", 0)],
+      [exit(3, "queued", 0), exit(5, "queued", 2)],
+      [exit(3, "queued", 0), exit(4, "queued", 1), exit(4, "stranded")],
+      [exit(3, "queued", 0), exit(4, "lost", 1)],
+    ]) {
+      await assert.rejects(queue(exits), isCode("indexer_fault"));
+    }
   });
 });
 

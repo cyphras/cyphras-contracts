@@ -65,6 +65,13 @@ export type Route =
   | { readonly kind: "relayer"; readonly url: string }
   | { readonly kind: "self"; readonly account: string };
 
+// The exit of an unshield in the vault's exit queue, and what it still owes.
+export interface PlanExit {
+  readonly id: number;
+  payoutLeft: bigint;
+  feeLeft: bigint;
+}
+
 // A spend, saved before anything is submitted (sdk.md, Submission state machine).
 export interface Plan {
   readonly id: string;
@@ -93,7 +100,7 @@ export interface Plan {
     | { readonly txHash: string; readonly ledger: number; readonly positions: number[] }
     | undefined;
   relayerStatus: string | undefined;
-  exitId: number | undefined;
+  exit: PlanExit | undefined;
   error: string | undefined;
 }
 

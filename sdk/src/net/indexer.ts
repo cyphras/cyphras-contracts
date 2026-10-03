@@ -66,33 +66,32 @@ export interface DepositQueue {
   readonly resolved: readonly ResolvedDeposit[];
 }
 
-export interface QueuedExit {
+export type ExitState = "queued" | "paid_in_part" | "stranded" | "settled";
+
+// One exit as the indexer serves it: payoutLeft and feeLeft are what the vault still owes.
+export interface ExitEntry {
   readonly id: number;
-  readonly payout: bigint;
-  readonly fee: bigint;
+  readonly state: ExitState;
+  // Set while the exit is in the queue: its place from the head, and the end of the UTC day by
+  // which releases have paid it at the latest, in Unix seconds.
+  readonly position: number | undefined;
+  readonly paidBy: number | undefined;
+  readonly payoutLeft: bigint;
+  readonly feeLeft: bigint;
   // The transact that queued the exit.
   readonly txHash: string;
-  // Unix seconds: the earliest time a release can pay it, if every exit ahead is released as
-  // soon as it fits.
-  readonly earliestRelease: number;
 }
 
-// A released exit with parts the asset contract refused: what is still owed, which claim pays.
-export interface StrandedExit {
-  readonly id: number;
-  readonly payout: bigint;
-  readonly recipient: string;
-}
-
-// The vault's exit queue as the indexer serves it: every queued exit from the head, in order,
-// and every stranded one.
+// The vault's exit queue as the indexer serves it: every queued exit from the head in order,
+// every stranded one, and those paid in full lately.
 export interface ExitQueue {
   readonly head: number;
   readonly tail: number;
-  readonly queued: readonly QueuedExit[];
-  readonly stranded: readonly StrandedExit[];
+  readonly exits: readonly ExitEntry[];
   readonly completeTo: number;
 }
+
+const EXIT_STATES: readonly ExitState[] = ["queued", "paid_in_part", "stranded", "settled"];
 
 export interface PoolStats {
   readonly leafCount: number;
@@ -234,27 +233,33 @@ export class IndexerClient {
     const f = await this.#get("/v1/exits");
     const head = f.integer("head", 1);
     const tail = f.integer("tail", head);
-    const queued = f.array("queued").map((raw, i): QueuedExit => {
-      const e: Fields = f.item(raw, i, "queued");
-      if (e.integer("id") !== head + i || e.integer("position") !== i) {
-        e.fault("the queued exits are not the queue from its head, in order");
+    const exits = f.array("exits").map((raw, i): ExitEntry => {
+      const e: Fields = f.item(raw, i, "exits");
+      const id = e.integer("id", 1);
+      const state = e.string("state") as ExitState;
+      if (!EXIT_STATES.includes(state)) e.fault("unknown exit state");
+      const inQueue = state === "queued" || state === "paid_in_part";
+      const position = inQueue ? e.integer("position") : undefined;
+      if (inQueue ? id !== head + (position as number) : id >= head) {
+        e.fault("an exit lies on the wrong side of the queue's head");
       }
       return {
-        id: head + i,
-        payout: e.amount("payout"),
-        fee: e.amount("fee"),
+        id,
+        state,
+        position,
+        paidBy: inQueue ? e.integer("paid_by") : undefined,
+        payoutLeft: e.amount("payout_left"),
+        feeLeft: e.amount("fee_left"),
         txHash: e.hash("tx_hash"),
-        earliestRelease: e.integer("earliest_release"),
       };
     });
-    if (queued.length !== tail - head) f.fault("the queue does not hold every exit to its tail");
-    const stranded = f.array("stranded").map((raw, i): StrandedExit => {
-      const e: Fields = f.item(raw, i, "stranded");
-      const id = e.integer("id", 1);
-      if (id >= head) e.fault("a stranded exit lies at or after the head");
-      return { id, payout: e.amount("payout"), recipient: e.string("recipient") };
-    });
-    return { head, tail, queued, stranded, completeTo: f.integer("complete_to") };
+    const positions = exits
+      .flatMap((e) => (e.position === undefined ? [] : [e.position]))
+      .sort((a, b) => a - b);
+    if (positions.length !== tail - head || positions.some((p, i) => p !== i)) {
+      f.fault("the queue does not list every exit from its head to its tail, in order");
+    }
+    return { head, tail, exits, completeTo: f.integer("complete_to") };
   }
 
   async stats(): Promise<PoolStats> {

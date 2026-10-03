@@ -23,7 +23,7 @@ export function balanceOf(state: WalletState, spendsVisible: boolean): Balance {
     locked: state.notes.filter((n) => locked.has(n.pos)).reduce((s, n) => s + n.value, 0n),
     awaitingPayout: state.plans
       .filter((p) => p.state === "queued" || p.state === "stranded")
-      .reduce((s, p) => s + p.amount, 0n),
+      .reduce((s, p) => s + (p.exit?.payoutLeft ?? p.amount), 0n),
     spendsUnknown: !spendsVisible,
   };
 }

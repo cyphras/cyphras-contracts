@@ -248,7 +248,7 @@ function planOf(
     spentBy: [undefined, undefined],
     landed: undefined,
     relayerStatus: undefined,
-    exitId: undefined,
+    exit: undefined,
     error: undefined,
   };
 }
@@ -471,7 +471,7 @@ async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Pro
   if (payout?.kind === "settled") plan.state = "settled";
   if (payout?.kind === "queued") {
     plan.state = "queued";
-    plan.exitId = payout.id;
+    plan.exit = payout.exit;
   }
   for (const input of plan.inputs) {
     const note = core.state.notes.find((n) => n.pos === input.pos);

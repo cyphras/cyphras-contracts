@@ -1,7 +1,10 @@
 // A model of contracts/vault on the contracts branch: the entry points the SDK calls, their
 // checks in the vault's order, the state they change and the events they emit. Proofs are
 // verified for real against the trapdoor key.
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Address, MuxedAccount, StrKey, nativeToScVal, xdr } from "@stellar/stellar-base";
+import { parseVaultErrors } from "../../scripts/vault-errors.ts";
 import { bytesToHex, hexToBytes } from "../../src/bytes.ts";
 import {
   type ExtData,
@@ -15,39 +18,53 @@ import { parseVerifyingKey, verifyGroth16 } from "../../src/groth16.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
 import { TRAPDOOR_VK } from "./trapdoor.ts";
 
+// The vault's error codes by name, read from the contract source the SDK's table is generated from.
+const CODES = new Map(
+  [
+    ...parseVaultErrors(
+      readFileSync(join(import.meta.dirname, "..", "fixtures", "vault-error.rs"), "utf8"),
+    ),
+  ].map(([code, name]) => [name, code]),
+);
+const code = (name: string): number => {
+  const value = CODES.get(name);
+  if (value === undefined) throw new Error(`the vault has no error ${name}`);
+  return value;
+};
+
 export const ERROR = {
-  Halted: 4,
-  DepositsPaused: 5,
-  TransfersPaused: 6,
-  NonEmptyRoot: 7,
-  BadAmount: 8,
-  BadFee: 9,
-  BadParties: 10,
-  WrongVault: 11,
-  WrongNetwork: 12,
-  BadCiphertext: 13,
-  DepositTooLarge: 14,
-  DepositorDailyLimit: 15,
-  TvlCapExceeded: 16,
-  OutflowLimit: 17,
-  BadArity: 18,
-  NonCanonical: 19,
-  DuplicateNullifier: 20,
-  DuplicateCommitment: 21,
-  Expired: 22,
-  UnknownRoot: 23,
-  NullifierSpent: 25,
-  ExtDataHashMismatch: 26,
-  PublicAmountMismatch: 27,
-  InvalidProof: 28,
-  UnknownDeposit: 29,
-  NotFlagged: 30,
-  RefundTooEarly: 40,
-  ExceedsAdmittedValue: 41,
-  DepositTooSmall: 42,
-  ExceedsDailyOutflow: 43,
-  NotStranded: 44,
-} as const;
+  Halted: code("Halted"),
+  DepositsPaused: code("DepositsPaused"),
+  TransfersPaused: code("TransfersPaused"),
+  NonEmptyRoot: code("NonEmptyRoot"),
+  BadAmount: code("BadAmount"),
+  BadFee: code("BadFee"),
+  BadParties: code("BadParties"),
+  WrongVault: code("WrongVault"),
+  WrongNetwork: code("WrongNetwork"),
+  BadCiphertext: code("BadCiphertext"),
+  DepositTooLarge: code("DepositTooLarge"),
+  DepositorDailyLimit: code("DepositorDailyLimit"),
+  TvlCapExceeded: code("TvlCapExceeded"),
+  BadArity: code("BadArity"),
+  NonCanonical: code("NonCanonical"),
+  DuplicateNullifier: code("DuplicateNullifier"),
+  DuplicateCommitment: code("DuplicateCommitment"),
+  Expired: code("Expired"),
+  UnknownRoot: code("UnknownRoot"),
+  NullifierSpent: code("NullifierSpent"),
+  ExtDataHashMismatch: code("ExtDataHashMismatch"),
+  PublicAmountMismatch: code("PublicAmountMismatch"),
+  InvalidProof: code("InvalidProof"),
+  UnknownDeposit: code("UnknownDeposit"),
+  NotFlagged: code("NotFlagged"),
+  RefundTooEarly: code("RefundTooEarly"),
+  ExceedsAdmittedValue: code("ExceedsAdmittedValue"),
+  DepositTooSmall: code("DepositTooSmall"),
+  ExceedsDailyOutflow: code("ExceedsDailyOutflow"),
+  NotStranded: code("NotStranded"),
+  NothingClaimable: code("NothingClaimable"),
+};
 
 export class VaultError extends Error {
   readonly code: number;
@@ -82,10 +99,14 @@ export interface Pending {
   flaggedAt: bigint;
 }
 
+// An exit the vault owes: payout and fee are what is still owed, queuedPayout and queuedFee what
+// transact queued.
 export interface Exit {
   id: number;
   payout: bigint;
   fee: bigint;
+  queuedPayout: bigint;
+  queuedFee: bigint;
   recipient: string;
   relayer: string;
   queuedAt: bigint;
@@ -175,6 +196,8 @@ export class MockVault {
   readonly dayTotals = new Map<string, bigint>();
   readonly exits = new Map<number, Exit>();
   readonly stranded = new Map<number, Exit>();
+  // Exits paid in full, by release or claim, for the indexer's view of the queue.
+  readonly settledExits: Exit[] = [];
   readonly events: EmittedEvent[] = [];
   readonly transfers: Transfer[] = [];
   // Accounts that cannot receive a payout, to strand exits in tests.
@@ -371,6 +394,8 @@ export class MockVault {
         id,
         payout,
         fee: ext.fee,
+        queuedPayout: payout,
+        queuedFee: ext.fee,
         recipient: ext.recipient,
         relayer: ext.relayer,
         queuedAt: this.timestamp,
@@ -410,8 +435,16 @@ export class MockVault {
     ]);
   }
 
-  // Pays queued exits from the head while each fits today's window. A payout the recipient
-  // cannot receive is set aside as a stranded exit, so it never holds up the exits behind it.
+  // Pays one part of an exit unless the asset contract would refuse it, and returns what it paid.
+  #tryPay(to: string, amount: bigint): bigint {
+    if (amount === 0n || this.unpayable.has(baseAccount(to))) return 0n;
+    this.#pay(to, amount);
+    return amount;
+  }
+
+  // Pays queued exits from the head until today's window is full: of an exit that does not fit, the
+  // part that does, payout first, and the rest stays at the head. An exit with a part the asset
+  // contract refuses is set aside as stranded with everything it still owes.
   release(max: number): number {
     if (this.#halted()) refuse(ERROR.Halted);
     if (this.dryRun) return 0;
@@ -419,27 +452,37 @@ export class MockVault {
     let today = this.outflowDay === day ? this.outflow : 0n;
     let count = 0;
     while (count < max && this.exitHead < this.exitTail) {
-      const exit = this.exits.get(this.exitHead) as Exit;
-      if (today + exit.payout + exit.fee > this.limits.maxDailyOutflow) break;
-      this.exits.delete(exit.id);
-      this.exitHead++;
+      const room = this.limits.maxDailyOutflow - today;
+      if (room === 0n) break;
+      const id = this.exitHead;
+      const exit = this.exits.get(id) as Exit;
       count++;
-      const unpaid = this.unpayable.has(baseAccount(exit.recipient)) ? exit.payout : 0n;
-      const paid = exit.payout + exit.fee - unpaid;
+      const payout = exit.payout < room ? exit.payout : room;
+      const fee = exit.fee < room - payout ? exit.fee : room - payout;
+      const payoutPaid = this.#tryPay(exit.recipient, payout);
+      const feePaid = this.#tryPay(exit.relayer, fee);
+      const paid = payoutPaid + feePaid;
       today += paid;
       this.tvl -= paid;
       this.queuedTotal -= paid;
-      this.#pay(exit.relayer, exit.fee);
-      if (unpaid === 0n) {
-        this.#pay(exit.recipient, exit.payout);
-        this.#settled(-exit.payout, exit.fee, exit.recipient, exit.relayer, exit.id);
-      } else {
-        this.stranded.set(exit.id, { ...exit, fee: 0n });
+      const left = { ...exit, payout: exit.payout - payoutPaid, fee: exit.fee - feePaid };
+      if (payoutPaid < payout || feePaid < fee) {
+        this.exits.delete(id);
+        this.exitHead++;
+        this.stranded.set(id, left);
         this.#emit("exit_stranded", [
-          ["id", u64(exit.id)],
-          ["payout", i128(unpaid)],
-          ["fee", i128(0n)],
+          ["id", u64(id)],
+          ["payout", i128(left.payout)],
+          ["fee", i128(left.fee)],
         ]);
+      } else if (left.payout === 0n && left.fee === 0n) {
+        this.exits.delete(id);
+        this.exitHead++;
+        this.settledExits.push(left);
+        this.#settled(-payoutPaid, feePaid, exit.recipient, exit.relayer, id);
+      } else {
+        this.exits.set(id, left);
+        this.#exitPaid(id, payoutPaid, feePaid, left);
       }
     }
     if (count > 0) {
@@ -449,21 +492,47 @@ export class MockVault {
     return count;
   }
 
+  #exitPaid(id: number, payoutPaid: bigint, feePaid: bigint, left: Exit): void {
+    this.#emit("exit_paid", [
+      ["id", u64(id)],
+      ["payout_paid", i128(payoutPaid)],
+      ["fee_paid", i128(feePaid)],
+      ["payout_left", i128(left.payout)],
+      ["fee_left", i128(left.fee)],
+    ]);
+  }
+
+  // Pays each part of a stranded exit whole when it fits today's window and the asset contract
+  // takes it; a call that pays nothing fails.
   claim(id: number): void {
     if (this.#halted()) refuse(ERROR.Halted);
     const exit = this.stranded.get(id) ?? refuse(ERROR.NotStranded);
     const day = this.timestamp / DAY;
-    const today = (this.outflowDay === day ? this.outflow : 0n) + exit.payout + exit.fee;
-    if (today > this.limits.maxDailyOutflow) refuse(ERROR.OutflowLimit);
-    if (this.unpayable.has(baseAccount(exit.recipient))) throw new Error("transfer refused");
+    let today = this.outflowDay === day ? this.outflow : 0n;
+    const fits = (part: bigint): boolean => today + part <= this.limits.maxDailyOutflow;
+    const payable = (to: string, part: bigint): bigint =>
+      part > 0n && fits(part) && !this.unpayable.has(baseAccount(to)) ? part : 0n;
+    const payoutPaid = payable(exit.recipient, exit.payout);
+    today += payoutPaid;
+    const feePaid = payable(exit.relayer, exit.fee);
+    today += feePaid;
+    if (payoutPaid + feePaid === 0n) refuse(ERROR.NothingClaimable);
     if (this.dryRun) return;
-    this.stranded.delete(id);
-    this.tvl -= exit.payout + exit.fee;
-    this.queuedTotal -= exit.payout + exit.fee;
+    this.#pay(exit.recipient, payoutPaid);
+    this.#pay(exit.relayer, feePaid);
+    this.tvl -= payoutPaid + feePaid;
+    this.queuedTotal -= payoutPaid + feePaid;
     this.outflowDay = day;
     this.outflow = today;
-    this.#settled(-exit.payout, exit.fee, exit.recipient, exit.relayer, id);
-    this.#pay(exit.recipient, exit.payout);
+    const left = { ...exit, payout: exit.payout - payoutPaid, fee: exit.fee - feePaid };
+    if (left.payout === 0n && left.fee === 0n) {
+      this.stranded.delete(id);
+      this.settledExits.push(left);
+      this.#settled(-payoutPaid, feePaid, exit.recipient, exit.relayer, id);
+    } else {
+      this.stranded.set(id, left);
+      this.#exitPaid(id, payoutPaid, feePaid, left);
+    }
   }
 
   attest(upTo: number): void {

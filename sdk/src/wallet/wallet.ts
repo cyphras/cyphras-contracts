@@ -142,7 +142,9 @@ export interface PlanView extends Submission {
   readonly amount: bigint;
   readonly to: string;
   readonly createdAt: number;
+  // The exit of an unshield that waits in the vault's exit queue, and what it still owes.
   readonly exitId: number | undefined;
+  readonly payoutLeft: bigint | undefined;
   readonly operationId: string | undefined;
   readonly relayerStatus: string | undefined;
 }
@@ -511,7 +513,8 @@ export class PrivateWallet {
       amount: p.amount,
       to: p.to,
       createdAt: p.createdAt,
-      exitId: p.exitId,
+      exitId: p.exit?.id,
+      payoutLeft: p.exit?.payoutLeft,
       operationId: p.operationId,
       relayerStatus: p.relayerStatus,
     }));
@@ -763,13 +766,16 @@ export class PrivateWallet {
   /** Where a queued payout of this wallet stands in the vault's exit queue, and when it is due. */
   async exitPosition(planId: string): Promise<ExitPosition | undefined> {
     const plan = this.#core.state.plans.find((p) => p.id === planId);
-    if (plan?.exitId === undefined || plan.state !== "queued") return undefined;
+    if (plan?.exit === undefined || plan.state !== "queued") return undefined;
     const queue = await this.#indexer()?.exits();
     if (queue === undefined) return undefined;
-    return exitPosition(queue, plan.exitId, Math.floor(this.#core.now() / 1000));
+    return exitPosition(queue, plan.exit.id);
   }
 
-  /** Pays queued exits in FIFO order, up to `max`; anyone may call it once the window has room. */
+  /**
+   * Pays queued exits in FIFO order, up to `max`, as far as today's outflow window reaches; anyone
+   * may call it.
+   */
   releaseExits(signer: TransactionSigner, max = 10): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
       await this.#ensureVerified();
@@ -782,7 +788,10 @@ export class PrivateWallet {
     });
   }
 
-  /** Pays a stranded exit once its recipient can receive; anyone may submit it. */
+  /**
+   * Pays the parts of a stranded exit that its recipient and relayer can now receive, each part
+   * whole within today's outflow window; anyone may submit it.
+   */
   claimExit(exitId: number, signer: TransactionSigner): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
       await this.#ensureVerified();
