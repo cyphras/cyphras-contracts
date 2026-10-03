@@ -12,7 +12,8 @@ import (
 // Schema holds the relay records, kept at least five years, and the cooldowns of transactions
 // that failed on chain. A record is written when the transaction is sent, as pending, and
 // completed with its outcome, so a restart in between loses nothing. It holds no client address
-// and no request time; its ledger, nullifiers and channel are public in the transaction itself.
+// and no request time; its ledger, nullifiers and channel are public in the transaction itself,
+// and the request and simulation ledger it holds while pending are dropped with the outcome.
 const Schema = `
 CREATE TABLE IF NOT EXISTS relays (
 	tx_hash text PRIMARY KEY,
@@ -29,6 +30,8 @@ CREATE TABLE IF NOT EXISTS relays (
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS nullifier0 text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS nullifier1 text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS channel text;
+ALTER TABLE relays ADD COLUMN IF NOT EXISTS request text;
+ALTER TABLE relays ADD COLUMN IF NOT EXISTS simulated_at bigint;
 CREATE INDEX IF NOT EXISTS relays_confirmed ON relays (ledger) WHERE outcome = 'success';
 CREATE INDEX IF NOT EXISTS relays_pending ON relays (tx_hash) WHERE outcome = 'pending';
 CREATE INDEX IF NOT EXISTS relays_settled ON relays (ledger) WHERE outcome IN ('success', 'failed');
@@ -62,8 +65,8 @@ type Record struct {
 	ExitID      *uint64
 	Nullifiers  [2]string
 	Channel     string
-	// Request names the proof that was sent and SimulatedAt the ledger its simulation read, while
-	// this run follows the transaction; neither is stored.
+	// Request names the proof that was sent and SimulatedAt the ledger its simulation read; both
+	// are kept only while the transaction is pending.
 	Request     string
 	SimulatedAt uint32
 }
@@ -79,10 +82,12 @@ func NewStore(pool *pgxpool.Pool) store {
 
 // sent records a transaction the network accepted, before its outcome is known.
 func (s store) sent(ctx context.Context, r Record) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO relays (tx_hash, outcome, kind, fee, destination, screening, nullifier0, nullifier1, channel)
-		VALUES ($1, 'pending', $2, $3::numeric, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''))
+	_, err := s.pool.Exec(ctx, `INSERT INTO relays (tx_hash, outcome, kind, fee, destination, screening, nullifier0, nullifier1, channel,
+		request, simulated_at)
+		VALUES ($1, 'pending', $2, $3::numeric, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''),
+		NULLIF($9, ''), NULLIF($10, 0))
 		ON CONFLICT (tx_hash) DO NOTHING`,
-		r.Hash, r.Kind, r.Fee, r.Destination, r.Screening, r.Nullifiers[0], r.Nullifiers[1], r.Channel)
+		r.Hash, r.Kind, r.Fee, r.Destination, r.Screening, r.Nullifiers[0], r.Nullifiers[1], r.Channel, r.Request, int64(r.SimulatedAt))
 	return err
 }
 
@@ -97,7 +102,8 @@ func (s store) finish(ctx context.Context, r Record) error {
 		l, n, f := int64(r.Ledger), r.NetworkFee, r.ResourceFee
 		ledger, networkFee, resourceFee = &l, &n, &f
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE relays SET outcome = $2, ledger = $3, network_fee = $4, resource_fee = $5, exit_id = $6
+	_, err := s.pool.Exec(ctx, `UPDATE relays SET outcome = $2, ledger = $3, network_fee = $4, resource_fee = $5, exit_id = $6,
+		request = NULL, simulated_at = NULL
 		WHERE tx_hash = $1 AND outcome = 'pending'`, r.Hash, r.Outcome, ledger, networkFee, resourceFee, exitID)
 	return err
 }
@@ -105,7 +111,7 @@ func (s store) finish(ctx context.Context, r Record) error {
 // pending lists the transactions sent but not yet finished.
 func (s store) pending(ctx context.Context) ([]Record, error) {
 	rows, err := s.pool.Query(ctx, `SELECT tx_hash, COALESCE(destination, ''), COALESCE(nullifier0, ''), COALESCE(nullifier1, ''),
-		COALESCE(channel, '') FROM relays WHERE outcome = 'pending' ORDER BY tx_hash`)
+		COALESCE(channel, ''), COALESCE(request, ''), COALESCE(simulated_at, 0) FROM relays WHERE outcome = 'pending' ORDER BY tx_hash`)
 	if err != nil {
 		return nil, err
 	}
@@ -113,9 +119,11 @@ func (s store) pending(ctx context.Context) ([]Record, error) {
 	var out []Record
 	for rows.Next() {
 		var r Record
-		if err := rows.Scan(&r.Hash, &r.Destination, &r.Nullifiers[0], &r.Nullifiers[1], &r.Channel); err != nil {
+		var simulated int64
+		if err := rows.Scan(&r.Hash, &r.Destination, &r.Nullifiers[0], &r.Nullifiers[1], &r.Channel, &r.Request, &simulated); err != nil {
 			return nil, err
 		}
+		r.SimulatedAt = uint32(simulated)
 		out = append(out, r)
 	}
 	return out, rows.Err()
