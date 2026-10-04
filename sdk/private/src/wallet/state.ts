@@ -1,4 +1,5 @@
-import { bytesToHex, hexToBytes } from "../bytes.ts";
+import { bytesToHex, hexToBytes, utf8 } from "../bytes.ts";
+import type { Deployment } from "../deployments.ts";
 import { fail } from "../errors.ts";
 import type { ExtDataJson, TxProofJson } from "../extdata.ts";
 import type { TreeSnapshot } from "../merkle.ts";
@@ -408,32 +409,83 @@ export async function saveState(store: SealedStore, state: WalletState): Promise
 export const stateScope = (vault: string, deployLedger: number): string =>
   `vault/${vault}/${deployLedger}`;
 
-// A state in the unscoped records, which every vault of the network shares, fits the vault opening
-// it unless one of its plans is for another vault, or it was synced from, or holds a leaf of, a
-// ledger before that vault was deployed.
-function fits(state: WalletState, vault: string, deployLedger: number): boolean {
-  return (
-    state.plans.every((p) => p.ext.vault === vault) &&
-    state.nullifierSince >= deployLedger &&
-    (state.lastLeafLedger === 0 || state.lastLeafLedger >= deployLedger)
-  );
+// What a state in the unscoped records, which every vault of the network shares, is to the vault
+// opening it. "empty": it records no note, payment, operation or deposit, so nothing in it needs
+// keeping. "ours": it is this vault's, as its plans name this vault alone, or, with no plan, as its
+// ledgers fit this vault alone among those this release pins on the network, this vault being one of
+// them. "theirs": it is another vault's, as its plans name another vault alone, or it holds a ledger
+// from before this vault was deployed. "unassigned": none of these is certain, as when its plans
+// name several vaults, or nothing ties a state without plans to one pinned vault.
+export type UnscopedFit = "empty" | "ours" | "theirs" | "unassigned";
+
+export function unscopedFit(
+  state: WalletState,
+  deployment: Deployment,
+  pinned: readonly Deployment[],
+): UnscopedFit {
+  const records = [state.plans, state.deposits, state.operations, state.notes, state.sent];
+  if (records.every((r) => r.length === 0)) return "empty";
+  const ledgers = [
+    state.nullifierSince,
+    ...(state.lastLeafLedger === 0 ? [] : [state.lastLeafLedger]),
+    ...state.deposits.map((d) => d.builtAt),
+    ...state.plans.map((p) => p.builtAt),
+  ];
+  const after = (d: Deployment): boolean => ledgers.every((l) => l >= d.deployLedger);
+  const vaults = new Set(state.plans.map((p) => p.ext.vault));
+  if (vaults.size > 1) return "unassigned";
+  if (vaults.size === 1) {
+    if (!vaults.has(deployment.vault)) return "theirs";
+    return after(deployment) ? "ours" : "unassigned";
+  }
+  if (!after(deployment)) return "theirs";
+  const fitting = pinned.filter((d) => d.network === deployment.network && after(d));
+  const self = (d: Deployment): boolean =>
+    d.vault === deployment.vault && d.deployLedger === deployment.deployLedger;
+  return fitting.length === 1 && fitting.some(self) ? "ours" : "unassigned";
 }
 
-// Moves a state from the unscoped records into the vault's own when it fits the vault: it starts the
-// vault's revisions anew, and the unscoped records are removed, so no other vault takes it too.
-// Undefined when there is none, or it is another vault's, which it is then left to.
-export async function adoptLegacyState(
-  states: StateStore,
-  legacy: StateStore,
-  vault: string,
-  deployLedger: number,
-): Promise<WalletState | undefined> {
-  const state = await legacy.load();
-  if (state === undefined || !fits(state, vault, deployLedger)) return undefined;
-  state.revision = 0;
-  await states.save(state);
-  await legacy.discard();
-  return state;
+// The mark of a move of the unscoped records into a vault's scope, which names that scope.
+const MOVING_RECORD = "moving";
+
+// The unscoped records of an account's state, which every vault of the network shares: the state,
+// its revision record, which plays no part here, so that one left without its state stops nothing,
+// and the mark of a move into a vault's scope.
+export class UnscopedState {
+  readonly #store: SealedStore;
+
+  constructor(store: SealedStore) {
+    this.#store = store;
+  }
+
+  // The scope a move of these records was started for, until the move is done.
+  async movingTo(): Promise<string | undefined> {
+    const bytes = await this.#store.read(MOVING_RECORD);
+    return bytes === undefined ? undefined : new TextDecoder().decode(bytes);
+  }
+
+  read(): Promise<WalletState | undefined> {
+    return loadState(this.#store);
+  }
+
+  // Moves `state`, read from these records, into the vault's scope: the mark names the scope first,
+  // so that no other vault takes a copy of a move that stops half way, then the state starts the
+  // vault's revisions anew there, and these records are removed.
+  async moveTo(scope: string, states: StateStore, state: WalletState): Promise<WalletState> {
+    await this.#store.write(MOVING_RECORD, utf8(scope));
+    state.revision = 0;
+    await states.save(state);
+    await this.remove();
+    return state;
+  }
+
+  // Removes the records, the mark of a move last, so that a removal cut off half way leaves the
+  // state it named marked as that move's.
+  async remove(): Promise<void> {
+    await this.#store.remove(REVISION_RECORD);
+    await this.#store.remove(STATE_RECORD);
+    await this.#store.remove(MOVING_RECORD);
+  }
 }
 
 // The state of one account in its sealed store. A save first checks that the store still holds the

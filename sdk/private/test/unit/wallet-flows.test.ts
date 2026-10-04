@@ -11,14 +11,18 @@ import {
   xdr,
 } from "@stellar/stellar-base";
 import type { ArtifactName, ArtifactSource } from "../../src/artifacts.ts";
+import { utf8 } from "../../src/bytes.ts";
+import { type Deployment, PINNED_DEPLOYMENTS } from "../../src/deployments.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
 import { keySource } from "../../src/keysource.ts";
 import { type KeyValueStore, MemoryStore, SealedStore } from "../../src/storage.ts";
 import {
   type Deposit,
+  type Plan,
   StateStore,
   type WalletState,
+  emptyState,
   loadState,
   saveState,
 } from "../../src/wallet/state.ts";
@@ -3283,18 +3287,40 @@ describe("wallet: a pool of an issued asset", () => {
 });
 
 describe("wallet: state kept per vault", () => {
-  // Moves the account's state into the unscoped records, which every vault of the network shares.
-  async function toShared(storage: MemoryStore, world: World): Promise<WalletState> {
+  // Moves the account's state into the unscoped records, which every vault of the network shares,
+  // as `edit` changes it.
+  async function toShared(
+    storage: KeyValueStore,
+    world: World,
+    edit: (state: WalletState) => void = () => {},
+  ): Promise<WalletState> {
     const scoped = sealedState(storage, world);
     const state = (await loadState(scoped)) as WalletState;
     await scoped.remove("state");
     await scoped.remove("revision");
+    edit(state);
     state.revision = 0;
     await new StateStore(new SealedStore(storage, storeKeyOf(0))).save(state);
     return state;
   }
 
+  const shared = async (storage: KeyValueStore): Promise<WalletState | undefined> =>
+    loadState(new SealedStore(storage, storeKeyOf(0)));
+
   const elsewhere = StrKey.encodeContract(Buffer.alloc(32, 7));
+
+  // A wallet whose state holds a deposit and a plan for the world's vault.
+  async function withPlan(storage: KeyValueStore) {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0, storage);
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    return { world, alice };
+  }
 
   it("keeps the state of each vault of a network apart, a vault deployed again included", async () => {
     const world = await createWorld();
@@ -3312,47 +3338,209 @@ describe("wallet: state kept per vault", () => {
     assert.equal((await reopened.deposits()).length, 1);
   });
 
-  it("takes a state kept for every vault of the network into the vault it fits, and only that one", async () => {
-    const world = await createWorld();
+  it("takes a shared state into the vault its plans name, and leaves it to that vault", async () => {
     const storage = new MemoryStore();
-    const alice = await openWallet(world, 0, storage);
-    await shielded(alice, 100n * XLM, world.signer("depositor"));
-    world.advance(3_601);
-    world.admitAll();
-    await alice.sync();
-    const bob = await openWallet(world, 1);
-    await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    const { world } = await withPlan(storage);
     const { lastLeafLedger } = await toShared(storage, world);
-    // Another vault, which the state's plan is not for, and the same vault deployed after the
-    // state's last leaf was added, leave it alone.
-    for (const deployment of [
-      { ...world.deployment, vault: elsewhere },
-      { ...world.deployment, deployLedger: lastLeafLedger + 1 },
-    ]) {
-      const wallet = await openWallet({ ...world, deployment }, 0, storage);
-      assert.deepEqual(await wallet.plans(), []);
-    }
+    // Another vault opens afresh; the same vault deployed after the state's last leaf cannot tell.
+    const other = await openWallet(
+      { ...world, deployment: { ...world.deployment, vault: elsewhere } },
+      0,
+      storage,
+    );
+    assert.deepEqual(await other.plans(), []);
+    const later = { ...world.deployment, deployLedger: lastLeafLedger + 1 };
+    await assert.rejects(
+      openWallet({ ...world, deployment: later }, 0, storage),
+      isError("state_unassigned"),
+    );
+    assert.equal((await shared(storage))?.plans.length, 1);
     const reopened = await openWallet(world, 0, storage);
     assert.equal((await reopened.plans()).length, 1);
     assert.equal((await reopened.deposits()).length, 1);
-    assert.equal(await new SealedStore(storage, storeKeyOf(0)).read("state"), undefined);
+    assert.equal(await shared(storage), undefined);
     const redeployed = { ...world.deployment, deployLedger: world.deployment.deployLedger + 1 };
     const again = await openWallet({ ...world, deployment: redeployed }, 0, storage);
     assert.deepEqual(await again.plans(), []);
   });
 
-  it("leaves a state kept for every vault to a vault deployed after it was synced from", async () => {
+  it("refuses a shared state whose plans name several vaults, and leaves it as it is unless told to start afresh", async () => {
+    const storage = new MemoryStore();
+    const world = await createWorld();
+    const alice = await openWallet(world, 0, storage);
+    const depositor = world.signer("depositor");
+    await shielded(alice, 11n * XLM, depositor);
+    await shielded(alice, 70n * XLM, depositor);
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    const notBefore = Number(world.vault.timestamp) + 3_600;
+    await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      notBefore,
+      confirm: confirmAll,
+    });
+    // A payment held until later, and a plan for another vault beside it.
+    await toShared(storage, world, (state) => {
+      const copy = structuredClone(state.plans[0] as Plan);
+      state.plans.push({ ...copy, id: "other", ext: { ...copy.ext, vault: elsewhere } });
+    });
+    await assert.rejects(openWallet(world, 0, storage), isError("state_unassigned"));
+    assert.equal((await shared(storage))?.plans.length, 2);
+    const fresh = await openWallet(world, 0, storage, undefined, { resetUnassignedState: true });
+    assert.equal(fresh.stateReset()?.reason, "unassigned");
+    assert.match(fresh.stateReset()?.warning ?? "", /before paying again/);
+    assert.deepEqual(await fresh.plans(), []);
+    assert.equal((await shared(storage))?.plans.length, 2);
+    const reopened = await openWallet(world, 0, storage);
+    assert.equal(reopened.stateReset(), undefined);
+  });
+
+  it("takes a shared state with no plan only into the one pinned vault its ledgers fit", async () => {
+    const pinned = PINNED_DEPLOYMENTS["testnet/xlm"] as Deployment;
+    const storage = new MemoryStore();
+    const template: Deposit = {
+      id: 1,
+      depositor: keypairFor("depositor").publicKey(),
+      amount: 10n * XLM,
+      commitments: [1n, 2n],
+      createdAt: 0,
+      builtAt: pinned.deployLedger + 100,
+      deadline: pinned.deployLedger + 220,
+      txHash: "ab".repeat(32),
+      state: "pending",
+      attested: false,
+      earliestAdmission: undefined,
+      flag: undefined,
+      leafIndices: undefined,
+      refundReason: undefined,
+      confirmed: true,
+      seenAt: undefined,
+      goneAt: undefined,
+      ownReturn: undefined,
+    };
+    const state = emptyState(pinned.deployLedger + 1_000);
+    state.deposits = [1, 2, 3].map((id) => ({
+      ...template,
+      id,
+      commitments: [BigInt(2 * id), BigInt(2 * id + 1)] as const,
+      flag: id === 3 ? { reason: 100, flaggedAt: 1 } : undefined,
+    }));
+    await new StateStore(new SealedStore(storage, storeKeyOf(0))).save(state);
+    const world = await createWorld();
+    // A vault this release does not pin cannot tell whether the state is its own.
+    for (const deployment of [
+      { ...pinned, id: "testnet/other", vault: elsewhere, deployLedger: 5 },
+      world.deployment,
+    ]) {
+      await assert.rejects(
+        openWallet({ ...world, deployment }, 0, storage),
+        isError("state_unassigned"),
+      );
+    }
+    assert.equal((await shared(storage))?.deposits.length, 3);
+    const wallet = await PrivateWallet.open({
+      deployment: "testnet/xlm",
+      keys: keySource.mnemonic(MNEMONIC, { account: 0 }),
+      prover: new TrapdoorProver(),
+      artifacts: trapdoorArtifacts,
+      storage,
+      rpcUrl: "https://rpc.test",
+      fetch: async () => {
+        throw new TypeError("offline");
+      },
+    });
+    assert.deepEqual(
+      (await wallet.deposits()).map((d) => [d.id, d.flag?.kind]),
+      [
+        [1, undefined],
+        [2, undefined],
+        [3, "legal_hold"],
+      ],
+    );
+    assert.equal(await shared(storage), undefined);
+  });
+
+  it("drops a shared state that records nothing worth keeping, whichever vault opens", async () => {
     const world = await createWorld();
     const storage = new MemoryStore();
     const alice = await openWallet(world, 0, storage);
     await alice.sync();
-    const { nullifierSince } = await toShared(storage, world);
-    const later = { ...world.deployment, deployLedger: nullifierSince + 1 };
-    await openWallet({ ...world, deployment: later }, 0, storage);
-    assert.notEqual(await new SealedStore(storage, storeKeyOf(0)).read("state"), undefined);
+    await toShared(storage, world);
+    await openWallet(
+      { ...world, deployment: { ...world.deployment, vault: elsewhere } },
+      0,
+      storage,
+    );
+    assert.equal(await shared(storage), undefined);
   });
 
-  it("refuses a state kept for every vault that does not decrypt, unless told to start afresh", async () => {
+  it("leaves a shared state to a vault it holds ledgers from before this one was deployed of", async () => {
+    const world = await createWorld();
+    const storage = new MemoryStore();
+    const alice = await openWallet(world, 0, storage);
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    await alice.sync();
+    const { nullifierSince } = await toShared(storage, world);
+    const later = { ...world.deployment, deployLedger: nullifierSince + 1 };
+    const wallet = await openWallet({ ...world, deployment: later }, 0, storage);
+    assert.deepEqual(await wallet.deposits(), []);
+    assert.equal((await shared(storage))?.deposits.length, 1);
+  });
+
+  // A store whose next writes or deletes, from a count of them on, fail as a closed app's would.
+  function faulty() {
+    const backend = new MemoryStore();
+    const plan = { sets: Infinity, deletes: Infinity };
+    const store: KeyValueStore = {
+      get: (key) => backend.get(key),
+      set: async (key, value) => {
+        if (plan.sets-- <= 0) throw new Error("the app was closed");
+        await backend.set(key, value);
+      },
+      delete: async (key) => {
+        if (plan.deletes-- <= 0) throw new Error("the app was closed");
+        await backend.delete(key);
+      },
+    };
+    return { store, plan };
+  }
+
+  for (const [cut, at] of [
+    ["once the mark is written", { sets: 1, deletes: Infinity }],
+    ["between the vault's write and the first delete", { sets: Infinity, deletes: 0 }],
+    ["between the two deletes", { sets: Infinity, deletes: 1 }],
+  ] as const) {
+    it(`finishes a move cut off ${cut}, and leaves no copy for another scope to take`, async () => {
+      const { store, plan } = faulty();
+      const { world } = await withPlan(store);
+      await toShared(store, world);
+      Object.assign(plan, at);
+      await assert.rejects(openWallet(world, 0, store), /the app was closed/);
+      Object.assign(plan, { sets: Infinity, deletes: Infinity });
+      // The same vault deployed again, which the state's plan would otherwise fit too.
+      const again = { ...world.deployment, deployLedger: world.deployment.deployLedger - 1 };
+      const other = await openWallet({ ...world, deployment: again }, 0, store);
+      assert.deepEqual(await other.plans(), [], cut);
+      const reopened = await openWallet(world, 0, store);
+      assert.equal((await reopened.plans()).length, 1, cut);
+      assert.equal(await shared(store), undefined, cut);
+      assert.equal(await new SealedStore(store, storeKeyOf(0)).read("moving"), undefined, cut);
+    });
+  }
+
+  it("opens past a shared revision record left without its state", async () => {
+    const world = await createWorld();
+    const storage = new MemoryStore();
+    await new SealedStore(storage, storeKeyOf(0)).write("revision", utf8("3"));
+    const wallet = await openWallet(world, 0, storage);
+    assert.equal(wallet.stateReset(), undefined);
+  });
+
+  it("refuses a shared state that does not decrypt, unless told to start afresh", async () => {
     const world = await createWorld();
     const storage = new MemoryStore();
     const before = new Set(storage.keys());
@@ -3362,6 +3550,22 @@ describe("wallet: state kept per vault", () => {
     await assert.rejects(openWallet(world, 0, storage), isError("storage_unreadable"));
     const fresh = await openWallet(world, 0, storage, undefined, { resetUnreadableState: true });
     assert.equal(fresh.stateReset()?.reason, "unreadable");
+    assert.equal(await storage.get(location), undefined);
+  });
+
+  it("keeps the vault's own state when the shared records beside it do not decrypt", async () => {
+    const world = await createWorld();
+    const storage = new MemoryStore();
+    const alice = await openWallet(world, 0, storage);
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    const before = new Set(storage.keys());
+    await new SealedStore(storage, storeKeyOf(0)).write("moving", new Uint8Array([1]));
+    const location = storage.keys().find((k) => !before.has(k)) as string;
+    await storage.set(location, new Uint8Array(64).fill(9));
+    await assert.rejects(openWallet(world, 0, storage), isError("storage_unreadable"));
+    const kept = await openWallet(world, 0, storage, undefined, { resetUnreadableState: true });
+    assert.equal(kept.stateReset(), undefined);
+    assert.equal((await kept.deposits()).length, 1);
     assert.equal(await storage.get(location), undefined);
   });
 });

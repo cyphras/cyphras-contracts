@@ -17,6 +17,7 @@ export type ErrorCode =
   | "signature_seed_changed"
   | "storage_unreadable"
   | "state_conflict"
+  | "state_unassigned"
   | "locks_unavailable"
   | "service_unavailable"
   | "service_rejected"

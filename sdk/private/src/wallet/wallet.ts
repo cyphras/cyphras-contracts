@@ -11,7 +11,12 @@ import { type ArtifactSource, PinnedArtifacts } from "../artifacts.ts";
 import { packPoint } from "../babyjub.ts";
 import { bigIntToBytesLE, concatBytes, randomBytes, utf8 } from "../bytes.ts";
 import { CommitmentTree } from "../merkle.ts";
-import { type Deployment, type DeploymentName, resolveDeployment } from "../deployments.ts";
+import {
+  type Deployment,
+  type DeploymentName,
+  PINNED_DEPLOYMENTS,
+  resolveDeployment,
+} from "../deployments.ts";
 import { CyphrasError, fail } from "../errors.ts";
 import {
   type AddressKey,
@@ -97,10 +102,11 @@ import {
   type Route,
   StateStore,
   type UncheckedRange,
+  UnscopedState,
   type WalletState,
-  adoptLegacyState,
   emptyState,
   stateScope,
+  unscopedFit,
 } from "./state.ts";
 import {
   type ScanKeys,
@@ -147,6 +153,10 @@ export interface ConnectionOptions {
   // saved or missing while its record remains, as a restore from an old backup or a lost write
   // leaves it, instead of refusing to open with state_conflict.
   readonly resetRolledBackState?: boolean;
+  // Starts this vault from a fresh state, in the same way, when the store holds a state every vault
+  // of the network shares that cannot be assigned to this vault with certainty, instead of refusing
+  // to open with state_unassigned. That state stays in the store as it is.
+  readonly resetUnassignedState?: boolean;
   // The caller's guarantee that no other wallet instance uses this store, needed where the
   // platform has no Web Locks API. Instances that share a store, such as an extension's popup and
   // its service worker, rely on Web Locks to run one operation at a time; without it two of them
@@ -292,9 +302,13 @@ export interface PlanView extends Submission {
   readonly needsUserDecision: boolean;
 }
 
-/** Why the wallet opened on a fresh state in place of the stored one, and what was lost with it. */
+/**
+ * Why the wallet opened on a fresh state in place of the stored one, and what was lost with it.
+ * "unassigned": the store holds a state every vault of the network shares that could not be assigned
+ * to this vault with certainty, which stays in the store as it is.
+ */
 export interface StateReset {
-  readonly reason: "unreadable" | "rolled_back";
+  readonly reason: "unreadable" | "rolled_back" | "unassigned";
   readonly warning: string;
 }
 
@@ -304,6 +318,13 @@ const STATE_RESET_WARNING =
   "longer followed and may still land, its notes look spendable until the chain shows them " +
   "spent, and a deposit being submitted is no longer tracked. Before paying again, wait until " +
   "any such payment has landed or its deadline has passed.";
+
+const UNASSIGNED_WARNING =
+  "This store holds private-payment records that every vault of the network shares and that " +
+  "cannot be told apart by vault, so this vault starts from a fresh state, which the next sync " +
+  "rebuilds from the chain; those records stay in the store as they are. A payment or deposit in " +
+  "flight that only they record is not followed here: before paying again, wait until any such " +
+  "payment has landed or its deadline has passed.";
 
 const VIEWING_KEY_WARNING =
   "A viewing key reveals the whole history and future of this private account to whoever holds " +
@@ -385,37 +406,77 @@ function addressAt(keys: IncomingKeys, self: AddressKey, index: number | undefin
   return encodeAddress(keys.network, key.d, key.pkd);
 }
 
-// The vault's stored state, or the one in the unscoped records when it fits this vault; or, as the
-// options allow, a fresh one in place of a stored state that is unreadable or older than its
-// revision record.
+// Why a stored state is set aside for a fresh one, as the options allow, or undefined.
+function resetReason(err: unknown, options: ConnectionOptions): StateReset["reason"] | undefined {
+  const code = err instanceof CyphrasError ? err.code : undefined;
+  if (code === "storage_unreadable" && options.resetUnreadableState === true) return "unreadable";
+  if (code === "state_conflict" && options.resetRolledBackState === true) return "rolled_back";
+  return undefined;
+}
+
+// The vaults this release pins, which a state in the unscoped records with no plan is weighed
+// against.
+const PINNED_VAULTS: readonly Deployment[] = Object.values(PINNED_DEPLOYMENTS).filter(
+  (d): d is Deployment => d !== null,
+);
+
+// The vault's stored state, after the end of a move into its scope that stopped half way; or the
+// state in the unscoped records when it is this vault's and no move into another scope holds it; or
+// a fresh one. A state there that cannot be assigned to this vault with certainty is refused with
+// state_unassigned, and left untouched, unless the options allow a fresh state, which is then saved
+// at once. As the options allow, a fresh state also takes the place of one that is unreadable or
+// older than its revision record.
 async function openState(
   states: StateStore,
-  legacy: StateStore,
+  unscoped: UnscopedState,
   deployment: Deployment,
   options: ConnectionOptions,
 ): Promise<{ readonly state: WalletState; readonly reset: StateReset | undefined }> {
-  let source = states;
+  const fresh = (reset?: StateReset) => ({ state: emptyState(deployment.deployLedger), reset });
+  let stored: WalletState | undefined;
   try {
-    let state = await states.load();
-    if (state === undefined) {
-      source = legacy;
-      state = await adoptLegacyState(states, legacy, deployment.vault, deployment.deployLedger);
-    }
-    return { state: state ?? emptyState(deployment.deployLedger), reset: undefined };
+    stored = await states.load();
   } catch (err) {
-    const code = err instanceof CyphrasError ? err.code : undefined;
-    const reason =
-      code === "storage_unreadable" && options.resetUnreadableState === true
-        ? "unreadable"
-        : code === "state_conflict" && options.resetRolledBackState === true
-          ? "rolled_back"
-          : undefined;
+    const reason = resetReason(err, options);
     if (reason === undefined) throw err;
-    await source.discard();
-    return {
-      state: emptyState(deployment.deployLedger),
-      reset: { reason, warning: STATE_RESET_WARNING },
-    };
+    await states.discard();
+    return fresh({ reason, warning: STATE_RESET_WARNING });
+  }
+  const scope = stateScope(deployment.vault, deployment.deployLedger);
+  try {
+    const moving = await unscoped.movingTo();
+    if (stored !== undefined) {
+      if (moving === scope) await unscoped.remove();
+      return { state: stored, reset: undefined };
+    }
+    const state = await unscoped.read();
+    if (moving !== undefined && moving !== scope) return fresh();
+    if (state === undefined) {
+      if (moving === scope) await unscoped.remove();
+      return fresh();
+    }
+    const fit = unscopedFit(state, deployment, PINNED_VAULTS);
+    if (fit === "ours") {
+      return { state: await unscoped.moveTo(scope, states, state), reset: undefined };
+    }
+    if (fit === "empty") await unscoped.remove();
+    if (fit !== "unassigned") return fresh();
+    if (options.resetUnassignedState !== true) {
+      fail(
+        "state_unassigned",
+        "the store holds a state every vault of the network shares that cannot be assigned to this vault with certainty; resetUnassignedState opens this vault afresh and leaves that state as it is",
+      );
+    }
+    const opened = fresh({ reason: "unassigned", warning: UNASSIGNED_WARNING });
+    await states.save(opened.state);
+    return opened;
+  } catch (err) {
+    const reason = resetReason(err, options);
+    if (reason === undefined) throw err;
+    await unscoped.remove();
+    return stored === undefined
+      ? fresh({ reason, warning: STATE_RESET_WARNING })
+      : { state: stored, reset: undefined };
   }
 }
 
@@ -555,8 +616,10 @@ export class PrivateWallet {
           ));
     const scope = stateScope(deployment.vault, deployment.deployLedger);
     const states = new StateStore(new SealedStore(options.storage, storeKey, scope));
-    const legacy = new StateStore(new SealedStore(options.storage, storeKey));
-    const { state, reset } = await lock.hold(() => openState(states, legacy, deployment, options));
+    const unscoped = new UnscopedState(new SealedStore(options.storage, storeKey));
+    const { state, reset } = await lock.hold(() =>
+      openState(states, unscoped, deployment, options),
+    );
     const now = options.clock ?? (() => Date.now());
     const sleep =
       options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
