@@ -389,17 +389,24 @@ function simulationFailure(code: number | undefined): CyphrasError {
   });
 }
 
+// What a caller learns of each attempt of a call: its hash just before the signed envelope goes
+// out, and again once the network has the transaction, before the wait for it.
+export interface SubmitHooks {
+  readonly onSending?: (hash: string) => Promise<void>;
+  readonly onSubmitted?: (hash: string) => Promise<void>;
+}
+
 // Builds, simulates, signs and submits one vault call with the signer's account as source, then
-// waits until the transaction is final. `onSubmitted` runs with the hash once the network has the
-// transaction, before the wait, again for every attempt.
+// waits until the transaction is final. A transaction the network refused, or did not take before
+// its time bound passed, fails with details.refused: it never lands.
 export async function invokeVault(
   ctx: InvokeContext,
   signer: TransactionSigner,
   call: VaultCall,
-  onSubmitted: (hash: string) => Promise<void> = async () => {},
+  hooks: SubmitHooks = {},
 ): Promise<InvokeResult> {
   for (let attempt = 1; ; attempt++) {
-    const outcome = await attemptCall(ctx, signer, call, onSubmitted);
+    const outcome = await attemptCall(ctx, signer, call, hooks);
     if (outcome.result !== undefined) return outcome.result;
     const failed = (message: string, details: ErrorDetails = {}): CyphrasError =>
       new CyphrasError("transaction_failed", message, { hash: outcome.hash, ...details });
@@ -465,7 +472,7 @@ async function attemptCall(
   ctx: InvokeContext,
   signer: TransactionSigner,
   call: VaultCall,
-  onSubmitted: (hash: string) => Promise<void>,
+  hooks: SubmitHooks,
 ): Promise<{ readonly result?: InvokeResult; readonly hash: string; readonly conflict?: boolean }> {
   const sourceKey = accountKey(signer.publicKey);
   const { entries } = await ctx.rpc.getLedgerEntries([sourceKey]);
@@ -544,20 +551,25 @@ async function attemptCall(
 
   const deadline = ctx.now() + (TIMEOUT_SECONDS + 30) * 1000;
   let backoff = POLL_MS;
+  await hooks.onSending?.(hash);
   for (;;) {
     const sent = await ctx.rpc.sendTransaction(signedXdr);
     if (sent.hash !== hash) fail("rpc_error", "the RPC reports a different transaction hash");
     if (sent.status === "PENDING" || sent.status === "DUPLICATE") break;
     if (sent.status === "ERROR") {
-      fail("transaction_failed", "the network refused the transaction");
+      fail("transaction_failed", "the network refused the transaction", { hash, refused: true });
     }
     // TRY_AGAIN_LATER: the same signed envelope goes again until its time bound passes.
-    if (ctx.now() > deadline)
-      fail("transaction_failed", "the network did not take the transaction");
+    if (ctx.now() > deadline) {
+      fail("transaction_failed", "the network did not take the transaction", {
+        hash,
+        refused: true,
+      });
+    }
     await ctx.sleep(backoff);
     backoff = Math.min(backoff * 2, 30_000);
   }
-  await onSubmitted(hash);
+  await hooks.onSubmitted?.(hash);
   for (;;) {
     const status = await ctx.rpc.getTransaction(hash);
     if (status.status === "SUCCESS") {

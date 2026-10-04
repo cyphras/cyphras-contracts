@@ -658,10 +658,12 @@ async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Pro
         transfers: [],
         extend: transactRoom(core, ext),
       },
-      async (hash) => {
-        plan.state = "submitted";
-        plan.txHash = hash;
-        await core.save();
+      {
+        onSubmitted: async (hash) => {
+          plan.state = "submitted";
+          plan.txHash = hash;
+          await core.save();
+        },
       },
     );
   } catch (err) {

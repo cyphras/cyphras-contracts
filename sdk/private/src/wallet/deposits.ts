@@ -226,9 +226,11 @@ export async function shield(
           },
         ],
       },
-      async (hash) => {
-        deposit.txHash = hash;
-        await core.save();
+      {
+        onSending: async (hash) => {
+          deposit.txHash = hash;
+          await core.save();
+        },
       },
     );
     // The deposit's ID counts once every RPC provider reports its transaction alike; until then the
@@ -243,8 +245,12 @@ export async function shield(
     await core.save();
     return { depositId: deposit.id, txHash: result.hash };
   } catch (err) {
-    // A deposit that never reached the network is void; one that did is settled by the next sync.
-    if (deposit.txHash === undefined && err instanceof CyphrasError) {
+    // A deposit whose envelope never left the device, or that the network refused, is void; one
+    // that may have reached the network stays submitting with its hash, for a sync to settle.
+    if (
+      err instanceof CyphrasError &&
+      (deposit.txHash === undefined || err.details["refused"] === true)
+    ) {
       deposit.state = "failed";
       await core.save();
     }
