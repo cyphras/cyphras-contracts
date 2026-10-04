@@ -466,7 +466,8 @@ describe("wallet: reads of the entry queue", () => {
       const res = await world.fetch(url.origin === second ? RPC : input, init);
       if (!flood || url.origin !== INDEXER || url.pathname !== "/v1/deposits") return res;
       // Three hundred made-up entries like the unnamed deposit, made after it and listed before it,
-      // and the held deposit refunded.
+      // other depositors' entries of its amount, made with it and listed first, and the held
+      // deposit refunded.
       const listed = (await res.json()) as { pending: Record<string, unknown>[] } & Record<
         string,
         unknown
@@ -476,6 +477,11 @@ describe("wallet: reads of the entry queue", () => {
         ...mine,
         id: 1000 + i,
         created_at: (mine["created_at"] as number) + 60 * (i + 1),
+      }));
+      const others = Array.from({ length: 4 }, (_, i) => ({
+        ...mine,
+        id: 2000 + i,
+        depositor: keypairFor(`other depositor ${i}`).publicKey(),
       }));
       const refunded = {
         id: 1,
@@ -491,7 +497,7 @@ describe("wallet: reads of the entry queue", () => {
       return new Response(
         JSON.stringify({
           ...listed,
-          pending: [...fakes, ...listed.pending.filter((d) => d["id"] !== 1)],
+          pending: [...others, ...fakes, ...listed.pending.filter((d) => d["id"] !== 1)],
           resolved: [...(listed["resolved"] as unknown[]), refunded],
         }),
       );
@@ -1104,13 +1110,15 @@ describe("wallet: a cancel or refund every provider does not report", () => {
     assert.equal(deposit?.confirmed, true);
   });
 
-  it("takes a deposit it cancelled, once gone from the entry queue and not in the confirmed tree, as cancelled", async () => {
+  it("takes a deposit it cancelled, once gone from the entry queue and not in the confirmed tree, as cancelled, for good", async () => {
     const world = await createWorld();
     let hiding = false;
+    let queueReads = 0;
     // While hiding, the second provider reports no transaction at all.
     const fetch: FetchLike = async (input, init) => {
       const url = new URL(input);
       const body = bodyOf(init);
+      if (body !== undefined && readsQueue(body)) queueReads++;
       if (hiding && url.origin === second && body?.method === "getTransaction") {
         const result = { status: "NOT_FOUND", latestLedger: world.vault.ledger };
         return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
@@ -1134,6 +1142,11 @@ describe("wallet: a cancel or refund every provider does not report", () => {
     assert.equal(deposit?.state, "cancelled");
     assert.equal(deposit?.refundKind, "cancelled");
     assert.equal(deposit?.confirmed, true);
+    // Every source confirmed it, so no later sync reads the entry queue for it.
+    queueReads = 0;
+    world.advance(60);
+    await alice.sync();
+    assert.equal(queueReads, 0);
   });
 });
 
