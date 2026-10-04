@@ -1319,49 +1319,51 @@ describe("wallet: a deposit gone from the entry queue", () => {
   });
 
   it("is gone by the ledger of the read that shows it gone, not by one a later read undid", async () => {
-    const world = await createWorld();
-    let mode: "gone" | "split" | "honest" = "honest";
-    let goneLedger = 0;
-    let admitting = false;
-    const fetch: FetchLike = async (input, init) => {
-      const url = new URL(input);
-      const body = bodyOf(init);
-      if (body !== undefined && readsQueue(body)) {
-        const split = mode === "split" && url.origin === RPC;
-        if (mode === "gone" || split) {
-          return rpcResult(body.id, { entries: [], latestLedger: goneLedger });
+    // The second provider shows it again while the first still claims it gone, or both do.
+    for (const undone of ["split", "honest"] as const) {
+      const world = await createWorld();
+      let mode: "gone" | "split" | "honest" = "honest";
+      let goneLedger = 0;
+      let admitting = false;
+      const fetch: FetchLike = async (input, init) => {
+        const url = new URL(input);
+        const body = bodyOf(init);
+        if (body !== undefined && readsQueue(body)) {
+          const split = mode === "split" && url.origin === RPC;
+          if (mode === "gone" || split) {
+            return rpcResult(body.id, { entries: [], latestLedger: goneLedger });
+          }
+          if (admitting) {
+            admitting = false;
+            world.admitAll();
+          }
         }
-        if (admitting) {
-          admitting = false;
-          world.admitAll();
-        }
-      }
-      return world.fetch(url.origin === second ? RPC : input, init);
-    };
-    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
-      secondRpcUrl: second,
-    });
-    await shielded(alice, 10n * XLM, world.signer("depositor"));
-    world.advance(121 * 5);
-    await alice.sync();
-    mode = "gone";
-    goneLedger = world.vault.ledger + 50;
-    await alice.sync();
-    // The second provider shows it again, while the first still claims it gone.
-    mode = "split";
-    await alice.sync();
-    mode = "honest";
-    // The tree passes that ledger, and the deposit is admitted after a sync's views, before its
-    // reads of the entry queue.
-    for (let i = 0; i < 60; i++) world.fill(1);
-    world.advance(3_601);
-    admitting = true;
-    await alice.sync();
-    let [deposit] = await alice.deposits();
-    assert.notEqual(deposit?.state, "refunded");
-    await alice.sync();
-    [deposit] = await alice.deposits();
-    assert.equal(deposit?.state, "admitted");
+        return world.fetch(url.origin === second ? RPC : input, init);
+      };
+      const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+        secondRpcUrl: second,
+      });
+      await shielded(alice, 10n * XLM, world.signer("depositor"));
+      world.advance(121 * 5);
+      await alice.sync();
+      mode = "gone";
+      goneLedger = world.vault.ledger + 50;
+      await alice.sync();
+      mode = undone;
+      await alice.sync();
+      mode = "honest";
+      // The tree passes that ledger, and the deposit is admitted after a sync's views, before its
+      // reads of the entry queue.
+      for (let i = 0; i < 60; i++) world.fill(1);
+      world.advance(3_601);
+      admitting = true;
+      await alice.sync();
+      let [deposit] = await alice.deposits();
+      assert.notEqual(deposit?.state, "refunded", undone);
+      await alice.sync();
+      [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, "admitted", undone);
+    }
   });
 
   it("went back to its depositor when its notes are not in the confirmed tree of a later ledger", async () => {
