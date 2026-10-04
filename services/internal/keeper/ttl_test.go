@@ -275,6 +275,52 @@ func TestANullifierThatCannotBeReadStillLetsTheCyclePage(t *testing.T) {
 	}
 }
 
+func TestAnEntryOfTheVaultsOwnWarnsOnlyADayBelowTheHold(t *testing.T) {
+	h := newHarness(t)
+	h.sync()
+	latest := h.chain.Ledger
+	h.vaultLive(latest + holdWithin + renewStep)
+	// After a cycle whose extensions all fail, the code is a ledger short of 44 days and Roots has
+	// exactly 44.
+	short, held := latest+holdWithin-ledgersPerDay-1, latest+holdWithin-ledgersPerDay
+	h.fake.SetEntry(vault.CodeKey([32]byte{9}), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeContractCode, ContractCode: &xdr.ContractCodeEntry{Hash: xdr.Hash{9}}}, 10, &short)
+	h.fake.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), vault.U64(0), 10, &held)
+	h.simFail = func(d string) bool { return strings.HasPrefix(d, "extend") }
+	if err := h.k.TTLCycle(context.Background()); err == nil {
+		t.Fatal("the cycle completed")
+	}
+	var warned string
+	for _, p := range h.pages {
+		if p.Code == "ttl_behind" {
+			warned = p.Message
+		}
+	}
+	if !strings.HasPrefix(warned, "vault code:") {
+		t.Fatalf("ttl_behind warned %q", warned)
+	}
+}
+
+func TestANullifierScanThatFailsAsItIsReadFailsTheCycle(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.shield(10, nil, 0)
+	h.sync()
+	h.vaultLive(h.chain.Ledger + holdWithin + renewStep)
+	// The query is accepted, and its rows fail as they are read.
+	for _, q := range []string{
+		`ALTER TABLE nullifiers RENAME TO nullifiers_kept`,
+		`CREATE VIEW nullifiers AS SELECT seq / 0 AS seq, nullifier, live_until FROM nullifiers_kept`,
+	} {
+		if _, err := h.k.chain.Pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := h.k.TTLCycle(ctx)
+	if err == nil || !strings.Contains(err.Error(), "nullifiers") || !strings.Contains(err.Error(), "division by zero") {
+		t.Fatalf("a nullifier scan that failed: %v", err)
+	}
+}
+
 func TestACycleSendsNoMoreOnceChargedTenTimesTheFeeCap(t *testing.T) {
 	h := newHarness(t)
 	var ids []uint64

@@ -526,6 +526,8 @@ func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A failure inside the loop must release the connection, or the pool's cleanup waits for it.
+	defer rows.Close()
 	for rows.Next() {
 		var raw []byte
 		var until int64
