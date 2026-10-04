@@ -171,8 +171,10 @@ export interface Deposit {
   // the wallet's own transactions every provider reports, the vault's events every provider showed
   // and the confirmed tree, rather than on the indexer's account.
   confirmed: boolean;
-  // The ledger by which every provider showed the deposit gone from the entry queue, and whether
-  // this wallet sent its cancel or refund.
+  // The newest ledger at which a provider showed the deposit in the entry queue; the ledger by
+  // which every provider showed it gone, on reads past that and past its proof's deadline; and
+  // whether this wallet sent its cancel or refund.
+  seenAt: number | undefined;
   goneAt: number | undefined;
   ownReturn: "cancelled" | "refunded" | undefined;
 }

@@ -204,6 +204,7 @@ export async function shield(
     leafIndices: undefined,
     refundReason: undefined,
     confirmed: true,
+    seenAt: undefined,
     goneAt: undefined,
     ownReturn: undefined,
   };
@@ -358,15 +359,15 @@ async function depositOutcome(core: Core, hash: string): Promise<number | "faile
   return outcomeOf(statuses);
 }
 
-// What every RPC provider shows alike of the entry queue under an ID: its entry, or none, as of the
-// latest ledger they read at.
-interface QueueRead {
+// What each RPC provider shows of the entry queue under an ID: its entry, or none, and the ledger
+// it read at.
+type QueueRead = readonly {
   readonly entry: PendingDepositEntry | undefined;
   readonly ledger: number;
-}
+}[];
 
-// Every RPC provider's reads of the entry queue under these IDs, in one read from each: what they
-// show alike under each ID; nothing while a provider cannot answer.
+// Every RPC provider's reads of the entry queue under these IDs, in one read from each; nothing
+// while a provider cannot answer.
 async function readQueue(core: Core, ids: readonly number[]): Promise<Map<number, QueueRead>> {
   const out = new Map<number, QueueRead>();
   if (ids.length === 0) return out;
@@ -380,14 +381,25 @@ async function readQueue(core: Core, ids: readonly number[]): Promise<Map<number
     if (read === undefined) return out;
     reads.push(read);
   }
-  const key = (e: PendingDepositEntry | undefined): string =>
-    JSON.stringify(e, (_k, v: unknown) => (typeof v === "bigint" ? `${v}` : v)) ?? "";
-  const ledger = Math.max(...reads.map((r) => r.ledger));
   for (const id of ids) {
-    const [entry, ...rest] = reads.map((r) => r.entries.get(BigInt(id)));
-    if (rest.every((e) => key(e) === key(entry))) out.set(id, { entry, ledger });
+    out.set(
+      id,
+      reads.map((r) => ({ entry: r.entries.get(BigInt(id)), ledger: r.ledger })),
+    );
   }
   return out;
+}
+
+const entryKey = (e: PendingDepositEntry | undefined): string =>
+  JSON.stringify(e, (_k, v: unknown) => (typeof v === "bigint" ? `${v}` : v)) ?? "";
+
+// The entry every provider shows alike under an ID, if they all show one.
+function alike(read: QueueRead | undefined): PendingDepositEntry | undefined {
+  const [first, ...rest] = read ?? [];
+  const entry = first?.entry;
+  return entry !== undefined && rest.every((r) => entryKey(r.entry) === entryKey(entry))
+    ? entry
+    : undefined;
 }
 
 // The deposit as the entry queue holds it: pending, with the chain's flag, the time from which it
@@ -405,6 +417,13 @@ function follow(deposit: Deposit, entry: PendingDepositEntry, attestedUpTo: bigi
   deposit.confirmed = true;
 }
 
+// Records the newest ledger at which a provider showed the deposit in the entry queue.
+function see(deposit: Deposit, read: QueueRead | undefined): void {
+  for (const r of read ?? []) {
+    if (r.entry !== undefined) deposit.seenAt = Math.max(deposit.seenAt ?? 0, r.ledger);
+  }
+}
+
 // Whether the entry queue's entry is this deposit's: its depositor's, of its amount, holding its
 // commitments.
 const holds = (entry: PendingDepositEntry | undefined, deposit: Deposit): boolean =>
@@ -418,7 +437,7 @@ const holds = (entry: PendingDepositEntry | undefined, deposit: Deposit): boolea
 // every RPC provider's entry under it holds the deposit.
 async function claimId(core: Core, id: number): Promise<void> {
   if (core.state.deposits.some((d) => d.id === id)) return;
-  const entry = (await readQueue(core, [id])).get(id)?.entry;
+  const entry = alike((await readQueue(core, [id])).get(id));
   const deposit = core.state.deposits.find(
     (d) => d.state === "submitting" && d.id === undefined && holds(entry, d),
   );
@@ -500,10 +519,11 @@ export async function trackDeposits(
           deposit.state = "pending";
         }
       }
-      const found = candidates(deposit).find((e) => holds(reads.get(e.id)?.entry, deposit));
+      const found = candidates(deposit).find((e) => holds(alike(reads.get(e.id)), deposit));
       if (deposit.state === "submitting" && found !== undefined) {
         deposit.id = found.id;
-        follow(deposit, reads.get(found.id)?.entry as PendingDepositEntry, context.attestedUpTo);
+        see(deposit, reads.get(found.id));
+        follow(deposit, alike(reads.get(found.id)) as PendingDepositEntry, context.attestedUpTo);
         continue;
       }
       if (
@@ -515,17 +535,27 @@ export async function trackDeposits(
     }
     if (!followed(deposit)) continue;
     const read = reads.get(deposit.id as number);
-    if (holds(read?.entry, deposit)) {
-      follow(deposit, read?.entry as PendingDepositEntry, context.attestedUpTo);
+    see(deposit, read);
+    const entry = alike(read);
+    if (holds(entry, deposit)) {
+      follow(deposit, entry as PendingDepositEntry, context.attestedUpTo);
       continue;
     }
-    // Gone from the entry queue, the deposit is no longer as the chain last showed it.
-    if (read !== undefined && read.entry === undefined) {
-      deposit.goneAt ??= read.ledger;
+    // Gone from the entry queue only on every provider's read of a ledger past the last one any
+    // provider showed the deposit at, and past its proof's deadline, by which it was made; a
+    // provider that shows it again undoes that. Gone, it is no longer as the chain last showed it.
+    const gone =
+      read !== undefined &&
+      read.every((r) => r.entry === undefined) &&
+      Math.min(...read.map((r) => r.ledger)) > Math.max(deposit.deadline, deposit.seenAt ?? 0);
+    if (gone) {
+      deposit.goneAt ??= Math.max(...read.map((r) => r.ledger));
       deposit.confirmed = false;
+    } else if (read?.some((r) => r.entry !== undefined)) {
+      deposit.goneAt = undefined;
     }
     const { goneAt } = deposit;
-    if (goneAt !== undefined && context.treeAt >= goneAt) {
+    if (gone && goneAt !== undefined && context.treeAt >= goneAt) {
       const cancelled = deposit.ownReturn === "cancelled";
       deposit.state = cancelled ? "cancelled" : "refunded";
       deposit.refundReason = cancelled ? 0 : (deposit.refundReason ?? deposit.flag?.reason);
