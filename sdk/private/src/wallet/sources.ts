@@ -126,21 +126,37 @@ export interface VaultEvents {
   readonly times: readonly LedgerTime[];
 }
 
+// What a read of the vault's events needs no more of: the events after a ledger, once the leaves
+// before a position are in, when it names one.
+export interface EventsEnd {
+  readonly ledger: number;
+  readonly leafEnd: number | undefined;
+}
+
 // The fallback when no indexer is available: the vault's own events from RPC, which keeps them
-// for about a week. A wallet further behind than that cannot sync this way.
+// for about a week. A wallet further behind than that cannot sync this way. A read with an end
+// stops at the first page past it.
 export class RpcEventSource implements ChainSource {
   readonly kind = "rpc";
   readonly #rpc: SorobanRpc;
   readonly #vault: string;
   readonly #startLedger: number;
   readonly #maxPages: number;
+  readonly #end: EventsEnd | undefined;
   #loaded: Promise<VaultEvents> | undefined;
 
-  constructor(rpc: SorobanRpc, vault: string, startLedger: number, maxPages: number) {
+  constructor(
+    rpc: SorobanRpc,
+    vault: string,
+    startLedger: number,
+    maxPages: number,
+    end?: EventsEnd,
+  ) {
     this.#rpc = rpc;
     this.#vault = vault;
     this.#startLedger = startLedger;
     this.#maxPages = maxPages;
+    this.#end = end;
   }
 
   async #load(): Promise<VaultEvents> {
@@ -156,6 +172,8 @@ export class RpcEventSource implements ChainSource {
     let latest = this.#startLedger;
     let head = this.#startLedger;
     let headTime: number | undefined;
+    // The position after the last leaf read.
+    let leafEnd = 0;
     for (let pages = 1; ; pages++) {
       let page;
       try {
@@ -186,6 +204,7 @@ export class RpcEventSource implements ChainSource {
         if (!event.successful || event.contractId !== this.#vault) continue;
         const decoded = decodeVaultEvent(event);
         if (decoded.kind === "new_commitment") {
+          leafEnd = Math.max(leafEnd, decoded.index + 1);
           leaves.push({
             index: decoded.index,
             commitment: decoded.commitment,
@@ -212,9 +231,12 @@ export class RpcEventSource implements ChainSource {
         }
       }
       if (page.events.length < EVENT_PAGE || page.cursor === undefined) break;
-      if (pages === this.#maxPages) {
+      const last = page.events[page.events.length - 1]?.ledger ?? this.#startLedger;
+      const end = this.#end;
+      const past = end !== undefined && last > end.ledger && leafEnd >= (end.leafEnd ?? leafEnd);
+      if (past || pages === this.#maxPages) {
         // Every ledger before the last one listed is complete.
-        latest = (page.events[page.events.length - 1]?.ledger ?? this.#startLedger) - 1;
+        latest = last - 1;
         break;
       }
       cursor = page.cursor;

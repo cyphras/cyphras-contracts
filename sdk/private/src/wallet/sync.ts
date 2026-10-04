@@ -551,9 +551,10 @@ export async function recheck(
   // The events of each provider that still holds the range.
   const held: VaultEvents[] = [];
   let busy = false;
+  const end = { ledger: range.to, leafEnd: range.leaves?.end };
   for (const rpc of rpcs) {
     try {
-      held.push(await new RpcEventSource(rpc, vault, start, maxPages).events());
+      held.push(await new RpcEventSource(rpc, vault, start, maxPages, end).events());
     } catch (err) {
       if (!(err instanceof CyphrasError)) throw err;
       // A busy RPC is asked again in the next sync.

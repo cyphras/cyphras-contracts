@@ -402,6 +402,23 @@ describe("unchecked ranges", () => {
     ]).toXDR("base64"),
   });
 
+  // The vault adding a leaf, as getEvents shows it.
+  const added = (l: Leaf, i: number) => ({
+    type: "contract",
+    ledger: l.ledger,
+    ledgerClosedAt: "2026-10-04T00:00:00Z",
+    contractId: VAULT,
+    id: `${String(l.ledger).padStart(12, "0")}-${String(i).padStart(8, "0")}`,
+    txHash: l.txHash,
+    inSuccessfulContractCall: true,
+    topic: [xdr.ScVal.scvSymbol("new_commitment").toXDR("base64")],
+    value: map([
+      ["index", xdr.ScVal.scvU64(new xdr.Uint64(BigInt(l.index)))],
+      ["commitment", nativeToScVal(l.commitment, { type: "u256" })],
+      ["encrypted_output", xdr.ScVal.scvBytes(Buffer.from(l.ciphertext))],
+    ]).toXDR("base64"),
+  });
+
   // An RPC whose getEvents shows the vault adding these leaves, and any other events, up to the
   // ledger `latest`.
   function showing(
@@ -409,27 +426,33 @@ describe("unchecked ranges", () => {
     latest = 70,
     others: readonly object[] = [],
   ): SorobanRpc {
-    const added = leaves.map((l, i) => ({
-      type: "contract",
-      ledger: l.ledger,
-      ledgerClosedAt: "2026-10-04T00:00:00Z",
-      contractId: VAULT,
-      id: `${String(l.ledger).padStart(12, "0")}-${String(i).padStart(8, "0")}`,
-      txHash: l.txHash,
-      inSuccessfulContractCall: true,
-      topic: [xdr.ScVal.scvSymbol("new_commitment").toXDR("base64")],
-      value: map([
-        ["index", xdr.ScVal.scvU64(new xdr.Uint64(BigInt(l.index)))],
-        ["commitment", nativeToScVal(l.commitment, { type: "u256" })],
-        ["encrypted_output", xdr.ScVal.scvBytes(Buffer.from(l.ciphertext))],
-      ]).toXDR("base64"),
-    }));
-    const events = [...added, ...others];
+    const events = [...leaves.map(added), ...others];
     return new SorobanRpc("http://rpc", async (_input, init) => {
       const { id } = JSON.parse(String(init?.body));
       const result = { events, latestLedger: latest, oldestLedger: 1 };
       return new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
     });
+  }
+
+  // An RPC that shows the vault adding these leaves in pages, as RPC pages events, and counts the
+  // pages it serves.
+  function paging(leaves: readonly Leaf[], latest: number) {
+    const events = leaves.map(added);
+    let served = 0;
+    const rpc = new SorobanRpc("http://rpc", async (_input, init) => {
+      const { id, params } = JSON.parse(String(init?.body));
+      const from = Number(params.pagination.cursor ?? 0);
+      const page = events.slice(from, from + Number(params.pagination.limit));
+      served++;
+      const result = {
+        events: page,
+        cursor: String(from + page.length),
+        latestLedger: latest,
+        oldestLedger: 1,
+      };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    });
+    return { rpc, pages: () => served };
   }
 
   // An RPC that answers getEvents with a JSON-RPC error: -32600 as one that no longer holds the
@@ -490,6 +513,29 @@ describe("unchecked ranges", () => {
       spends.unchecked.map((r) => [r.from, r.to]),
       [[100, 110]],
     );
+  });
+
+  it("reads a range's events no further than the first page past both its ledgers and its leaves", async () => {
+    // The range's leaves were added at ledgers 110 to 1,609, past its last ledger, and others after.
+    const taken = Array.from({ length: 1_500 }, (_, i) => leafAt(4 + i, 110 + i));
+    const later = Array.from({ length: 2_500 }, (_, i) => leafAt(1_504 + i, 2_000 + i));
+    const state = emptyState(1);
+    state.nullifierSince = 2_000;
+    const chunks = [chunk(taken.slice(0, 1_024)), chunk(taken.slice(1_024))];
+    state.unchecked = [
+      {
+        from: 100,
+        to: 120,
+        leaves: { first: 4, end: 1_504, ledger: 110, chunks },
+        status: "open",
+        askedAt: undefined,
+      },
+    ];
+    const { rpc, pages } = paging([...taken, ...later], 5_000);
+    await recheck(state, [rpc], VAULT, 10, 0);
+    assert.deepEqual(state.unchecked, []);
+    assert.equal(state.checkedLeafLedger, 1_609);
+    assert.equal(pages(), 2);
   });
 
   it("refuses a leaf whose ledger or transaction the sync took otherwise", async () => {
