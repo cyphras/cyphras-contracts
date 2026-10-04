@@ -89,14 +89,14 @@ export interface ExitPart {
   stranded: boolean;
 }
 
-// The exit of an unshield in the vault's exit queue: the ID transact gave it, the exits that still
-// owe part of it, and how far it follows the chain. Every vault event of a ledger before `ledger`
-// is applied, and of `ledger` itself those up to `event`, or all of them when it is undefined, so
-// no event is applied twice and no account older than what it shows is taken. `confirmed` while the
-// parts follow the vault's events every RPC provider showed, from the exit's queueing on without a
-// gap, rather than resting in part on the indexer's account. `account` is the indexer's account of
-// a confirmed exit, newer than its events: what the plan shows, unconfirmed, until the events reach
-// its ledger.
+// The exit of an unshield in the vault's exit queue: the ID transact gave it, every exit known to
+// hold or have held part of it, with what each still owes, and how far it follows the chain. Every
+// vault event of a ledger before `ledger` is applied, and of `ledger` itself those up to `event`,
+// or all of them when it is undefined, so no event is applied twice and no account older than what
+// it shows is taken. `confirmed` while the parts follow the vault's events every RPC provider
+// showed, from the exit's queueing on without a gap, rather than resting in part on the indexer's
+// account. `account` is the indexer's account of a confirmed exit, newer than its events: what the
+// plan shows, unconfirmed, until the events reach its ledger.
 export interface PlanExit {
   readonly id: number;
   parts: ExitPart[];

@@ -1199,6 +1199,134 @@ describe("the exit queue: sources", () => {
   });
 });
 
+describe("an exit the indexer's account alone settled", () => {
+  type World = Awaited<ReturnType<typeof createWorld>>;
+  const SECOND = "http://rpc2.test";
+
+  // A fetch whose first RPC provider answers getEvents from a start ledger `refusing` picks with
+  // the error it gives, and whose indexer has every exit settled while `lying` is set.
+  function liar(world: World, refusing: (start: number) => number | undefined) {
+    const control = { lying: false };
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      const start = body?.params?.startLedger as number | undefined;
+      const code = start === undefined ? undefined : refusing(start);
+      if (url.origin === RPC && body?.method === "getEvents" && code !== undefined) {
+        const error = { code, message: "refused" };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+      }
+      const res = await world.fetch(url.origin === SECOND ? RPC : input, init);
+      if (!control.lying || url.origin !== INDEXER || url.pathname !== "/v1/exits") return res;
+      const queue = (await res.json()) as Record<string, unknown>;
+      const exits = (queue["exits"] as Record<string, unknown>[]).map(
+        ({ position: _p, paid_by: _b, ...e }) => ({
+          ...e,
+          state: "settled",
+          payout_left: "0",
+          fee_left: "0",
+        }),
+      );
+      return new Response(JSON.stringify({ ...queue, head: queue["tail"], exits }));
+    };
+    return { fetch, control };
+  }
+
+  // A wallet with 100 XLM shielded that unshields 10 XLM to an account the vault cannot pay, into
+  // a queue the day's outflow keeps it in.
+  async function unshielding(world: World, fetch: FetchLike) {
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: SECOND,
+    });
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+    const destination = world.signer("closed account").publicKey;
+    await alice.unshield({
+      to: destination,
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    world.vault.unpayable.add(destination);
+    return alice;
+  }
+
+  // One indexer reply that settles every exit, newer than the ledgers its sync checks.
+  async function lie(world: World, alice: PrivateWallet, control: { lying: boolean }) {
+    control.lying = true;
+    world.indexer.completeTo = world.vault.ledger;
+    world.fill(1);
+    await alice.sync();
+    control.lying = false;
+    world.indexer.completeTo = undefined;
+  }
+
+  it("is moved back by the vault's events of a later strand, when the indexer alone gave the exit", async () => {
+    const world = await createWorld({ limits: SMALL });
+    let disowned = 0;
+    const { fetch, control } = liar(world, (start) => (start <= disowned ? -32600 : undefined));
+    const alice = await unshielding(world, fetch);
+    // The first provider claims to hold no history up to the landing.
+    disowned = world.vault.ledger;
+    await alice.sync();
+    let [plan] = await alice.plans();
+    assert.equal(plan?.state, "queued");
+    assert.equal(plan?.exitConfirmed, false);
+    await lie(world, alice, control);
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    world.advance(86_400);
+    await alice.releaseExits(world.signer("anyone"));
+    for (let i = 0; i < 3; i++) {
+      world.advance(3_600);
+      world.fill(1);
+      await alice.sync();
+    }
+    [plan] = await alice.plans();
+    assert.equal(world.vault.stranded.get(1)?.payout, 10n * XLM);
+    assert.equal(plan?.state, "stranded");
+    assert.equal(plan?.payoutLeft, 10n * XLM);
+  });
+
+  it("is moved back by the vault's events of a later strand, when a gap left a confirmed exit on the indexer's word", async () => {
+    const world = await createWorld({ limits: SMALL });
+    let busy = { from: Number.POSITIVE_INFINITY, to: 0 };
+    const { fetch, control } = liar(world, (start) =>
+      start >= busy.from && start <= busy.to ? -32603 : undefined,
+    );
+    const alice = await unshielding(world, fetch);
+    await alice.sync();
+    let [plan] = await alice.plans();
+    assert.equal(plan?.exitConfirmed, true);
+    await lie(world, alice, control);
+    // The first provider leaves one sync unchecked, and keeps its recheck busy while the indexer
+    // lies; the next sync's events leave a gap in what the exit followed.
+    control.lying = true;
+    busy = { from: world.vault.ledger, to: world.vault.ledger + 1 };
+    world.fill(1);
+    await alice.sync();
+    control.lying = false;
+    world.fill(1);
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(plan?.state, "settled");
+    assert.equal(plan?.exitConfirmed, false);
+    world.advance(86_400);
+    await alice.releaseExits(world.signer("anyone"));
+    world.fill(1);
+    await alice.sync();
+    [plan] = await alice.plans();
+    assert.equal(world.vault.stranded.get(1)?.payout, 10n * XLM);
+    assert.equal(plan?.state, "stranded");
+    assert.equal(plan?.payoutLeft, 10n * XLM);
+  });
+});
+
 describe("an indexer that renames the transaction a payment landed in", () => {
   type Entry = { tx_hash: string; ledger: number };
   const renamed = (x: Entry): Entry => ({ ...x, tx_hash: "ab".repeat(32) });
@@ -1489,7 +1617,10 @@ describe("following an exit from the vault's events and the indexer's account", 
     applyExits(state, [], account(50, [entry(1, "settled", 0n)]), 50);
     assert.equal(plan.state, "settled");
     assert.equal(plan.exit?.confirmed, true);
-    assert.deepEqual(plan.exit?.account, { parts: [], ledger: 50 });
+    assert.deepEqual(plan.exit?.account, {
+      parts: [{ id: 1, payoutLeft: 0n, feeLeft: 0n, stranded: false }],
+      ledger: 50,
+    });
     // An account older than the one shown is not taken.
     applyExits(state, [], account(40, [entry(1, "paid_in_part", 6n, { position: 0 })]), 50);
     assert.equal(plan.state, "settled");
@@ -1519,14 +1650,16 @@ describe("following an exit from the vault's events and the indexer's account", 
     ]);
   });
 
+  // The indexer's account of the plan's own exit 1 alone.
+  const mine = (completeTo: number, entryState: ExitEntry["state"], payoutLeft: bigint) =>
+    account(completeTo, [
+      entry(1, entryState, payoutLeft, {
+        txHash: TX,
+        position: entryState === "settled" ? undefined : 0,
+      }),
+    ]);
+
   it("gives way to the vault's events where the indexer's account alone gave the plan its exit", () => {
-    const mine = (completeTo: number, entryState: ExitEntry["state"], payoutLeft: bigint) =>
-      account(completeTo, [
-        entry(1, entryState, payoutLeft, {
-          txHash: TX,
-          position: entryState === "settled" ? undefined : 0,
-        }),
-      ]);
     let { state, plan } = withUnshield();
     applyExits(state, [], mine(40, "queued", 10n), 40);
     assert.equal(plan.state, "queued");
@@ -1550,12 +1683,90 @@ describe("following an exit from the vault's events and the indexer's account", 
     assert.equal(plan.exit, undefined);
   });
 
+  it("keeps an exit the indexer's account settles among the plan's, for the vault's events to rebuild", () => {
+    const { state, plan } = withUnshield();
+    applyExits(state, [], mine(40, "queued", 10n), 40);
+    // An exit the account settles owes nothing, whatever it says is left.
+    applyExits(state, [], mine(45, "settled", 5n), 45);
+    assert.equal(plan.state, "settled");
+    assert.deepEqual(plan.exit?.parts, [{ id: 1, payoutLeft: 0n, feeLeft: 0n, stranded: false }]);
+    // The events show it claimed as exit 2, though not the strand before: it owes nothing more.
+    const claimed: ExitEvent = {
+      kind: "exit_requeued",
+      id: 1,
+      newId: 2,
+      payout: 10n,
+      fee: 1n,
+      ...at(50),
+    };
+    applyExits(state, [events(46, 55, [claimed])], undefined, 55);
+    assert.equal(plan.state, "queued");
+    assert.deepEqual(plan.exit?.parts, [
+      { id: 1, payoutLeft: 0n, feeLeft: 0n, stranded: false },
+      { id: 2, payoutLeft: 10n, feeLeft: 1n, stranded: false },
+    ]);
+    // An account that pays exit 2 in part, and so does not contradict what the wallet knows.
+    const paidInPart = [
+      entry(1, "requeued", 0n, { requeuedTo: [2] }),
+      entry(2, "paid_in_part", 4n, { position: 0, requeuedFrom: 1 }),
+    ];
+    applyExits(state, [], account(60, paidInPart), 60);
+    assert.deepEqual(shownParts(plan.exit as PlanExit), [
+      { id: 2, payoutLeft: 4n, feeLeft: 0n, stranded: false },
+    ]);
+  });
+
+  it("rebuilds an exit the indexer's account no longer lists, or already listed, from the vault's events", () => {
+    let { state, plan } = withUnshield();
+    applyExits(state, [], mine(40, "queued", 10n), 40);
+    // Exit 1 no longer listed, and a claim queued from it: it owes nothing, until an event says.
+    applyExits(
+      state,
+      [],
+      account(45, [entry(2, "queued", 10n, { position: 0, requeuedFrom: 1 })]),
+      45,
+    );
+    applyExits(state, [events(46, 55, [stranded(50, 1n)])], undefined, 55);
+    assert.deepEqual(shownParts(plan.exit as PlanExit), [
+      { id: 1, payoutLeft: 10n, feeLeft: 1n, stranded: true },
+      { id: 2, payoutLeft: 10n, feeLeft: 0n, stranded: false },
+    ]);
+    // Exit 2 listed before the event that queues it: the event gives the plan one exit 2.
+    ({ state, plan } = withUnshield());
+    applyExits(state, [], mine(40, "queued", 10n), 40);
+    const claimed = [
+      entry(1, "requeued", 0n, { txHash: TX, requeuedTo: [2] }),
+      entry(2, "queued", 10n, { position: 0, requeuedFrom: 1 }),
+    ];
+    applyExits(state, [], account(45, claimed), 45);
+    applyExits(state, [events(46, 55, [requeued(50)])], undefined, 55);
+    assert.deepEqual(shownParts(plan.exit as PlanExit), [
+      { id: 2, payoutLeft: 10n, feeLeft: 0n, stranded: false },
+    ]);
+  });
+
+  it("keeps an exit the vault's events gave the plan when it falls back on an account that leaves it out", () => {
+    const { state, plan } = strandedPlan();
+    // The account has exit 1 claimed, though it names no exit the claim queued.
+    applyExits(state, [], account(50, [entry(1, "requeued", 0n)]), 50);
+    assert.equal(plan.state, "settled");
+    // The events up to ledger 40 queue the claimed payout as exit 2; then a gap.
+    applyExits(state, [events(31, 40, [requeued(35)])], undefined, 50);
+    applyExits(state, [events(61, 70, [paidPart(2, 65, 4n)])], undefined, 70);
+    assert.equal(plan.exit?.confirmed, false);
+    assert.equal(plan.state, "queued");
+    assert.deepEqual(shownParts(plan.exit as PlanExit), [
+      { id: 2, payoutLeft: 4n, feeLeft: 0n, stranded: false },
+    ]);
+  });
+
   it("takes no account that contradicts what the wallet knows of the exit", () => {
     for (const exits of [
       // a stranded exit owing more than it did
       [entry(1, "stranded", 12n)],
-      // a stranded exit back in the queue
+      // a stranded exit back in the queue, or paid from it
       [entry(1, "queued", 10n, { position: 0 })],
+      [entry(1, "settled", 0n)],
       // a requeue that queues more than the stranded exit owed
       [entry(1, "requeued", 0n), entry(2, "queued", 15n, { position: 0, requeuedFrom: 1 })],
     ]) {
