@@ -29,6 +29,46 @@ export function sep53Digest(message: string): Uint8Array {
   return sha256(concatBytes(utf8(SEP53_PREFIX), utf8(message)));
 }
 
+// The bytes a message given as text may stand for: its UTF-8, and what it decodes to as hex or
+// base64, as some signing APIs take data.
+function readings(message: string): Uint8Array[] {
+  const out = [utf8(message)];
+  const text = message.trim();
+  if (/^([0-9a-fA-F]{2})+$/.test(text)) out.push(hexToBytes(text.toLowerCase()));
+  try {
+    out.push(base64.decode(text));
+  } catch {
+    // not base64
+  }
+  return out;
+}
+
+// The message as text with the SEP-53 prefix, line endings and white space at the ends of lines and
+// of the whole left aside.
+function normalized(bytes: Uint8Array): string {
+  const text = new TextDecoder().decode(bytes).replace(/\r\n?/g, "\n");
+  const bare = text.startsWith(SEP53_PREFIX) ? text.slice(SEP53_PREFIX.length) : text;
+  return bare
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+}
+
+/**
+ * Whether signing `message` for a site would hand it the key to a mode (b) private account:
+ * SIGNATURE_MESSAGE whatever its line endings or the white space around its lines, as text, as
+ * UTF-8 bytes or as hex or base64, with the SEP-53 prefix or without it, or its SEP-53 digest, of
+ * which a raw signature is the same signature. A wallet that signs messages for sites should warn
+ * before it signs any of them.
+ */
+export function isKeyDerivationMessage(message: string | Uint8Array): boolean {
+  const digest = sep53Digest(SIGNATURE_MESSAGE);
+  return (typeof message === "string" ? readings(message) : [message]).some(
+    (bytes) => equalBytes(bytes, digest) || normalized(bytes) === SIGNATURE_MESSAGE,
+  );
+}
+
 // Strict RFC 8032 verification: a non-canonical S would be a second encoding of one signature,
 // and so a second seed.
 export function verifySep53(publicKey: string, message: string, signature: Uint8Array): boolean {

@@ -25,7 +25,7 @@ export type { ExitPart, PlanState, Route } from "./wallet/state.ts";
 export type { SyncLimits } from "./wallet/sources.ts";
 export type { NetworkFee, NetworkFeeCaps, TransactionSigner } from "./vault/invoke.ts";
 
-export { keySource, SIGNATURE_MESSAGE } from "./keysource.ts";
+export { isKeyDerivationMessage, keySource, SIGNATURE_MESSAGE } from "./keysource.ts";
 export type {
   KeySource,
   KeySourceContext,
