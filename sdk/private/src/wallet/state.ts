@@ -97,7 +97,8 @@ export interface ExitPart {
 // showed, from the exit's queueing on without a gap, rather than resting in part on the indexer's
 // account. `account` is the indexer's account of a confirmed exit, newer than its events: what the
 // plan shows, unconfirmed, until the events reach its ledger. `known` holds what the vault's
-// checked events last showed of each part of an exit that rests on the indexer's account.
+// checked events last showed, or imply, of each part of an exit that rests on the indexer's
+// account.
 export interface PlanExit {
   readonly id: number;
   parts: ExitPart[];
