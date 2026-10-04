@@ -6,7 +6,7 @@ import type { FetchLike } from "../net/http.ts";
 import { IndexerClient } from "../net/indexer.ts";
 import { RelayerClient } from "../net/relayer.ts";
 import { SorobanRpc } from "../net/rpc.ts";
-import { type VaultInstance, VaultReader } from "../vault/state.ts";
+import { VaultReader } from "../vault/state.ts";
 
 export type ServiceState = "ok" | "mismatch" | "unavailable";
 
@@ -86,117 +86,173 @@ const reachable = async <T>(probe: () => Promise<T>): Promise<T | undefined> => 
   }
 };
 
-// Checks the RPC's network, the vault's code and domain as it reads them, and every service's
-// identity; with a second RPC provider, the same of it. Anything pointing elsewhere is a mismatch,
-// which refuses shields and spends; an unreachable service is only unavailable.
-export async function verify(
-  services: Services,
-): Promise<{ verification: Verification; instance: VaultInstance | undefined }> {
-  const { deployment, networkId } = services;
-  let reason: string | undefined;
-  const mismatch = (what: string): ServiceState => {
-    reason ??= what;
-    return "mismatch";
-  };
+// What one check found, and a public description of a mismatch.
+interface Checked {
+  readonly state: ServiceState;
+  readonly reason: string | undefined;
+}
 
-  const provider = async (
-    rpcClient: SorobanRpc,
-    reader: VaultReader,
-    what: string,
-  ): Promise<{ rpc: ServiceState; vault: ServiceState; instance: VaultInstance | undefined }> => {
-    const passphrase = await reachable(() => rpcClient.getNetworkPassphrase());
-    const rpc: ServiceState =
-      passphrase === undefined
-        ? "unavailable"
-        : passphrase === deployment.networkPassphrase
-          ? "ok"
-          : mismatch(`${what} serves another network`);
-    let instance: VaultInstance | undefined;
-    let vault: ServiceState = "unavailable";
-    if (rpc === "ok") {
-      try {
-        instance = await reader.instance();
-        if (instance.wasmHash !== deployment.vaultWasmHash)
-          vault = mismatch("the vault runs other code");
-        else if (instance.config.domain !== deployment.domain)
-          vault = mismatch("the vault has another domain");
-        else if (instance.config.token !== deployment.asset.contract)
-          vault = mismatch("the vault holds another asset");
-        else vault = "ok";
-      } catch (err) {
-        if (err instanceof CyphrasError && err.code === "deployment_mismatch")
-          vault = mismatch(err.message);
-        else if (!(err instanceof CyphrasError)) throw err;
-      }
-    }
-    return { rpc, vault, instance };
-  };
+const ok: Checked = { state: "ok", reason: undefined };
+const unavailable: Checked = { state: "unavailable", reason: undefined };
+const mismatch = (reason: string): Checked => ({ state: "mismatch", reason });
 
-  const { rpc, vault, instance } = await provider(services.rpc, services.vault, "the RPC");
-  let secondRpc: ServiceState | "not_set" = "not_set";
-  if (services.second !== undefined) {
-    const second = await provider(services.second.rpc, services.second.vault, "the second RPC");
-    secondRpc = [second.rpc, second.vault].includes("mismatch")
-      ? "mismatch"
-      : second.rpc === "ok" && second.vault === "ok"
-        ? "ok"
-        : "unavailable";
+// An RPC provider's network, and the vault's code, domain and asset as it reads them.
+async function checkProvider(
+  deployment: Deployment,
+  rpc: SorobanRpc,
+  reader: VaultReader,
+  what: string,
+  timeoutMs: number | undefined,
+): Promise<{ readonly rpc: Checked; readonly vault: Checked }> {
+  const passphrase = await reachable(() => rpc.getNetworkPassphrase(timeoutMs));
+  if (passphrase === undefined) return { rpc: unavailable, vault: unavailable };
+  if (passphrase !== deployment.networkPassphrase) {
+    return { rpc: mismatch(`${what} serves another network`), vault: unavailable };
   }
+  let vault: Checked = unavailable;
+  try {
+    const instance = await reader.instance(timeoutMs);
+    if (instance.wasmHash !== deployment.vaultWasmHash)
+      vault = mismatch("the vault runs other code");
+    else if (instance.config.domain !== deployment.domain)
+      vault = mismatch("the vault has another domain");
+    else if (instance.config.token !== deployment.asset.contract)
+      vault = mismatch("the vault holds another asset");
+    else vault = ok;
+  } catch (err) {
+    if (err instanceof CyphrasError && err.code === "deployment_mismatch") {
+      vault = mismatch(err.message);
+    } else if (!(err instanceof CyphrasError)) {
+      throw err;
+    }
+  }
+  return { rpc: ok, vault };
+}
 
-  const identity = (
-    h: { vault: string; networkId: string } | undefined,
-    what: string,
-  ): ServiceState => {
-    if (h === undefined) return "unavailable";
-    if (h.vault !== deployment.vault || h.networkId !== networkId)
-      return mismatch(`${what} serves another vault`);
-    return "ok";
-  };
+function identity(
+  services: Services,
+  health: { readonly vault: string; readonly networkId: string } | undefined,
+  what: string,
+): Checked {
+  if (health === undefined) return unavailable;
+  if (health.vault !== services.deployment.vault || health.networkId !== services.networkId) {
+    return mismatch(`${what} serves another vault`);
+  }
+  return ok;
+}
 
-  const indexers = await Promise.all(
-    services.indexers.map(async (indexer) => {
-      const health = await reachable(() => indexer.health());
-      let state = identity(health, "an indexer");
-      if (state === "ok" && health?.ready !== true) state = "unavailable";
-      return { url: indexer.url, state };
-    }),
-  );
+// An indexer's identity, and whether it is ready.
+async function checkIndexer(
+  services: Services,
+  indexer: IndexerClient,
+  timeoutMs: number | undefined,
+): Promise<Checked> {
+  const health = await reachable(() => indexer.health(timeoutMs));
+  const checked = identity(services, health, "an indexer");
+  return checked.state === "ok" && health?.ready !== true ? unavailable : checked;
+}
 
-  const relayers = await Promise.all(
-    services.relayers.map(async ({ client, pinned }) => {
-      const health = await reachable(() => client.health());
-      let state = identity(health, "a relayer");
-      if (state === "ok" && pinned !== undefined && health?.feeAddress !== pinned.feeAddress) {
-        state = mismatch("a relayer names another fee address");
-      }
-      if (state === "ok" && health?.ready !== true) state = "unavailable";
-      return { url: client.url, state, feeAddress: health?.feeAddress };
-    }),
-  );
+async function checkRelayer(
+  services: Services,
+  { client, pinned }: Services["relayers"][number],
+  timeoutMs: number | undefined,
+): Promise<Checked & { readonly feeAddress: string | undefined }> {
+  const health = await reachable(() => client.health(timeoutMs));
+  let checked = identity(services, health, "a relayer");
+  if (checked.state === "ok" && pinned !== undefined && health?.feeAddress !== pinned.feeAddress) {
+    checked = mismatch("a relayer names another fee address");
+  }
+  if (checked.state === "ok" && health?.ready !== true) checked = unavailable;
+  return { ...checked, feeAddress: health?.feeAddress };
+}
 
+// What a verification found, from its checks: a mismatch anywhere refuses shields and spends, and
+// its reason is the first in the order RPC, second RPC, indexers, relayers.
+function verification(
+  services: Services,
+  first: { readonly rpc: Checked; readonly vault: Checked },
+  second: { readonly rpc: Checked; readonly vault: Checked } | undefined,
+  indexers: readonly Checked[],
+  relayers: readonly (Checked & { readonly feeAddress: string | undefined })[],
+): Verification {
+  const secondRpc: ServiceState | "not_set" =
+    second === undefined
+      ? "not_set"
+      : [second.rpc.state, second.vault.state].includes("mismatch")
+        ? "mismatch"
+        : second.rpc.state === "ok" && second.vault.state === "ok"
+          ? "ok"
+          : "unavailable";
   const all = [
-    rpc,
-    vault,
-    secondRpc,
-    ...indexers.map((i) => i.state),
-    ...relayers.map((r) => r.state),
+    first.rpc,
+    first.vault,
+    ...(second === undefined ? [] : [second.rpc, second.vault]),
+    ...indexers,
+    ...relayers,
   ];
-  const state = all.includes("mismatch")
+  const state = all.some((c) => c.state === "mismatch")
     ? "mismatch"
-    : rpc === "ok" && vault === "ok"
+    : first.rpc.state === "ok" && first.vault.state === "ok"
       ? "verified"
       : "unverified";
   return {
-    verification: {
-      state,
-      rpc,
-      vault,
-      secondRpc,
-      secondRpcRecommended: deployment.recommendSecondRpc === true,
-      indexers,
-      relayers,
-      reason,
-    },
-    instance,
+    state,
+    rpc: first.rpc.state,
+    vault: first.vault.state,
+    secondRpc,
+    secondRpcRecommended: services.deployment.recommendSecondRpc === true,
+    indexers: indexers.map((c, i) => ({
+      url: (services.indexers[i] as IndexerClient).url,
+      state: c.state,
+    })),
+    relayers: relayers.map((c, i) => ({
+      url: (services.relayers[i] as Services["relayers"][number]).client.url,
+      state: c.state,
+      feeAddress: c.feeAddress,
+    })),
+    reason: all.find((c) => c.reason !== undefined)?.reason,
+  };
+}
+
+// Checks the RPC's network, the vault's code and domain as it reads them, and every service's
+// identity, all at once; with a second RPC provider, the same of it. Anything pointing elsewhere is
+// a mismatch, which refuses shields and spends; a service that does not answer within `timeoutMs`
+// per request is only unavailable.
+export async function verify(services: Services, timeoutMs?: number): Promise<Verification> {
+  const { deployment, second } = services;
+  const [first, other, indexers, relayers] = await Promise.all([
+    checkProvider(deployment, services.rpc, services.vault, "the RPC", timeoutMs),
+    second === undefined
+      ? undefined
+      : checkProvider(deployment, second.rpc, second.vault, "the second RPC", timeoutMs),
+    Promise.all(services.indexers.map((i) => checkIndexer(services, i, timeoutMs))),
+    Promise.all(services.relayers.map((r) => checkRelayer(services, r, timeoutMs))),
+  ]);
+  return verification(services, first, other, indexers, relayers);
+}
+
+// Asks again the indexers a verification found unavailable, so one that was slow to answer is not
+// passed over for good; one that now points elsewhere is a mismatch.
+export async function recheckIndexers(
+  services: Services,
+  found: Verification,
+  timeoutMs: number,
+): Promise<Verification> {
+  const indexers = await Promise.all(
+    found.indexers.map(async (entry, i) =>
+      entry.state === "unavailable"
+        ? checkIndexer(services, services.indexers[i] as IndexerClient, timeoutMs)
+        : { state: entry.state, reason: undefined },
+    ),
+  );
+  const mismatched = indexers.find((c) => c.state === "mismatch");
+  return {
+    ...found,
+    state: mismatched === undefined ? found.state : "mismatch",
+    indexers: found.indexers.map((entry, i) => ({
+      url: entry.url,
+      state: (indexers[i] as Checked).state,
+    })),
+    reason: found.reason ?? mismatched?.reason,
   };
 }

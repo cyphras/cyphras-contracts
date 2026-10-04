@@ -258,7 +258,7 @@ export async function shield(
     // A deposit whose envelope never left the device is void. One that may have reached the
     // network stays submitting with its hash, whatever the RPC it went through answered, for a
     // sync to settle.
-    if (err instanceof CyphrasError && deposit.txHash === undefined) {
+    if (deposit.txHash === undefined) {
       deposit.state = "failed";
       await core.save();
     }
@@ -339,19 +339,24 @@ const providers = (core: Core): SorobanRpc[] =>
     : [core.services.rpc, core.services.second.rpc];
 
 // What every RPC provider reports of a deposit's shield transaction: the ID it made, once they all
-// report it alike; failed, once every one reports it failed, or missing while it holds every
-// ledger the deposit could have been made in, at a ledger past its proof's deadline, after which
-// it can no longer land; none otherwise.
+// report it alike. At a ledger past its proof's deadline, after which it can no longer land:
+// failed, once every one reports it failed, or missing while it holds every ledger the deposit
+// could have been made in; unresolved, once every one reports it missing and holds none of those
+// ledgers any more, so that none can tell whether it landed. None otherwise.
 function outcomeOf(
   statuses: readonly (TransactionStatus | undefined)[],
   deposit: Deposit,
-): number | "failed" | undefined {
+): number | "failed" | "unresolved" | undefined {
+  const past = (s: TransactionStatus | undefined): s is TransactionStatus =>
+    s !== undefined && s.latestLedger > deposit.deadline;
   const ended = (s: TransactionStatus | undefined): boolean =>
-    s !== undefined &&
-    s.latestLedger > deposit.deadline &&
+    past(s) &&
     (s.status === "FAILED" ||
       (s.status === "NOT_FOUND" && (s.oldestLedger ?? Infinity) <= deposit.builtAt + 1));
   if (statuses.every(ended)) return "failed";
+  const forgotten = (s: TransactionStatus | undefined): boolean =>
+    s?.status === "NOT_FOUND" && (s.oldestLedger ?? 0) > deposit.deadline;
+  if (statuses.every(forgotten)) return "unresolved";
   const ids = statuses.map(idOf);
   return ids.every((id) => id === ids[0]) ? ids[0] : undefined;
 }
@@ -442,10 +447,13 @@ function follow(deposit: Deposit, entry: PendingDepositEntry, attestedUpTo: bigi
   deposit.confirmed = true;
 }
 
-// Records the newest ledger at which a provider showed the deposit in the entry queue.
-function see(deposit: Deposit, read: QueueRead | undefined): void {
+// Records the newest ledger at which a provider showed the deposit in the entry queue, counting no
+// read as newer than `viewLedger`, so a provider cannot hold the deposit off "gone" for good with
+// one read of a ledger the chain has not reached.
+function see(deposit: Deposit, read: QueueRead | undefined, viewLedger: number): void {
   for (const r of read ?? []) {
-    if (r.entry !== undefined) deposit.seenAt = Math.max(deposit.seenAt ?? 0, r.ledger);
+    if (r.entry === undefined) continue;
+    deposit.seenAt = Math.max(deposit.seenAt ?? 0, Math.min(r.ledger, viewLedger));
   }
 }
 
@@ -476,10 +484,12 @@ async function claimId(core: Core, id: number): Promise<void> {
 const INDEXER_CANDIDATES = 4;
 
 // What a sync's reads of the vault show beyond the deposits' entries: the ledger up to which the
-// confirmed tree holds every leaf, and the last deposit every RPC provider shows attested.
+// confirmed tree holds every leaf, the last deposit every RPC provider shows attested, and the
+// oldest ledger among the providers' views of the vault.
 export interface QueueContext {
   readonly treeAt: number;
   readonly attestedUpTo: bigint;
+  readonly viewLedger: number;
 }
 
 // Follows this wallet's deposits through the entry queue. A deposit still being submitted is found
@@ -488,8 +498,10 @@ export interface QueueContext {
 // provider reports it; or under an ID that any provider's events or report of its transaction,
 // or the indexer's entries for its depositor and amount, give, once every provider's entry under
 // that ID holds its commitments. One that cannot land any more, as every provider reports its
-// transaction or every ledger up to its deadline checked shows, failed, until checked events or
-// the entry queue show it made after all. Until every source confirms what became of it, a
+// transaction or every ledger up to its deadline checked shows, failed; one that cannot land any
+// more and of which no provider holds the ledgers it could have landed in, unresolved; either
+// until checked events or the entry queue show it made after all. Until every source confirms what
+// became of it, a
 // deposit is followed in the entry queue as every provider shows it, where an entry still there
 // outweighs any resolution the indexer gave. One gone from the queue whose notes are not in the
 // confirmed tree of a later ledger went back to its depositor. A deposit's notes are spendable
@@ -505,13 +517,14 @@ export async function trackDeposits(
   const holding = (e: DepositEvent, d: Deposit): boolean =>
     e.commitments[0] === d.commitments[0] && e.commitments[1] === d.commitments[1];
   // A resolution every source confirmed is final.
+  const settled = (d: Deposit): boolean => d.state === "failed" || d.state === "unresolved";
   const followed = (d: Deposit): boolean =>
     d.id !== undefined &&
     d.state !== "submitting" &&
-    d.state !== "failed" &&
+    !settled(d) &&
     (d.state === "pending" || !d.confirmed);
   const unnamed = state.deposits.filter(
-    (d) => (d.state === "submitting" || d.state === "failed") && d.id === undefined,
+    (d) => (d.state === "submitting" || settled(d)) && d.id === undefined,
   );
   // Every provider's report of the transaction of each deposit still being submitted that no
   // checked event shows.
@@ -552,8 +565,9 @@ export async function trackDeposits(
       continue;
     }
     const made = events.find((e) => holding(e, deposit));
-    // A deposit taken for failed that the vault's events show made after all is being submitted.
-    if (deposit.state === "failed" && made !== undefined) deposit.state = "submitting";
+    // A deposit taken for failed or unresolved that the vault's events show made after all is
+    // being submitted.
+    if (settled(deposit) && made !== undefined) deposit.state = "submitting";
     if (deposit.state === "submitting") {
       const reported = reports.get(deposit);
       const outcome = reported === undefined ? undefined : outcomeOf(reported, deposit);
@@ -561,49 +575,49 @@ export async function trackDeposits(
         deposit.id = made.id;
         deposit.txHash = made.txHash;
         deposit.state = "pending";
-      } else if (outcome === "failed") {
-        deposit.state = "failed";
+      } else if (outcome === "failed" || outcome === "unresolved") {
+        deposit.state = outcome;
       } else if (outcome !== undefined) {
         deposit.id = outcome;
         deposit.state = "pending";
       }
     }
-    if (
-      (deposit.state === "submitting" || deposit.state === "failed") &&
-      deposit.id === undefined
-    ) {
+    if ((deposit.state === "submitting" || settled(deposit)) && deposit.id === undefined) {
       const found = candidates(deposit).find((id) => holds(alike(reads.get(id)), deposit));
       if (found !== undefined) {
         deposit.id = found;
-        see(deposit, reads.get(found));
+        see(deposit, reads.get(found), context.viewLedger);
         follow(deposit, alike(reads.get(found)) as PendingDepositEntry, context.attestedUpTo);
         continue;
       }
     }
     if (
-      deposit.state === "submitting" &&
+      (deposit.state === "submitting" || deposit.state === "unresolved") &&
       checkedBetween(state, deposit.builtAt, deposit.deadline)
     ) {
       deposit.state = "failed";
     }
     if (!followed(deposit)) continue;
     const read = reads.get(deposit.id as number);
-    see(deposit, read);
+    see(deposit, read, context.viewLedger);
     const entry = alike(read);
     if (holds(entry, deposit)) {
       follow(deposit, entry as PendingDepositEntry, context.attestedUpTo);
       continue;
     }
-    // Gone from the entry queue only on every provider's read of a ledger past the last one any
-    // provider showed the deposit at, and past its proof's deadline, by which it was made; a
-    // provider that shows it again undoes that. Gone, it is no longer as the chain last showed it.
+    // While every provider shows no entry, the deposit is no longer as the chain last showed it.
+    // It is gone from the entry queue only on every provider's read of a ledger past the last one
+    // any provider showed it at, and past its proof's deadline, by which it was made; a provider
+    // that shows it again undoes that. It is gone by the newest ledger of such a read, the earliest
+    // one over every such read, as one read of a ledger the chain has not reached must not hold
+    // the deposit off for good.
+    const none = read !== undefined && read.every((r) => r.entry === undefined);
     const gone =
-      read !== undefined &&
-      read.every((r) => r.entry === undefined) &&
+      none &&
       Math.min(...read.map((r) => r.ledger)) > Math.max(deposit.deadline, deposit.seenAt ?? 0);
+    if (none) deposit.confirmed = false;
     if (gone) {
-      deposit.goneAt ??= Math.max(...read.map((r) => r.ledger));
-      deposit.confirmed = false;
+      deposit.goneAt = Math.min(deposit.goneAt ?? Infinity, Math.max(...read.map((r) => r.ledger)));
     } else if (read?.some((r) => r.entry !== undefined)) {
       deposit.goneAt = undefined;
     }

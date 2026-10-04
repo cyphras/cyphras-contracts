@@ -56,7 +56,8 @@ function know(exit: PlanExit, p: ExitPart): void {
 // Applies one of the vault's events to the exit `p` it concerns, which holds or held part of the
 // plan's: what the event shows of an exit replaces what the wallet knew of it, a part paid from the
 // queue not being stranded. A part that missed earlier events may owe less than a claim moved from
-// it, and then owes nothing more.
+// it, and then owes nothing more. What a claimed exit still owes follows from the claim only as far
+// as what it owed before rests on checked events.
 function apply(plan: Plan, exit: PlanExit, p: ExitPart, event: ExitEvent): void {
   switch (event.kind) {
     case "exit_paid":
@@ -64,8 +65,10 @@ function apply(plan: Plan, exit: PlanExit, p: ExitPart, event: ExitEvent): void 
       p.payoutLeft = event.payoutLeft;
       p.feeLeft = event.feeLeft;
       p.stranded = event.kind === "exit_stranded";
+      know(exit, p);
       break;
     case "exit_requeued": {
+      const before = exit.known.find((k) => k.id === p.id);
       p.payoutLeft = less(p.payoutLeft, event.payout);
       p.feeLeft = less(p.feeLeft, event.fee);
       const moved = {
@@ -76,16 +79,23 @@ function apply(plan: Plan, exit: PlanExit, p: ExitPart, event: ExitEvent): void 
       };
       exit.parts = [...exit.parts.filter((x) => x.id !== event.newId), moved];
       know(exit, moved);
+      if (before !== undefined) {
+        know(exit, {
+          ...before,
+          payoutLeft: less(before.payoutLeft, event.payout),
+          feeLeft: less(before.feeLeft, event.fee),
+        });
+      }
       break;
     }
     case "settled":
       p.payoutLeft = 0n;
       p.feeLeft = 0n;
+      know(exit, p);
       break;
     case "exit_queued":
       return;
   }
-  know(exit, p);
   exit.ledger = event.ledger;
   exit.event = event.eventId;
   settle(plan, exit);

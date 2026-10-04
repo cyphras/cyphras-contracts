@@ -11,16 +11,24 @@ import { type ArtifactSource, PinnedArtifacts } from "../artifacts.ts";
 import { packPoint } from "../babyjub.ts";
 import { bigIntToBytesLE, concatBytes, randomBytes, utf8 } from "../bytes.ts";
 import { CommitmentTree } from "../merkle.ts";
-import { type Deployment, type DeploymentName, resolveDeployment } from "../deployments.ts";
+import {
+  type Deployment,
+  type DeploymentName,
+  PINNED_DEPLOYMENTS,
+  resolveDeployment,
+} from "../deployments.ts";
 import { CyphrasError, fail } from "../errors.ts";
 import {
+  type AddressKey,
   type FullViewingKeys,
   type IncomingKeys,
+  type Network,
   type SpendingKeys,
   addressKeyAt,
   addressKeyFor,
   defaultAddressKey,
   deriveSpendingKeys,
+  isNetwork,
 } from "../keys.ts";
 import { type KeySource, checkSeed } from "../keysource.ts";
 import type { FetchLike } from "../net/http.ts";
@@ -62,8 +70,9 @@ import {
 } from "./disclosure.ts";
 import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
+import { type VaultLimitsView, vaultLimits } from "./limits.ts";
 import { updatePace } from "./pace.ts";
-import { type Verification, createServices, verify } from "./services.ts";
+import { type Verification, createServices, recheckIndexers, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
   IndexerSource,
@@ -73,10 +82,12 @@ import {
 } from "./sources.ts";
 import {
   type ConfirmSpend,
+  type SpendQuote,
   type Submission,
   cancelHeld,
   checkIssuer,
   followHeld,
+  quoteSpend,
   resendConflicted,
   spend,
   submissionOf,
@@ -88,10 +99,14 @@ import {
   type OwnedNote,
   type Plan,
   type RootCheck,
+  type Route,
   StateStore,
   type UncheckedRange,
+  UnscopedState,
   type WalletState,
   emptyState,
+  stateScope,
+  unscopedFit,
 } from "./state.ts";
 import {
   type ScanKeys,
@@ -138,6 +153,10 @@ export interface ConnectionOptions {
   // saved or missing while its record remains, as a restore from an old backup or a lost write
   // leaves it, instead of refusing to open with state_conflict.
   readonly resetRolledBackState?: boolean;
+  // Starts this vault from a fresh state, in the same way, when the store holds a state every vault
+  // of the network shares that cannot be assigned to this vault with certainty, instead of refusing
+  // to open with state_unassigned. That state stays in the store as it is.
+  readonly resetUnassignedState?: boolean;
   // The caller's guarantee that no other wallet instance uses this store, needed where the
   // platform has no Web Locks API. Instances that share a store, such as an extension's popup and
   // its service worker, rely on Web Locks to run one operation at a time; without it two of them
@@ -151,8 +170,19 @@ export interface ConnectionOptions {
 /** Options of PrivateWallet.open. */
 export interface OpenOptions extends ConnectionOptions {
   readonly keys: KeySource;
+  // Proves with the witness generator and the proving key it loads itself.
   readonly prover: Prover;
+  // Where the SDK reads the verifying key, which every proof is checked against; it reads no other
+  // artifact.
   readonly artifacts: ArtifactSource;
+}
+
+/** Options of PrivateWallet.address. */
+export interface AddressOptions {
+  readonly network: Network;
+  readonly keys: KeySource;
+  readonly storage: KeyValueStore;
+  readonly index?: number;
 }
 
 /** Options of PrivateWallet.openViewOnly. */
@@ -212,6 +242,14 @@ export interface UnshieldRequest {
   readonly burnToIssuer?: boolean;
 }
 
+/** What a spend would pay: a send, or an unshield through a relayer or self-relayed. */
+export interface QuoteRequest {
+  readonly kind: "send" | "unshield";
+  readonly relayer?: string | readonly string[];
+  readonly selfRelay?: boolean;
+  readonly maxFee?: bigint;
+}
+
 /** A stalled payment proved again, with the same notes. */
 export interface RetryRequest {
   readonly maxFee?: bigint;
@@ -241,6 +279,9 @@ export interface PlanView extends Submission {
   readonly amount: bigint;
   readonly to: string;
   readonly createdAt: number;
+  // The relayer it went through, or the account that self-relayed it: where retry sends it again
+  // unless told otherwise.
+  readonly route: Route;
   // The exit of an unshield that waits in the vault's exit queue: the ID transact gave it, what
   // it still owes the recipient, and the exits that owe it, a stranded one until claimed; and
   // whether that rests on the vault's events every RPC provider showed, rather than on the
@@ -261,9 +302,13 @@ export interface PlanView extends Submission {
   readonly needsUserDecision: boolean;
 }
 
-/** Why the wallet opened on a fresh state in place of the stored one, and what was lost with it. */
+/**
+ * Why the wallet opened on a fresh state in place of the stored one, and what was lost with it.
+ * "unassigned": the store holds a state every vault of the network shares that could not be assigned
+ * to this vault with certainty, which stays in the store as it is.
+ */
 export interface StateReset {
-  readonly reason: "unreadable" | "rolled_back";
+  readonly reason: "unreadable" | "rolled_back" | "unassigned";
   readonly warning: string;
 }
 
@@ -274,9 +319,20 @@ const STATE_RESET_WARNING =
   "spent, and a deposit being submitted is no longer tracked. Before paying again, wait until " +
   "any such payment has landed or its deadline has passed.";
 
+const UNASSIGNED_WARNING =
+  "This store holds private-payment records that every vault of the network shares and that " +
+  "cannot be told apart by vault, so this vault starts from a fresh state, which the next sync " +
+  "rebuilds from the chain; those records stay in the store as they are. A payment or deposit in " +
+  "flight that only they record is not followed here: before paying again, wait until any such " +
+  "payment has landed or its deadline has passed.";
+
 const VIEWING_KEY_WARNING =
   "A viewing key reveals the whole history and future of this private account to whoever holds " +
   "it, and cannot be revoked. To prove a single payment, use disclosePayment instead.";
+
+// How long one request of the checks of the services may take when a wallet opens, and when an
+// indexer that did not answer is asked again: a service slower than that is passed over for now.
+const CHECK_MS = 5_000;
 
 // Parts of a split unshield follow the previous part's landing by one to six hours, at random.
 const SPLIT_GAP_MS = { min: 3_600_000, max: 21_600_000 };
@@ -338,6 +394,91 @@ function viewStoreKey(decoded: ReturnType<typeof decodeViewingKey>): Uint8Array 
 }
 
 const defaultFetch: FetchLike = (input, init) => globalThis.fetch(input, init);
+
+// The address at a diversifier index, or the default address `self`.
+function addressAt(keys: IncomingKeys, self: AddressKey, index: number | undefined): string {
+  if (index === undefined) return encodeAddress(keys.network, self.d, self.pkd);
+  if (!Number.isInteger(index) || index < 0 || index > 0xffffffff) {
+    fail("invalid_argument", "a diversifier index is a 32-bit integer");
+  }
+  const key = addressKeyAt(keys, index);
+  if (key === undefined) fail("invalid_argument", "this diversifier index has no valid address");
+  return encodeAddress(keys.network, key.d, key.pkd);
+}
+
+// Why a stored state is set aside for a fresh one, as the options allow, or undefined.
+function resetReason(err: unknown, options: ConnectionOptions): StateReset["reason"] | undefined {
+  const code = err instanceof CyphrasError ? err.code : undefined;
+  if (code === "storage_unreadable" && options.resetUnreadableState === true) return "unreadable";
+  if (code === "state_conflict" && options.resetRolledBackState === true) return "rolled_back";
+  return undefined;
+}
+
+// The vaults this release pins, which a state in the unscoped records with no plan is weighed
+// against.
+const PINNED_VAULTS: readonly Deployment[] = Object.values(PINNED_DEPLOYMENTS).filter(
+  (d): d is Deployment => d !== null,
+);
+
+// The vault's stored state, after the end of a move into its scope that stopped half way; or the
+// state in the unscoped records when it is this vault's and no move into another scope holds it; or
+// a fresh one. A state there that cannot be assigned to this vault with certainty is refused with
+// state_unassigned, and left untouched, unless the options allow a fresh state, which is then saved
+// at once. As the options allow, a fresh state also takes the place of one that is unreadable or
+// older than its revision record.
+async function openState(
+  states: StateStore,
+  unscoped: UnscopedState,
+  deployment: Deployment,
+  options: ConnectionOptions,
+): Promise<{ readonly state: WalletState; readonly reset: StateReset | undefined }> {
+  const fresh = (reset?: StateReset) => ({ state: emptyState(deployment.deployLedger), reset });
+  let stored: WalletState | undefined;
+  try {
+    stored = await states.load();
+  } catch (err) {
+    const reason = resetReason(err, options);
+    if (reason === undefined) throw err;
+    await states.discard();
+    return fresh({ reason, warning: STATE_RESET_WARNING });
+  }
+  const scope = stateScope(deployment.vault, deployment.deployLedger);
+  try {
+    const moving = await unscoped.movingTo();
+    if (stored !== undefined) {
+      if (moving === scope) await unscoped.remove();
+      return { state: stored, reset: undefined };
+    }
+    const state = await unscoped.read();
+    if (moving !== undefined && moving !== scope) return fresh();
+    if (state === undefined) {
+      if (moving === scope) await unscoped.remove();
+      return fresh();
+    }
+    const fit = unscopedFit(state, deployment, PINNED_VAULTS);
+    if (fit === "ours") {
+      return { state: await unscoped.moveTo(scope, states, state), reset: undefined };
+    }
+    if (fit === "empty") await unscoped.remove();
+    if (fit !== "unassigned") return fresh();
+    if (options.resetUnassignedState !== true) {
+      fail(
+        "state_unassigned",
+        "the store holds a state every vault of the network shares that cannot be assigned to this vault with certainty; resetUnassignedState opens this vault afresh and leaves that state as it is",
+      );
+    }
+    const opened = fresh({ reason: "unassigned", warning: UNASSIGNED_WARNING });
+    await states.save(opened.state);
+    return opened;
+  } catch (err) {
+    const reason = resetReason(err, options);
+    if (reason === undefined) throw err;
+    await unscoped.remove();
+    return stored === undefined
+      ? fresh({ reason, warning: STATE_RESET_WARNING })
+      : { state: stored, reset: undefined };
+  }
+}
 
 /**
  * A private account on one vault. It syncs the pool, proves spends on this device and talks to
@@ -403,6 +544,25 @@ export class PrivateWallet {
     );
   }
 
+  /**
+   * The cy1 or cyt1 address of a private account at a diversifier index, or its default address,
+   * from its key source alone: no state is loaded, no service is asked and nothing syncs. A mode (b)
+   * key source still has its signer sign, and holds the seed to the one of earlier sessions.
+   */
+  static async address(options: AddressOptions): Promise<string> {
+    if (!isNetwork(options.network)) fail("invalid_argument", "unknown network");
+    const material = await options.keys.resolve({
+      network: options.network,
+      storage: options.storage,
+    });
+    checkSeed(material);
+    const keys = deriveSpendingKeys(material.seed, options.network, material.account);
+    material.seed.fill(0);
+    const address = addressAt(keys, defaultAddressKey(keys), options.index);
+    for (const secret of [keys.storeKey, keys.ovk, keys.dk]) secret.fill(0);
+    return address;
+  }
+
   /** A wallet that syncs and reports from an incoming or full viewing key and cannot spend. */
   static async openViewOnly(options: ViewOnlyOptions): Promise<PrivateWallet> {
     const deployment = resolveDeployment(
@@ -446,28 +606,6 @@ export class PrivateWallet {
       options.relayers,
       options.secondRpcUrl,
     );
-    const store = new SealedStore(options.storage, storeKey);
-    const states = new StateStore(store);
-    let state: WalletState;
-    let reset: StateReset | undefined;
-    try {
-      state = (await states.load()) ?? emptyState(deployment.deployLedger);
-    } catch (err) {
-      const code = err instanceof CyphrasError ? err.code : undefined;
-      const reason =
-        code === "storage_unreadable" && options.resetUnreadableState === true
-          ? "unreadable"
-          : code === "state_conflict" && options.resetRolledBackState === true
-            ? "rolled_back"
-            : undefined;
-      if (reason === undefined) throw err;
-      await states.discard();
-      state = emptyState(deployment.deployLedger);
-      reset = { reason, warning: STATE_RESET_WARNING };
-    }
-    const now = options.clock ?? (() => Date.now());
-    const sleep =
-      options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const lock =
       webLock(lockName(storeKey)) ??
       (options.singleInstance === true
@@ -476,6 +614,15 @@ export class PrivateWallet {
             "locks_unavailable",
             "this platform has no Web Locks API; set singleInstance if only one wallet instance uses this store",
           ));
+    const scope = stateScope(deployment.vault, deployment.deployLedger);
+    const states = new StateStore(new SealedStore(options.storage, storeKey, scope));
+    const unscoped = new UnscopedState(new SealedStore(options.storage, storeKey));
+    const { state, reset } = await lock.hold(() =>
+      openState(states, unscoped, deployment, options),
+    );
+    const now = options.clock ?? (() => Date.now());
+    const sleep =
+      options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const core: Core = {
       deployment,
       services,
@@ -491,7 +638,7 @@ export class PrivateWallet {
       now,
       sleep,
     };
-    const { verification } = await verify(services);
+    const verification = await verify(services, CHECK_MS);
     const limits = { ...DEFAULT_SYNC_LIMITS, ...options.syncLimits };
     return new PrivateWallet(core, fetchFn, states, lock, limits, verification, reset);
   }
@@ -584,7 +731,9 @@ export class PrivateWallet {
 
   async #ensureVerified(): Promise<void> {
     if (this.#verification.state === "unverified") {
-      this.#verification = (await verify(this.#core.services)).verification;
+      this.#verification = await verify(this.#core.services);
+    } else if (this.#verification.indexers.some((i) => i.state === "unavailable")) {
+      this.#verification = await recheckIndexers(this.#core.services, this.#verification, CHECK_MS);
     }
     if (this.#verification.state === "mismatch") {
       fail("deployment_mismatch", this.#verification.reason ?? "a service points elsewhere");
@@ -596,14 +745,7 @@ export class PrivateWallet {
 
   /** The cy1 or cyt1 address at a diversifier index, or the default address. */
   generateAddress(index?: number): string {
-    const { scan, self } = this.#core;
-    if (index === undefined) return encodeAddress(scan.network, self.d, self.pkd);
-    if (!Number.isInteger(index) || index < 0 || index > 0xffffffff) {
-      fail("invalid_argument", "a diversifier index is a 32-bit integer");
-    }
-    const key = addressKeyAt(scan.incoming, index);
-    if (key === undefined) fail("invalid_argument", "this diversifier index has no valid address");
-    return encodeAddress(scan.network, key.d, key.pkd);
+    return addressAt(this.#core.scan.incoming, this.#core.self, index);
   }
 
   #indexer(): IndexerClient | undefined {
@@ -764,10 +906,8 @@ export class PrivateWallet {
     // up to the oldest view.
     const complete =
       verified && views.every((v) => v?.roots.nextLeaf === core.state.tree.leafCount);
-    const treeAt = Math.max(
-      core.state.checkedLeafLedger - 1,
-      complete ? Math.min(...answered.map((v) => v.ledger)) : 0,
-    );
+    const viewLedger = Math.min(...answered.map((v) => v.ledger));
+    const treeAt = Math.max(core.state.checkedLeafLedger - 1, complete ? viewLedger : 0);
     // What a recheck cleared is older than this sync's ledgers, and goes first; what any provider
     // showed of this sync's ledgers names IDs to read the entry queue under.
     await trackDeposits(
@@ -780,6 +920,7 @@ export class PrivateWallet {
         attestedUpTo: answered
           .map((v) => v.instance.status.attestedUpTo)
           .reduce((a, b) => (a < b ? a : b)),
+        viewLedger,
       },
     );
     applyExits(
@@ -878,6 +1019,7 @@ export class PrivateWallet {
       amount: p.amount,
       to: p.to,
       createdAt: p.createdAt,
+      route: p.route,
       exitId: p.exit?.id,
       payoutLeft: p.exit === undefined ? undefined : payoutLeft(p.exit),
       exitParts: (p.exit === undefined ? [] : shownParts(p.exit)).map((part) => ({ ...part })),
@@ -888,6 +1030,16 @@ export class PrivateWallet {
       mustRetry: isActive(p) || p.state === "dead",
       needsUserDecision: isActive(p) && (this.#core.state.rootCheck?.ledger ?? 0) >= p.deadline,
     }));
+  }
+
+  /**
+   * The vault's limits as the chain shows them now: the deposit bounds and what the TVL cap and,
+   * for `depositor`, its daily allowance leave, the admission delays, and what today's outflow
+   * window leaves before payouts wait in the exit queue.
+   */
+  async vaultLimits(depositor?: string): Promise<VaultLimitsView> {
+    await this.#ensureVerified();
+    return vaultLimits(this.#core, depositor);
   }
 
   /**
@@ -933,6 +1085,22 @@ export class PrivateWallet {
     );
   }
 
+  /**
+   * The fee a send or an unshield would pay now, from the first relayer that quotes within the cap,
+   * or none for a self-relayed unshield, and the most one transaction can pay with it from the
+   * notes spendable as of the last sync: what a wallet shows, with a Max button, before review.
+   */
+  quote(request: QuoteRequest): Promise<SpendQuote> {
+    return this.#run(async () =>
+      quoteSpend(
+        this.#core,
+        request.kind,
+        request.selfRelay === true ? undefined : this.#relayerClients(request.relayer),
+        request.maxFee,
+      ),
+    );
+  }
+
   /** Pays a shielded address through a relayer. */
   send(request: SendRequest): Promise<Submission> {
     return this.#run(async () => {
@@ -959,8 +1127,11 @@ export class PrivateWallet {
   /**
    * Pays a Stellar address through a relayer or, with selfRelay, from the user's own account.
    * With split, an amount above the vault's single-exit cap becomes an operation whose parts go
-   * one after another; continueOperations sends each next part once it is due.
+   * one after another; continueOperations sends each next part once it is due. Without split it
+   * is always one submission.
    */
+  unshield(request: UnshieldRequest & { readonly split?: false }): Promise<Submission>;
+  unshield(request: UnshieldRequest): Promise<Submission | OperationView>;
   unshield(request: UnshieldRequest): Promise<Submission | OperationView> {
     return this.#run(async () => {
       await this.#sync(false);
@@ -1185,9 +1356,11 @@ export class PrivateWallet {
 
   /**
    * Proves a stalled or dead payment again with the same notes, so at most one of the two can
-   * land. The relayer, the fee cap and self-relay may differ from the first attempt.
+   * land. The relayer, the fee cap and self-relay may differ from the first attempt; by default it
+   * goes the way the plan went: through its relayer first, then the others, or self-relayed, which
+   * needs selfRelay again.
    */
-  retry(planId: string, request: RetryRequest): Promise<Submission> {
+  retry(planId: string, request: RetryRequest = {}): Promise<Submission> {
     return this.#run(async () => {
       await this.#sync(false);
       const { state } = this.#core;
@@ -1196,6 +1369,20 @@ export class PrivateWallet {
       if (!isActive(plan) && plan.state !== "dead") {
         fail("invalid_argument", "only a prepared, submitted or dead plan can be retried");
       }
+      const { route } = plan;
+      if (
+        route.kind === "self" &&
+        request.selfRelay === undefined &&
+        request.relayer === undefined
+      ) {
+        fail("invalid_argument", "the plan was self-relayed; retry needs its signer, or a relayer");
+      }
+      const others = this.#relayerClients(undefined).map((r) => r.url);
+      const relayers =
+        request.relayer ??
+        (route.kind === "relayer"
+          ? [route.url, ...others.filter((url) => url !== route.url)]
+          : undefined);
       const inputs = plan.inputs.map((input) => {
         const note = state.notes.find((n) => n.pos === input.pos);
         if (note === undefined || note.spent !== undefined) {
@@ -1208,7 +1395,7 @@ export class PrivateWallet {
         to: plan.to,
         amount: plan.amount,
         maxFee: request.selfRelay === undefined ? (request.maxFee ?? plan.fee) : 0n,
-        relayers: request.selfRelay === undefined ? this.#relayerClients(request.relayer) : [],
+        relayers: request.selfRelay === undefined ? this.#relayerClients(relayers) : [],
         selfRelay: request.selfRelay,
         confirm: request.confirm,
         notBefore: undefined,

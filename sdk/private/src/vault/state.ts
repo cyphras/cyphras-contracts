@@ -241,9 +241,9 @@ export class VaultReader {
     this.vault = vault;
   }
 
-  async instance(): Promise<VaultInstance> {
+  async instance(timeoutMs?: number): Promise<VaultInstance> {
     const key = instanceKey(this.vault);
-    const { entries, latestLedger } = await this.#rpc.getLedgerEntries([key]);
+    const { entries, latestLedger } = await this.#rpc.getLedgerEntries([key], timeoutMs);
     const entry = entries.get(keyId(key));
     if (entry === undefined) fail("deployment_mismatch", "the pinned vault does not exist");
     return { ...parseInstance(entry.data), latestLedger };

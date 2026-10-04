@@ -13,7 +13,7 @@ import {
   type TransactionSigner,
   invokeVault,
 } from "../../src/vault/invoke.ts";
-import { MemoryStore, SealedStore } from "../../src/storage.ts";
+import { MemoryStore } from "../../src/storage.ts";
 import { applyExits, shownParts } from "../../src/wallet/exits.ts";
 import type { ExitEvent } from "../../src/wallet/sources.ts";
 import {
@@ -27,7 +27,7 @@ import {
 import type { OpenOptions, OperationView, PrivateWallet } from "../../src/wallet/wallet.ts";
 import { INDEXER, RPC, XLM, createWorld, rewritingFetch } from "../support/network.ts";
 import { diagnostic, keypairFor } from "../support/rpc.ts";
-import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
+import { confirmAll, isError, openWallet, sealedState } from "../support/wallets.ts";
 
 const SMALL = { maxDailyOutflow: 50n * XLM, tvlCap: 350n * XLM };
 
@@ -154,7 +154,7 @@ describe("split unshields whose parts do not plainly land", () => {
     world.advance(121 * 5);
     world.fill(1);
     await alice.continueOperations();
-    const kept = (await loadState(new SealedStore(store, storeKeyOf(0)))) as WalletState;
+    const kept = (await loadState(sealedState(store, world))) as WalletState;
     const [dead, again] = kept.plans as [Plan, Plan | undefined];
     assert.equal(dead.state, "dead");
     assert.equal(again?.retryOf, dead.id);
@@ -240,7 +240,7 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal(dead?.state, "dead");
     assert.equal(view?.plans.length, 2);
     assert.equal(again?.amount, dead?.amount);
-    const kept = (await loadState(new SealedStore(store, storeKeyOf(0)))) as WalletState;
+    const kept = (await loadState(sealedState(store, world))) as WalletState;
     const [first, second] = kept.plans as [Plan, Plan];
     assert.equal(second.retryOf, first.id);
     assert.deepEqual(
@@ -602,7 +602,7 @@ describe("split unshields whose parts do not plainly land", () => {
     await alice.sync();
     // An earlier reading took the part, which landed, for dead; and the wallet holds another
     // payment, which never landed, of the same notes.
-    const sealed = new SealedStore(store, storeKeyOf(0));
+    const sealed = sealedState(store, world);
     const state = (await loadState(sealed)) as WalletState;
     const part = state.plans[0] as Plan;
     Object.assign(part, { state: "dead", evidence: [] });
@@ -629,7 +629,7 @@ describe("split unshields whose parts do not plainly land", () => {
     });
     await alice.sync();
     // An earlier reading took the part, which landed, for superseded, and so blocked the split.
-    const sealed = new SealedStore(store, storeKeyOf(0));
+    const sealed = sealedState(store, world);
     const state = (await loadState(sealed)) as WalletState;
     const part = state.plans[0] as Plan;
     Object.assign(part, { state: "superseded", evidence: [] });
@@ -1872,6 +1872,63 @@ describe("following an exit from the vault's events and the indexer's account", 
       ]);
     applyExits(state, [], claimed(15n), 60);
     assert.deepEqual(shownParts(plan.exit as PlanExit), [
+      { id: 2, payoutLeft: 10n, feeLeft: 0n, stranded: false },
+    ]);
+  });
+
+  it("judges the accounts of an exit that rests on the indexer against a checked settlement", () => {
+    const { state, plan } = withUnshield();
+    applyExits(state, [], mine(40, "queued", 10n), 40);
+    applyExits(state, [events(41, 50, [{ kind: "settled", exitId: 1, ...at(45) }])], undefined, 50);
+    assert.equal(plan.state, "settled");
+    applyExits(state, [], mine(60, "queued", 10n), 60);
+    assert.equal(plan.state, "settled");
+  });
+
+  it("judges the exit a checked claim moved from by nothing the indexer alone gave of it", () => {
+    const { state, plan } = withUnshield();
+    // The indexer alone gives the exit, queued, then stranded with its fee owing nothing.
+    applyExits(
+      state,
+      [],
+      account(20, [entry(1, "queued", 10n, { txHash: TX, position: 0, feeLeft: 1n })]),
+      20,
+    );
+    applyExits(state, [], account(30, [entry(1, "stranded", 10n, { txHash: TX })]), 30);
+    // A checked claim moves the payout to exit 2; the fee, which the relayer still cannot take,
+    // stays.
+    applyExits(state, [events(31, 40, [requeued(35)])], undefined, 40);
+    // An honest account: exit 1 still owes its fee, and release paid exit 2 in full.
+    applyExits(
+      state,
+      [],
+      account(50, [
+        entry(1, "stranded", 0n, { txHash: TX, feeLeft: 1n, requeuedTo: [2] }),
+        entry(2, "settled", 0n, { requeuedFrom: 1 }),
+      ]),
+      50,
+    );
+    assert.equal(plan.state, "settled");
+  });
+
+  it("judges the exit a checked claim moved from by what checked events showed of it before", () => {
+    const { state, plan } = withUnshield();
+    applyExits(state, [], mine(40, "queued", 10n), 40);
+    applyExits(state, [events(41, 50, [stranded(43, 1n), requeued(45)])], undefined, 50);
+    // The checked strand and claim leave exit 1 owing its fee alone, which an account that has it
+    // owe part of the payout contradicts.
+    applyExits(
+      state,
+      [],
+      account(60, [
+        entry(1, "stranded", 4n, { txHash: TX, feeLeft: 1n, requeuedTo: [2] }),
+        entry(2, "settled", 0n, { requeuedFrom: 1 }),
+      ]),
+      60,
+    );
+    assert.equal(plan.state, "queued");
+    assert.deepEqual(shownParts(plan.exit as PlanExit), [
+      { id: 1, payoutLeft: 0n, feeLeft: 1n, stranded: true },
       { id: 2, payoutLeft: 10n, feeLeft: 0n, stranded: false },
     ]);
   });

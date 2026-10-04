@@ -133,9 +133,37 @@ export interface EventsEnd {
   readonly leafEnd: number | undefined;
 }
 
+// Where a getEvents cursor or event ID stands: its TOID and event index, in the order RPC pages in;
+// its ledger, the TOID shifted right by 32 bits; and whether it closes that ledger, as the cursor of
+// a scan that stopped there does, with the largest transaction, operation and event index.
+interface Position {
+  readonly toid: bigint;
+  readonly event: bigint;
+  readonly ledger: number;
+  readonly closes: boolean;
+}
+
+function position(id: string): Position | undefined {
+  const parts = /^(\d{1,19})-(\d{1,10})$/.exec(id);
+  if (parts === null) return undefined;
+  const toid = BigInt(parts[1] as string);
+  const event = BigInt(parts[2] as string);
+  return {
+    toid,
+    event,
+    ledger: Number(toid >> 32n),
+    closes: (toid & 0xffffffffn) === 0xffffffffn && event === 0xffffffffn,
+  };
+}
+
+const after = (a: Position, b: Position): boolean =>
+  a.toid > b.toid || (a.toid === b.toid && a.event > b.event);
+
 // The fallback when no indexer is available: the vault's own events from RPC, which keeps them
-// for about a week. A wallet further behind than that cannot sync this way. A read with an end
-// stops at the first page past it.
+// for about a week. A wallet further behind than that cannot sync this way. RPC scans a bounded
+// range of ledgers per request, so a short page says nothing of the ledgers after it: the read
+// follows the cursor until it covers the latest ledger, and counts as covered only the ledgers the
+// cursor shows were scanned. A read with an end stops once it covers that end.
 export class RpcEventSource implements ChainSource {
   readonly kind = "rpc";
   readonly #rpc: SorobanRpc;
@@ -169,7 +197,9 @@ export class RpcEventSource implements ChainSource {
       if (at !== undefined) times.push({ ledger, at });
     };
     let cursor: string | undefined;
-    let latest = this.#startLedger;
+    let at: Position | undefined;
+    // The last ledger every ledger up to which was scanned.
+    let covered = this.#startLedger - 1;
     let head = this.#startLedger;
     let headTime: number | undefined;
     // The position after the last leaf read.
@@ -197,7 +227,6 @@ export class RpcEventSource implements ChainSource {
         const first = page.events[0];
         if (first !== undefined) time(first.ledger, first.closedAt);
       }
-      latest = page.latestLedger;
       head = page.latestLedger;
       headTime = page.latestCloseTime;
       for (const event of page.events) {
@@ -230,17 +259,23 @@ export class RpcEventSource implements ChainSource {
           deposits.push({ ...decoded, txHash: event.txHash, ledger: event.ledger });
         }
       }
-      if (page.events.length < EVENT_PAGE || page.cursor === undefined) break;
-      const last = page.events[page.events.length - 1]?.ledger ?? this.#startLedger;
-      const end = this.#end;
-      const past = end !== undefined && last > end.ledger && leafEnd >= (end.leafEnd ?? leafEnd);
-      if (past || pages === this.#maxPages) {
-        // Every ledger before the last one listed is complete.
-        latest = last - 1;
-        break;
+      const next = page.cursor === undefined ? undefined : position(page.cursor);
+      if (next === undefined) {
+        fail("rpc_error", "the RPC's events came without a cursor to go on from");
       }
+      // A cursor that does not move on leaves the rest of the range unscanned.
+      if (at !== undefined && !after(next, at)) break;
+      at = next;
+      // A full page stops inside the ledger of its last event, which is covered only once a later
+      // page closes it.
+      covered = Math.max(covered, next.closes ? next.ledger : next.ledger - 1);
+      const end = this.#end;
+      const past =
+        end !== undefined && covered >= end.ledger && leafEnd >= (end.leafEnd ?? leafEnd);
+      if (covered >= head || past || pages === this.#maxPages) break;
       cursor = page.cursor;
     }
+    const latest = Math.min(covered, head);
     time(head, headTime);
     const upTo = <T extends { readonly ledger: number }>(xs: T[]): T[] =>
       xs.filter((x) => x.ledger <= latest);

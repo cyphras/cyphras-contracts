@@ -2,8 +2,9 @@ import { mnemonicToSeedSync } from "@scure/bip39";
 import { CyphrasError } from "../../src/errors.ts";
 import { deriveStoreKey } from "../../src/keys.ts";
 import { keySource } from "../../src/keysource.ts";
-import { type KeyValueStore, MemoryStore } from "../../src/storage.ts";
+import { type KeyValueStore, MemoryStore, SealedStore } from "../../src/storage.ts";
 import type { TransactionSigner } from "../../src/vault/invoke.ts";
+import { stateScope } from "../../src/wallet/state.ts";
 import { type OpenOptions, PrivateWallet } from "../../src/wallet/wallet.ts";
 import { MNEMONIC } from "../helpers.ts";
 import { RPC, type World } from "./network.ts";
@@ -40,6 +41,12 @@ export function isError(code: string): (err: unknown) => boolean {
 /** The store key of a test account, to read and change its sealed state as an attacker could not. */
 export function storeKeyOf(account: number): Uint8Array {
   return deriveStoreKey(mnemonicToSeedSync(MNEMONIC), "testnet", account);
+}
+
+/** The sealed records of a test account's state on the world's vault. */
+export function sealedState(store: KeyValueStore, world: World, account = 0): SealedStore {
+  const { vault, deployLedger } = world.deployment;
+  return new SealedStore(store, storeKeyOf(account), stateScope(vault, deployLedger));
 }
 
 // A deposit made through the wallet, with the ID every RPC provider reported for it.

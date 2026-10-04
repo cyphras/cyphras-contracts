@@ -13,6 +13,7 @@ import { IndexerSource, RpcEventSource } from "../../src/wallet/sources.ts";
 import { vaultErrorName } from "../../src/vault/errors.ts";
 import { parseVaultErrors } from "../../scripts/vault-errors.ts";
 import { SDK_ROOT } from "../helpers.ts";
+import { eventId, ledgerEnd } from "../support/rpc.ts";
 import { ERROR } from "../support/vault.ts";
 
 const reply =
@@ -650,6 +651,7 @@ describe("RPC client", () => {
         id: 1,
         result: {
           events: [],
+          cursor: ledgerEnd(2_000),
           latestLedger: 2_000,
           oldestLedger: 1_000,
           latestLedgerCloseTime: "1700005000",
@@ -669,7 +671,7 @@ describe("RPC client", () => {
       ledger: 1_500,
       ledgerClosedAt: new Date(1_700_002_500_000).toISOString(),
       contractId: vault,
-      id: "000000001500-00000000",
+      id: eventId(1_500, 1),
       txHash: "ab".repeat(32),
       inSuccessfulContractCall: true,
       topic: [xdr.ScVal.scvSymbol("new_nullifier").toXDR("base64")],
@@ -687,6 +689,7 @@ describe("RPC client", () => {
         id: 1,
         result: {
           events: [spend],
+          cursor: ledgerEnd(2_000),
           latestLedger: 2_000,
           oldestLedger: 1_000,
           latestLedgerCloseTime: "1700005000",

@@ -106,6 +106,17 @@ export interface Account {
   createdLedger: number;
 }
 
+// The ID stellar-rpc gives the `n`-th event, from 1, of a ledger: the TOID of the ledger and its
+// transaction, then the event's index.
+export const eventId = (ledger: number, n: number): string =>
+  `${((BigInt(ledger) << 32n) | (BigInt(n) << 12n)).toString().padStart(19, "0")}-0000000000`;
+
+// The cursor that closes a ledger, which stellar-rpc gives where its scan stopped.
+export const ledgerEnd = (ledger: number): string =>
+  `${((BigInt(ledger) << 32n) | 0xffffffffn).toString().padStart(19, "0")}-4294967295`;
+
+const ledgerOf = (id: string): number => Number(BigInt(id.split("-")[0] as string) >> 32n);
+
 export class MockRpc {
   readonly vault: MockVault;
   readonly passphrase: string;
@@ -115,6 +126,9 @@ export class MockRpc {
   readonly contracts = new Set<string>();
   readonly records = new Map<string, TxRecord>();
   oldestLedger = 1;
+  // The ledgers one getEvents request scans at most, from its start ledger or its cursor's on, as
+  // stellar-rpc bounds a scan.
+  scanLedgers = 10_000;
   // The pace at which the ledgers it reports closed, from a fixed moment at ledger 0.
   secondsPerLedger = 5;
   calls: string[] = [];
@@ -769,14 +783,20 @@ export class MockRpc {
     if (start !== undefined && start < this.oldestLedger) {
       throw new RpcFailure(-32600, "startLedger must be within the ledger range");
     }
-    const all = this.vault.events.map((e, i) => ({
-      e,
-      id: `${String(e.ledger).padStart(12, "0")}-${String(i).padStart(8, "0")}`,
-    }));
+    const counts = new Map<number, number>();
+    const all = this.vault.events.map((e) => {
+      const n = (counts.get(e.ledger) ?? 0) + 1;
+      counts.set(e.ledger, n);
+      return { e, id: eventId(e.ledger, n) };
+    });
     const after = pagination.cursor;
+    const from = after === undefined ? (start ?? 0) : ledgerOf(after);
+    const last = Math.min(this.vault.ledger, from + this.scanLedgers - 1);
     const selected = all
-      .filter(({ e, id }) => (after === undefined ? e.ledger >= (start ?? 0) : id > after))
+      .filter(({ e, id }) => (after === undefined ? e.ledger >= from : id > after))
+      .filter(({ e }) => e.ledger <= last)
       .slice(0, limit);
+    const full = selected.length === limit;
     return {
       events: selected.map(({ e, id }) => ({
         type: "contract",
@@ -790,7 +810,7 @@ export class MockRpc {
         topic: [xdr.ScVal.scvSymbol(e.topic).toXDR("base64")],
         value: map(e.fields).toXDR("base64"),
       })),
-      cursor: selected[selected.length - 1]?.id ?? after ?? "",
+      cursor: full ? (selected[selected.length - 1] as { id: string }).id : ledgerEnd(last),
       latestLedger: this.vault.ledger,
       oldestLedger: this.oldestLedger,
       latestLedgerCloseTime: String(this.closeTime(this.vault.ledger)),

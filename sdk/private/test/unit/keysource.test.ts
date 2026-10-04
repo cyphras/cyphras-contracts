@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, createPrivateKey, sign as nodeSign } from "node:crypto";
 import { describe, it } from "node:test";
 import { ed25519 } from "@noble/curves/ed25519";
+import { base64, base64nopad, base64url, base64urlnopad } from "@scure/base";
 import { mnemonicToSeedSync, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english";
 import { StrKey } from "@stellar/stellar-base";
@@ -12,6 +13,7 @@ import { defaultAddressKey, deriveSpendingKeys } from "../../src/keys.ts";
 import {
   type MessageSigner,
   SIGNATURE_MESSAGE,
+  isKeyDerivationMessage,
   keySource,
   sep53Digest,
   signatureSeed,
@@ -116,6 +118,55 @@ describe("signature seed vectors", () => {
     for (const network of ["mainnet", "testnet"] as const) {
       const key = defaultAddressKey(deriveSpendingKeys(seed, network, 0));
       assert.equal(encodeAddress(network, key.d, key.pkd), VECTORS.default_addresses[network]);
+    }
+  });
+});
+
+describe("the key-derivation message", () => {
+  const prefixed = `Stellar Signed Message:\n${SIGNATURE_MESSAGE}`;
+  const digest = sep53Digest(SIGNATURE_MESSAGE);
+
+  it("is recognized in every form a signer could be asked to sign it in", () => {
+    for (const form of [
+      SIGNATURE_MESSAGE,
+      SIGNATURE_MESSAGE.replace(/\n/g, "\r\n"),
+      SIGNATURE_MESSAGE.replace(/\n/g, "\r"),
+      `\n  ${SIGNATURE_MESSAGE}  \n`,
+      SIGNATURE_MESSAGE.split("\n").join(" \n"),
+      utf8(SIGNATURE_MESSAGE),
+      bytesToHex(utf8(SIGNATURE_MESSAGE)),
+      bytesToHex(utf8(SIGNATURE_MESSAGE)).toUpperCase(),
+      base64.encode(utf8(SIGNATURE_MESSAGE)),
+      prefixed,
+      utf8(prefixed),
+      digest,
+      bytesToHex(digest),
+      `0x${bytesToHex(digest)}`,
+      `0X${bytesToHex(digest).toUpperCase()}`,
+      `0x${bytesToHex(utf8(SIGNATURE_MESSAGE))}`,
+      (bytesToHex(digest).match(/../g) as string[]).join(" "),
+      base64.encode(digest),
+      base64nopad.encode(digest),
+      base64url.encode(digest),
+      base64urlnopad.encode(digest),
+      base64nopad.encode(utf8(SIGNATURE_MESSAGE)),
+    ]) {
+      assert.equal(isKeyDerivationMessage(form), true, String(form).slice(0, 48));
+    }
+  });
+
+  it("is not taken for another message", () => {
+    for (const other of [
+      "",
+      "Sign in to example.com",
+      SIGNATURE_MESSAGE.replace("v2", "v3"),
+      `Sign in\n\n${SIGNATURE_MESSAGE}`,
+      SIGNATURE_MESSAGE.toUpperCase(),
+      new Uint8Array(32),
+      utf8(SIGNATURE_MESSAGE).subarray(1),
+      sep53Digest(prefixed),
+    ]) {
+      assert.equal(isKeyDerivationMessage(other), false, String(other).slice(0, 48));
     }
   });
 });
@@ -277,5 +328,18 @@ describe("sealed store", () => {
     const [first, second] = backend.keys() as [string, string];
     await backend.set(second, (await backend.get(first)) as Uint8Array);
     await assert.rejects(store.read("b"), (err: unknown) => err instanceof CyphrasError);
+  });
+
+  it("refuses a record moved to the same name in another scope", async () => {
+    const backend = new MemoryStore();
+    const key = new Uint8Array(32).fill(3);
+    const one = new SealedStore(backend, key, "vault/one");
+    const two = new SealedStore(backend, key, "vault/two");
+    await one.write("state", utf8("one's"));
+    await two.write("state", utf8("two's"));
+    const [first, second] = backend.keys() as [string, string];
+    await backend.set(second, (await backend.get(first)) as Uint8Array);
+    await assert.rejects(two.read("state"), (err: unknown) => err instanceof CyphrasError);
+    assert.deepEqual(await one.read("state"), utf8("one's"));
   });
 });

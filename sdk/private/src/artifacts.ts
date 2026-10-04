@@ -2,14 +2,15 @@ import { sha256 } from "@noble/hashes/sha2";
 import { bytesToHex } from "./bytes.ts";
 import { fail } from "./errors.ts";
 import { type VerifyingKey, parseVerifyingKey } from "./groth16.ts";
-import type { CircuitArtifacts } from "./prover.ts";
+import type { CircuitArtifacts, CircuitPins } from "./prover.ts";
 
 /** The circuit artifacts: the witness generator, the proving key and the verifying key. */
 export type ArtifactName = "wasm" | "zkey" | "vkey";
 
 /**
- * Where the SDK reads the circuit artifacts from, for example files shipped with an extension or
- * fetched from the release. The SDK checks every file against its pinned SHA-256 before use.
+ * Where the circuit artifacts are read from, for example files shipped with an extension or fetched
+ * from the release. Every file is checked against its pinned SHA-256 before use: the verifying key
+ * by the SDK, and the witness generator and the proving key by the prover that proves with them.
  */
 export interface ArtifactSource {
   load(name: ArtifactName): Promise<Uint8Array>;
@@ -35,12 +36,43 @@ export function checkArtifactPins(pins: ArtifactPins): void {
   }
 }
 
-// Loads the artifacts once, after their hashes match the pins. A failed load is retried on the
-// next call rather than cached.
+async function loadPinned(
+  source: ArtifactSource,
+  name: ArtifactName,
+  expected: string,
+): Promise<Uint8Array> {
+  const bytes = await source.load(name);
+  const computed = await sha256Hex(bytes);
+  if (computed !== expected) {
+    fail(
+      "artifact_mismatch",
+      `the ${name} artifact does not match its pin: sha256 is ${computed}, expected ${expected}`,
+      { artifact: name, computed, expected },
+    );
+  }
+  return bytes;
+}
+
+/**
+ * Loads the witness generator and the proving key from `source` and checks each against its pin,
+ * failing with artifact_mismatch and both hashes otherwise: what a prover does before it proves.
+ */
+export async function loadCircuit(
+  source: ArtifactSource,
+  pins: CircuitPins,
+): Promise<CircuitArtifacts> {
+  const [wasm, zkey] = await Promise.all([
+    loadPinned(source, "wasm", pins.wasm),
+    loadPinned(source, "zkey", pins.zkey),
+  ]);
+  return { wasm, zkey };
+}
+
+// The pins of a deployment's circuit, and its verifying key, loaded once after its hash matches the
+// pin. A failed load is retried on the next call rather than cached.
 export class PinnedArtifacts {
   readonly #source: ArtifactSource;
   readonly #pins: ArtifactPins;
-  #proving: Promise<CircuitArtifacts> | undefined;
   #verifyingKey: Promise<VerifyingKey> | undefined;
 
   constructor(source: ArtifactSource, pins: ArtifactPins) {
@@ -49,36 +81,13 @@ export class PinnedArtifacts {
     this.#pins = pins;
   }
 
-  async #load(name: ArtifactName): Promise<Uint8Array> {
-    const bytes = await this.#source.load(name);
-    const computed = await sha256Hex(bytes);
-    const expected = this.#pins[name];
-    if (computed !== expected) {
-      fail(
-        "artifact_mismatch",
-        `the ${name} artifact does not match its pin: sha256 is ${computed}, expected ${expected}`,
-        { artifact: name, computed, expected },
-      );
-    }
-    return bytes;
-  }
-
-  proving(): Promise<CircuitArtifacts> {
-    if (this.#proving === undefined) {
-      const loading = Promise.all([this.#load("wasm"), this.#load("zkey")]).then(
-        ([wasm, zkey]) => ({ wasm, zkey }),
-      );
-      this.#proving = loading;
-      loading.catch(() => {
-        if (this.#proving === loading) this.#proving = undefined;
-      });
-    }
-    return this.#proving;
+  get circuit(): CircuitPins {
+    return { wasm: this.#pins.wasm, zkey: this.#pins.zkey };
   }
 
   verifyingKey(): Promise<VerifyingKey> {
     if (this.#verifyingKey === undefined) {
-      const loading = this.#load("vkey").then((bytes) =>
+      const loading = loadPinned(this.#source, "vkey", this.#pins.vkey).then((bytes) =>
         parseVerifyingKey(JSON.parse(new TextDecoder().decode(bytes))),
       );
       this.#verifyingKey = loading;

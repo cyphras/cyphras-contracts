@@ -1,6 +1,6 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { sha256, sha512 } from "@noble/hashes/sha2";
-import { base64 } from "@scure/base";
+import { base64, base64nopad, base64url, base64urlnopad } from "@scure/base";
 import { generateMnemonic, mnemonicToSeed, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english";
 import { StrKey } from "@stellar/stellar-base";
@@ -27,6 +27,50 @@ const MARKER = utf8("cyphras/v2/sig-marker");
 
 export function sep53Digest(message: string): Uint8Array {
   return sha256(concatBytes(utf8(SEP53_PREFIX), utf8(message)));
+}
+
+// The bytes a message given as text may stand for: its UTF-8, and what it decodes to as hex, with
+// or without 0x and white space between bytes, or as base64 or base64url, padded or not, as some
+// signing APIs take data.
+function readings(message: string): Uint8Array[] {
+  const out = [utf8(message)];
+  const text = message.trim();
+  const hex = (/^0x/i.test(text) ? text.slice(2) : text).replace(/\s+/g, "");
+  if (/^([0-9a-fA-F]{2})+$/.test(hex)) out.push(hexToBytes(hex.toLowerCase()));
+  for (const codec of [base64, base64nopad, base64url, base64urlnopad]) {
+    try {
+      out.push(codec.decode(text));
+    } catch {
+      // not in this encoding
+    }
+  }
+  return out;
+}
+
+// The message as text with the SEP-53 prefix, line endings and white space at the ends of lines and
+// of the whole left aside.
+function normalized(bytes: Uint8Array): string {
+  const text = new TextDecoder().decode(bytes).replace(/\r\n?/g, "\n");
+  const bare = text.startsWith(SEP53_PREFIX) ? text.slice(SEP53_PREFIX.length) : text;
+  return bare
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+}
+
+/**
+ * Whether signing `message` for a site would hand it the key to a mode (b) private account:
+ * SIGNATURE_MESSAGE whatever its line endings or the white space around its lines, as text, as
+ * UTF-8 bytes or as hex or base64, with the SEP-53 prefix or without it, or its SEP-53 digest, of
+ * which a raw signature is the same signature. A wallet that signs messages for sites should warn
+ * before it signs any of them.
+ */
+export function isKeyDerivationMessage(message: string | Uint8Array): boolean {
+  const digest = sep53Digest(SIGNATURE_MESSAGE);
+  return (typeof message === "string" ? readings(message) : [message]).some(
+    (bytes) => equalBytes(bytes, digest) || normalized(bytes) === SIGNATURE_MESSAGE,
+  );
 }
 
 // Strict RFC 8032 verification: a non-canonical S would be a second encoding of one signature,

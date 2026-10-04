@@ -147,8 +147,10 @@ export class IndexerClient {
     return Fields.of(body, "indexer_fault", "indexer reply");
   }
 
-  async health(): Promise<IndexerHealth> {
-    const { body } = await requestJson(this.#fetch, "indexer", joinUrl(this.url, "/v1/health"));
+  async health(timeoutMs?: number): Promise<IndexerHealth> {
+    const { body } = await requestJson(this.#fetch, "indexer", joinUrl(this.url, "/v1/health"), {
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    });
     const f = Fields.of(body, "indexer_fault", "indexer health");
     return {
       ...readIdentity(f),

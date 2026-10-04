@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { StrKey } from "@stellar/stellar-base";
+import { type Deployment, PINNED_DEPLOYMENTS } from "../../src/deployments.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
-import { emptyState, loadState, saveState } from "../../src/wallet/state.ts";
+import {
+  type Deposit,
+  type Plan,
+  type WalletState,
+  emptyState,
+  loadState,
+  saveState,
+  unscopedFit,
+} from "../../src/wallet/state.ts";
 import { testBytes } from "../helpers.ts";
 
 describe("stored state", () => {
@@ -98,5 +108,68 @@ describe("stored state", () => {
     const text = new TextDecoder().decode((await store.read("state")) as Uint8Array);
     await store.write("state", new TextEncoder().encode(text.replace('"+5"', '"5"')));
     await assert.rejects(loadState(store), /malformed number/);
+  });
+});
+
+describe("a state in the unscoped records", () => {
+  const pinned = PINNED_DEPLOYMENTS["testnet/xlm"] as Deployment;
+  const other = StrKey.encodeContract(Buffer.alloc(32, 9));
+  const at = (deployLedger: number, vault = pinned.vault): Deployment => ({
+    ...pinned,
+    vault,
+    deployLedger,
+  });
+  const deposit = { builtAt: 0 } as unknown as Deposit;
+  const plan = { id: "p", builtAt: 0, ext: { vault: "" } } as unknown as Plan;
+  // A state synced from `ledger`, with a deposit built then and plans for `vaults` built then.
+  function state(ledger: number, vaults: readonly string[] = []): WalletState {
+    const s = emptyState(ledger);
+    s.deposits = [{ ...deposit, builtAt: ledger }];
+    s.plans = vaults.map((vault, i) => ({
+      ...plan,
+      id: `p${i}`,
+      builtAt: ledger,
+      ext: { ...plan.ext, vault },
+    }));
+    return s;
+  }
+
+  it("is nothing to keep when it records no note, payment, operation or deposit", () => {
+    assert.equal(unscopedFit(emptyState(100), at(50), [at(50)]), "empty");
+  });
+
+  it("goes to the vault its plans name alone, and to no other", () => {
+    const named = state(100, [pinned.vault]);
+    assert.equal(unscopedFit(named, at(50), []), "ours");
+    assert.equal(unscopedFit(named, at(50, other), []), "theirs");
+    // The vault it names, deployed after the state's ledgers, cannot be it.
+    assert.equal(unscopedFit(named, at(150), []), "unassigned");
+    assert.equal(unscopedFit(state(100, [pinned.vault, other]), at(50), [at(50)]), "unassigned");
+  });
+
+  it("goes, with no plan, only to the one pinned vault its ledgers fit", () => {
+    const bare = state(100);
+    assert.equal(unscopedFit(bare, at(50), [at(50)]), "ours");
+    assert.equal(unscopedFit(bare, at(50), [at(50), at(60, other)]), "unassigned");
+    assert.equal(unscopedFit(bare, at(50), [at(50), at(150, other)]), "ours");
+    assert.equal(unscopedFit(bare, at(50, other), [at(50)]), "unassigned");
+    assert.equal(unscopedFit(bare, at(150), [at(150)]), "theirs");
+  });
+
+  it("is not this vault's when any ledger it records is from before this one", () => {
+    const early: [string, (s: WalletState) => void][] = [
+      ["synced from", (s) => (s.nullifierSince = 10)],
+      ["a leaf", (s) => (s.lastLeafLedger = 10)],
+      ["a deposit", (s) => (s.deposits[0] = { ...deposit, builtAt: 10 })],
+    ];
+    for (const [what, edit] of early) {
+      const s = state(100);
+      edit(s);
+      assert.equal(unscopedFit(s, at(50), [at(50)]), "theirs", what);
+    }
+    // A plan that names this vault yet was built before it was deployed leaves it in doubt.
+    const s = state(100, [pinned.vault]);
+    s.plans = [{ ...(s.plans[0] as Plan), builtAt: 10 }];
+    assert.equal(unscopedFit(s, at(50), [at(50)]), "unassigned");
   });
 });

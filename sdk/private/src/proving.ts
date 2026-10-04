@@ -4,7 +4,7 @@ import { type TxProof, toHostProof } from "./extdata.ts";
 import { verifyGroth16 } from "./groth16.ts";
 import { type Prover, type TransactionWitness, publicInputs } from "./prover.ts";
 
-// Proves a transaction with checked artifacts and accepts the proof only if it carries the
+// Proves a transaction with the pinned circuit and accepts the proof only if it carries the
 // expected public inputs and verifies against the pinned verifying key, so a faulty prover can
 // cost a retry but never a transaction the vault refuses.
 export async function proveTransaction(
@@ -12,10 +12,10 @@ export async function proveTransaction(
   prover: Prover,
   artifacts: PinnedArtifacts,
 ): Promise<TxProof> {
-  const [circuit, vk] = await Promise.all([artifacts.proving(), artifacts.verifyingKey()]);
+  const vk = await artifacts.verifyingKey();
   let proof;
   try {
-    proof = await prover.prove(witness, circuit);
+    proof = await prover.prove(witness, artifacts.circuit);
   } catch (err) {
     if (err instanceof CyphrasError) throw err;
     fail("prover_failed", "the prover failed");

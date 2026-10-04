@@ -13,13 +13,13 @@ import { encryptOutput } from "../../src/encryption.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import { noteCommitment, randomFieldElement, randomScalar } from "../../src/notes.ts";
 import type { FetchLike } from "../../src/net/http.ts";
-import { MemoryStore, SealedStore } from "../../src/storage.ts";
+import { MemoryStore } from "../../src/storage.ts";
 import { keySource } from "../../src/keysource.ts";
 import { NETWORK_PASSPHRASES } from "../../src/keys.ts";
 import { type Plan, type WalletState, loadState, saveState } from "../../src/wallet/state.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
 import { INDEXER, RPC, XLM, createWorld, rewritingFetch, type World } from "../support/network.ts";
-import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
+import { confirmAll, isError, openWallet, sealedState } from "../support/wallets.ts";
 import { TrapdoorProver, trapdoorArtifacts } from "../support/trapdoor.ts";
 import { map } from "../support/vault.ts";
 import { MNEMONIC } from "../helpers.ts";
@@ -145,8 +145,8 @@ const fakeSpend = (nullifier: bigint): FakeEvent => ({
 });
 
 // The wallet's first plan, as its sealed store holds it.
-async function storedPlan(store: MemoryStore): Promise<Plan> {
-  const state = (await loadState(new SealedStore(store, storeKeyOf(0)))) as WalletState;
+async function storedPlan(store: MemoryStore, world: World): Promise<Plan> {
+  const state = (await loadState(sealedState(store, world))) as WalletState;
   return state.plans[0] as Plan;
 }
 
@@ -422,7 +422,7 @@ describe("wallet safety: an RPC that lies about the vault's events", () => {
       alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
     );
     // The relayer saw the proof, and so knows the commitments a node could claim landed.
-    const [cm0, cm1] = (await storedPlan(store)).commitments;
+    const [cm0, cm1] = (await storedPlan(store, world)).commitments;
     const next = world.vault.leaves.length;
     // An indexer one ledger behind, as is usual, leaves the newest ledger to RPC alone.
     world.indexer.completeTo = world.vault.ledger - 1;
@@ -453,7 +453,7 @@ describe("wallet safety: an RPC that lies about the vault's events", () => {
     const bob = await openWallet(world, 1);
     const notBefore = Number(world.vault.timestamp) + 600;
     await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
-    const [input] = (await storedPlan(store)).inputs;
+    const [input] = (await storedPlan(store, world)).inputs;
     const next = world.vault.leaves.length;
     const forged = [
       fakeSpend(input?.nf as bigint),
@@ -494,7 +494,7 @@ describe("wallet safety: an RPC that lies about the vault's events", () => {
     const notBefore = Number(world.vault.timestamp) + 3600;
     const plain = await openWallet(world, 0, store);
     await plain.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
-    const [spent] = (await storedPlan(store)).inputs;
+    const [spent] = (await storedPlan(store, world)).inputs;
     // A real pair from someone else, which the lying RPC passes off as a transaction that also
     // spent the held payment's note.
     world.fill(1);
@@ -543,7 +543,7 @@ describe("wallet safety: an RPC that lies about the vault's events", () => {
       alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
     );
     // A state written by an earlier release that took fabricated events for the landing.
-    const sealed = new SealedStore(store, storeKeyOf(0));
+    const sealed = sealedState(store, world);
     const state = (await loadState(sealed)) as WalletState;
     const plan = state.plans[0] as Plan;
     const fake = { txHash: "ee".repeat(32), ledger: world.vault.ledger };
@@ -773,7 +773,7 @@ describe("wallet safety: a second RPC provider", () => {
     );
     // The liars' chain: the vault's own, then a pair holding the refused payment's commitments,
     // which its relayer saw.
-    const plan = await storedPlan(store);
+    const plan = await storedPlan(store, world);
     const fake = await createWorld();
     const real = world.vault;
     const copy = fake.vault;
@@ -924,7 +924,7 @@ describe("wallet safety: a second RPC provider", () => {
     const notBefore = Number(world.vault.timestamp) + 600;
     const plain = await openWallet(world, 0, store);
     await plain.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
-    const nf = (await storedPlan(store)).inputs[0]?.nf as bigint;
+    const nf = (await storedPlan(store, world)).inputs[0]?.nf as bigint;
     const forged = "dd".repeat(32);
     // The indexer and the first provider lie together: the first shows a transaction that spends
     // the held payment's note past the ledger the indexer is complete to, and the indexer serves
@@ -1291,7 +1291,7 @@ describe("wallet safety: syncs that fail", () => {
     const bob = await openWallet(world, 1);
     await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
     // A state written by an older release that took a forged spend for another plan's.
-    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const sealed = sealedState(backend, world);
     const state = (await loadState(sealed)) as WalletState;
     const plan = state.plans[0] as Plan;
     plan.state = "superseded";
@@ -1329,7 +1329,7 @@ describe("wallet safety: syncs that fail", () => {
       alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
     );
     // A state written by an older release that took a forged spend for another plan's.
-    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const sealed = sealedState(backend, world);
     const state = (await loadState(sealed)) as WalletState;
     const plan = state.plans[0] as Plan;
     plan.state = "superseded";
@@ -1632,7 +1632,7 @@ describe("wallet safety: when a payment is dead", () => {
     );
     // Other users' leaves, past the deadline, and the spends up to it, which a lagging indexer
     // has not taken in yet.
-    const { deadline } = await storedPlan(store);
+    const { deadline } = await storedPlan(store, world);
     world.advance(121 * 5);
     world.indexer.leafLimit = world.vault.leaves.length;
     world.indexer.completeTo = deadline - 1;
@@ -1710,7 +1710,7 @@ describe("wallet safety: when a payment is dead", () => {
     await assert.rejects(
       alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
     );
-    const { deadline } = await storedPlan(store);
+    const { deadline } = await storedPlan(store, world);
     world.advance(121 * 5);
     // Other users' pairs past the deadline, the newest of which the indexer has not taken in, nor
     // the spends up to the deadline.
@@ -1788,7 +1788,7 @@ describe("wallet safety: when a payment is dead", () => {
     const notBefore = Number(world.vault.timestamp) + 600;
     await alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM, notBefore });
     // An earlier reading of the chain took it for dead.
-    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const sealed = sealedState(backend, world);
     const state = (await loadState(sealed)) as WalletState;
     (state.plans[0] as Plan).state = "dead";
     await saveState(sealed, state);
@@ -2139,7 +2139,7 @@ describe("wallet safety: unchecked ledgers", () => {
       alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM }),
     );
     assert.equal((await alice.plans())[0]?.needsUserDecision, false);
-    const { deadline } = await storedPlan(store);
+    const { deadline } = await storedPlan(store, world);
     world.advance(121 * 5);
     world.indexer.leafLimit = world.vault.leaves.length;
     world.indexer.completeTo = deadline - 1;
@@ -2252,7 +2252,7 @@ describe("wallet safety: a damaged store", () => {
   it("starts afresh from a rolled-back store only when asked, and warns that its records are lost", async () => {
     const { world, store } = await funded();
     // The state record is gone while the record of its revision stays, as a rollback leaves it.
-    await new SealedStore(store, storeKeyOf(0)).remove("state");
+    await sealedState(store, world).remove("state");
     await assert.rejects(openWallet(world, 0, store), isError("state_conflict"));
     await assert.rejects(
       openWallet(world, 0, store, undefined, { resetUnreadableState: true }),
@@ -2278,7 +2278,7 @@ describe("wallet safety: a damaged store", () => {
     const receipt = await alice.shield({ amount: 40n * XLM, signer: world.signer("depositor") });
     // As if the wallet had stopped before it learned the transaction of the first deposit, and the
     // second never reached the network.
-    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const sealed = sealedState(backend, world);
     const state = (await loadState(sealed)) as WalletState;
     const landed = state.deposits[0] as WalletState["deposits"][0];
     Object.assign(landed, { id: undefined, txHash: undefined, state: "submitting" });
@@ -2307,7 +2307,7 @@ describe("wallet safety: a damaged store", () => {
     const rpc = flakyEvents(world);
     const alice = await openWallet({ ...world, fetch: rpc.fetch }, 0, backend);
     await alice.shield({ amount: 40n * XLM, signer: world.signer("depositor") });
-    const sealed = new SealedStore(backend, storeKeyOf(0));
+    const sealed = sealedState(backend, world);
     const state = (await loadState(sealed)) as WalletState;
     const landed = state.deposits[0] as WalletState["deposits"][0];
     state.deposits.push({
