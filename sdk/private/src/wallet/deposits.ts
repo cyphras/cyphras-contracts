@@ -3,11 +3,12 @@ import { hexToBytes } from "../bytes.ts";
 import { CyphrasError, fail } from "../errors.ts";
 import { extDataToScVal, isAccountId, txProofToScVal } from "../extdata.ts";
 import { EMPTY_ROOT } from "../merkle.ts";
-import type { DepositQueue } from "../net/indexer.ts";
+import type { DepositQueue, QueuedDeposit } from "../net/indexer.ts";
+import type { SorobanRpc, TransactionStatus } from "../net/rpc.ts";
 import { proveTransaction } from "../proving.ts";
 import { buildTransaction } from "../transaction.ts";
-import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
-import type { VaultInstance } from "../vault/state.ts";
+import { type TransactionSigner, askTransaction, invokeVault } from "../vault/invoke.ts";
+import type { PendingDepositEntry, VaultInstance } from "../vault/state.ts";
 import { type Core, invokeContext, spendingKeys } from "./core.ts";
 import { DEADLINE_LEDGERS } from "./spend.ts";
 import type { DepositEvent } from "./sources.ts";
@@ -140,8 +141,8 @@ async function checkDepositLimits(
 
 /**
  * A submitted deposit: its ID in the entry queue and its transaction. The ID is undefined while the
- * RPC providers do not all report the transaction alike; a later sync takes it from the vault's
- * checked events.
+ * RPC providers do not all report the transaction alike within half a minute; a later sync takes
+ * it from the chain.
  */
 export interface ShieldReceipt {
   readonly depositId: number | undefined;
@@ -229,8 +230,10 @@ export async function shield(
       },
     );
     // The deposit's ID counts once every RPC provider reports its transaction alike; until then the
-    // deposit stays submitting, and a sync takes its ID from the vault's checked events.
-    const outcome = await depositOutcome(core, result.hash);
+    // deposit stays submitting, and a sync takes its ID from the chain.
+    const outcome = outcomeOf(
+      await askTransaction(invokeContext(core), providers(core), result.hash),
+    );
     if (typeof outcome === "number") {
       deposit.id = outcome;
       deposit.state = "pending";
@@ -257,6 +260,7 @@ export async function cancelDeposit(
   if (pending.depositor !== signer.publicKey) {
     fail("invalid_argument", "only the depositor can cancel a deposit");
   }
+  await claimId(core, id);
   const result = await invokeVault(invokeContext(core), signer, {
     fn: "cancel",
     args: [u64(id)],
@@ -290,6 +294,7 @@ export async function refundDeposit(
       },
     );
   }
+  await claimId(core, id);
   const result = await invokeVault(invokeContext(core), signer, {
     fn: "refund",
     args: [u64(id)],
@@ -305,40 +310,121 @@ export async function refundDeposit(
   return result.hash;
 }
 
-// The ID of the deposit a transaction made, or its failure, as every RPC provider reports it; none
-// while they differ, cannot answer or do not hold the transaction yet.
+const providers = (core: Core): SorobanRpc[] =>
+  core.services.second === undefined
+    ? [core.services.rpc]
+    : [core.services.rpc, core.services.second.rpc];
+
+// The ID of the deposit a shield transaction made, or its failure, as every RPC provider reports
+// it; none while they differ, cannot answer or do not hold the transaction.
+function outcomeOf(
+  statuses: readonly (TransactionStatus | undefined)[],
+): number | "failed" | undefined {
+  const outcomes = statuses.map((status) =>
+    status?.status === "FAILED"
+      ? "failed"
+      : status?.status === "SUCCESS" && status.returnValue?.switch().name === "scvU64"
+        ? Number(scValToBigInt(status.returnValue))
+        : undefined,
+  );
+  return outcomes.every((o) => o === outcomes[0]) ? outcomes[0] : undefined;
+}
+
 async function depositOutcome(core: Core, hash: string): Promise<number | "failed" | undefined> {
-  const { rpc, second } = core.services;
-  const outcomes: (number | "failed" | undefined)[] = [];
-  for (const provider of second === undefined ? [rpc] : [rpc, second.rpc]) {
-    const status = await provider.getTransaction(hash).catch((err: unknown) => {
+  const statuses: (TransactionStatus | undefined)[] = [];
+  for (const provider of providers(core)) {
+    statuses.push(
+      await provider.getTransaction(hash).catch((err: unknown) => {
+        if (err instanceof CyphrasError) return undefined;
+        throw err;
+      }),
+    );
+  }
+  return outcomeOf(statuses);
+}
+
+// The entry queue's entries under these IDs that every RPC provider shows alike, in one read from
+// each; none while a provider cannot answer.
+async function queueEntries(
+  core: Core,
+  ids: readonly number[],
+): Promise<Map<number, PendingDepositEntry>> {
+  const out = new Map<number, PendingDepositEntry>();
+  if (ids.length === 0) return out;
+  const { vault, second } = core.services;
+  const reads: Map<bigint, PendingDepositEntry>[] = [];
+  for (const reader of second === undefined ? [vault] : [vault, second.vault]) {
+    const read = await reader.pendings(ids.map(BigInt)).catch((err: unknown) => {
       if (err instanceof CyphrasError) return undefined;
       throw err;
     });
-    outcomes.push(
-      status?.status === "FAILED"
-        ? "failed"
-        : status?.status === "SUCCESS" && status.returnValue?.switch().name === "scvU64"
-          ? Number(scValToBigInt(status.returnValue))
-          : undefined,
-    );
+    if (read === undefined) return out;
+    reads.push(read.entries);
   }
-  return outcomes.every((o) => o === outcomes[0]) ? outcomes[0] : undefined;
+  const key = (e: PendingDepositEntry | undefined): string =>
+    JSON.stringify(e, (_k, v: unknown) => (typeof v === "bigint" ? `${v}` : v));
+  for (const id of ids) {
+    const [first, ...rest] = reads.map((r) => r.get(BigInt(id)));
+    if (first !== undefined && rest.every((e) => key(e) === key(first))) out.set(id, first);
+  }
+  return out;
+}
+
+// Whether the entry queue's entry is this deposit's: its depositor's, of its amount, holding its
+// commitments.
+const holds = (entry: PendingDepositEntry | undefined, deposit: Deposit): boolean =>
+  entry !== undefined &&
+  entry.depositor === deposit.depositor &&
+  entry.amount === deposit.amount &&
+  entry.commitments[0] === deposit.commitments[0] &&
+  entry.commitments[1] === deposit.commitments[1];
+
+// A deposit of this wallet still being submitted takes the ID a cancel or a refund names, once
+// every RPC provider's entry under it holds the deposit.
+async function claimId(core: Core, id: number): Promise<void> {
+  if (core.state.deposits.some((d) => d.id === id)) return;
+  const entry = (await queueEntries(core, [id])).get(id);
+  const deposit = core.state.deposits.find(
+    (d) => d.state === "submitting" && d.id === undefined && holds(entry, d),
+  );
+  if (deposit === undefined) return;
+  deposit.id = id;
+  deposit.state = "pending";
+  await core.save();
 }
 
 // Follows this wallet's deposits through the entry queue. A deposit still being submitted is found
 // by its commitments in the vault's deposit_pending events, of ledgers every RPC provider showed
-// alike, even when this wallet never learned its transaction, or by its transaction as every
-// provider reports it; one that cannot land any more, with every ledger up to its deadline
-// checked, failed. A deposit's notes are spendable only once admitted, which is when their leaves
-// appear.
+// alike, even when this wallet never learned its transaction; by its transaction as every
+// provider reports it; or under an ID the indexer gives for its depositor and amount, once every
+// provider's entry under that ID holds its commitments. One that cannot land any more, with every
+// ledger up to its deadline checked, failed. A deposit's notes are spendable only once admitted,
+// which is when their leaves appear.
 export async function trackDeposits(
   core: Core,
   queue: DepositQueue | undefined,
   events: readonly DepositEvent[],
 ): Promise<void> {
   const state: WalletState = core.state;
+  const candidates = (d: Deposit): QueuedDeposit[] =>
+    queue?.pending.filter(
+      (e) =>
+        e.depositor === d.depositor &&
+        e.amount === d.amount &&
+        !state.deposits.some((x) => x.id === e.id),
+    ) ?? [];
+  const unnamed = state.deposits.filter((d) => d.state === "submitting" && d.id === undefined);
+  const entries = await queueEntries(core, [
+    ...new Set(unnamed.flatMap((d) => candidates(d).map((e) => e.id))),
+  ]);
   for (const deposit of state.deposits) {
+    // The confirmed tree outweighs whatever else said what became of the deposit.
+    if (state.notes.some((n) => deposit.commitments.includes(n.cm))) {
+      deposit.state = "admitted";
+      deposit.flag = undefined;
+      deposit.confirmed = true;
+      continue;
+    }
     if (deposit.state === "submitting") {
       const pending = events.find(
         (e) =>
@@ -358,20 +444,23 @@ export async function trackDeposits(
           deposit.state = "pending";
         }
       }
+      const found = candidates(deposit).find((e) => holds(entries.get(e.id), deposit));
+      if (deposit.state === "submitting" && found !== undefined) {
+        const entry = entries.get(found.id) as PendingDepositEntry;
+        deposit.id = found.id;
+        deposit.state = "pending";
+        deposit.flag =
+          entry.flag === undefined
+            ? undefined
+            : { reason: entry.flag, flaggedAt: Number(entry.flaggedAt) };
+        continue;
+      }
       if (
         deposit.state === "submitting" &&
         checkedBetween(state, deposit.builtAt, deposit.deadline)
       ) {
         deposit.state = "failed";
       }
-    }
-    if (deposit.state === "submitting" || deposit.state === "failed") continue;
-    // The confirmed tree outweighs whatever the indexer said became of the deposit.
-    if (state.notes.some((n) => deposit.commitments.includes(n.cm))) {
-      deposit.state = "admitted";
-      deposit.flag = undefined;
-      deposit.confirmed = true;
-      continue;
     }
     if (deposit.state !== "pending" || deposit.id === undefined) continue;
     // The indexer's account of the ID counts only for the depositor and amount of this deposit, so

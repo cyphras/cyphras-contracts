@@ -437,7 +437,7 @@ async function secondDoubt(ctx: InvokeContext, hash: string): Promise<Doubt | un
 
 // Asks every one of `providers` about a transaction, again while some do not hold it yet, within
 // ASK_POLLS requests and ASK_MS in all: each one's status, undefined where it never answered.
-async function askTransaction(
+export async function askTransaction(
   ctx: Pick<InvokeContext, "now" | "sleep">,
   providers: readonly SorobanRpc[],
   hash: string,

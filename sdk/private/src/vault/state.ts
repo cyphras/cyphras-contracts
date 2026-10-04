@@ -134,6 +134,8 @@ export interface VaultStatus {
   readonly transfersPaused: boolean;
   readonly haltedUntil: bigint;
   readonly nextDepositId: bigint;
+  // Deposits up to this ID are attested.
+  readonly attestedUpTo: bigint;
   readonly tvl: bigint;
   readonly pendingTotal: bigint;
   readonly outflowDay: bigint;
@@ -167,8 +169,13 @@ export interface ChainView {
   readonly roots: RootHistory;
 }
 
+// A deposit in the entry queue. Times are Unix seconds; `delay` is the wait its amount called for.
 export interface PendingDepositEntry {
   readonly depositor: string;
+  readonly amount: bigint;
+  readonly commitments: readonly [bigint, bigint];
+  readonly createdAt: bigint;
+  readonly delay: bigint;
   readonly flag: number | undefined;
   // Zero while the deposit is not flagged.
   readonly flaggedAt: bigint;
@@ -211,6 +218,7 @@ function parseInstance(data: xdr.LedgerEntryData): Omit<VaultInstance, "latestLe
       transfersPaused: status.bool("transfers_paused"),
       haltedUntil: status.u64("halted_until"),
       nextDepositId: status.u64("next_deposit_id"),
+      attestedUpTo: status.u64("attested_up_to"),
       tvl: status.i128("tvl"),
       pendingTotal: status.i128("pending_total"),
       outflowDay: status.u64("outflow_day"),
@@ -292,19 +300,33 @@ export class VaultReader {
   }
 
   async pending(id: bigint): Promise<PendingDepositEntry | undefined> {
-    const key = contractDataKey(
-      this.vault,
-      dataKey("Pending", xdr.ScVal.scvU64(new xdr.Uint64(id))),
+    return (await this.pendings([id])).entries.get(id);
+  }
+
+  // The entry queue's deposits among these IDs, in one read, and the ledger it is of.
+  async pendings(
+    ids: readonly bigint[],
+  ): Promise<{ readonly entries: Map<bigint, PendingDepositEntry>; readonly ledger: number }> {
+    const keys = ids.map((id) =>
+      contractDataKey(this.vault, dataKey("Pending", xdr.ScVal.scvU64(new xdr.Uint64(id)))),
     );
-    const { entries } = await this.#rpc.getLedgerEntries([key]);
-    const entry = entries.get(keyId(key));
-    if (entry === undefined) return undefined;
-    const d = new Struct(entry.data.contractData().val(), "pending deposit");
-    return {
-      depositor: d.address("depositor"),
-      flag: d.optionU32("flag"),
-      flaggedAt: d.u64("flagged_at"),
-    };
+    const { entries, latestLedger } = await this.#rpc.getLedgerEntries(keys);
+    const out = new Map<bigint, PendingDepositEntry>();
+    ids.forEach((id, i) => {
+      const entry = entries.get(keyId(keys[i] as xdr.LedgerKey));
+      if (entry === undefined) return;
+      const d = new Struct(entry.data.contractData().val(), "pending deposit");
+      out.set(id, {
+        depositor: d.address("depositor"),
+        amount: d.i128("amount"),
+        commitments: [d.u256("commitment0"), d.u256("commitment1")],
+        createdAt: d.u64("created_at"),
+        delay: d.u64("delay"),
+        flag: d.optionU32("flag"),
+        flaggedAt: d.u64("flagged_at"),
+      });
+    });
+    return { entries: out, ledger: latestLedger };
   }
 
   async depositorDayTotal(depositor: string, day: bigint): Promise<bigint> {
