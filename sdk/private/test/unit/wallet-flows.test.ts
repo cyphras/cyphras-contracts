@@ -25,7 +25,7 @@ describe("wallet: opening", () => {
     const world = await createWorld();
     await assert.rejects(
       PrivateWallet.open({
-        deployment: "testnet/xlm",
+        deployment: "mainnet/xlm",
         keys: (await import("../../src/keysource.ts")).keySource.random(),
         prover: { prove: async () => assert.fail("no proof expected") },
         artifacts: { load: async () => new Uint8Array() },

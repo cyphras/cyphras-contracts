@@ -1,15 +1,17 @@
-# Extends the default gitleaks ruleset. Deployment manifests hold only public on-chain identifiers
-# (Stellar account and contract IDs, wasm hashes), and the circuit test vectors derive every key from
-# the published all-"abandon" test mnemonic, so both are allowlisted; every other path is still
+# Extends the default gitleaks ruleset. Deployment manifests, and the SDK's pinned copy of them in
+# sdk/private/src/deployments.ts, hold only public on-chain identifiers and hashes (Stellar account
+# and contract IDs, wasm and circuit artifact hashes), and the circuit test vectors derive every key
+# from the published all-"abandon" test mnemonic, so these are allowlisted; every other path is still
 # scanned with the full default ruleset. A Stellar contract ID is public wherever it appears, and
 # never a secret, which as a seed starts with S.
 [extend]
 useDefault = true
 
 [allowlist]
-description = "Deployment manifests, circuit test vectors and Stellar contract IDs hold no secrets"
+description = "Deployment manifests and their SDK pins, circuit test vectors and Stellar contract IDs hold no secrets"
 paths = [
   '''deployments/.*\.json$''',
+  '''^sdk/private/src/deployments\.ts$''',
   '''^circuits/test/vectors/[a-z-]+\.json$''',
 ]
 regexes = [
