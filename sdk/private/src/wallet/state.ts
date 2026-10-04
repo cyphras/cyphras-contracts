@@ -146,13 +146,17 @@ export interface Plan {
   error: string | undefined;
 }
 
+// "unresolved": past its proof's deadline, no RPC provider holds the ledgers the deposit could have
+// landed in any more and no other source shows it, so it can no longer land and nothing can tell
+// whether it did. Like a failed deposit, it is followed again once a source shows it landed.
 export type DepositState =
   | "submitting"
   | "pending"
   | "admitted"
   | "cancelled"
   | "refunded"
-  | "failed";
+  | "failed"
+  | "unresolved";
 
 export interface Deposit {
   id: number | undefined;

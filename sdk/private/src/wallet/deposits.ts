@@ -339,19 +339,24 @@ const providers = (core: Core): SorobanRpc[] =>
     : [core.services.rpc, core.services.second.rpc];
 
 // What every RPC provider reports of a deposit's shield transaction: the ID it made, once they all
-// report it alike; failed, once every one reports it failed, or missing while it holds every
-// ledger the deposit could have been made in, at a ledger past its proof's deadline, after which
-// it can no longer land; none otherwise.
+// report it alike. At a ledger past its proof's deadline, after which it can no longer land:
+// failed, once every one reports it failed, or missing while it holds every ledger the deposit
+// could have been made in; unresolved, once every one reports it missing and holds none of those
+// ledgers any more, so that none can tell whether it landed. None otherwise.
 function outcomeOf(
   statuses: readonly (TransactionStatus | undefined)[],
   deposit: Deposit,
-): number | "failed" | undefined {
+): number | "failed" | "unresolved" | undefined {
+  const past = (s: TransactionStatus | undefined): s is TransactionStatus =>
+    s !== undefined && s.latestLedger > deposit.deadline;
   const ended = (s: TransactionStatus | undefined): boolean =>
-    s !== undefined &&
-    s.latestLedger > deposit.deadline &&
+    past(s) &&
     (s.status === "FAILED" ||
       (s.status === "NOT_FOUND" && (s.oldestLedger ?? Infinity) <= deposit.builtAt + 1));
   if (statuses.every(ended)) return "failed";
+  const forgotten = (s: TransactionStatus | undefined): boolean =>
+    s?.status === "NOT_FOUND" && (s.oldestLedger ?? 0) > deposit.deadline;
+  if (statuses.every(forgotten)) return "unresolved";
   const ids = statuses.map(idOf);
   return ids.every((id) => id === ids[0]) ? ids[0] : undefined;
 }
@@ -493,8 +498,10 @@ export interface QueueContext {
 // provider reports it; or under an ID that any provider's events or report of its transaction,
 // or the indexer's entries for its depositor and amount, give, once every provider's entry under
 // that ID holds its commitments. One that cannot land any more, as every provider reports its
-// transaction or every ledger up to its deadline checked shows, failed, until checked events or
-// the entry queue show it made after all. Until every source confirms what became of it, a
+// transaction or every ledger up to its deadline checked shows, failed; one that cannot land any
+// more and of which no provider holds the ledgers it could have landed in, unresolved; either
+// until checked events or the entry queue show it made after all. Until every source confirms what
+// became of it, a
 // deposit is followed in the entry queue as every provider shows it, where an entry still there
 // outweighs any resolution the indexer gave. One gone from the queue whose notes are not in the
 // confirmed tree of a later ledger went back to its depositor. A deposit's notes are spendable
@@ -510,13 +517,14 @@ export async function trackDeposits(
   const holding = (e: DepositEvent, d: Deposit): boolean =>
     e.commitments[0] === d.commitments[0] && e.commitments[1] === d.commitments[1];
   // A resolution every source confirmed is final.
+  const settled = (d: Deposit): boolean => d.state === "failed" || d.state === "unresolved";
   const followed = (d: Deposit): boolean =>
     d.id !== undefined &&
     d.state !== "submitting" &&
-    d.state !== "failed" &&
+    !settled(d) &&
     (d.state === "pending" || !d.confirmed);
   const unnamed = state.deposits.filter(
-    (d) => (d.state === "submitting" || d.state === "failed") && d.id === undefined,
+    (d) => (d.state === "submitting" || settled(d)) && d.id === undefined,
   );
   // Every provider's report of the transaction of each deposit still being submitted that no
   // checked event shows.
@@ -557,8 +565,9 @@ export async function trackDeposits(
       continue;
     }
     const made = events.find((e) => holding(e, deposit));
-    // A deposit taken for failed that the vault's events show made after all is being submitted.
-    if (deposit.state === "failed" && made !== undefined) deposit.state = "submitting";
+    // A deposit taken for failed or unresolved that the vault's events show made after all is
+    // being submitted.
+    if (settled(deposit) && made !== undefined) deposit.state = "submitting";
     if (deposit.state === "submitting") {
       const reported = reports.get(deposit);
       const outcome = reported === undefined ? undefined : outcomeOf(reported, deposit);
@@ -566,17 +575,14 @@ export async function trackDeposits(
         deposit.id = made.id;
         deposit.txHash = made.txHash;
         deposit.state = "pending";
-      } else if (outcome === "failed") {
-        deposit.state = "failed";
+      } else if (outcome === "failed" || outcome === "unresolved") {
+        deposit.state = outcome;
       } else if (outcome !== undefined) {
         deposit.id = outcome;
         deposit.state = "pending";
       }
     }
-    if (
-      (deposit.state === "submitting" || deposit.state === "failed") &&
-      deposit.id === undefined
-    ) {
+    if ((deposit.state === "submitting" || settled(deposit)) && deposit.id === undefined) {
       const found = candidates(deposit).find((id) => holds(alike(reads.get(id)), deposit));
       if (found !== undefined) {
         deposit.id = found;
@@ -586,7 +592,7 @@ export async function trackDeposits(
       }
     }
     if (
-      deposit.state === "submitting" &&
+      (deposit.state === "submitting" || deposit.state === "unresolved") &&
       checkedBetween(state, deposit.builtAt, deposit.deadline)
     ) {
       deposit.state = "failed";

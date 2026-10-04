@@ -323,17 +323,22 @@ describe("wallet: a shield whose sending goes wrong", () => {
     }
   });
 
-  it("stays submitting while a provider does not hold every ledger the deposit could have been made in", async () => {
+  it("stays submitting past its deadline while a provider holds part of the ledgers it could have been made in", async () => {
     const world = await createWorld();
     const fetch = sending(world, async (body, hash) =>
       rpcResult(body.id, { status: "ERROR", hash, latestLedger: world.vault.ledger }),
     );
     const alice = await openWallet({ ...world, fetch }, 0);
     await assert.rejects(alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") }));
+    const deadline = world.vault.ledger + 120;
     world.rpc.oldestLedger = world.vault.ledger + 2;
     world.advance(121 * 5);
     await alice.sync();
     assert.equal((await alice.deposits())[0]?.state, "submitting");
+    // Once it holds none of them, nothing can tell whether the deposit landed.
+    world.rpc.oldestLedger = deadline + 1;
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "unresolved");
   });
 
   it("follows a shield the RPC took on though it answered that the network refused it", async () => {
@@ -745,6 +750,212 @@ describe("wallet: a deposit taken for failed", () => {
     const [deposit] = await reopened.deposits();
     assert.equal(deposit?.state, "admitted");
     assert.equal(deposit?.confirmed, true);
+  });
+});
+
+describe("wallet: a shield no source can tell of any more", () => {
+  const second = "http://rpc2.test";
+
+  // The vault function a transaction envelope calls.
+  const fnOf = (envelope: string): string => {
+    const op = (TransactionBuilder.fromXDR(envelope, Networks.TESTNET) as Transaction)
+      .operations[0];
+    return op?.type === "invokeHostFunction"
+      ? op.func.invokeContract().functionName().toString()
+      : "";
+  };
+
+  it("is unresolved once the network dropped it and retention passed, and holds no later shield back", async () => {
+    const world = await createWorld();
+    let drop = true;
+    const dropped = new Set<string>();
+    // The first provider takes the shield's envelope on and drops it; the time bound passes while
+    // the wallet waits for it.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (
+        url.origin === RPC &&
+        drop &&
+        body?.method === "sendTransaction" &&
+        fnOf(body.params.transaction) === "shield"
+      ) {
+        drop = false;
+        const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+        const hash = tx.hash().toString("hex");
+        dropped.add(hash);
+        return rpcResult(body.id, { status: "PENDING", hash, latestLedger: world.vault.ledger });
+      }
+      if (body?.method === "getTransaction" && dropped.has(body.params.hash)) world.advance(400);
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const depositor = world.signer("depositor");
+    await assert.rejects(alice.shield({ amount: 100n * XLM, signer: depositor }));
+    assert.equal((await alice.deposits())[0]?.state, "submitting");
+    // Eight days pass with the app closed; RPC keeps seven.
+    world.advance(8 * 86_400);
+    world.rpc.oldestLedger = world.vault.ledger - 120_960;
+    world.fill(1);
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "unresolved");
+    assert.equal((await alice.balance()).pendingDeposits, 0n);
+    const again = await alice.shield({ amount: 100n * XLM, signer: depositor });
+    assert.equal(again.depositId, 1);
+  });
+
+  // A wallet with two providers whose shield never lands, or lands without the second provider
+  // reporting its transaction in time, and an indexer that lists no deposit. Past the deadline, no
+  // provider holds the transaction any more, though both still serve the vault's events, and
+  // neither lists events in the first sync after.
+  async function forgottenShield(lands: boolean) {
+    const world = await createWorld();
+    let shieldHash: string | undefined;
+    let shielding = true;
+    let forgotten = false;
+    let busy = false;
+    const indexer = rewritingFetch(world, { "/v1/deposits": (body) => ({ ...body, pending: [] }) });
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body?.method === "sendTransaction" && shieldHash === undefined) {
+        const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+        shieldHash = tx.hash().toString("hex");
+        if (!lands) {
+          return rpcResult(body.id, {
+            status: "ERROR",
+            hash: shieldHash,
+            latestLedger: world.vault.ledger,
+          });
+        }
+      }
+      const asked = body?.method === "getTransaction" && body.params.hash === shieldHash;
+      if (asked && ((shielding && url.origin === second) || forgotten)) {
+        return rpcResult(body.id, {
+          status: "NOT_FOUND",
+          latestLedger: world.vault.ledger,
+          oldestLedger: world.vault.ledger,
+        });
+      }
+      if (busy && body?.method === "getEvents") return busyReply(body.id);
+      return indexer(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await alice
+      .shield({ amount: 100n * XLM, signer: world.signer("depositor") })
+      .catch(() => undefined);
+    shielding = false;
+    assert.equal((await alice.deposits())[0]?.state, "submitting");
+    world.advance(121 * 5);
+    forgotten = true;
+    busy = true;
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "unresolved");
+    busy = false;
+    world.fill(1);
+    await alice.sync();
+    return (await alice.deposits())[0];
+  }
+
+  it("takes an unresolved deposit for failed once a recheck shows no deposit of it up to its deadline", async () => {
+    const deposit = await forgottenShield(false);
+    assert.equal(deposit?.state, "failed");
+  });
+
+  it("follows an unresolved deposit again once a recheck shows it made", async () => {
+    const deposit = await forgottenShield(true);
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+  });
+
+  it("stays submitting while one provider still holds the ledgers it could have been made in", async () => {
+    const world = await createWorld();
+    let shieldHash: string | undefined;
+    // The shield never lands; the first provider no longer holds its ledgers, nor lists events,
+    // while the second holds them all.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body?.method === "sendTransaction" && shieldHash === undefined) {
+        const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+        shieldHash = tx.hash().toString("hex");
+        return rpcResult(body.id, { status: "ERROR", hash: shieldHash, latestLedger: 1 });
+      }
+      const asked = body?.method === "getTransaction" && body.params.hash === shieldHash;
+      if (asked && url.origin === RPC) {
+        return rpcResult(body.id, {
+          status: "NOT_FOUND",
+          latestLedger: world.vault.ledger,
+          oldestLedger: world.vault.ledger,
+        });
+      }
+      if (url.origin === RPC && body?.method === "getEvents") return busyReply(body.id);
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await assert.rejects(alice.shield({ amount: 100n * XLM, signer: world.signer("depositor") }));
+    world.advance(121 * 5);
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "submitting");
+  });
+
+  it("follows an unresolved deposit again once a source shows it landed", async () => {
+    const world = await createWorld();
+    let shieldHash: string | undefined;
+    let shielding = true;
+    let forgotten = false;
+    let hidden = true;
+    // The second provider lags behind the shield's transaction, until neither holds it any more,
+    // and the indexer lists no deposit while hidden.
+    const indexer = rewritingFetch(world, {
+      "/v1/deposits": (body) => (hidden ? { ...body, pending: [] } : body),
+    });
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body?.method === "sendTransaction") {
+        const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+        shieldHash ??= tx.hash().toString("hex");
+      }
+      const asked = body?.method === "getTransaction" && body.params.hash === shieldHash;
+      if (asked && ((shielding && url.origin === second) || forgotten)) {
+        return rpcResult(body.id, {
+          status: "NOT_FOUND",
+          latestLedger: world.vault.ledger,
+          oldestLedger: world.rpc.oldestLedger,
+        });
+      }
+      return indexer(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const receipt = await alice.shield({ amount: 100n * XLM, signer: world.signer("depositor") });
+    shielding = false;
+    assert.equal(receipt.depositId, undefined);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    world.advance(8 * 86_400);
+    world.rpc.oldestLedger = world.vault.ledger - 120_960;
+    forgotten = true;
+    world.fill(1);
+    await alice.sync();
+    let [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "unresolved");
+    hidden = false;
+    world.fill(1);
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+    assert.equal((await alice.balance()).pendingDeposits, 100n * XLM);
   });
 });
 
