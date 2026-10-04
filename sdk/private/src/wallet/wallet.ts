@@ -768,11 +768,13 @@ export class PrivateWallet {
       core.state.checkedLeafLedger - 1,
       complete ? Math.min(...answered.map((v) => v.ledger)) : 0,
     );
-    // What a recheck cleared is older than this sync's ledgers, and goes first.
+    // What a recheck cleared is older than this sync's ledgers, and goes first; what any provider
+    // showed of this sync's ledgers names IDs to read the entry queue under.
     await trackDeposits(
       core,
       await live?.deposits().catch(() => undefined),
       [...(rechecked?.deposits ?? []), ...within(shown?.deposits ?? [])],
+      [events, ...others].flatMap((e) => e?.deposits ?? []),
       {
         treeAt,
         attestedUpTo: answered

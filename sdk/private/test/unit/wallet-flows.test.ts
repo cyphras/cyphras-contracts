@@ -267,8 +267,8 @@ describe("wallet: a shield whose sending goes wrong", () => {
   });
 
   it("does not fail on one provider's word while events cannot be checked", async () => {
-    // The second provider cannot answer reads of events; the first then reports the shield's
-    // transaction failed, or denies the transaction the second holds.
+    // The second provider cannot answer reads of events or of the entry queue; the first then
+    // reports the shield's transaction failed, or denies the transaction the second holds.
     for (const first of ["failed", "denied"] as const) {
       const world = await createWorld();
       const second = "http://rpc2.test";
@@ -277,7 +277,8 @@ describe("wallet: a shield whose sending goes wrong", () => {
       const fetch: FetchLike = async (input, init) => {
         const url = new URL(input);
         const body = bodyOf(init);
-        if (url.origin === second && body?.method === "getEvents") return busyReply(body.id);
+        const reads = body?.method === "getEvents" || (body !== undefined && readsQueue(body));
+        if (url.origin === second && reads) return busyReply(body.id);
         if (body?.method === "sendTransaction") {
           const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
           shieldHash = tx.hash().toString("hex");
@@ -370,6 +371,70 @@ describe("wallet: a shield whose sending goes wrong", () => {
   });
 });
 
+describe("wallet: a deposit's ID that some sources hide", () => {
+  const second = "http://rpc2.test";
+
+  // A wallet whose indexer lists no deposit and whose first provider denies the shield's
+  // transaction once it has answered the shield's own wait, and which `withheld` lets deny events,
+  // or the transaction on the second provider too, after the shield.
+  async function hidden(withheld: { events: boolean; secondReport: boolean }) {
+    const world = await createWorld();
+    let shieldHash: string | undefined;
+    let answered = false;
+    let shielding = true;
+    const indexer = rewritingFetch(world, { "/v1/deposits": (body) => ({ ...body, pending: [] }) });
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body?.method === "sendTransaction") {
+        const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+        shieldHash = tx.hash().toString("hex");
+      }
+      const asked = body?.method === "getTransaction" && body.params.hash === shieldHash;
+      if (asked && url.origin === RPC && !answered) {
+        answered = true;
+        return world.fetch(input, init);
+      }
+      const deniedBySecond = url.origin === second && withheld.secondReport && !shielding;
+      if (asked && (url.origin === RPC || deniedBySecond)) {
+        return rpcResult(body.id, { status: "NOT_FOUND", latestLedger: world.vault.ledger });
+      }
+      if (body?.method === "getEvents" && (url.origin === RPC || withheld.events)) {
+        const error = { code: -32600, message: "startLedger must be within the ledger range" };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+      }
+      return indexer(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const receipt = await alice.shield({ amount: 100n * XLM, signer: world.signer("depositor") });
+    shielding = false;
+    assert.equal(receipt.depositId, undefined);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    return { world, alice };
+  }
+
+  // Each source alone: the second provider's events, or its report of the transaction.
+  for (const [source, withheld] of [
+    ["events", { events: false, secondReport: true }],
+    ["report", { events: true, secondReport: false }],
+  ] as const) {
+    it(`takes the ID the second provider's ${source} give, once every provider's entry holds the deposit`, async () => {
+      const { world, alice } = await hidden(withheld);
+      for (let i = 0; i < 2; i++) {
+        world.advance(3_600);
+        world.fill(1);
+        await alice.sync();
+      }
+      const [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, "pending", source);
+      assert.equal(deposit?.id, 1, source);
+      assert.equal(deposit?.flag?.kind, "legal_hold", source);
+    });
+  }
+});
+
 describe("wallet: a deposit taken for failed", () => {
   it("is being submitted again once the vault's events show it made", async () => {
     const world = await createWorld();
@@ -378,7 +443,8 @@ describe("wallet: a deposit taken for failed", () => {
     let shieldHash: string | undefined;
     let answered = false;
     // Both providers deny the shield's transaction once the first has answered the shield's own
-    // wait for it; the second cannot answer reads of events while busy.
+    // wait for it, and cannot answer reads of events while busy; the indexer lists no deposit.
+    const indexer = rewritingFetch(world, { "/v1/deposits": (body) => ({ ...body, pending: [] }) });
     const fetch: FetchLike = async (input, init) => {
       const url = new URL(input);
       const body = bodyOf(init);
@@ -398,13 +464,12 @@ describe("wallet: a deposit taken for failed", () => {
           oldestLedger: 1,
         });
       }
-      if (busy && url.origin === second && body?.method === "getEvents") return busyReply(body.id);
-      return world.fetch(url.origin === second ? RPC : input, init);
+      if (busy && body?.method === "getEvents") return busyReply(body.id);
+      return indexer(url.origin === second ? RPC : input, init);
     };
     const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
       secondRpcUrl: second,
     });
-    world.indexer.down = true;
     const receipt = await alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") });
     assert.equal(receipt.depositId, undefined);
     world.advance(121 * 5);
@@ -474,7 +539,7 @@ describe("wallet: deposits seen through two RPC providers", () => {
       const body =
         init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
       if (url.origin === second) {
-        if (busy && body?.method === "getEvents") {
+        if (busy && (body?.method === "getEvents" || readsQueue(body ?? {}))) {
           const error = { code: -32603, message: "busy" };
           return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
         }
@@ -495,7 +560,7 @@ describe("wallet: deposits seen through two RPC providers", () => {
       isError("transaction_failed"),
     );
     // The deposit's event cannot be checked against the second provider, which reports the
-    // transaction as a success, and no indexer names an ID to read the entry queue under.
+    // transaction as a success and cannot answer reads of the entry queue, to verify an ID under.
     busy = true;
     world.indexer.down = true;
     assert.equal((await alice.sync()).crossChecked, false);
