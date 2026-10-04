@@ -60,7 +60,7 @@ import {
   disclose,
   verifyDisclosure,
 } from "./disclosure.ts";
-import { type ExitPosition, applyExits, exitPosition, payoutLeft } from "./exits.ts";
+import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
 import { updatePace } from "./pace.ts";
 import { type Verification, createServices, verify } from "./services.ts";
@@ -175,6 +175,9 @@ export interface SyncSummary {
   // check them against the vault's events while the providers still hold them.
   readonly uncheckedLedgers: number;
   readonly uncheckedLeaves: number;
+  // Of those leaves, the ones some RPC provider no longer holds while every other one confirmed
+  // them: syncs ask every provider about them again each hour.
+  readonly partialLeaves: number;
   // Of those leaves, the ones no RPC provider holds any more, so that nothing can check them: an
   // incoming payment an indexer hid among them stays hidden until a rescan through an indexer the
   // user trusts.
@@ -239,10 +242,13 @@ export interface PlanView extends Submission {
   readonly to: string;
   readonly createdAt: number;
   // The exit of an unshield that waits in the vault's exit queue: the ID transact gave it, what
-  // it still owes the recipient, and the exits that owe it, a stranded one until claimed.
+  // it still owes the recipient, and the exits that owe it, a stranded one until claimed; and
+  // whether that rests on the vault's events every RPC provider showed, rather than on the
+  // indexer's account alone.
   readonly exitId: number | undefined;
   readonly payoutLeft: bigint | undefined;
   readonly exitParts: readonly ExitPart[];
+  readonly exitConfirmed: boolean | undefined;
   readonly operationId: string | undefined;
   // The relayer's last word on a pending plan: held until its not_before, pending, success or
   // failed, or unknown when the relayer could not say. The chain's evidence alone confirms it.
@@ -743,7 +749,7 @@ export class PrivateWallet {
       stageDownload(core.state, core.scan, data, checked);
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
-    const rechecked = await recheck(core.state, rpcs, vault, limits.eventPages);
+    const rechecked = await recheck(core.state, rpcs, vault, limits.eventPages, core.now());
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
     if (verified) advancePlans(core.state, views as [ChainView, ...ChainView[]]);
     const live = source.kind === "indexer" ? indexer : undefined;
@@ -752,11 +758,30 @@ export class PrivateWallet {
     onReads({ view, stats: await live?.stats().catch(() => undefined), pace });
     const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
       xs.filter((x) => x.ledger >= data.since && x.ledger <= data.horizon);
-    // What a recheck cleared is older than this sync's ledgers, and goes first.
-    await trackDeposits(core, await live?.deposits().catch(() => undefined), [
-      ...(rechecked?.deposits ?? []),
-      ...within(shown?.deposits ?? []),
-    ]);
+    const answered = views.filter((v): v is ChainView => v !== undefined);
+    // The confirmed tree holds every leaf of the ledgers before that of a leaf whose ledger a check
+    // confirmed, and, when it holds as many leaves as every provider's view shows, of the ledgers
+    // up to the oldest view.
+    const complete =
+      verified && views.every((v) => v?.roots.nextLeaf === core.state.tree.leafCount);
+    const treeAt = Math.max(
+      core.state.checkedLeafLedger - 1,
+      complete ? Math.min(...answered.map((v) => v.ledger)) : 0,
+    );
+    // What a recheck cleared is older than this sync's ledgers, and goes first; what any provider
+    // showed of this sync's ledgers names IDs to read the entry queue under.
+    await trackDeposits(
+      core,
+      await live?.deposits().catch(() => undefined),
+      [...(rechecked?.deposits ?? []), ...within(shown?.deposits ?? [])],
+      [events, ...others].map((e) => e?.deposits ?? []),
+      {
+        treeAt,
+        attestedUpTo: answered
+          .map((v) => v.instance.status.attestedUpTo)
+          .reduce((a, b) => (a < b ? a : b)),
+      },
+    );
     applyExits(
       core.state,
       [
@@ -785,6 +810,10 @@ export class PrivateWallet {
         0,
       ),
       uncheckedLeaves: core.state.unchecked.reduce((n, r) => n + leavesOf(r), 0),
+      partialLeaves: core.state.unchecked.reduce(
+        (n, r) => n + (r.status === "partial" ? leavesOf(r) : 0),
+        0,
+      ),
       lostLeaves: core.state.unchecked.reduce(
         (n, r) => n + (r.status === "lost" ? leavesOf(r) : 0),
         0,
@@ -851,7 +880,9 @@ export class PrivateWallet {
       createdAt: p.createdAt,
       exitId: p.exit?.id,
       payoutLeft: p.exit === undefined ? undefined : payoutLeft(p.exit),
-      exitParts: (p.exit?.parts ?? []).map((part) => ({ ...part })),
+      exitParts: (p.exit === undefined ? [] : shownParts(p.exit)).map((part) => ({ ...part })),
+      exitConfirmed:
+        p.exit === undefined ? undefined : p.exit.confirmed && p.exit.account === undefined,
       operationId: p.operationId,
       relayerStatus: p.relayerStatus,
       mustRetry: isActive(p) || p.state === "dead",
@@ -859,14 +890,19 @@ export class PrivateWallet {
     }));
   }
 
-  /** Proves a deposit, has the depositor sign it, submits it and returns its deposit ID. */
+  /**
+   * Proves a deposit, has the depositor sign it, submits it and returns its deposit ID. While
+   * another deposit of this wallet is still being submitted, and so may yet land, it fails with
+   * deposit_submitting unless whileSubmitting is set.
+   */
   shield(request: {
     readonly amount: bigint;
     readonly signer: TransactionSigner;
+    readonly whileSubmitting?: boolean;
   }): Promise<ShieldReceipt> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      return shield(this.#core, request.amount, request.signer);
+      return shield(this.#core, request.amount, request.signer, request.whileSubmitting === true);
     });
   }
 

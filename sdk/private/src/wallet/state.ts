@@ -89,15 +89,23 @@ export interface ExitPart {
   stranded: boolean;
 }
 
-// The exit of an unshield in the vault's exit queue: the ID transact gave it, the exits that still
-// owe part of it, and how far it follows the chain. Every vault event of a ledger before `ledger`
-// is applied, and of `ledger` itself those up to `event`, or all of them when it is undefined, so
-// no event is applied twice and no account older than what it shows is taken.
+// The exit of an unshield in the vault's exit queue: the ID transact gave it, every exit known to
+// hold or have held part of it, with what each still owes, and how far it follows the chain. Every
+// vault event of a ledger before `ledger` is applied, and of `ledger` itself those up to `event`,
+// or all of them when it is undefined, so no event is applied twice and no account older than what
+// it shows is taken. `confirmed` while the parts follow the vault's events every RPC provider
+// showed, from the exit's queueing on without a gap, rather than resting in part on the indexer's
+// account. `account` is the indexer's account of a confirmed exit, newer than its events: what the
+// plan shows, unconfirmed, until the events reach its ledger. `known` holds what the vault's
+// checked events last showed of each part of an exit that rests on the indexer's account.
 export interface PlanExit {
   readonly id: number;
   parts: ExitPart[];
   ledger: number;
   event: string | undefined;
+  confirmed: boolean;
+  account: { readonly parts: ExitPart[]; readonly ledger: number } | undefined;
+  known: ExitPart[];
 }
 
 // A spend, saved before anything is submitted.
@@ -161,6 +169,16 @@ export interface Deposit {
   flag: { readonly reason: number; readonly flaggedAt: number | undefined } | undefined;
   leafIndices: readonly [number, number] | undefined;
   refundReason: number | undefined;
+  // The state and the entry queue's details rest on every RPC provider's reads of the entry queue,
+  // the wallet's own transactions every provider reports, the vault's events every provider showed
+  // and the confirmed tree, rather than on the indexer's account.
+  confirmed: boolean;
+  // The newest ledger at which a provider showed the deposit in the entry queue; the ledger by
+  // which every provider showed it gone, on reads past that and past its proof's deadline; and
+  // whether this wallet sent its cancel or refund.
+  seenAt: number | undefined;
+  goneAt: number | undefined;
+  ownReturn: "cancelled" | "refunded" | undefined;
 }
 
 // A payment spread over several transactions, each within the vault's single-exit cap and sent
@@ -221,9 +239,10 @@ export interface FoundLeaf {
 // What syncs took from the indexer while not every RPC provider could confirm it: the spends of
 // the ledgers from `from` to `to`, none when `from` is past `to`, and the leaves at positions from
 // `first` up to `end`, the first of them added at `ledger`, kept as digests of runs of them. "open"
-// while the providers may still confirm it; "partial" once some provider no longer holds it and
-// every other one showed it as the syncs took it, so that it can never be confirmed by every
-// provider; "lost" once none holds it, so that nothing can check it any more.
+// while the providers may still confirm it; "partial" while some provider no longer holds it and
+// every other one showed it as the syncs took it, asked about again an hour after `askedAt`, in
+// milliseconds of the wallet's clock, in case every provider holds it once more; "lost" once none
+// holds it, so that nothing can check it any more.
 export interface UncheckedRange {
   readonly from: number;
   readonly to: number;
@@ -236,6 +255,7 @@ export interface UncheckedRange {
       }
     | undefined;
   readonly status: "open" | "partial" | "lost";
+  readonly askedAt: number | undefined;
 }
 
 // A ledger and the Unix second it closed at.
@@ -335,15 +355,20 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   const state = JSON.parse(new TextDecoder().decode(bytes), reviver) as WalletState;
   if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
   // A state need not hold close times yet, nor a checked leaf's ledger; its next syncs record them.
-  // Leaves it took unchecked without the digests a recheck compares can no longer be checked, and
-  // leaves it staged without them the next sync takes again.
+  // Leaves it took unchecked without digests a recheck compares up to the last of them can no
+  // longer be checked, and leaves it staged without them the next sync takes again. A range kept
+  // as lost without a status was given up on the first RPC provider's word alone, and is open again
+  // for every provider to be asked.
   state.ledgerTimes ??= [];
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {
-    const { lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };
-    const undigested = range.leaves !== undefined && range.leaves.chunks === undefined;
-    const status = range.status ?? (lost === true ? "lost" : "open");
-    return { ...range, status: undigested ? "lost" : status };
+    const { lost: _lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };
+    const { leaves } = range;
+    const undigested =
+      leaves !== undefined &&
+      (leaves.chunks === undefined ||
+        (leaves.chunks[leaves.chunks.length - 1]?.end ?? leaves.first) !== leaves.end);
+    return { ...range, status: undigested ? "lost" : (range.status ?? "open") };
   });
   if (state.staging?.unchecked !== undefined && state.staging.unchecked.chunks === undefined) {
     state.staging = undefined;
@@ -352,6 +377,19 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   // root alone.
   for (const e of state.plans.flatMap((p) => p.evidence)) {
     e.providers ??= e.outputs.some((pos) => pos !== undefined) ? 1 : 0;
+  }
+  // Exits and deposits kept without saying what they rest on count as the indexer's word; a deposit
+  // then cancelled was by its depositor.
+  for (const plan of state.plans) {
+    if (plan.exit === undefined) continue;
+    plan.exit.confirmed ??= false;
+    plan.exit.known ??= [];
+  }
+  for (const deposit of state.deposits) {
+    if (deposit.confirmed === undefined && deposit.state === "cancelled") {
+      deposit.ownReturn = "cancelled";
+    }
+    deposit.confirmed ??= false;
   }
   return state;
 }

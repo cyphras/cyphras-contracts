@@ -26,7 +26,7 @@ interface TxRecord {
 }
 
 // A diagnostic event naming a host error, as the host emits for a failed call.
-function diagnostic(error: xdr.ScError): string {
+export function diagnostic(error: xdr.ScError): string {
   return new xdr.DiagnosticEvent({
     inSuccessfulContractCall: false,
     event: new xdr.ContractEvent({

@@ -458,7 +458,7 @@ export function applyDownload(
       : { ...staging.unchecked, end: staging.tree.leafCount };
   const to = checked ? data.since - 1 : data.horizon;
   if (to >= data.since || leaves !== undefined) {
-    addUnchecked(state, { from: data.since, to, leaves, status: "open" });
+    addUnchecked(state, { from: data.since, to, leaves, status: "open", askedAt: undefined });
   }
   state.nullifierSince = data.horizon + 1;
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
@@ -489,6 +489,7 @@ function addUnchecked(state: WalletState, range: UncheckedRange): void {
         ? (a ?? b)
         : { first: a.first, end: b.end, ledger: a.ledger, chunks: [...a.chunks, ...b.chunks] },
     status: "open",
+    askedAt: undefined,
   };
 }
 
@@ -512,22 +513,35 @@ function confirmedRuns(
   return next;
 }
 
-// Checks what the wallet kept from the oldest open range a sync took unchecked, against the
-// vault's own events from every RPC provider that still holds them: every leaf the sync took, by
-// the digests of runs of them, and the spends of the wallet's notes in the range's ledgers. A
-// difference is the indexer's. Nothing moves while a provider is busy. What every provider shows
-// alike is cleared, the ledgers of its leaves become the vault's own, and the first provider's
-// events of the ledgers whose spends were cleared are returned, once every provider shows the
-// vault's exits and deposits in them alike. A range some provider no longer holds can never be
-// confirmed by every one: what every other provider shows alike is kept as partial, and a range
-// none of them holds is kept as lost.
+// A partial range is asked about again this long after the last time, in milliseconds.
+const PARTIAL_AGAIN_MS = 3_600_000;
+
+// Checks what the wallet kept from the oldest open range a sync took unchecked, or with none open
+// from the first partial range asked about an hour or more before `now`, against the vault's own
+// events from every RPC provider that still holds them: every leaf the sync took, by the digests
+// of runs of them, and the spends of the wallet's notes in the range's ledgers. A difference is
+// the indexer's. Nothing moves while a provider is busy. What every provider shows alike is
+// cleared, the ledgers of its leaves become the vault's own, and the first provider's events of
+// the ledgers whose spends were cleared are returned, once every provider shows the vault's exits
+// and deposits in them alike. A range some provider no longer holds cannot be confirmed by every
+// one for now: what every other provider shows alike is kept as partial, and a range none of them
+// holds is kept as lost.
 export async function recheck(
   state: WalletState,
   rpcs: readonly SorobanRpc[],
   vault: string,
   maxPages: number,
+  now: number,
 ): Promise<VaultEvents | undefined> {
-  const at = state.unchecked.findIndex((r) => r.status === "open");
+  const open = state.unchecked.findIndex((r) => r.status === "open");
+  const at =
+    open >= 0
+      ? open
+      : state.unchecked.findIndex(
+          (r) =>
+            r.status === "partial" &&
+            (r.askedAt === undefined || now - r.askedAt >= PARTIAL_AGAIN_MS),
+        );
   const range = state.unchecked[at];
   if (range === undefined) return undefined;
   const start = Math.min(
@@ -537,9 +551,10 @@ export async function recheck(
   // The events of each provider that still holds the range.
   const held: VaultEvents[] = [];
   let busy = false;
+  const end = { ledger: range.to, leafEnd: range.leaves?.end };
   for (const rpc of rpcs) {
     try {
-      held.push(await new RpcEventSource(rpc, vault, start, maxPages).events());
+      held.push(await new RpcEventSource(rpc, vault, start, maxPages, end).events());
     } catch (err) {
       if (!(err instanceof CyphrasError)) throw err;
       // A busy RPC is asked again in the next sync.
@@ -582,7 +597,15 @@ export async function recheck(
     const { first, end } = taken;
     const next = Math.min(...confirmed);
     const shown = shownBy(events);
-    done = next === first ? undefined : { first, end: next, ledger: taken.ledger, chunks: [] };
+    done =
+      next === first
+        ? undefined
+        : {
+            first,
+            end: next,
+            ledger: taken.ledger,
+            chunks: taken.chunks.filter((c) => c.end <= next),
+          };
     leaves =
       next === end
         ? undefined
@@ -602,10 +625,17 @@ export async function recheck(
     to: range.to,
     leaves,
     status: "open",
+    askedAt: undefined,
   };
   const kept = rest.from <= rest.to || leaves !== undefined ? [rest] : [];
   if (held.length < rpcs.length) {
-    const seen: UncheckedRange = { from: range.from, to, leaves: done, status: "partial" };
+    const seen: UncheckedRange = {
+      from: range.from,
+      to,
+      leaves: done,
+      status: "partial",
+      askedAt: now,
+    };
     state.unchecked.splice(
       at,
       1,

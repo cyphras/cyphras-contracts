@@ -340,9 +340,11 @@ export class MockRelayer {
   quoteFeeAddress: string | undefined;
   // Test hooks: errors to answer submissions with, in order, and how many of the next
   // transactions sent fail on the host's storage, which the relayer reports as failed with the
-  // code "unavailable" and rests nothing for.
+  // code "unavailable" and rests nothing for, or fail on chain otherwise, which it reports as
+  // failed with the code "rejected".
   failures: { error: string; reason?: number }[] = [];
   conflictNext = 0;
+  failNext = 0;
   // The nullifiers of requests held in memory, which a second submission may not claim.
   inFlight = new Set<string>();
   submissions: { proof: TxProofJson; ext: ExtDataJson; notBefore: number | undefined }[] = [];
@@ -511,6 +513,11 @@ export class MockRelayer {
       if (this.conflictNext > 0) {
         this.conflictNext--;
         this.status.set(hash, "conflict");
+        return true;
+      }
+      if (this.failNext > 0) {
+        this.failNext--;
+        this.status.set(hash, "failed");
         return true;
       }
       try {

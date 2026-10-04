@@ -39,12 +39,16 @@ export interface MetaEvent {
 export interface TransactionStatus {
   readonly status: "SUCCESS" | "FAILED" | "NOT_FOUND";
   readonly ledger: number | undefined;
+  // The ledgers RPC holds transactions of, the oldest when it says.
   readonly latestLedger: number;
+  readonly oldestLedger: number | undefined;
   readonly returnValue: xdr.ScVal | undefined;
   readonly events: readonly MetaEvent[];
   // A failure whose diagnostic events name an error of the host's storage, as of a call that
-  // touched an entry its footprint does not hold.
+  // touched an entry its footprint does not hold; and whether a failure's reply carries any
+  // diagnostic events, without which it cannot show one.
   readonly conflict: boolean;
+  readonly diagnosed: boolean;
 }
 
 export interface ContractEvent {
@@ -86,10 +90,11 @@ export class SorobanRpc {
     this.#fetch = fetchFn;
   }
 
-  async call(method: string, params?: unknown): Promise<Fields> {
+  async call(method: string, params?: unknown, timeoutMs?: number): Promise<Fields> {
     const { status, body } = await requestJson(this.#fetch, "RPC", this.#url, {
       method: "POST",
       body: { jsonrpc: "2.0", id: this.#nextId++, method, params },
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
     });
     const reply = Fields.of(body, "rpc_error", `RPC ${method}`);
     if (reply.has("error")) {
@@ -180,8 +185,8 @@ export class SorobanRpc {
     return { status: status as SendStatus, hash: r.hash("hash") };
   }
 
-  async getTransaction(hash: string): Promise<TransactionStatus> {
-    const r: Fields = await this.call("getTransaction", { hash });
+  async getTransaction(hash: string, timeoutMs?: number): Promise<TransactionStatus> {
+    const r: Fields = await this.call("getTransaction", { hash }, timeoutMs);
     const status = r.string("status");
     if (status !== "SUCCESS" && status !== "FAILED" && status !== "NOT_FOUND") {
       r.fault("unknown transaction status");
@@ -210,8 +215,10 @@ export class SorobanRpc {
       status,
       ledger: r.has("ledger") ? r.integer("ledger") : undefined,
       latestLedger: r.integer("latestLedger", 1),
+      oldestLedger: r.has("oldestLedger") ? r.integer("oldestLedger") : undefined,
       returnValue,
       events,
+      diagnosed: diagnostics.length > 0,
       conflict: diagnostics.some((d) =>
         d
           .event()

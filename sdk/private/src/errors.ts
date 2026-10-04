@@ -34,6 +34,7 @@ export type ErrorCode =
   | "destination_is_issuer"
   | "signer_mismatch"
   | "transaction_failed"
+  | "deposit_submitting"
   | "view_only"
   | "not_found"
   | "history_unavailable";

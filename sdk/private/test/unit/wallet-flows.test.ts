@@ -1,13 +1,23 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Account, MuxedAccount, StrKey } from "@stellar/stellar-base";
+import {
+  Account,
+  Address,
+  MuxedAccount,
+  Networks,
+  StrKey,
+  type Transaction,
+  TransactionBuilder,
+  xdr,
+} from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
-import { MemoryStore } from "../../src/storage.ts";
+import { MemoryStore, SealedStore } from "../../src/storage.ts";
+import { type Deposit, type WalletState, loadState, saveState } from "../../src/wallet/state.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
-import { INDEXER, RELAYER, RPC, XLM, createWorld } from "../support/network.ts";
+import { INDEXER, RELAYER, RPC, XLM, createWorld, rewritingFetch } from "../support/network.ts";
 import { keypairFor } from "../support/rpc.ts";
-import { confirmAll, isError, openWallet } from "../support/wallets.ts";
+import { confirmAll, isError, openWallet, shielded, storeKeyOf } from "../support/wallets.ts";
 
 async function funded(amount = 100n * XLM) {
   const world = await createWorld();
@@ -63,6 +73,28 @@ describe("wallet: opening", () => {
   });
 });
 
+// Whether a JSON-RPC request reads the vault's entry queue.
+const readsQueue = (body: { method?: string; params?: { keys?: string[] } }): boolean =>
+  body.method === "getLedgerEntries" &&
+  (body.params?.keys ?? []).some((k) => {
+    const key = xdr.LedgerKey.fromXDR(k, "base64");
+    return (
+      key.switch().name === "contractData" &&
+      key.contractData().key().vec()?.[0]?.sym().toString() === "Pending"
+    );
+  });
+
+// A busy RPC's reply to a JSON-RPC request.
+const busyReply = (id: number): Response =>
+  new Response(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32603, message: "busy" } }));
+
+const bodyOf = (init: RequestInit | undefined) =>
+  init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+
+// An RPC's reply to a JSON-RPC request with this result.
+const rpcResult = (id: number, result: unknown): Response =>
+  new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
+
 describe("wallet: deposits", () => {
   it("shields, follows the deposit through the queue and spends it once admitted", async () => {
     const world = await createWorld();
@@ -111,8 +143,8 @@ describe("wallet: deposits", () => {
     const world = await createWorld();
     const alice = await openWallet(world, 0);
     const depositor = world.signer("alice depositor");
-    const first = await alice.shield({ amount: 10n * XLM, signer: depositor });
-    const second = await alice.shield({ amount: 20n * XLM, signer: depositor });
+    const first = await shielded(alice, 10n * XLM, depositor);
+    const second = await shielded(alice, 20n * XLM, depositor);
     const stranger = world.signer("anyone");
     await assert.rejects(
       alice.cancelDeposit(first.depositId, stranger),
@@ -143,6 +175,567 @@ describe("wallet: deposits", () => {
   });
 });
 
+describe("wallet: a shield whose sending goes wrong", () => {
+  // A fetch that answers the shield's first sendTransaction with `answer`, given the request and
+  // the transaction's hash, and passes everything else to the world.
+  function sending(
+    world: Awaited<ReturnType<typeof createWorld>>,
+    answer: (
+      body: { id: number },
+      hash: string,
+      init: RequestInit | undefined,
+    ) => Promise<Response>,
+  ): FetchLike {
+    let first = true;
+    return async (input, init) => {
+      const body = bodyOf(init);
+      if (first && new URL(input).origin === RPC && body?.method === "sendTransaction") {
+        first = false;
+        const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+        return answer(body, tx.hash().toString("hex"), init);
+      }
+      return world.fetch(input, init);
+    };
+  }
+
+  it("stays submitting when the reply is lost after the envelope left, and a sync finds it", async () => {
+    const world = await createWorld();
+    const fetch = sending(world, async (_body, _hash, init) => {
+      await world.fetch(RPC, init);
+      throw new TypeError("connection reset");
+    });
+    const alice = await openWallet({ ...world, fetch }, 0);
+    await assert.rejects(
+      alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") }),
+      isError("service_unavailable"),
+    );
+    let [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "submitting");
+    assert.notEqual(deposit?.txHash, undefined);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+  });
+
+  it("stays submitting when the RPC answers that the network refused the envelope, and fails once every provider shows it can no longer land", async () => {
+    for (const answer of ["ERROR", "TRY_AGAIN_LATER"] as const) {
+      const world = await createWorld();
+      const second = "http://rpc2.test";
+      // The first provider takes the shield to no one, and gives this answer every time.
+      const fetch: FetchLike = async (input, init) => {
+        const url = new URL(input);
+        const body = bodyOf(init);
+        if (url.origin === RPC && body?.method === "sendTransaction") {
+          const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+          const hash = tx.hash().toString("hex");
+          return rpcResult(body.id, { status: answer, hash, latestLedger: world.vault.ledger });
+        }
+        return world.fetch(url.origin === second ? RPC : input, init);
+      };
+      const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+        secondRpcUrl: second,
+        sleep: async (ms) => {
+          world.advance(Math.ceil(ms / 1000));
+        },
+      });
+      await assert.rejects(
+        alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") }),
+        (err: unknown) => err instanceof CyphrasError && err.details["refused"] === true,
+      );
+      assert.equal((await alice.deposits())[0]?.state, "submitting", answer);
+      world.advance(121 * 5);
+      await alice.sync();
+      assert.equal((await alice.deposits())[0]?.state, "failed", answer);
+    }
+  });
+
+  it("fails once every provider reports its transaction failed, past its proof's deadline", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    world.rpc.failNext = 1;
+    await assert.rejects(
+      alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") }),
+      isError("transaction_failed"),
+    );
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "submitting");
+    world.advance(121 * 5);
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "failed");
+  });
+
+  it("does not fail on one provider's word while events cannot be checked", async () => {
+    // The second provider cannot answer reads of events or of the entry queue; the first then
+    // reports the shield's transaction failed, or denies the transaction the second holds.
+    for (const first of ["failed", "denied"] as const) {
+      const world = await createWorld();
+      const second = "http://rpc2.test";
+      let shieldHash: string | undefined;
+      let answered = false;
+      const fetch: FetchLike = async (input, init) => {
+        const url = new URL(input);
+        const body = bodyOf(init);
+        const reads = body?.method === "getEvents" || (body !== undefined && readsQueue(body));
+        if (url.origin === second && reads) return busyReply(body.id);
+        if (body?.method === "sendTransaction") {
+          const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+          shieldHash = tx.hash().toString("hex");
+        }
+        const asked = body?.method === "getTransaction" && body.params.hash === shieldHash;
+        if (first === "denied" && asked && url.origin === RPC) {
+          if (!answered) {
+            answered = true;
+            return world.fetch(input, init);
+          }
+          const ledger = world.vault.ledger;
+          return rpcResult(body.id, { status: "NOT_FOUND", latestLedger: ledger, oldestLedger: 1 });
+        }
+        return world.fetch(url.origin === second ? RPC : input, init);
+      };
+      const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+        secondRpcUrl: second,
+      });
+      world.indexer.down = true;
+      if (first === "failed") world.rpc.failNext = 1;
+      await alice
+        .shield({ amount: 10n * XLM, signer: world.signer("depositor") })
+        .catch(() => undefined);
+      world.advance(121 * 5);
+      await alice.sync();
+      const [deposit] = await alice.deposits();
+      // A transaction every provider reports failed did fail; one only the first denies did not.
+      assert.equal(deposit?.state, first === "failed" ? "failed" : "submitting", first);
+    }
+  });
+
+  it("stays submitting while a provider does not hold every ledger the deposit could have been made in", async () => {
+    const world = await createWorld();
+    const fetch = sending(world, async (body, hash) =>
+      rpcResult(body.id, { status: "ERROR", hash, latestLedger: world.vault.ledger }),
+    );
+    const alice = await openWallet({ ...world, fetch }, 0);
+    await assert.rejects(alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") }));
+    world.rpc.oldestLedger = world.vault.ledger + 2;
+    world.advance(121 * 5);
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "submitting");
+  });
+
+  it("follows a shield the RPC took on though it answered that the network refused it", async () => {
+    const world = await createWorld();
+    const fetch = sending(world, async (body, hash, init) => {
+      await world.fetch(RPC, init);
+      return rpcResult(body.id, { status: "ERROR", hash, latestLedger: world.vault.ledger });
+    });
+    const alice = await openWallet({ ...world, fetch }, 0);
+    const depositor = world.signer("depositor");
+    await assert.rejects(alice.shield({ amount: 100n * XLM, signer: depositor }));
+    assert.equal((await alice.deposits())[0]?.state, "submitting");
+    // Another deposit goes only on the caller's word, while the first may yet land.
+    await assert.rejects(
+      alice.shield({ amount: 100n * XLM, signer: depositor }),
+      isError("deposit_submitting"),
+    );
+    assert.equal(world.vault.pending.size, 1);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    for (let i = 0; i < 3; i++) {
+      world.advance(3_600);
+      world.fill(1);
+      await alice.sync();
+    }
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+    assert.equal((await alice.history()).filter((h) => h.kind === "shield").length, 1);
+  });
+
+  it("makes another deposit while one is being submitted on the caller's word", async () => {
+    const world = await createWorld();
+    const fetch = sending(world, async (body, hash, init) => {
+      await world.fetch(RPC, init);
+      return rpcResult(body.id, { status: "ERROR", hash, latestLedger: world.vault.ledger });
+    });
+    const alice = await openWallet({ ...world, fetch }, 0);
+    const depositor = world.signer("depositor");
+    await assert.rejects(alice.shield({ amount: 10n * XLM, signer: depositor }));
+    const again = await alice.shield({
+      amount: 20n * XLM,
+      signer: depositor,
+      whileSubmitting: true,
+    });
+    assert.equal(again.depositId, 2);
+    assert.equal(world.vault.pending.size, 2);
+  });
+});
+
+describe("wallet: a deposit's ID that some sources hide", () => {
+  const second = "http://rpc2.test";
+
+  // A wallet whose indexer lists no deposit and whose first provider denies the shield's
+  // transaction once it has answered the shield's own wait, and which `withheld` lets deny the
+  // events of either provider, or the transaction on the second provider too, after the shield. A
+  // `flooding` first provider lists the events of one request, as of a ledger short of the latest
+  // and with three hundred made-up deposit_pending events that hold the deposit's commitments
+  // before the real one, and denies its events after that.
+  async function hidden(
+    withheld: { events: "first" | "second" | "both" | "none"; secondReport: boolean },
+    flooding = false,
+  ) {
+    const world = await createWorld();
+    let shieldHash: string | undefined;
+    let answered = false;
+    let shielding = true;
+    let flooded = false;
+    const reads = { keys: 0 };
+    const indexer = rewritingFetch(world, { "/v1/deposits": (body) => ({ ...body, pending: [] }) });
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body?.method === "sendTransaction") {
+        const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+        shieldHash = tx.hash().toString("hex");
+      }
+      if (body !== undefined && readsQueue(body)) reads.keys += body.params.keys.length;
+      const asked = body?.method === "getTransaction" && body.params.hash === shieldHash;
+      if (asked && url.origin === RPC && !answered) {
+        answered = true;
+        return world.fetch(input, init);
+      }
+      const deniedBySecond = url.origin === second && withheld.secondReport && !shielding;
+      if (asked && (url.origin === RPC || deniedBySecond)) {
+        return rpcResult(body.id, { status: "NOT_FOUND", latestLedger: world.vault.ledger });
+      }
+      if (body?.method === "getEvents") {
+        const first = url.origin === RPC;
+        if (flooding && first && !flooded) {
+          flooded = true;
+          return floodedEvents(await world.fetch(input, init), world.vault.ledger - 1);
+        }
+        const denied =
+          withheld.events === "both" ||
+          withheld.events === (first ? "first" : "second") ||
+          (flooding && first);
+        if (denied) {
+          const error = { code: -32600, message: "startLedger must be within the ledger range" };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+        }
+      }
+      return indexer(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const receipt = await alice.shield({ amount: 100n * XLM, signer: world.signer("depositor") });
+    shielding = false;
+    assert.equal(receipt.depositId, undefined);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    return { world, alice, reads };
+  }
+
+  // A page of events with three hundred made-up deposit_pending events, each like the first real
+  // one but under another ID, listed before it, as of `latestLedger`.
+  async function floodedEvents(res: Response, latestLedger: number): Promise<Response> {
+    const page = (await res.json()) as {
+      result: { events: { topic: string[]; value: string }[]; latestLedger: number };
+    };
+    const { events } = page.result;
+    const at = events.findIndex(
+      (e) =>
+        xdr.ScVal.fromXDR(e.topic[0] as string, "base64")
+          .sym()
+          .toString() === "deposit_pending",
+    );
+    const real = events[at];
+    if (real !== undefined) {
+      const fields = xdr.ScVal.fromXDR(real.value, "base64").map() ?? [];
+      const fakes = Array.from({ length: 300 }, (_, i) => {
+        const id = xdr.ScVal.scvU64(new xdr.Uint64(BigInt(1000 + i)));
+        const value = xdr.ScVal.scvMap(
+          fields.map((f) =>
+            f.key().sym().toString() === "id" ? new xdr.ScMapEntry({ key: f.key(), val: id }) : f,
+          ),
+        );
+        return { ...real, value: value.toXDR("base64") };
+      });
+      events.splice(at, 0, ...fakes);
+    }
+    page.result.latestLedger = latestLedger;
+    return new Response(JSON.stringify(page));
+  }
+
+  for (const [source, withheld] of [
+    ["the second provider's events", { events: "first", secondReport: true }],
+    ["the first provider's events", { events: "second", secondReport: true }],
+    ["the second provider's report", { events: "both", secondReport: false }],
+  ] as const) {
+    it(`takes the ID from ${source} alone, once every provider's entry holds the deposit`, async () => {
+      const { world, alice } = await hidden(withheld);
+      for (let i = 0; i < 2; i++) {
+        world.advance(3_600);
+        world.fill(1);
+        await alice.sync();
+      }
+      const [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, "pending", source);
+      assert.equal(deposit?.id, 1, source);
+      assert.equal(deposit?.flag?.kind, "legal_hold", source);
+    });
+  }
+
+  it("takes the ID from the second provider's events, and reads one of the hundreds the first makes up before it", async () => {
+    const { world, alice, reads } = await hidden({ events: "none", secondReport: true }, true);
+    world.advance(3_600);
+    world.fill(1);
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+    // The first ID each provider's events give, on each provider.
+    assert.equal(reads.keys, 2 * 2);
+  });
+});
+
+describe("wallet: reads of the entry queue", () => {
+  const second = "http://rpc2.test";
+  const tooMany = (id: number): Response =>
+    new Response(
+      JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32602, message: "too many keys" } }),
+    );
+
+  it("read a few of the IDs an indexer lists for a deposit, and every deposit followed, though it lists hundreds", async () => {
+    const world = await createWorld();
+    let lagging = false;
+    let flood = false;
+    let keysRead = 0;
+    const depositor = world.signer("depositor");
+    const dropped = new Set<string>();
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      const provider = url.origin === RPC || url.origin === second;
+      if (provider && body?.method === "getTransaction") {
+        if (dropped.has(body.params.hash) || (url.origin === second && lagging)) {
+          return rpcResult(body.id, { status: "NOT_FOUND", latestLedger: world.vault.ledger });
+        }
+      }
+      if (provider && body !== undefined && readsQueue(body)) {
+        if (body.params.keys.length > 200) return tooMany(body.id);
+        keysRead += body.params.keys.length;
+      }
+      const res = await world.fetch(url.origin === second ? RPC : input, init);
+      if (!flood || url.origin !== INDEXER || url.pathname !== "/v1/deposits") return res;
+      // Three hundred made-up entries like the unnamed deposit, made after it and listed before it,
+      // other depositors' entries of its amount, made with it and listed first, and the held
+      // deposit refunded.
+      const listed = (await res.json()) as { pending: Record<string, unknown>[] } & Record<
+        string,
+        unknown
+      >;
+      const mine = listed.pending.find((d) => d["id"] === 2) as Record<string, unknown>;
+      const fakes = Array.from({ length: 300 }, (_, i) => ({
+        ...mine,
+        id: 1000 + i,
+        created_at: (mine["created_at"] as number) + 60 * (i + 1),
+      }));
+      const others = Array.from({ length: 4 }, (_, i) => ({
+        ...mine,
+        id: 2000 + i,
+        depositor: keypairFor(`other depositor ${i}`).publicKey(),
+      }));
+      const refunded = {
+        id: 1,
+        depositor: depositor.publicKey,
+        amount: (10n * XLM).toString(),
+        created_at: 1,
+        outcome: "refunded",
+        reason: 1,
+        resolved_at: 1,
+        leaf_index0: null,
+        leaf_index1: null,
+      };
+      return new Response(
+        JSON.stringify({
+          ...listed,
+          pending: [...others, ...fakes, ...listed.pending.filter((d) => d["id"] !== 1)],
+          resolved: [...(listed["resolved"] as unknown[]), refunded],
+        }),
+      );
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await shielded(alice, 10n * XLM, depositor);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    await alice.sync();
+    lagging = true;
+    const unnamed = await alice.shield({ amount: 20n * XLM, signer: depositor });
+    assert.equal(unnamed.depositId, undefined);
+    lagging = false;
+    // The app is closed for eight days; RPC keeps seven days of events and transactions.
+    world.advance(8 * 86_400);
+    world.rpc.oldestLedger = world.vault.ledger - 120_960;
+    dropped.add(unnamed.txHash);
+    flood = true;
+    keysRead = 0;
+    world.fill(1);
+    await alice.sync();
+    const [held, other] = await alice.deposits();
+    assert.equal(held?.state, "pending");
+    assert.equal(held?.flag?.kind, "legal_hold");
+    assert.equal(held?.confirmed, true);
+    assert.equal(other?.id, 2);
+    assert.ok(keysRead <= 2 * (1 + 4), `${keysRead} keys read`);
+  });
+
+  it("follows every deposit in requests of at most 200 keys, each on its own", async () => {
+    const world = await createWorld();
+    const store = new MemoryStore();
+    const wallet = await openWallet(world, 0, store);
+    await shielded(wallet, 10n * XLM, world.signer("depositor"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    // Two hundred more deposits to follow, kept before it, as a wallet with many could have.
+    const sealed = new SealedStore(store, storeKeyOf(0));
+    const kept = (await loadState(sealed)) as WalletState;
+    const own = kept.deposits[0] as Deposit;
+    const others = Array.from({ length: 200 }, (_, i) => ({
+      ...own,
+      id: 1000 + i,
+      commitments: [BigInt(i + 1), BigInt(i + 2)] as const,
+    }));
+    kept.deposits = [...others, own];
+    await saveState(sealed, kept);
+    // Every provider refuses a request of more than 200 keys, and the first refuses any request
+    // that reads deposit 1000.
+    const refused = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(world.vault.address).toScAddress(),
+        key: xdr.ScVal.scvVec([
+          xdr.ScVal.scvSymbol("Pending"),
+          xdr.ScVal.scvU64(new xdr.Uint64(1000n)),
+        ]),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    ).toXDR("base64");
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body !== undefined && readsQueue(body)) {
+        const keys = body.params.keys as string[];
+        if (keys.length > 200 || (url.origin === RPC && keys.includes(refused))) {
+          return tooMany(body.id);
+        }
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, store, undefined, {
+      secondRpcUrl: second,
+    });
+    await alice.sync();
+    const deposit = (await alice.deposits()).find((d) => d.id === 1);
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+    assert.equal(deposit?.confirmed, true);
+  });
+});
+
+describe("wallet: a deposit taken for failed", () => {
+  it("is being submitted again once the vault's events show it made", async () => {
+    const world = await createWorld();
+    const second = "http://rpc2.test";
+    let busy = false;
+    let shieldHash: string | undefined;
+    let answered = false;
+    // Both providers deny the shield's transaction once the first has answered the shield's own
+    // wait for it, and cannot answer reads of events while busy; the indexer lists no deposit.
+    const indexer = rewritingFetch(world, { "/v1/deposits": (body) => ({ ...body, pending: [] }) });
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body?.method === "sendTransaction") {
+        const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+        shieldHash = tx.hash().toString("hex");
+      }
+      const denied = body?.method === "getTransaction" && body.params.hash === shieldHash;
+      if (denied && url.origin === RPC && !answered) {
+        answered = true;
+        return world.fetch(input, init);
+      }
+      if (denied) {
+        return rpcResult(body.id, {
+          status: "NOT_FOUND",
+          latestLedger: world.vault.ledger,
+          oldestLedger: 1,
+        });
+      }
+      if (busy && body?.method === "getEvents") return busyReply(body.id);
+      return indexer(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const receipt = await alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") });
+    assert.equal(receipt.depositId, undefined);
+    world.advance(121 * 5);
+    busy = true;
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "failed");
+    busy = false;
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+  });
+
+  // A wallet whose only deposit is kept as failed and without its ID, as a sync that every provider
+  // deceived would have left it, past the ledgers whose events show it made.
+  async function keptFailed(world: Awaited<ReturnType<typeof createWorld>>) {
+    const store = new MemoryStore();
+    const alice = await openWallet(world, 0, store);
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    await alice.sync();
+    const sealed = new SealedStore(store, storeKeyOf(0));
+    const kept = (await loadState(sealed)) as WalletState;
+    (kept.deposits[0] as Deposit).state = "failed";
+    (kept.deposits[0] as Deposit).id = undefined;
+    await saveState(sealed, kept);
+    return openWallet(world, 0, store);
+  }
+
+  it("takes the ID the indexer gives once every provider's entry under it holds the deposit", async () => {
+    const world = await createWorld();
+    const alice = await keptFailed(world);
+    world.fill(1);
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+  });
+
+  it("is admitted once its notes are in the confirmed tree", async () => {
+    const world = await createWorld();
+    const store = new MemoryStore();
+    const alice = await openWallet(world, 0, store);
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    // A deposit kept as failed, as a sync that every provider deceived would have left it.
+    const sealed = new SealedStore(store, storeKeyOf(0));
+    const kept = (await loadState(sealed)) as WalletState;
+    (kept.deposits[0] as Deposit).state = "failed";
+    (kept.deposits[0] as Deposit).id = undefined;
+    await saveState(sealed, kept);
+    const reopened = await openWallet(world, 0, store);
+    world.advance(3_601);
+    world.admitAll();
+    await reopened.sync();
+    const [deposit] = await reopened.deposits();
+    assert.equal(deposit?.state, "admitted");
+    assert.equal(deposit?.confirmed, true);
+  });
+});
+
 describe("wallet: deposits seen through two RPC providers", () => {
   it("moves a deposit along only on what every RPC provider shows of it", async () => {
     const world = await createWorld();
@@ -153,7 +746,7 @@ describe("wallet: deposits seen through two RPC providers", () => {
       const body =
         init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
       if (url.origin === second) {
-        if (busy && body?.method === "getEvents") {
+        if (busy && (body?.method === "getEvents" || readsQueue(body ?? {}))) {
           const error = { code: -32603, message: "busy" };
           return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
         }
@@ -174,16 +767,937 @@ describe("wallet: deposits seen through two RPC providers", () => {
       isError("transaction_failed"),
     );
     // The deposit's event cannot be checked against the second provider, which reports the
-    // transaction as a success.
+    // transaction as a success and cannot answer reads of the entry queue, to verify an ID under.
     busy = true;
+    world.indexer.down = true;
     assert.equal((await alice.sync()).crossChecked, false);
     let [deposit] = await alice.deposits();
     assert.equal(deposit?.state, "submitting");
     busy = false;
+    world.indexer.down = false;
     await alice.sync();
     [deposit] = await alice.deposits();
     assert.equal(deposit?.state, "pending");
     assert.equal(deposit?.id, 1);
+  });
+});
+
+describe("wallet: a deposit's ID", () => {
+  it("is taken from the shield only as every RPC provider reports it, and never shows another deposit", async () => {
+    const world = await createWorld();
+    const second = "http://rpc2.test";
+    let lying = false;
+    // While lying, the first provider reports every deposit's transaction as making deposit 1.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (url.origin === second) return world.fetch(RPC, init);
+      const res = await world.fetch(input, init);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (!lying || url.origin !== RPC || body?.method !== "getTransaction") return res;
+      const reply = await res.json();
+      if (reply.result?.status !== "SUCCESS") return new Response(JSON.stringify(reply));
+      const meta = xdr.TransactionMeta.fromXDR(reply.result.resultMetaXdr, "base64");
+      meta
+        .v4()
+        .sorobanMeta()
+        ?.returnValue(xdr.ScVal.scvU64(new xdr.Uint64(1n)));
+      reply.result.resultMetaXdr = meta.toXDR("base64");
+      return new Response(JSON.stringify(reply));
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    // Someone else's deposit 1, which screening flagged.
+    const other = await openWallet(world, 1);
+    const { depositId: theirs } = await shielded(other, 50n * XLM, world.signer("someone"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(theirs, 1));
+    lying = true;
+    const receipt = await alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") });
+    assert.equal(receipt.depositId, undefined);
+    let [mine] = await alice.deposits();
+    assert.equal(mine?.state, "submitting");
+    assert.equal(mine?.id, undefined);
+    await alice.sync();
+    [mine] = await alice.deposits();
+    assert.equal(mine?.state, "pending");
+    assert.equal(mine?.id, 2);
+    assert.equal(mine?.flag, undefined);
+  });
+
+  it("is taken from the shield once a provider that lags reports it within half a minute", async () => {
+    const world = await createWorld();
+    const second = "http://rpc2.test";
+    let asked = 0;
+    let first = 0;
+    // The second provider has not taken in the deposit's ledger the first three times it is asked.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (url.origin === RPC && body?.method === "getTransaction") first++;
+      if (url.origin === second && body?.method === "getTransaction" && ++asked <= 3) {
+        const result = { status: "NOT_FOUND", latestLedger: world.vault.ledger };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const receipt = await alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") });
+    assert.equal(receipt.depositId, 1);
+    assert.equal(asked, 4);
+    // The first provider, which held the transaction at once, is not asked again.
+    assert.equal(first, 2);
+  });
+
+  it("takes the indexer's account of a deposit only for its own depositor and amount", async () => {
+    const world = await createWorld();
+    let forged: Record<string, unknown> = {};
+    // RPC cannot answer reads of the entry queue, so the indexer's account is all there is.
+    let busy = true;
+    const indexer = rewritingFetch(world, {
+      "/v1/deposits": (body) => {
+        const pending = body["pending"] as Record<string, unknown>[];
+        return { ...body, pending: pending.map((d) => ({ ...d, ...forged })) };
+      },
+    });
+    const fetch: FetchLike = async (input, init) => {
+      const body = bodyOf(init);
+      if (busy && body !== undefined && readsQueue(body)) return busyReply(body.id);
+      return indexer(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0);
+    const { depositId } = await shielded(alice, 10n * XLM, world.signer("depositor"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(depositId, 1));
+    for (const field of [{ amount: "1" }, { depositor: world.signer("someone").publicKey }]) {
+      forged = field;
+      await alice.sync();
+      const [mine] = await alice.deposits();
+      assert.equal(mine?.flag, undefined);
+    }
+    forged = {};
+    await alice.sync();
+    let [mine] = await alice.deposits();
+    assert.equal(mine?.flag?.reason, 1);
+    assert.equal(mine?.confirmed, false);
+    busy = false;
+    await alice.sync();
+    [mine] = await alice.deposits();
+    assert.equal(mine?.flag?.reason, 1);
+    assert.equal(mine?.confirmed, true);
+  });
+});
+
+describe("wallet: a deposit whose ID the RPC providers did not report alike at once", () => {
+  const second = "http://rpc2.test";
+
+  // A wallet whose second provider has not yet taken in the ledger of the deposit it makes, so the
+  // shield returns no ID; then neither provider holds that transaction any more. While `queue` is
+  // "busy" the second provider fails its reads of the entry queue, and while it is "behind" it
+  // shows no entry there.
+  async function lagged(world: Awaited<ReturnType<typeof createWorld>>) {
+    let lagging = true;
+    const secondProvider = { queue: "honest" as "honest" | "busy" | "behind" };
+    const dropped = new Set<string>();
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (url.origin === second && secondProvider.queue !== "honest" && readsQueue(body ?? {})) {
+        const reply =
+          secondProvider.queue === "busy"
+            ? { error: { code: -32603, message: "busy" } }
+            : { result: { entries: [], latestLedger: world.vault.ledger } };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, ...reply }));
+      }
+      if ((url.origin === RPC || url.origin === second) && body?.method === "getTransaction") {
+        const hash = body.params.hash as string;
+        if (dropped.has(hash) || (url.origin === second && lagging)) {
+          const result = { status: "NOT_FOUND", latestLedger: world.vault.ledger };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+        }
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const depositor = world.signer("depositor");
+    const receipt = await alice.shield({ amount: 100n * XLM, signer: depositor });
+    assert.equal(receipt.depositId, undefined);
+    lagging = false;
+    dropped.add(receipt.txHash);
+    return { alice, depositor, second: secondProvider };
+  }
+
+  // Eight days pass with the app closed, longer than RPC keeps events and transactions.
+  function closedForEightDays(world: Awaited<ReturnType<typeof createWorld>>): void {
+    world.advance(8 * 86_400);
+    world.rpc.oldestLedger = world.vault.ledger - 120_960;
+  }
+
+  it("is admitted once its notes are in the confirmed tree, and no longer counts as pending", async () => {
+    const world = await createWorld();
+    const { alice } = await lagged(world);
+    closedForEightDays(world);
+    world.admitAll();
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "admitted");
+    assert.equal(deposit?.confirmed, true);
+    const balance = await alice.balance();
+    assert.equal(balance.spendable, 100n * XLM);
+    assert.equal(balance.pendingDeposits, 0n);
+  });
+
+  it("takes the ID the indexer gives once every provider's entry under it holds the deposit", async () => {
+    const world = await createWorld();
+    const { alice } = await lagged(world);
+    closedForEightDays(world);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+    const entry = world.vault.pending.get(1);
+    assert.equal(deposit?.earliestAdmission, Number(entry?.createdAt) + Number(entry?.delay));
+    assert.equal(deposit?.confirmed, true);
+  });
+
+  it("takes the ID the indexer gives only on every provider's entry under it", async () => {
+    const world = await createWorld();
+    const { alice, second: provider } = await lagged(world);
+    closedForEightDays(world);
+    for (const queue of ["busy", "behind"] as const) {
+      provider.queue = queue;
+      await alice.sync();
+      assert.equal((await alice.deposits())[0]?.state, "submitting", queue);
+    }
+    // An entry under the ID with another commitment is not this deposit's.
+    const entry = world.vault.pending.get(1) as { commitments: [bigint, bigint] };
+    const commitments = entry.commitments;
+    entry.commitments = [commitments[0], commitments[1] + 1n];
+    provider.queue = "honest";
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "submitting");
+    entry.commitments = commitments;
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.id, 1);
+  });
+
+  it("takes no ID whose entry holds another deposit of the same depositor and amount", async () => {
+    const world = await createWorld();
+    const other = await openWallet(world, 1);
+    await shielded(other, 100n * XLM, world.signer("depositor"));
+    const { alice } = await lagged(world);
+    closedForEightDays(world);
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.id, 2);
+    assert.equal(deposit?.state, "pending");
+  });
+
+  it("takes the ID a refund names once every provider's entry under it holds the deposit, and no other", async () => {
+    const world = await createWorld();
+    const other = await openWallet(world, 1);
+    const theirs = await shielded(other, 100n * XLM, world.signer("depositor"));
+    const { alice, depositor } = await lagged(world);
+    // A cancel of the other wallet's deposit names no ID of this one.
+    await alice.cancelDeposit(theirs.depositId, depositor);
+    assert.equal((await alice.deposits())[0]?.state, "submitting");
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(2, 1));
+    world.advance(86_400);
+    await alice.refundDeposit(2, world.signer("anyone"));
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.id, 2);
+    assert.equal(deposit?.state, "refunded");
+  });
+
+  it("takes the ID a cancel names once every provider's entry under it holds the deposit", async () => {
+    const world = await createWorld();
+    const { alice, depositor } = await lagged(world);
+    await alice.cancelDeposit(1, depositor);
+    assert.equal(world.vault.pending.has(1), false);
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.id, 1);
+    assert.equal(deposit?.state, "cancelled");
+    assert.equal((await alice.balance()).pendingDeposits, 0n);
+  });
+});
+
+describe("wallet: deposit status the indexer alone gives", () => {
+  // A wallet whose indexer gives every pending deposit the resolution `lie` while it is set, and
+  // whose RPC cannot answer reads of the entry queue while `busy` is.
+  async function lied() {
+    const world = await createWorld();
+    const control: { lie: "refunded" | "admitted" | undefined; busy: boolean } = {
+      lie: undefined,
+      busy: false,
+    };
+    const indexer = rewritingFetch(world, {
+      "/v1/deposits": (body) => {
+        if (control.lie === undefined) return body;
+        const pending = body["pending"] as Record<string, unknown>[];
+        return {
+          ...body,
+          pending: [],
+          resolved: pending.map((d) => ({ ...d, outcome: control.lie, reason: 1, resolved_at: 1 })),
+        };
+      },
+    });
+    const fetch: FetchLike = async (input, init) => {
+      const body = bodyOf(init);
+      if (control.busy && body !== undefined && readsQueue(body)) return busyReply(body.id);
+      return indexer(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0);
+    return { world, alice, control };
+  }
+
+  it("is shown as unconfirmed, and the confirmed tree outweighs it", async () => {
+    const { world, alice, control } = await lied();
+    const depositor = world.signer("depositor");
+    const byId = async () => new Map((await alice.deposits()).map((d) => [d.id, d]));
+    const first = await shielded(alice, 10n * XLM, depositor);
+    assert.equal((await byId()).get(first.depositId)?.confirmed, true);
+    control.lie = "refunded";
+    control.busy = true;
+    await alice.sync();
+    let deposits = await byId();
+    assert.equal(deposits.get(first.depositId)?.state, "refunded");
+    assert.equal(deposits.get(first.depositId)?.confirmed, false);
+    control.lie = undefined;
+    const second = await shielded(alice, 20n * XLM, depositor);
+    assert.equal((await byId()).get(second.depositId)?.confirmed, true);
+    await alice.sync();
+    deposits = await byId();
+    assert.equal(deposits.get(second.depositId)?.state, "pending");
+    assert.equal(deposits.get(second.depositId)?.attested, false);
+    assert.equal(deposits.get(second.depositId)?.confirmed, false);
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    deposits = await byId();
+    for (const { depositId } of [first, second]) {
+      assert.equal(deposits.get(depositId)?.state, "admitted");
+      assert.equal(deposits.get(depositId)?.confirmed, true);
+    }
+  });
+
+  it("gives way to every provider's entry in the entry queue, which shows the deposit still held", async () => {
+    for (const lie of ["refunded", "admitted"] as const) {
+      const { world, alice, control } = await lied();
+      const { depositId } = await shielded(alice, 10n * XLM, world.signer("depositor"));
+      world.rpc.run("ab".repeat(32), () => world.vault.flag(depositId, 100));
+      control.lie = lie;
+      control.busy = true;
+      await alice.sync();
+      let [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, lie);
+      assert.equal(deposit?.confirmed, false);
+      // The indexer lists the deposit again, while RPC still cannot answer.
+      control.lie = undefined;
+      await alice.sync();
+      [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, "pending");
+      assert.equal(deposit?.confirmed, false);
+      // The indexer lies again; the entry queue every provider reads has the final word.
+      control.lie = lie;
+      control.busy = false;
+      world.advance(3 * 86_400);
+      await alice.sync();
+      [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, "pending");
+      assert.equal(deposit?.flag?.kind, "legal_hold");
+      assert.equal(deposit?.attested, false);
+      assert.equal(
+        deposit?.earliestAdmission,
+        Number(world.vault.pending.get(1)?.createdAt) + 3_600,
+      );
+      assert.equal(deposit?.confirmed, true);
+    }
+  });
+});
+
+describe("wallet: a cancel or refund every provider does not report", () => {
+  const second = "http://rpc2.test";
+
+  it("leaves a deposit whose cancel a first provider made up to the entry queue", async () => {
+    const world = await createWorld();
+    const swallowed = new Set<string>();
+    // The first provider takes no cancel to the network, yet reports it a success.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (url.origin === RPC && body?.method === "sendTransaction") {
+        const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
+        const op = (tx as Transaction).operations[0];
+        if (
+          op?.type === "invokeHostFunction" &&
+          op.func.invokeContract().functionName().toString() === "cancel"
+        ) {
+          const hash = tx.hash().toString("hex");
+          swallowed.add(hash);
+          const result = { status: "PENDING", hash, latestLedger: world.vault.ledger };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+        }
+      }
+      if (
+        url.origin === RPC &&
+        body?.method === "getTransaction" &&
+        swallowed.has(body.params.hash)
+      ) {
+        const ledger = world.vault.ledger;
+        const result = { status: "SUCCESS", ledger, latestLedger: ledger };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const depositor = world.signer("depositor");
+    const { depositId } = await shielded(alice, 10n * XLM, depositor);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(depositId, 100));
+    await alice.cancelDeposit(depositId, depositor);
+    let [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "cancelled");
+    assert.equal(deposit?.confirmed, false);
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(world.vault.pending.has(depositId), true);
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+    assert.equal(deposit?.confirmed, true);
+  });
+
+  it("takes a deposit it cancelled, once gone from the entry queue and not in the confirmed tree, as cancelled, for good", async () => {
+    const world = await createWorld();
+    let hiding = false;
+    let queueReads = 0;
+    // While hiding, the second provider reports no transaction at all.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body !== undefined && readsQueue(body)) queueReads++;
+      if (hiding && url.origin === second && body?.method === "getTransaction") {
+        const result = { status: "NOT_FOUND", latestLedger: world.vault.ledger };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const depositor = world.signer("depositor");
+    const { depositId } = await shielded(alice, 10n * XLM, depositor);
+    hiding = true;
+    await alice.cancelDeposit(depositId, depositor);
+    hiding = false;
+    let [deposit] = await alice.deposits();
+    assert.equal(deposit?.confirmed, false);
+    // Past its proof's deadline, by which the deposit was made.
+    world.advance(121 * 5);
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "cancelled");
+    assert.equal(deposit?.refundKind, "cancelled");
+    assert.equal(deposit?.confirmed, true);
+    // Every source confirmed it, so no later sync reads the entry queue for it.
+    queueReads = 0;
+    world.advance(60);
+    await alice.sync();
+    assert.equal(queueReads, 0);
+  });
+});
+
+describe("wallet: a deposit gone from the entry queue", () => {
+  const second = "http://rpc2.test";
+
+  // A wallet with two providers, whose reads of the entry queue `answer` replaces, given the
+  // provider, with no entry as of the ledger it returns, while it returns one.
+  async function readsOfQueue(
+    world: Awaited<ReturnType<typeof createWorld>>,
+    answer: (provider: string) => number | undefined,
+  ) {
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      const ledger = body !== undefined && readsQueue(body) ? answer(url.origin) : undefined;
+      if (ledger !== undefined) return rpcResult(body.id, { entries: [], latestLedger: ledger });
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    return openWallet({ ...world, fetch }, 0, undefined, undefined, { secondRpcUrl: second });
+  }
+
+  it("is not gone on reads of providers behind the ledger it was last shown at", async () => {
+    // Both providers answer from a ledger before the deposit, or the first claims it gone at the
+    // latest ledger while the second answers from before it.
+    for (const lying of [false, true]) {
+      const world = await createWorld();
+      let hideAt: number | undefined;
+      const alice = await readsOfQueue(world, (provider) =>
+        hideAt === undefined ? undefined : lying && provider === RPC ? world.vault.ledger : hideAt,
+      );
+      const before = world.vault.ledger;
+      const { depositId } = await shielded(alice, 100n * XLM, world.signer("depositor"));
+      world.rpc.run("ab".repeat(32), () => world.vault.flag(depositId, 100));
+      world.advance(121 * 5);
+      world.fill(1);
+      await alice.sync();
+      hideAt = before;
+      world.fill(1);
+      await alice.sync();
+      hideAt = undefined;
+      for (let i = 0; i < 3; i++) {
+        world.fill(1);
+        await alice.sync();
+      }
+      const [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, "pending");
+      assert.equal(deposit?.flag?.kind, "legal_hold");
+      assert.equal(deposit?.confirmed, true);
+    }
+  });
+
+  it("is not gone on reads from before its proof's deadline, though no provider showed it yet", async () => {
+    const world = await createWorld();
+    let hideAt: number | undefined;
+    const alice = await readsOfQueue(world, () => hideAt);
+    hideAt = world.vault.ledger;
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    await alice.sync();
+    assert.notEqual((await alice.deposits())[0]?.state, "refunded");
+  });
+
+  it("is not gone on reads from before the ledger it was last shown at, past its deadline", async () => {
+    const world = await createWorld();
+    let hideAt: number | undefined;
+    const alice = await readsOfQueue(world, () => hideAt);
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    world.advance(121 * 5);
+    world.fill(1);
+    await alice.sync();
+    hideAt = world.vault.ledger - 1;
+    world.fill(1);
+    await alice.sync();
+    assert.notEqual((await alice.deposits())[0]?.state, "refunded");
+  });
+
+  it("is settled only by a sync whose reads still show it gone", async () => {
+    const world = await createWorld();
+    let mode: "gone" | "busy" | "honest" = "honest";
+    let goneLedger = 0;
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body !== undefined && readsQueue(body)) {
+        if (mode === "gone") return rpcResult(body.id, { entries: [], latestLedger: goneLedger });
+        if (mode === "busy" && url.origin === second) return busyReply(body.id);
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    world.advance(121 * 5);
+    await alice.sync();
+    // Both claim it gone as of a ledger the tree has not reached; then the tree passes it while
+    // the second provider cannot answer.
+    mode = "gone";
+    goneLedger = world.vault.ledger + 50;
+    await alice.sync();
+    mode = "busy";
+    for (let i = 0; i < 60; i++) world.fill(1);
+    await alice.sync();
+    assert.notEqual((await alice.deposits())[0]?.state, "refunded");
+    mode = "honest";
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "pending");
+  });
+
+  it("is not gone while one provider shows it, though another provider once answered from behind it", async () => {
+    const world = await createWorld();
+    let firstLies = false;
+    let secondStaleAt: number | undefined;
+    let firstLedger = 0;
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body !== undefined && readsQueue(body)) {
+        if (url.origin === RPC && firstLies) {
+          return rpcResult(body.id, { entries: [], latestLedger: firstLedger });
+        }
+        if (url.origin === second && secondStaleAt !== undefined) {
+          const stale = secondStaleAt;
+          secondStaleAt = undefined;
+          return rpcResult(body.id, { entries: [], latestLedger: stale });
+        }
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const before = world.vault.ledger;
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    await alice.sync();
+    // The first provider claims the deposit gone as of a ledger past the wallet's tree, while the
+    // second answers once from a node behind the deposit, then shows it again.
+    firstLies = true;
+    firstLedger = world.vault.ledger + 50;
+    secondStaleAt = before;
+    await alice.sync();
+    for (let i = 0; i < 60; i++) world.fill(1);
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+  });
+
+  it("is not gone once every provider showed it again, while they then disagree", async () => {
+    const world = await createWorld();
+    let mode: "gone" | "split" | "honest" = "honest";
+    let goneLedger = 0;
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      const split = mode === "split" && url.origin === RPC;
+      if (body !== undefined && readsQueue(body) && (mode === "gone" || split)) {
+        return rpcResult(body.id, { entries: [], latestLedger: goneLedger });
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    world.advance(121 * 5);
+    await alice.sync();
+    // Both show it gone as of a ledger the tree has not reached; then both show it again.
+    mode = "gone";
+    goneLedger = world.vault.ledger + 50;
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.confirmed, false);
+    mode = "honest";
+    await alice.sync();
+    // Then they disagree while the tree passes the old ledger.
+    mode = "split";
+    goneLedger = world.vault.ledger;
+    for (let i = 0; i < 60; i++) world.fill(1);
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "pending");
+  });
+
+  it("is gone by the ledger of the read that shows it gone, not by one a later read undid", async () => {
+    // The second provider shows it again while the first still claims it gone, or both do.
+    for (const undone of ["split", "honest"] as const) {
+      const world = await createWorld();
+      let mode: "gone" | "split" | "honest" = "honest";
+      let goneLedger = 0;
+      let admitting = false;
+      const fetch: FetchLike = async (input, init) => {
+        const url = new URL(input);
+        const body = bodyOf(init);
+        if (body !== undefined && readsQueue(body)) {
+          const split = mode === "split" && url.origin === RPC;
+          if (mode === "gone" || split) {
+            return rpcResult(body.id, { entries: [], latestLedger: goneLedger });
+          }
+          if (admitting) {
+            admitting = false;
+            world.admitAll();
+          }
+        }
+        return world.fetch(url.origin === second ? RPC : input, init);
+      };
+      const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+        secondRpcUrl: second,
+      });
+      await shielded(alice, 10n * XLM, world.signer("depositor"));
+      world.advance(121 * 5);
+      await alice.sync();
+      mode = "gone";
+      goneLedger = world.vault.ledger + 50;
+      await alice.sync();
+      mode = undone;
+      await alice.sync();
+      mode = "honest";
+      // The tree passes that ledger, and the deposit is admitted after a sync's views, before its
+      // reads of the entry queue.
+      for (let i = 0; i < 60; i++) world.fill(1);
+      world.advance(3_601);
+      admitting = true;
+      await alice.sync();
+      let [deposit] = await alice.deposits();
+      assert.notEqual(deposit?.state, "refunded", undone);
+      await alice.sync();
+      [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, "admitted", undone);
+    }
+  });
+
+  it("went back to its depositor when its notes are not in the confirmed tree of a later ledger", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const { depositId } = await shielded(alice, 10n * XLM, world.signer("depositor"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(depositId, 1));
+    await alice.sync();
+    // Refunded by someone else, while no indexer gives the deposit's resolution.
+    world.advance(86_400);
+    world.rpc.run("ac".repeat(32), () => world.vault.refund(depositId));
+    world.indexer.down = true;
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "refunded");
+    assert.equal(deposit?.refundKind, "refused");
+    assert.equal(deposit?.confirmed, true);
+  });
+
+  it("waits for the confirmed tree of the latest ledger any provider showed the deposit gone at", async () => {
+    const world = await createWorld();
+    const second = "http://rpc2.test";
+    let reading = false;
+    // The first provider shows the entry queue without the deposit while it is still there; the
+    // deposit is admitted before the second provider reads the queue.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (reading && body !== undefined && readsQueue(body)) {
+        if (url.origin === RPC) {
+          const result = { entries: [], latestLedger: world.vault.ledger };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+        }
+        reading = false;
+        world.admitAll();
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    world.advance(3_601);
+    reading = true;
+    await alice.sync();
+    let [deposit] = await alice.deposits();
+    assert.notEqual(deposit?.state, "refunded");
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "admitted");
+    assert.equal(deposit?.confirmed, true);
+  });
+
+  // A fetch that answers the vault reads of a sync, while `stale` names a ledger for a provider,
+  // with what the vault showed when `capture` was last called, as of that ledger.
+  function staleViews(world: Awaited<ReturnType<typeof createWorld>>, second: string) {
+    const nextLeaf = xdr.ScVal.scvVec([xdr.ScVal.scvSymbol("NextLeaf")]);
+    const isView = (body: { method?: string; params?: { keys?: string[] } }): boolean =>
+      body.method === "getLedgerEntries" &&
+      (body.params?.keys ?? []).some((k) => {
+        const key = xdr.LedgerKey.fromXDR(k, "base64");
+        return (
+          key.switch().name === "contractData" &&
+          key.contractData().key().toXDR("base64") === nextLeaf.toXDR("base64")
+        );
+      });
+    let captured: Record<string, unknown> | undefined;
+    const control = {
+      stale: new Map<string, number>(),
+      capture: async () => {
+        const keys = (await lastView)?.params.keys;
+        const res = await world.fetch(RPC, {
+          method: "POST",
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 0,
+            method: "getLedgerEntries",
+            params: { keys },
+          }),
+        });
+        captured = ((await res.json()) as { result: Record<string, unknown> }).result;
+      },
+    };
+    let lastView: Promise<{ params: { keys: string[] } } | undefined> = Promise.resolve(undefined);
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body !== undefined && isView(body)) {
+        lastView = Promise.resolve(body);
+        const ledger = control.stale.get(url.origin);
+        if (ledger !== undefined && captured !== undefined) {
+          const result = { ...captured, latestLedger: ledger };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }));
+        }
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    return { fetch, control };
+  }
+
+  it("never takes a deposit gone from the queue for refunded on a tree an indexer that lags left short", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    await alice.sync();
+    world.advance(3_601);
+    // The indexer serves the leaves, and is complete to the ledgers, from before the admission.
+    world.indexer.leafLimit = world.vault.tree.leafCount;
+    world.indexer.completeTo = world.vault.ledger;
+    world.admitAll();
+    await alice.sync();
+    let [deposit] = await alice.deposits();
+    assert.notEqual(deposit?.state, "refunded");
+    world.indexer.leafLimit = undefined;
+    world.indexer.completeTo = undefined;
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "admitted");
+  });
+
+  it("never takes a deposit gone from the queue for refunded on a tree that holds only part of a ledger", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    await alice.sync();
+    world.advance(3_601);
+    // One ledger adds another payment's pair, then the deposit's; the indexer serves the first.
+    world.indexer.leafLimit = world.vault.tree.leafCount + 2;
+    world.indexer.completeTo = world.vault.ledger;
+    world.rpc.run("ad".repeat(32), () => {
+      world.vault.insertFiller(1);
+      world.vault.attest(1);
+      world.vault.admit([1]);
+    });
+    await alice.sync();
+    let [deposit] = await alice.deposits();
+    assert.notEqual(deposit?.state, "refunded");
+    world.indexer.leafLimit = undefined;
+    world.indexer.completeTo = undefined;
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "admitted");
+  });
+
+  it("takes a deposit as attested only once every provider's view shows it", async () => {
+    const world = await createWorld();
+    const second = "http://rpc2.test";
+    const { fetch, control } = staleViews(world, second);
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    await alice.sync();
+    await control.capture();
+    world.rpc.run("ae".repeat(32), () => world.vault.attest(1));
+    control.stale.set(second, world.vault.ledger);
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.attested, false);
+    control.stale.clear();
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.attested, true);
+  });
+
+  it("takes a deposit gone from the queue, and not in a tree with a checked leaf of a later ledger, for refunded", async () => {
+    const world = await createWorld();
+    let refunding = false;
+    const fetch: FetchLike = async (input, init) => {
+      const body = bodyOf(init);
+      if (refunding && body !== undefined && readsQueue(body)) {
+        refunding = false;
+        world.rpc.run("ac".repeat(32), () => world.vault.refund(1));
+      }
+      return world.fetch(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0);
+    const { depositId } = await shielded(alice, 10n * XLM, world.signer("depositor"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(depositId, 1));
+    world.advance(86_400);
+    // Refunded after the views of a sync, which then sees the deposit gone from the queue.
+    refunding = true;
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.confirmed, false);
+    // Other payments add leaves; the next sync checks the first of them, while the view already
+    // shows more.
+    world.fill(1);
+    world.indexer.leafLimit = world.vault.tree.leafCount;
+    world.indexer.completeTo = world.vault.ledger;
+    world.fill(1);
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "refunded");
+    assert.equal(deposit?.refundKind, "refused");
+    assert.equal(deposit?.confirmed, true);
+  });
+
+  it("never takes a deposit gone from the queue for refunded on a view of the tree older than it", async () => {
+    const world = await createWorld();
+    const second = "http://rpc2.test";
+    const { fetch, control } = staleViews(world, second);
+    let admitting = false;
+    const admitted: FetchLike = async (input, init) => {
+      const body = bodyOf(init);
+      if (admitting && body !== undefined && readsQueue(body)) {
+        admitting = false;
+        world.admitAll();
+      }
+      return fetch(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch: admitted }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    world.advance(3_601);
+    await alice.sync();
+    await control.capture();
+    // Admitted after the views of a sync, which then sees the deposit gone from the queue.
+    const before = world.vault.ledger;
+    admitting = true;
+    await alice.sync();
+    // The views of the tree as it was: the first provider's at a later ledger, the second's at the
+    // ledger before the admission.
+    control.stale.set(RPC, world.vault.ledger + 10);
+    control.stale.set(second, before);
+    await alice.sync();
+    let [deposit] = await alice.deposits();
+    assert.notEqual(deposit?.state, "refunded");
+    control.stale.clear();
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "admitted");
+  });
+
+  it("was admitted when it left the queue after the confirmed tree was read", async () => {
+    const world = await createWorld();
+    let admitting = false;
+    // The deposit is admitted between the sync's reads of the tree and of the entry queue.
+    const fetch: FetchLike = async (input, init) => {
+      const body = bodyOf(init);
+      if (admitting && body !== undefined && readsQueue(body)) {
+        admitting = false;
+        world.admitAll();
+      }
+      return world.fetch(input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0);
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    world.advance(3_601);
+    admitting = true;
+    world.indexer.down = true;
+    await alice.sync();
+    let [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.confirmed, false);
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "admitted");
+    assert.equal(deposit?.confirmed, true);
   });
 });
 
@@ -192,9 +1706,9 @@ describe("wallet: screening", () => {
     const world = await createWorld();
     const alice = await openWallet(world, 0);
     const depositor = world.signer("alice depositor");
-    const held = await alice.shield({ amount: 10n * XLM, signer: depositor });
-    const refused = await alice.shield({ amount: 20n * XLM, signer: depositor });
-    const ordered = await alice.shield({ amount: 30n * XLM, signer: depositor });
+    const held = await shielded(alice, 10n * XLM, depositor);
+    const refused = await shielded(alice, 20n * XLM, depositor);
+    const ordered = await shielded(alice, 30n * XLM, depositor);
     world.rpc.run("ab".repeat(32), () => world.vault.flag(held.depositId, 6));
     world.rpc.run("ac".repeat(32), () => world.vault.flag(refused.depositId, 5));
     world.rpc.run("ad".repeat(32), () => world.vault.flag(ordered.depositId, 100));
@@ -221,6 +1735,10 @@ describe("wallet: screening", () => {
     world.advance(86_400);
     await alice.refundDeposit(refused.depositId, world.signer("anyone"));
     await alice.cancelDeposit(ordered.depositId, depositor);
+    // Their own transactions, which every provider reports, now say what became of them.
+    deposits = await byId();
+    assert.equal(deposits.get(refused.depositId)?.confirmed, true);
+    assert.equal(deposits.get(ordered.depositId)?.confirmed, true);
     await alice.sync();
     deposits = await byId();
     assert.equal(deposits.get(refused.depositId)?.state, "refunded");
@@ -236,7 +1754,7 @@ describe("wallet: screening", () => {
     const codes = [1, 2, 3, 4, 99, 7, 101];
     const ids: number[] = [];
     for (const [i, code] of codes.entries()) {
-      const { depositId } = await alice.shield({ amount: 10n * XLM, signer: depositor });
+      const { depositId } = await shielded(alice, 10n * XLM, depositor);
       world.rpc.run(String(i).padStart(64, "f"), () => world.vault.flag(depositId, code));
       ids.push(depositId);
     }

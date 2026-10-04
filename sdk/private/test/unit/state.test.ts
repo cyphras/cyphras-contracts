@@ -18,13 +18,19 @@ describe("stored state", () => {
     );
   });
 
-  it("loads a state from before close times, checked ledgers, digests, counts of providers and range statuses", async () => {
+  it("loads a state from before close times, checked ledgers, digests, counts of providers, range statuses and confirmed exits", async () => {
     const store = new SealedStore(new MemoryStore(), testBytes("state/key", 2, 32));
     const state = emptyState(10);
     state.unchecked = [
-      { from: 20, to: 30, leaves: { first: 0, end: 4, ledger: 15, chunks: [] }, status: "open" },
-      { from: 31, to: 40, leaves: undefined, status: "open" },
-      { from: 41, to: 50, leaves: undefined, status: "open" },
+      {
+        from: 20,
+        to: 30,
+        leaves: { first: 0, end: 4, ledger: 15, chunks: [] },
+        status: "open",
+        askedAt: undefined,
+      },
+      { from: 31, to: 40, leaves: undefined, status: "open", askedAt: undefined },
+      { from: 41, to: 50, leaves: undefined, status: "open", askedAt: undefined },
     ];
     await saveState(store, state);
     const text = new TextDecoder().decode((await store.read("state")) as Uint8Array);
@@ -36,18 +42,29 @@ describe("stored state", () => {
       range["lost"] = i === 1;
     });
     delete older.unchecked[0].leaves.chunks;
+    // A partial range of leaves kept without their digests.
+    older.unchecked.push({
+      from: 51,
+      to: 60,
+      leaves: { first: 8, end: 10, ledger: 55, chunks: [] },
+      status: "partial",
+    });
     // Only what the load reads of a staging and of plans.
     older.staging = { unchecked: { first: 4, ledger: 31 } };
-    older.plans = [{ evidence: [{ outputs: [3, null] }, { outputs: [null, null] }] }];
+    older.plans = [
+      { evidence: [{ outputs: [3, null] }, { outputs: [null, null] }], exit: { id: 1, parts: [] } },
+    ];
+    older.deposits = [{ state: "admitted" }, { state: "cancelled" }];
     await store.write("state", new TextEncoder().encode(JSON.stringify(older)));
     const loaded = await loadState(store);
     assert.deepEqual(loaded?.ledgerTimes, []);
     assert.equal(loaded?.checkedLeafLedger, 0);
-    // Ranges keep whether they were lost; leaves kept without the digests a recheck compares can
-    // no longer be checked, and leaves staged without them are taken again.
+    // A range kept as lost on the first provider's word is open again; leaves kept without the
+    // digests a recheck compares can no longer be checked, and leaves staged without them are
+    // taken again.
     assert.deepEqual(
       loaded?.unchecked.map((r) => r.status),
-      ["lost", "lost", "open"],
+      ["lost", "open", "open", "lost"],
     );
     assert.equal(
       loaded?.unchecked.some((r) => "lost" in r),
@@ -58,6 +75,17 @@ describe("stored state", () => {
     assert.deepEqual(
       loaded?.plans[0]?.evidence.map((e) => e.providers),
       [1, 0],
+    );
+    // Exits and deposits kept without what they rest on count as the indexer's word; a deposit
+    // then cancelled was its depositor's cancel.
+    assert.equal(loaded?.plans[0]?.exit?.confirmed, false);
+    assert.deepEqual(loaded?.plans[0]?.exit?.known, []);
+    assert.deepEqual(
+      loaded?.deposits.map((d) => [d.confirmed, d.ownReturn]),
+      [
+        [false, undefined],
+        [false, "cancelled"],
+      ],
     );
   });
 
