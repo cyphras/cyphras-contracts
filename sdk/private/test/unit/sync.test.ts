@@ -306,6 +306,7 @@ describe("plan fate", () => {
       event: undefined,
       confirmed: true,
       account: undefined,
+      known: [],
     };
     plan.evidence = [evidence({ txHash: "bb".repeat(32), ledger: 206, outputs: [38, 39] })];
     advancePlans(state, [viewAt(250, 40)]);
@@ -325,6 +326,7 @@ describe("plan fate", () => {
       event: undefined,
       confirmed: true,
       account: undefined,
+      known: [],
     };
     // Until the spends of its ledger are checked, nothing refutes it.
     advancePlans(state, [viewAt(250, 40)]);

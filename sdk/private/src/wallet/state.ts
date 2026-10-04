@@ -96,7 +96,8 @@ export interface ExitPart {
 // it shows is taken. `confirmed` while the parts follow the vault's events every RPC provider
 // showed, from the exit's queueing on without a gap, rather than resting in part on the indexer's
 // account. `account` is the indexer's account of a confirmed exit, newer than its events: what the
-// plan shows, unconfirmed, until the events reach its ledger.
+// plan shows, unconfirmed, until the events reach its ledger. `known` holds what the vault's
+// checked events last showed of each part of an exit that rests on the indexer's account.
 export interface PlanExit {
   readonly id: number;
   parts: ExitPart[];
@@ -104,6 +105,7 @@ export interface PlanExit {
   event: string | undefined;
   confirmed: boolean;
   account: { readonly parts: ExitPart[]; readonly ledger: number } | undefined;
+  known: ExitPart[];
 }
 
 // A spend, saved before anything is submitted.
@@ -379,7 +381,9 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   // Exits and deposits kept without saying what they rest on count as the indexer's word; a deposit
   // then cancelled was by its depositor.
   for (const plan of state.plans) {
-    if (plan.exit !== undefined) plan.exit.confirmed ??= false;
+    if (plan.exit === undefined) continue;
+    plan.exit.confirmed ??= false;
+    plan.exit.known ??= [];
   }
   for (const deposit of state.deposits) {
     if (deposit.confirmed === undefined && deposit.state === "cancelled") {

@@ -79,6 +79,7 @@ describe("stored state", () => {
     // Exits and deposits kept without what they rest on count as the indexer's word; a deposit
     // then cancelled was its depositor's cancel.
     assert.equal(loaded?.plans[0]?.exit?.confirmed, false);
+    assert.deepEqual(loaded?.plans[0]?.exit?.known, []);
     assert.deepEqual(
       loaded?.deposits.map((d) => [d.confirmed, d.ownReturn]),
       [

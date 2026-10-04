@@ -47,16 +47,23 @@ function applied(exit: PlanExit, event: ExitEvent): boolean {
 
 const less = (owed: bigint, moved: bigint): bigint => (owed > moved ? owed - moved : 0n);
 
+// Records what a checked event showed of a part of an exit that rests on the indexer's account.
+function know(exit: PlanExit, p: ExitPart): void {
+  if (exit.confirmed) return;
+  exit.known = [...exit.known.filter((k) => k.id !== p.id), { ...p }];
+}
+
 // Applies one of the vault's events to the exit `p` it concerns, which holds or held part of the
-// plan's: what the event shows of an exit replaces what the wallet knew of it. A part that missed
-// earlier events may owe less than a claim moved from it, and then owes nothing more.
+// plan's: what the event shows of an exit replaces what the wallet knew of it, a part paid from the
+// queue not being stranded. A part that missed earlier events may owe less than a claim moved from
+// it, and then owes nothing more.
 function apply(plan: Plan, exit: PlanExit, p: ExitPart, event: ExitEvent): void {
   switch (event.kind) {
     case "exit_paid":
     case "exit_stranded":
       p.payoutLeft = event.payoutLeft;
       p.feeLeft = event.feeLeft;
-      if (event.kind === "exit_stranded") p.stranded = true;
+      p.stranded = event.kind === "exit_stranded";
       break;
     case "exit_requeued": {
       p.payoutLeft = less(p.payoutLeft, event.payout);
@@ -68,6 +75,7 @@ function apply(plan: Plan, exit: PlanExit, p: ExitPart, event: ExitEvent): void 
         stranded: false,
       };
       exit.parts = [...exit.parts.filter((x) => x.id !== event.newId), moved];
+      know(exit, moved);
       break;
     }
     case "settled":
@@ -77,6 +85,7 @@ function apply(plan: Plan, exit: PlanExit, p: ExitPart, event: ExitEvent): void 
     case "exit_queued":
       return;
   }
+  know(exit, p);
   exit.ledger = event.ledger;
   exit.event = event.eventId;
   settle(plan, exit);
@@ -95,6 +104,7 @@ function applyExitEvents(plans: readonly Plan[], exits: ExitEvents): void {
     for (const plan of plans) {
       const exit = plan.exit;
       if (exit === undefined || exits.from <= unfollowed(exit)) continue;
+      if (exit.confirmed) exit.known = exit.parts.map((p) => ({ ...p }));
       if (exit.account !== undefined) {
         const shown = exit.account.parts;
         exit.parts = [...shown, ...exit.parts.filter((p) => !shown.some((x) => x.id === p.id))];
@@ -122,6 +132,7 @@ function applyExitEvents(plans: readonly Plan[], exits: ExitEvents): void {
           before === undefined || before.ledger <= event.ledger
             ? undefined
             : { parts: before.parts, ledger: before.ledger },
+        known: [],
       };
       plan.exit = exit;
       settle(plan, exit);
@@ -166,8 +177,10 @@ function applyExitEvents(plans: readonly Plan[], exits: ExitEvents): void {
 // to hold part of it, and those claims queued from them, with what each owes then. An exit the
 // indexer lists as settled, or as requeued in full, owes nothing; one it no longer lists keeps
 // what the wallet knew of it, unless an exit queued from it is listed, which shows that claims
-// moved all it owed. An account in which an exit owes more than the wallet knew, or a stranded
-// exit is back in the queue or settled, contradicts the vault and is not taken.
+// moved all it owed. An account in which an exit owes more than the vault's checked events showed,
+// or one they showed stranded is back in the queue or settled, contradicts the vault and is not
+// taken, nor one of a confirmed exit in which its exits owe more in all; what an older account
+// showed is no ground to refuse a newer one.
 function account(exit: PlanExit, queue: ExitQueue): ExitPart[] | undefined {
   const entries = new Map(queue.exits.map((e) => [e.id, e]));
   const parts: ExitPart[] = [];
@@ -192,8 +205,9 @@ function account(exit: PlanExit, queue: ExitQueue): ExitPart[] | undefined {
     }
   };
   for (const p of exit.parts) visit(p.id, p);
+  const checked = exit.confirmed ? exit.parts : exit.known;
   const contradicts = parts.some((p) => {
-    const known = part(exit, p.id);
+    const known = checked.find((k) => k.id === p.id);
     return (
       known !== undefined &&
       (p.payoutLeft > known.payoutLeft ||
@@ -201,14 +215,15 @@ function account(exit: PlanExit, queue: ExitQueue): ExitPart[] | undefined {
         (known.stranded && !p.stranded))
     );
   });
-  if (contradicts || owed(parts) > owed(exit.parts)) return undefined;
+  if (contradicts || (exit.confirmed && owed(parts) > owed(exit.parts))) return undefined;
   return parts.sort((a, b) => a.id - b.id);
 }
 
 // The indexer's account of the queue, for what the vault's events of this sync did not cover. A
 // plan learns its exit ID only from the queued entry of its own transaction; from then on the
-// account is taken only when it is newer than what the plan's exit follows. It never moves how
-// far a confirmed exit follows the vault's events, which take over once they reach its ledger.
+// account is taken only when it is newer than what the plan's exit follows, or, for an exit that
+// rests on the indexer's account, as new. It never moves how far a confirmed exit follows the
+// vault's events, which take over once they reach its ledger.
 function applyExitQueue(plans: readonly Plan[], queue: ExitQueue): void {
   for (const plan of plans) {
     if (plan.exit === undefined) {
@@ -225,12 +240,14 @@ function applyExitQueue(plans: readonly Plan[], queue: ExitQueue): void {
         event: undefined,
         confirmed: false,
         account: undefined,
+        known: [],
       };
       settle(plan, plan.exit);
       continue;
     }
     const exit = plan.exit;
-    if (queue.completeTo <= (exit.account?.ledger ?? exit.ledger)) continue;
+    const since = exit.account?.ledger ?? exit.ledger;
+    if (exit.confirmed ? queue.completeTo <= since : queue.completeTo < since) continue;
     const parts = account(exit, queue);
     if (parts === undefined) continue;
     if (exit.confirmed) {
