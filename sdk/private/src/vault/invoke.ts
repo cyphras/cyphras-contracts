@@ -8,8 +8,8 @@ import {
   xdr,
 } from "@stellar/stellar-base";
 import { bytesToHex } from "../bytes.ts";
-import { CyphrasError, fail } from "../errors.ts";
-import { type MetaEvent, type SorobanRpc, keyId } from "../net/rpc.ts";
+import { CyphrasError, type ErrorDetails, fail } from "../errors.ts";
+import { type MetaEvent, type SorobanRpc, type TransactionStatus, keyId } from "../net/rpc.ts";
 import { vaultErrorName } from "./errors.ts";
 import { accountKey } from "./state.ts";
 
@@ -80,6 +80,8 @@ export interface InvokeContext {
   readonly networkPassphrase: string;
   readonly vault: string;
   readonly feeCaps: NetworkFeeCaps;
+  // Milliseconds since the epoch.
+  readonly now: () => number;
   readonly sleep: (ms: number) => Promise<void>;
 }
 
@@ -95,8 +97,12 @@ const MIN_INCLUSION_FEE = 100n;
 const POLL_MS = 1_500;
 // How often a call on the exit queue goes in all while it fails on the host's storage.
 const ATTEMPTS = 5;
-// How often a second provider is asked about a failed transaction it may not hold yet.
-const SECOND_POLLS = 20;
+// A provider asked about a transaction it does not hold yet is asked again, at most this many
+// times and for this long in all, with each request cut off after ASK_REQUEST_MS: one that hangs
+// must not keep the signer's account waiting.
+const ASK_POLLS = 20;
+const ASK_MS = 30_000;
+const ASK_REQUEST_MS = 5_000;
 // The bytes added to what a call may read for each account or trustline in its footprint, and to
 // what it may write for each it writes: anyone can grow their own account, by signers or
 // sponsorships, between a simulation and the ledger the call lands in. An account entry holds at
@@ -395,36 +401,60 @@ export async function invokeVault(
   for (let attempt = 1; ; attempt++) {
     const outcome = await attemptCall(ctx, signer, call, onSubmitted);
     if (outcome.result !== undefined) return outcome.result;
+    const failed = (message: string, details: ErrorDetails = {}): CyphrasError =>
+      new CyphrasError("transaction_failed", message, { hash: outcome.hash, ...details });
     // A call on the exit queue that failed on the host's storage touched an entry the queue moved
     // to past the room its footprint was given: a fresh simulation sees where it moved. With a
     // second provider, the first one's word alone does not send it again.
-    if (
-      call.extend === undefined ||
-      !outcome.conflict ||
-      attempt === ATTEMPTS ||
-      !(await conflictSeen(ctx, outcome.hash))
-    ) {
-      throw new CyphrasError("transaction_failed", "the transaction failed on chain", {
-        hash: outcome.hash,
-      });
+    if (call.extend === undefined || !outcome.conflict || attempt === ATTEMPTS) {
+      throw failed("the transaction failed on chain");
     }
+    const doubt = await secondDoubt(ctx, outcome.hash);
+    if (doubt !== undefined) throw failed(DOUBTS[doubt], { secondProvider: doubt });
   }
 }
 
-// Whether the second provider, when one is set, reports the transaction failed on the host's
-// storage as well, once it holds the transaction.
-async function conflictSeen(ctx: InvokeContext, hash: string): Promise<boolean> {
-  const { second } = ctx;
-  if (second === undefined) return true;
+// Why a second provider leaves a failure on the host's storage unconfirmed.
+type Doubt = "no_answer" | "no_diagnostics" | "other_outcome";
+
+const DOUBTS: Readonly<Record<Doubt, string>> = {
+  no_answer: "the transaction failed on chain, and the second RPC provider did not report it",
+  no_diagnostics:
+    "the transaction failed on chain, and the second RPC provider returns no diagnostic events to show why; a provider that does is needed to send such a call again",
+  other_outcome:
+    "the transaction failed on chain, and the second RPC provider reports it otherwise",
+};
+
+// Why the second provider, when one is set, does not report the transaction failed on the host's
+// storage as well; undefined when it does.
+async function secondDoubt(ctx: InvokeContext, hash: string): Promise<Doubt | undefined> {
+  if (ctx.second === undefined) return undefined;
+  const [status] = await askTransaction(ctx, [ctx.second], hash);
+  if (status === undefined || status.status === "NOT_FOUND") return "no_answer";
+  if (status.status === "FAILED" && status.conflict) return undefined;
+  return status.status === "FAILED" && !status.diagnosed ? "no_diagnostics" : "other_outcome";
+}
+
+// Asks every one of `providers` about a transaction, again while some do not hold it yet, within
+// ASK_POLLS requests and ASK_MS in all: each one's status, undefined where it never answered.
+async function askTransaction(
+  ctx: Pick<InvokeContext, "now" | "sleep">,
+  providers: readonly SorobanRpc[],
+  hash: string,
+): Promise<(TransactionStatus | undefined)[]> {
+  const deadline = ctx.now() + ASK_MS;
+  const statuses: (TransactionStatus | undefined)[] = providers.map(() => undefined);
+  const held = (s: TransactionStatus | undefined): boolean =>
+    s !== undefined && s.status !== "NOT_FOUND";
   for (let poll = 1; ; poll++) {
-    const status = await second.getTransaction(hash).catch((err: unknown) => {
-      if (err instanceof CyphrasError) return undefined;
-      throw err;
-    });
-    if (status !== undefined && status.status !== "NOT_FOUND") {
-      return status.status === "FAILED" && status.conflict;
+    for (const [i, provider] of providers.entries()) {
+      if (held(statuses[i])) continue;
+      statuses[i] = await provider.getTransaction(hash, ASK_REQUEST_MS).catch((err: unknown) => {
+        if (err instanceof CyphrasError) return undefined;
+        throw err;
+      });
     }
-    if (poll === SECOND_POLLS) return false;
+    if (statuses.every(held) || poll === ASK_POLLS || ctx.now() >= deadline) return statuses;
     await ctx.sleep(POLL_MS);
   }
 }
@@ -512,7 +542,7 @@ async function attemptCall(
   }
   if (signed.signatures.length === 0) fail("signer_mismatch", "the transaction is not signed");
 
-  const deadline = Date.now() + (TIMEOUT_SECONDS + 30) * 1000;
+  const deadline = ctx.now() + (TIMEOUT_SECONDS + 30) * 1000;
   let backoff = POLL_MS;
   for (;;) {
     const sent = await ctx.rpc.sendTransaction(signedXdr);
@@ -522,7 +552,7 @@ async function attemptCall(
       fail("transaction_failed", "the network refused the transaction");
     }
     // TRY_AGAIN_LATER: the same signed envelope goes again until its time bound passes.
-    if (Date.now() > deadline)
+    if (ctx.now() > deadline)
       fail("transaction_failed", "the network did not take the transaction");
     await ctx.sleep(backoff);
     backoff = Math.min(backoff * 2, 30_000);
@@ -538,7 +568,7 @@ async function attemptCall(
       };
     }
     if (status.status === "FAILED") return { hash, conflict: status.conflict };
-    if (Date.now() > deadline) {
+    if (ctx.now() > deadline) {
       throw new CyphrasError("transaction_failed", "the transaction expired unconfirmed", { hash });
     }
     await ctx.sleep(POLL_MS);

@@ -58,6 +58,7 @@ export function invokeContext(core: Core): InvokeContext {
     networkPassphrase: core.deployment.networkPassphrase,
     vault: core.deployment.vault,
     feeCaps: core.feeCaps,
+    now: () => core.now(),
     sleep: (ms: number) => core.sleep(ms),
   };
 }

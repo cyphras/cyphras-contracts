@@ -24,9 +24,9 @@ import {
   loadState,
   saveState,
 } from "../../src/wallet/state.ts";
-import type { OperationView, PrivateWallet } from "../../src/wallet/wallet.ts";
+import type { OpenOptions, OperationView, PrivateWallet } from "../../src/wallet/wallet.ts";
 import { INDEXER, RPC, XLM, createWorld, rewritingFetch } from "../support/network.ts";
-import { keypairFor } from "../support/rpc.ts";
+import { diagnostic, keypairFor } from "../support/rpc.ts";
 import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
 
 const SMALL = { maxDailyOutflow: 50n * XLM, tvlCap: 350n * XLM };
@@ -1667,55 +1667,112 @@ describe("exits that other exits race in the same ledger", () => {
     assert.equal(plan?.mustRetry, true);
   });
 
-  it("sends a call on the exit queue again only once a second RPC provider reports its failure on the host's storage too", async () => {
+  // A getTransaction reply of the second provider, as JSON.
+  type Reply = { id: number; result: Record<string, unknown> };
+  const notFound = (reply: Reply): Reply => ({
+    ...reply,
+    result: { status: "NOT_FOUND", latestLedger: reply.result["latestLedger"] },
+  });
+
+  // A wallet whose self-relayed exit fails on the host's storage on the first provider, while
+  // `answer` gives the second provider's reply to the failed transaction's nth getTransaction, from
+  // the reply as it is.
+  async function conflictedBehind(
+    answer: (reply: Reply, nth: number) => unknown,
+    options: Partial<OpenOptions> = {},
+  ) {
     const second = "http://rpc2.test";
-    // What the second provider answers about the failed transaction: the failure as it is, after it
-    // first answers that it does not hold it yet or is busy; the failure without its storage error;
-    // or never the transaction.
-    for (const [shows, sent] of [
-      ["the failure", 2],
-      ["the failure, late", 2],
-      ["the failure, once not busy", 2],
-      ["no storage error", 1],
-      ["no transaction", 1],
-    ] as const) {
-      const world = await createWorld({ limits: SMALL });
-      let asked = 0;
-      const fetch: FetchLike = async (input, init) => {
-        if (new URL(input).origin !== second) return world.fetch(input, init);
-        const res = await world.fetch(RPC, init);
-        const body = JSON.parse(String(init?.body));
-        if (body.method !== "getTransaction") return res;
-        const reply = await res.json();
-        if (reply.result?.status !== "FAILED") return new Response(JSON.stringify(reply));
-        asked++;
-        const { latestLedger } = reply.result;
-        if (shows === "the failure, once not busy" && asked <= 2) {
-          const error = { code: -32603, message: "busy" };
-          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
-        }
-        if (shows === "no transaction" || (shows === "the failure, late" && asked <= 3)) {
-          reply.result = { status: "NOT_FOUND", latestLedger };
-        } else if (shows === "no storage error") {
-          reply.result = { ...reply.result, diagnosticEventsXdr: undefined };
-        }
-        return new Response(JSON.stringify(reply));
-      };
-      const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
-        secondRpcUrl: second,
-      });
-      await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
-      world.advance(3_601);
-      world.admitAll();
-      await alice.sync();
-      world.vault.outflowDay = world.vault.timestamp / 86_400n;
-      world.vault.outflow = 50n * XLM;
-      world.rpc.conflictNext = 1;
-      const landing = selfRelayed(world, alice);
-      if (sent === 2) await landing;
-      else await assert.rejects(landing, isError("transaction_failed"));
-      assert.equal(sentCalls(world, "transact"), sent, shows);
+    const world = await createWorld({ limits: SMALL });
+    let asked = 0;
+    const fetch: FetchLike = async (input, init) => {
+      if (new URL(input).origin !== second) return world.fetch(input, init);
+      const res = await world.fetch(RPC, init);
+      const body = JSON.parse(String(init?.body));
+      if (body.method !== "getTransaction") return res;
+      const reply = await res.json();
+      if (reply.result?.status !== "FAILED") return new Response(JSON.stringify(reply));
+      return new Response(JSON.stringify(answer(reply, ++asked)));
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+      ...options,
+    });
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+    world.rpc.conflictNext = 1;
+    return { world, landing: () => selfRelayed(world, alice), asked: () => asked };
+  }
+
+  it("sends a call on the exit queue again only once a second RPC provider reports its failure on the host's storage too", async () => {
+    const busy = (reply: Reply) => ({
+      jsonrpc: "2.0",
+      id: reply.id,
+      error: { code: -32603, message: "busy" },
+    });
+    const withDiagnostics = (reply: Reply, events: string[] | undefined): Reply => ({
+      ...reply,
+      result: { ...reply.result, diagnosticEventsXdr: events },
+    });
+    const contractError = diagnostic(xdr.ScError.sceContract(121));
+    // The failure as it is, at once or after the second provider first answers that it does not
+    // hold it yet or is busy; or the failure without diagnostic events, with another error, or
+    // never the transaction, each with the reason the call goes no further.
+    const cases: [string, (reply: Reply, nth: number) => unknown, string | undefined][] = [
+      ["the failure", (r) => r, undefined],
+      ["the failure, late", (r, n) => (n <= 3 ? notFound(r) : r), undefined],
+      ["the failure, once not busy", (r, n) => (n <= 2 ? busy(r) : r), undefined],
+      ["no diagnostic events", (r) => withDiagnostics(r, undefined), "no_diagnostics"],
+      ["another error", (r) => withDiagnostics(r, [contractError]), "other_outcome"],
+      ["no transaction", notFound, "no_answer"],
+    ];
+    for (const [shows, answer, why] of cases) {
+      const { world, landing } = await conflictedBehind(answer);
+      if (why === undefined) {
+        await landing();
+        assert.equal(sentCalls(world, "transact"), 2, shows);
+      } else {
+        await assert.rejects(
+          landing(),
+          (err: unknown) =>
+            err instanceof CyphrasError &&
+            err.code === "transaction_failed" &&
+            err.details["secondProvider"] === why,
+        );
+        assert.equal(sentCalls(world, "transact"), 1, shows);
+      }
     }
+  });
+
+  it("asks a second RPC provider that does not hold the failed transaction again at an interval, and for half a minute at most", async () => {
+    // Each wait passes a second of the clock.
+    const slept: number[] = [];
+    let world: World | undefined;
+    const steady = await conflictedBehind(notFound, {
+      sleep: async (ms) => {
+        slept.push(ms);
+        world?.advance(1);
+      },
+    });
+    world = steady.world;
+    slept.length = 0;
+    await assert.rejects(steady.landing(), isError("transaction_failed"));
+    assert.equal(steady.asked(), 20);
+    assert.deepEqual(
+      slept,
+      Array.from({ length: 19 }, () => 1_500),
+    );
+    // A provider that takes ten seconds over each answer is asked for no longer than the window.
+    const slow = await conflictedBehind((reply) => {
+      world?.advance(10);
+      return notFound(reply);
+    });
+    world = slow.world;
+    await assert.rejects(slow.landing(), isError("transaction_failed"));
+    assert.equal(slow.asked(), 3);
   });
 
   it("releases again after a failure on the host's storage, and goes no further after any other", async () => {
@@ -1861,6 +1918,7 @@ describe("exits that other exits race in the same ledger", () => {
       networkPassphrase: world.deployment.networkPassphrase,
       vault,
       feeCaps: DEFAULT_NETWORK_FEE_CAPS,
+      now: () => Date.now(),
       sleep: async () => {},
     };
     const call = {
@@ -1949,6 +2007,7 @@ describe("exits that other exits race in the same ledger", () => {
       networkPassphrase: world.deployment.networkPassphrase,
       vault,
       feeCaps: DEFAULT_NETWORK_FEE_CAPS,
+      now: () => Date.now(),
       sleep: async () => {},
     };
     const send = (extra: Extra) =>
