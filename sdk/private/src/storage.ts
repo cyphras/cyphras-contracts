@@ -62,33 +62,41 @@ export function openRecord(
 
 // Records encrypted with XChaCha20-Poly1305 under the store key sk, with random nonces. Each record
 // is bound to its name as associated data, and stored under a name hashed with a key derived from
-// sk, so the backend sees neither the contents nor which record is which.
+// sk, so the backend sees neither the contents nor which record is which. A store with a scope
+// names its records within it, so no record of one scope can be read as one of another.
 export class SealedStore {
   readonly #backend: KeyValueStore;
   readonly #key: Uint8Array;
   readonly #nameKey: Uint8Array;
+  readonly #scope: string | undefined;
 
-  constructor(backend: KeyValueStore, storeKey: Uint8Array) {
+  constructor(backend: KeyValueStore, storeKey: Uint8Array, scope?: string) {
     if (storeKey.length !== 32) throw new RangeError("the store key is 32 bytes");
     this.#backend = backend;
     this.#key = Uint8Array.from(storeKey);
     this.#nameKey = hmac(sha256, storeKey, utf8("cyphras/v2/store/names"));
+    this.#scope = scope;
+  }
+
+  #named(name: string): string {
+    return this.#scope === undefined ? name : `${this.#scope}/${name}`;
   }
 
   #location(name: string): string {
-    return "cyphras/v2/" + bytesToHex(hmac(sha256, this.#nameKey, utf8(name)).subarray(0, 20));
+    const id = hmac(sha256, this.#nameKey, utf8(this.#named(name)));
+    return "cyphras/v2/" + bytesToHex(id.subarray(0, 20));
   }
 
   async read(name: string): Promise<Uint8Array | undefined> {
     const record = await this.#backend.get(this.#location(name));
     if (record === undefined) return undefined;
-    const plaintext = openRecord(this.#key, utf8(`cyphras/v2/store/${name}`), record);
+    const plaintext = openRecord(this.#key, utf8(`cyphras/v2/store/${this.#named(name)}`), record);
     if (plaintext === undefined) fail("storage_unreadable", "a stored record does not decrypt");
     return plaintext;
   }
 
   async write(name: string, plaintext: Uint8Array): Promise<void> {
-    const record = sealRecord(this.#key, utf8(`cyphras/v2/store/${name}`), plaintext);
+    const record = sealRecord(this.#key, utf8(`cyphras/v2/store/${this.#named(name)}`), plaintext);
     await this.#backend.set(this.#location(name), record);
   }
 

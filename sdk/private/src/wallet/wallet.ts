@@ -91,7 +91,9 @@ import {
   StateStore,
   type UncheckedRange,
   type WalletState,
+  adoptLegacyState,
   emptyState,
+  stateScope,
 } from "./state.ts";
 import {
   type ScanKeys,
@@ -339,6 +341,40 @@ function viewStoreKey(decoded: ReturnType<typeof decodeViewingKey>): Uint8Array 
 
 const defaultFetch: FetchLike = (input, init) => globalThis.fetch(input, init);
 
+// The vault's stored state, or the one in the unscoped records when it fits this vault; or, as the
+// options allow, a fresh one in place of a stored state that is unreadable or older than its
+// revision record.
+async function openState(
+  states: StateStore,
+  legacy: StateStore,
+  deployment: Deployment,
+  options: ConnectionOptions,
+): Promise<{ readonly state: WalletState; readonly reset: StateReset | undefined }> {
+  let source = states;
+  try {
+    let state = await states.load();
+    if (state === undefined) {
+      source = legacy;
+      state = await adoptLegacyState(states, legacy, deployment.vault, deployment.deployLedger);
+    }
+    return { state: state ?? emptyState(deployment.deployLedger), reset: undefined };
+  } catch (err) {
+    const code = err instanceof CyphrasError ? err.code : undefined;
+    const reason =
+      code === "storage_unreadable" && options.resetUnreadableState === true
+        ? "unreadable"
+        : code === "state_conflict" && options.resetRolledBackState === true
+          ? "rolled_back"
+          : undefined;
+    if (reason === undefined) throw err;
+    await source.discard();
+    return {
+      state: emptyState(deployment.deployLedger),
+      reset: { reason, warning: STATE_RESET_WARNING },
+    };
+  }
+}
+
 /**
  * A private account on one vault. It syncs the pool, proves spends on this device and talks to
  * the vault's services; one operation runs at a time and the rest wait their turn.
@@ -446,28 +482,6 @@ export class PrivateWallet {
       options.relayers,
       options.secondRpcUrl,
     );
-    const store = new SealedStore(options.storage, storeKey);
-    const states = new StateStore(store);
-    let state: WalletState;
-    let reset: StateReset | undefined;
-    try {
-      state = (await states.load()) ?? emptyState(deployment.deployLedger);
-    } catch (err) {
-      const code = err instanceof CyphrasError ? err.code : undefined;
-      const reason =
-        code === "storage_unreadable" && options.resetUnreadableState === true
-          ? "unreadable"
-          : code === "state_conflict" && options.resetRolledBackState === true
-            ? "rolled_back"
-            : undefined;
-      if (reason === undefined) throw err;
-      await states.discard();
-      state = emptyState(deployment.deployLedger);
-      reset = { reason, warning: STATE_RESET_WARNING };
-    }
-    const now = options.clock ?? (() => Date.now());
-    const sleep =
-      options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const lock =
       webLock(lockName(storeKey)) ??
       (options.singleInstance === true
@@ -476,6 +490,13 @@ export class PrivateWallet {
             "locks_unavailable",
             "this platform has no Web Locks API; set singleInstance if only one wallet instance uses this store",
           ));
+    const scope = stateScope(deployment.vault, deployment.deployLedger);
+    const states = new StateStore(new SealedStore(options.storage, storeKey, scope));
+    const legacy = new StateStore(new SealedStore(options.storage, storeKey));
+    const { state, reset } = await lock.hold(() => openState(states, legacy, deployment, options));
+    const now = options.clock ?? (() => Date.now());
+    const sleep =
+      options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const core: Core = {
       deployment,
       services,

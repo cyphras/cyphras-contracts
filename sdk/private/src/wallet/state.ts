@@ -403,6 +403,39 @@ export async function saveState(store: SealedStore, state: WalletState): Promise
   await store.write(STATE_RECORD, new TextEncoder().encode(JSON.stringify(state, replacer)));
 }
 
+// The scope of the records that hold a wallet's state: the vault as deployed, so that two vaults of
+// one network, of two assets or a vault deployed again after a testnet reset, never share a state.
+export const stateScope = (vault: string, deployLedger: number): string =>
+  `vault/${vault}/${deployLedger}`;
+
+// A state in the unscoped records, which every vault of the network shares, fits the vault opening
+// it unless one of its plans is for another vault, or it was synced from, or holds a leaf of, a
+// ledger before that vault was deployed.
+function fits(state: WalletState, vault: string, deployLedger: number): boolean {
+  return (
+    state.plans.every((p) => p.ext.vault === vault) &&
+    state.nullifierSince >= deployLedger &&
+    (state.lastLeafLedger === 0 || state.lastLeafLedger >= deployLedger)
+  );
+}
+
+// Moves a state from the unscoped records into the vault's own when it fits the vault: it starts the
+// vault's revisions anew, and the unscoped records are removed, so no other vault takes it too.
+// Undefined when there is none, or it is another vault's, which it is then left to.
+export async function adoptLegacyState(
+  states: StateStore,
+  legacy: StateStore,
+  vault: string,
+  deployLedger: number,
+): Promise<WalletState | undefined> {
+  const state = await legacy.load();
+  if (state === undefined || !fits(state, vault, deployLedger)) return undefined;
+  state.revision = 0;
+  await states.save(state);
+  await legacy.discard();
+  return state;
+}
+
 // The state of one account in its sealed store. A save first checks that the store still holds the
 // revision this instance read, which catches an instance that saved in between. It does not stop
 // two saves that interleave on an asynchronous store: only the account lock keeps instances apart.

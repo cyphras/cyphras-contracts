@@ -13,7 +13,7 @@ import {
   type TransactionSigner,
   invokeVault,
 } from "../../src/vault/invoke.ts";
-import { MemoryStore, SealedStore } from "../../src/storage.ts";
+import { MemoryStore } from "../../src/storage.ts";
 import { applyExits, shownParts } from "../../src/wallet/exits.ts";
 import type { ExitEvent } from "../../src/wallet/sources.ts";
 import {
@@ -27,7 +27,7 @@ import {
 import type { OpenOptions, OperationView, PrivateWallet } from "../../src/wallet/wallet.ts";
 import { INDEXER, RPC, XLM, createWorld, rewritingFetch } from "../support/network.ts";
 import { diagnostic, keypairFor } from "../support/rpc.ts";
-import { confirmAll, isError, openWallet, storeKeyOf } from "../support/wallets.ts";
+import { confirmAll, isError, openWallet, sealedState } from "../support/wallets.ts";
 
 const SMALL = { maxDailyOutflow: 50n * XLM, tvlCap: 350n * XLM };
 
@@ -154,7 +154,7 @@ describe("split unshields whose parts do not plainly land", () => {
     world.advance(121 * 5);
     world.fill(1);
     await alice.continueOperations();
-    const kept = (await loadState(new SealedStore(store, storeKeyOf(0)))) as WalletState;
+    const kept = (await loadState(sealedState(store, world))) as WalletState;
     const [dead, again] = kept.plans as [Plan, Plan | undefined];
     assert.equal(dead.state, "dead");
     assert.equal(again?.retryOf, dead.id);
@@ -240,7 +240,7 @@ describe("split unshields whose parts do not plainly land", () => {
     assert.equal(dead?.state, "dead");
     assert.equal(view?.plans.length, 2);
     assert.equal(again?.amount, dead?.amount);
-    const kept = (await loadState(new SealedStore(store, storeKeyOf(0)))) as WalletState;
+    const kept = (await loadState(sealedState(store, world))) as WalletState;
     const [first, second] = kept.plans as [Plan, Plan];
     assert.equal(second.retryOf, first.id);
     assert.deepEqual(
@@ -602,7 +602,7 @@ describe("split unshields whose parts do not plainly land", () => {
     await alice.sync();
     // An earlier reading took the part, which landed, for dead; and the wallet holds another
     // payment, which never landed, of the same notes.
-    const sealed = new SealedStore(store, storeKeyOf(0));
+    const sealed = sealedState(store, world);
     const state = (await loadState(sealed)) as WalletState;
     const part = state.plans[0] as Plan;
     Object.assign(part, { state: "dead", evidence: [] });
@@ -629,7 +629,7 @@ describe("split unshields whose parts do not plainly land", () => {
     });
     await alice.sync();
     // An earlier reading took the part, which landed, for superseded, and so blocked the split.
-    const sealed = new SealedStore(store, storeKeyOf(0));
+    const sealed = sealedState(store, world);
     const state = (await loadState(sealed)) as WalletState;
     const part = state.plans[0] as Plan;
     Object.assign(part, { state: "superseded", evidence: [] });
