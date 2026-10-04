@@ -177,6 +177,62 @@ describe("wallet: deposits", () => {
     assert.deepEqual(read, ["vkey"]);
   });
 
+  it("shows the vault's limits as the chain holds them, and what is left of them today", async () => {
+    const world = await createWorld({
+      limits: { maxDailyOutflow: 50n * XLM, tvlCap: 200n * XLM, maxDailyPerDepositor: 150n * XLM },
+    });
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("depositor");
+    await shielded(alice, 100n * XLM, depositor);
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const unshield = (amount: bigint) =>
+      alice.unshield({
+        to: world.signer("merchant").publicKey,
+        amount,
+        selfRelay: world.signer("my account"),
+        confirm: confirmAll,
+      });
+    await unshield(20n * XLM);
+    // The window has 30 left, so this one waits in the exit queue.
+    await unshield(40n * XLM);
+    const limits = await alice.vaultLimits(depositor.publicKey);
+    assert.equal(limits.ledger, world.vault.ledger);
+    assert.equal(limits.minDeposit, 1n * XLM);
+    assert.equal(limits.maxDeposit, 2_500n * XLM);
+    assert.equal(limits.tvlRoom, 120n * XLM);
+    assert.equal(limits.maxDailyPerDepositor, 150n * XLM);
+    assert.equal(limits.depositorRoomToday, 50n * XLM);
+    assert.equal(limits.depositRoom, 50n * XLM);
+    assert.equal(limits.largeDepositThreshold, 500n * XLM);
+    assert.equal(limits.delaySmall, 3_600);
+    assert.equal(limits.delayLarge, 86_400);
+    assert.equal(limits.maxDailyOutflow, 50n * XLM);
+    assert.equal(limits.outflowLeftToday, 30n * XLM);
+    assert.equal(limits.queuedExits, 1);
+    assert.equal(limits.maxFee, 5n * XLM);
+    assert.deepEqual([limits.depositsPaused, limits.transfersPaused], [false, false]);
+    assert.equal(limits.haltedUntil, undefined);
+    // Without a depositor, or for one with all of its day left, the TVL room bounds a deposit.
+    const general = await alice.vaultLimits();
+    assert.equal(general.depositorRoomToday, undefined);
+    assert.equal(general.depositRoom, 120n * XLM);
+    const fresh = await alice.vaultLimits(world.signer("another depositor").publicKey);
+    assert.equal(fresh.depositorRoomToday, 150n * XLM);
+    assert.equal(fresh.depositRoom, 120n * XLM);
+    // A new day opens the outflow window again; pauses and halts show as the vault sets them.
+    world.advance(86_400);
+    world.vault.depositsPaused = true;
+    world.vault.transfersPaused = true;
+    world.vault.haltedUntil = world.vault.timestamp + 600n;
+    const later = await alice.vaultLimits();
+    assert.equal(later.outflowLeftToday, 50n * XLM);
+    assert.deepEqual([later.depositsPaused, later.transfersPaused], [true, true]);
+    assert.equal(later.haltedUntil, Number(world.vault.timestamp) + 600);
+    await assert.rejects(alice.vaultLimits("not an account"), isError("invalid_argument"));
+  });
+
   it("refuses a deposit below the vault's minimum before proving", async () => {
     const world = await createWorld({ limits: { minDeposit: 10n * XLM } });
     const alice = await openWallet(world, 0);

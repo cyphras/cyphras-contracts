@@ -62,6 +62,7 @@ import {
 } from "./disclosure.ts";
 import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
+import { type VaultLimitsView, vaultLimits } from "./limits.ts";
 import { updatePace } from "./pace.ts";
 import { type Verification, createServices, verify } from "./services.ts";
 import {
@@ -911,6 +912,16 @@ export class PrivateWallet {
       mustRetry: isActive(p) || p.state === "dead",
       needsUserDecision: isActive(p) && (this.#core.state.rootCheck?.ledger ?? 0) >= p.deadline,
     }));
+  }
+
+  /**
+   * The vault's limits as the chain shows them now: the deposit bounds and what the TVL cap and,
+   * for `depositor`, its daily allowance leave, the admission delays, and what today's outflow
+   * window leaves before payouts wait in the exit queue.
+   */
+  async vaultLimits(depositor?: string): Promise<VaultLimitsView> {
+    await this.#ensureVerified();
+    return vaultLimits(this.#core, depositor);
   }
 
   /**
