@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   Account,
+  Address,
   MuxedAccount,
   Networks,
   StrKey,
@@ -433,6 +434,142 @@ describe("wallet: a deposit's ID that some sources hide", () => {
       assert.equal(deposit?.flag?.kind, "legal_hold", source);
     });
   }
+});
+
+describe("wallet: reads of the entry queue", () => {
+  const second = "http://rpc2.test";
+  const tooMany = (id: number): Response =>
+    new Response(
+      JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32602, message: "too many keys" } }),
+    );
+
+  it("read a few of the IDs an indexer lists for a deposit, and every deposit followed, though it lists hundreds", async () => {
+    const world = await createWorld();
+    let lagging = false;
+    let flood = false;
+    let keysRead = 0;
+    const depositor = world.signer("depositor");
+    const dropped = new Set<string>();
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      const provider = url.origin === RPC || url.origin === second;
+      if (provider && body?.method === "getTransaction") {
+        if (dropped.has(body.params.hash) || (url.origin === second && lagging)) {
+          return rpcResult(body.id, { status: "NOT_FOUND", latestLedger: world.vault.ledger });
+        }
+      }
+      if (provider && body !== undefined && readsQueue(body)) {
+        if (body.params.keys.length > 200) return tooMany(body.id);
+        keysRead += body.params.keys.length;
+      }
+      const res = await world.fetch(url.origin === second ? RPC : input, init);
+      if (!flood || url.origin !== INDEXER || url.pathname !== "/v1/deposits") return res;
+      // Three hundred made-up entries like the unnamed deposit, made after it and listed before it,
+      // and the held deposit refunded.
+      const listed = (await res.json()) as { pending: Record<string, unknown>[] } & Record<
+        string,
+        unknown
+      >;
+      const mine = listed.pending.find((d) => d["id"] === 2) as Record<string, unknown>;
+      const fakes = Array.from({ length: 300 }, (_, i) => ({
+        ...mine,
+        id: 1000 + i,
+        created_at: (mine["created_at"] as number) + 60 * (i + 1),
+      }));
+      const refunded = {
+        id: 1,
+        depositor: depositor.publicKey,
+        amount: (10n * XLM).toString(),
+        created_at: 1,
+        outcome: "refunded",
+        reason: 1,
+        resolved_at: 1,
+        leaf_index0: null,
+        leaf_index1: null,
+      };
+      return new Response(
+        JSON.stringify({
+          ...listed,
+          pending: [...fakes, ...listed.pending.filter((d) => d["id"] !== 1)],
+          resolved: [...(listed["resolved"] as unknown[]), refunded],
+        }),
+      );
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await shielded(alice, 10n * XLM, depositor);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    await alice.sync();
+    lagging = true;
+    const unnamed = await alice.shield({ amount: 20n * XLM, signer: depositor });
+    assert.equal(unnamed.depositId, undefined);
+    lagging = false;
+    // The app is closed for eight days; RPC keeps seven days of events and transactions.
+    world.advance(8 * 86_400);
+    world.rpc.oldestLedger = world.vault.ledger - 120_960;
+    dropped.add(unnamed.txHash);
+    flood = true;
+    keysRead = 0;
+    world.fill(1);
+    await alice.sync();
+    const [held, other] = await alice.deposits();
+    assert.equal(held?.state, "pending");
+    assert.equal(held?.flag?.kind, "legal_hold");
+    assert.equal(held?.confirmed, true);
+    assert.equal(other?.id, 2);
+    assert.ok(keysRead <= 2 * (1 + 4), `${keysRead} keys read`);
+  });
+
+  it("follows every deposit in requests of at most 200 keys, each on its own", async () => {
+    const world = await createWorld();
+    const store = new MemoryStore();
+    const wallet = await openWallet(world, 0, store);
+    await shielded(wallet, 10n * XLM, world.signer("depositor"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    // Two hundred more deposits to follow, kept before it, as a wallet with many could have.
+    const sealed = new SealedStore(store, storeKeyOf(0));
+    const kept = (await loadState(sealed)) as WalletState;
+    const own = kept.deposits[0] as Deposit;
+    const others = Array.from({ length: 200 }, (_, i) => ({
+      ...own,
+      id: 1000 + i,
+      commitments: [BigInt(i + 1), BigInt(i + 2)] as const,
+    }));
+    kept.deposits = [...others, own];
+    await saveState(sealed, kept);
+    // Every provider refuses a request of more than 200 keys, and the first refuses any request
+    // that reads deposit 1000.
+    const refused = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(world.vault.address).toScAddress(),
+        key: xdr.ScVal.scvVec([
+          xdr.ScVal.scvSymbol("Pending"),
+          xdr.ScVal.scvU64(new xdr.Uint64(1000n)),
+        ]),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    ).toXDR("base64");
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (body !== undefined && readsQueue(body)) {
+        const keys = body.params.keys as string[];
+        if (keys.length > 200 || (url.origin === RPC && keys.includes(refused))) {
+          return tooMany(body.id);
+        }
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, store, undefined, {
+      secondRpcUrl: second,
+    });
+    await alice.sync();
+    const deposit = (await alice.deposits()).find((d) => d.id === 1);
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+    assert.equal(deposit?.confirmed, true);
+  });
 });
 
 describe("wallet: a deposit taken for failed", () => {

@@ -383,26 +383,34 @@ type QueueRead = readonly {
   readonly ledger: number;
 }[];
 
-// Every RPC provider's reads of the entry queue under these IDs, in one read from each; nothing
-// while a provider cannot answer.
+// The most keys stellar-rpc takes in one getLedgerEntries request: getLedgerEntriesMaxKeys in
+// cmd/stellar-rpc/internal/methods/get_ledger_entries.go.
+const MAX_KEYS = 200;
+
+// Every RPC provider's reads of the entry queue under these IDs, in requests of at most MAX_KEYS
+// keys; nothing under the IDs of a request a provider cannot answer.
 async function readQueue(core: Core, ids: readonly number[]): Promise<Map<number, QueueRead>> {
   const out = new Map<number, QueueRead>();
-  if (ids.length === 0) return out;
   const { vault, second } = core.services;
-  const reads: Awaited<ReturnType<typeof vault.pendings>>[] = [];
-  for (const reader of second === undefined ? [vault] : [vault, second.vault]) {
-    const read = await reader.pendings(ids.map(BigInt)).catch((err: unknown) => {
-      if (err instanceof CyphrasError) return undefined;
-      throw err;
-    });
-    if (read === undefined) return out;
-    reads.push(read);
-  }
-  for (const id of ids) {
-    out.set(
-      id,
-      reads.map((r) => ({ entry: r.entries.get(BigInt(id)), ledger: r.ledger })),
-    );
+  const readers = second === undefined ? [vault] : [vault, second.vault];
+  for (let at = 0; at < ids.length; at += MAX_KEYS) {
+    const part = ids.slice(at, at + MAX_KEYS);
+    const reads: Awaited<ReturnType<typeof vault.pendings>>[] = [];
+    for (const reader of readers) {
+      const read = await reader.pendings(part.map(BigInt)).catch((err: unknown) => {
+        if (err instanceof CyphrasError) return undefined;
+        throw err;
+      });
+      if (read === undefined) break;
+      reads.push(read);
+    }
+    if (reads.length < readers.length) continue;
+    for (const id of part) {
+      out.set(
+        id,
+        reads.map((r) => ({ entry: r.entries.get(BigInt(id)), ledger: r.ledger })),
+      );
+    }
   }
   return out;
 }
@@ -464,6 +472,9 @@ async function claimId(core: Core, id: number): Promise<void> {
   await core.save();
 }
 
+// How many of the indexer's entries a deposit without an ID reads the entry queue under.
+const INDEXER_CANDIDATES = 4;
+
 // What a sync's reads of the vault show beyond the deposits' entries: the ledger up to which the
 // confirmed tree holds every leaf, and the last deposit every RPC provider shows attested.
 export interface QueueContext {
@@ -510,20 +521,24 @@ export async function trackDeposits(
       reports.set(d, await statusesOf(core, d.txHash));
     }
   }
-  // The IDs a deposit without one may have.
+  // The IDs a deposit without one may have: of the indexer's entries for its depositor and
+  // amount, only the few made nearest its shield, so that a long list costs no more reads.
   const candidates = (d: Deposit): number[] => [
     ...new Set([
       ...heard.filter((e) => holding(e, d)).map((e) => e.id),
       ...(reports.get(d) ?? []).flatMap((s) => idOf(s) ?? []),
       ...(queue?.pending ?? [])
         .filter((e) => e.depositor === d.depositor && e.amount === d.amount)
+        .map((e) => ({ id: e.id, off: Math.abs(e.createdAt - d.createdAt / 1000) }))
+        .sort((a, b) => a.off - b.off)
+        .slice(0, INDEXER_CANDIDATES)
         .map((e) => e.id),
     ]),
   ];
   const reads = await readQueue(core, [
     ...new Set([
-      ...unnamed.flatMap(candidates),
       ...state.deposits.filter(followed).map((d) => d.id as number),
+      ...unnamed.flatMap(candidates),
     ]),
   ]);
   for (const deposit of state.deposits) {
