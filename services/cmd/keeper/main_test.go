@@ -24,3 +24,20 @@ func TestOnlyACourtOrderIsHeldFromRefundsByDefault(t *testing.T) {
 		t.Fatal("the screening hold's reason was taken")
 	}
 }
+
+func TestTheTTLFeeCapIsFiveLumensUnlessSetToAPositiveFee(t *testing.T) {
+	t.Setenv("TTL_FEE_CAP", "")
+	if limit, err := ttlFeeCap(); err != nil || limit != 50_000_000 {
+		t.Fatalf("by default: %d, %v", limit, err)
+	}
+	t.Setenv("TTL_FEE_CAP", "100000000")
+	if limit, err := ttlFeeCap(); err != nil || limit != 100_000_000 {
+		t.Fatalf("set: %d, %v", limit, err)
+	}
+	for _, bad := range []string{"0", "-1", "5 XLM"} {
+		t.Setenv("TTL_FEE_CAP", bad)
+		if _, err := ttlFeeCap(); err == nil {
+			t.Fatalf("%q was taken", bad)
+		}
+	}
+}

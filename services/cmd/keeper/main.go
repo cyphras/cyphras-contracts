@@ -47,6 +47,9 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
+	if engine.MaxTTLFee, err = ttlFeeCap(); err != nil {
+		service.Fatal(log, "config", err)
+	}
 	hold, err := holdReasons()
 	if err != nil {
 		service.Fatal(log, "config", err)
@@ -120,3 +123,14 @@ func holdReasons() (map[uint32]bool, error) {
 
 // screeningHold is the reason of the screening service's holds.
 const screeningHold = 6
+
+// ttlFeeCap reads TTL_FEE_CAP, the most resource fee, in stroops, one extension or restoration of
+// entries may pay: 5 XLM by default. Their fee is the rent of the entries, which differs from the
+// cost of the vault's calls, so it is capped apart from RESOURCE_FEE_CAP.
+func ttlFeeCap() (int64, error) {
+	limit, err := config.Int("TTL_FEE_CAP", 50_000_000)
+	if err == nil && limit <= 0 {
+		err = errors.New("TTL_FEE_CAP must be positive")
+	}
+	return limit, err
+}

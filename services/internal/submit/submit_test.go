@@ -310,9 +310,40 @@ func TestAnUnansweredSendIsResolvedByItsHash(t *testing.T) {
 
 func TestAResourceFeeAboveTheCapIsRefused(t *testing.T) {
 	h := newHarness(t)
-	h.engine.MaxResourceFee = 49_999
-	if _, err := h.engine.Prepare(context.Background(), h.account, invoke()); !errors.Is(err, ErrSimulation) {
+	ctx := context.Background()
+	// The simulation asks for 50,000 stroops, which the margin makes 55,000.
+	h.engine.MaxResourceFee = 54_999
+	if _, err := h.engine.Prepare(ctx, h.account, invoke()); !errors.Is(err, ErrFeeCap) || !errors.Is(err, ErrSimulation) {
 		t.Fatalf("resource fee above the cap: %v", err)
+	}
+
+	// Extensions and restorations of entries have a cap of their own when one is set.
+	extend := func() txnbuild.Operation {
+		return &txnbuild.ExtendFootprintTtl{ExtendTo: 1_000, Ext: xdr.TransactionExt{V: 1, SorobanData: &xdr.SorobanTransactionData{}}}
+	}
+	restore := func() txnbuild.Operation {
+		return &txnbuild.RestoreFootprint{Ext: xdr.TransactionExt{V: 1, SorobanData: &xdr.SorobanTransactionData{}}}
+	}
+	if _, err := h.engine.Prepare(ctx, h.account, extend()); !errors.Is(err, ErrFeeCap) {
+		t.Fatalf("an extension above the call cap with no cap of its own: %v", err)
+	}
+	h.engine.MaxTTLFee = 55_000
+	for _, op := range []txnbuild.Operation{extend(), restore()} {
+		if _, err := h.engine.Prepare(ctx, h.account, op); err != nil {
+			t.Fatalf("%T within its cap: %v", op, err)
+		}
+	}
+	if _, err := h.engine.Prepare(ctx, h.account, invoke()); !errors.Is(err, ErrFeeCap) {
+		t.Fatalf("a call under the cap of extensions: %v", err)
+	}
+	h.engine.MaxResourceFee, h.engine.MaxTTLFee = 55_000, 54_999
+	if _, err := h.engine.Prepare(ctx, h.account, invoke()); err != nil {
+		t.Fatalf("a call within its cap: %v", err)
+	}
+	for _, op := range []txnbuild.Operation{extend(), restore()} {
+		if _, err := h.engine.Prepare(ctx, h.account, op); !errors.Is(err, ErrFeeCap) {
+			t.Fatalf("%T above its cap: %v", op, err)
+		}
 	}
 }
 
