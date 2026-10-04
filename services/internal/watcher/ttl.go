@@ -17,17 +17,25 @@ import (
 // expiryWarning is how close to expiry an entry may come before the watcher pages.
 const expiryWarning = 14 * ledgersPerDay
 
+// writeWarning is how close to expiry the vault's instance, code and tree entries may come before
+// the watcher warns: a day above the 30 days below which every user transaction, which writes
+// them, also pays their rent. A keeper that renews them keeps them far above it.
+const writeWarning = 31 * ledgersPerDay
+
 // entry is a ledger entry the vault depends on. An optional one may be gone by the time it is
-// read, such as a deposit admitted meanwhile.
+// read, such as a deposit admitted meanwhile. A written one is one that every user transaction
+// extends once it has 30 days or less left: the vault's instance, its code or a tree entry.
 type entry struct {
 	name     string
 	key      xdr.LedgerKey
 	optional bool
+	written  bool
 }
 
 // CheckTTL pages when any entry the vault depends on is archived or within 14 days of expiry: the
 // instance, the tree, the code, the asset contract, the vault's balance, pending deposits, queued
-// and stranded exits, and every spent nullifier.
+// and stranded exits, and every spent nullifier. It warns when the instance, the code or a tree
+// entry comes within writeWarning of expiry.
 func (w *Watcher) CheckTTL(ctx context.Context) error {
 	w.mu.RLock()
 	inst := w.inst
@@ -43,21 +51,21 @@ func (w *Watcher) CheckTTL(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		entries = append(entries, entry{name, key, optional})
+		entries = append(entries, entry{name, key, optional, false})
 		return nil
 	}
 	instKey, err := vault.InstanceKey(w.cfg.Vault)
-	if err := add("vault instance", false, instKey, err); err != nil {
+	if err != nil {
 		return err
 	}
 	tree, err := vault.TreeKeys(w.cfg.Vault)
 	if err != nil {
 		return err
 	}
+	entries = append(entries, entry{"vault instance", instKey, false, true}, entry{"vault code", vault.CodeKey(inst.WasmHash), false, true})
 	for _, k := range tree {
-		entries = append(entries, entry{"tree entry", k, false})
+		entries = append(entries, entry{"tree entry", k, false, true})
 	}
-	entries = append(entries, entry{"vault code", vault.CodeKey(inst.WasmHash), false})
 	tokenKey, err := vault.InstanceKey(inst.Config.Token)
 	if err := add("asset contract", false, tokenKey, err); err != nil {
 		return err
@@ -92,7 +100,7 @@ func (w *Watcher) CheckTTL(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var expiring []string
+	var expiring, unrenewed []string
 	for _, e := range entries {
 		got, ok := found[mustKeyString(e.key)]
 		switch {
@@ -103,7 +111,14 @@ func (w *Watcher) CheckTTL(ctx context.Context) error {
 			expiring = append(expiring, e.name+" is archived")
 		case got.LiveUntil != nil && *got.LiveUntil < latest+expiryWarning:
 			expiring = append(expiring, fmt.Sprintf("%s expires in %d ledgers", e.name, *got.LiveUntil-latest))
+		case e.written && got.LiveUntil != nil && *got.LiveUntil < latest+writeWarning:
+			unrenewed = append(unrenewed, fmt.Sprintf("%s expires in %d ledgers", e.name, *got.LiveUntil-latest))
 		}
+	}
+	if len(unrenewed) > 0 {
+		w.alerts.Raise(ctx, alert.Warning, "renewal_late", "the keeper is not renewing the vault's entries, and below 30 days every user transaction pays their rent: %v", unrenewed)
+	} else {
+		w.alerts.Clear(ctx, "renewal_late", "the vault's instance, code and tree entries have more than 31 days left")
 	}
 	n, err := w.expiringNullifiers(ctx, latest)
 	if err != nil {

@@ -46,6 +46,8 @@ func (a *Account) Unlock() { a.mu.Unlock() }
 var (
 	// ErrSimulation reports a simulation that failed; the transaction was not sent.
 	ErrSimulation = errors.New("submit: simulation failed")
+	// ErrFeeCap reports a simulation whose resource fee is above the cap. It is an ErrSimulation.
+	ErrFeeCap = fmt.Errorf("%w: the resource fee is above the cap", ErrSimulation)
 	// ErrRejected reports a transaction the network refused without including it.
 	ErrRejected = errors.New("submit: transaction rejected")
 	// ErrExpired reports a transaction whose time bound passed before it was included.
@@ -58,11 +60,16 @@ type Engine struct {
 	Passphrase string
 	// MaxInclusionFee caps the per-operation inclusion fee read from getFeeStats.
 	MaxInclusionFee int64
-	// ResourceMarginPct pads the simulated resource fee; the unused refundable part is refunded.
+	// ResourceMarginPct pads the simulated resource fee of an invocation; the unused refundable
+	// part is refunded. A footprint extension or restoration gets none: the simulation already
+	// pads its rent by 15%, more than the ledgers that pass before inclusion add.
 	ResourceMarginPct int64
 	// MaxResourceFee refuses a simulation that asks for more, so a lying RPC cannot drain the
 	// source's float.
 	MaxResourceFee int64
+	// MaxTTLFee, when set, takes the place of MaxResourceFee for footprint extensions and
+	// restorations, whose fee is mostly the rent of the entries they keep alive.
+	MaxTTLFee int64
 	// Validity is how long a signed transaction may wait for inclusion.
 	Validity time.Duration
 	// Poll is the interval between getTransaction calls.
@@ -331,6 +338,15 @@ func (e *Engine) now() time.Time {
 	return time.Now()
 }
 
+// TTLFeeCap is the most resource fee a footprint extension or restoration may declare:
+// MaxTTLFee, or MaxResourceFee when that is not set. Zero sets no cap.
+func (e *Engine) TTLFeeCap() int64 {
+	if e.MaxTTLFee > 0 {
+		return e.MaxTTLFee
+	}
+	return e.MaxResourceFee
+}
+
 // minInclusionFee is the network's minimum fee per operation, in stroops.
 const minInclusionFee = 100
 
@@ -484,11 +500,15 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 	if err != nil {
 		return nil, err
 	}
-	resource := sim.MinResourceFee + sim.MinResourceFee*e.ResourceMarginPct/100 + padding + extra
+	margin, limit := e.ResourceMarginPct, e.MaxResourceFee
+	if _, invoke := sop.(invokeOp); !invoke {
+		margin, limit = 0, e.TTLFeeCap()
+	}
+	resource := sim.MinResourceFee + sim.MinResourceFee*margin/100 + padding + extra
 	// The padding's fees come from the network's settings as the RPC reports them, so the cap
 	// bounds the whole fee.
-	if e.MaxResourceFee > 0 && resource > e.MaxResourceFee {
-		return nil, fmt.Errorf("%w: a resource fee of %d stroops is above the cap", ErrSimulation, resource)
+	if limit > 0 && resource > limit {
+		return nil, fmt.Errorf("%w: %d stroops, the cap is %d", ErrFeeCap, resource, limit)
 	}
 	data.ResourceFee = xdr.Int64(resource)
 	sop.setExt(xdr.TransactionExt{V: 1, SorobanData: &data})

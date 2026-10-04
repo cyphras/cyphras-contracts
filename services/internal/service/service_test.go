@@ -74,6 +74,28 @@ func TestAServicePagesThroughAtLeastTwoChannels(t *testing.T) {
 	}
 }
 
+func TestTheFeeCapsFitATransactionsFeeFieldTogether(t *testing.T) {
+	fake := rpctest.New(network.TestNetworkPassphrase, 1)
+	for _, c := range []struct {
+		inclusion, resource string
+		ok                  bool
+	}{
+		{"", "", true},
+		{"100", "4000000000", true},
+		{"100000000", "1", true},
+		{"99", "", false},
+		{"100000001", "", false},
+		{"", "0", false},
+		{"", "4000000001", false},
+	} {
+		t.Setenv("INCLUSION_FEE_CAP", c.inclusion)
+		t.Setenv("RESOURCE_FEE_CAP", c.resource)
+		if _, err := Engine(fake, network.TestNetworkPassphrase, nil); (err == nil) != c.ok {
+			t.Fatalf("INCLUSION_FEE_CAP %q and RESOURCE_FEE_CAP %q: %v", c.inclusion, c.resource, err)
+		}
+	}
+}
+
 func TestASignerMustMeetTheMediumThreshold(t *testing.T) {
 	f := rpctest.New("Test SDF Network ; September 2015", 1)
 	account := keypair.MustRandom()

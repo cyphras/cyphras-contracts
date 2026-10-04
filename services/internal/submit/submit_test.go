@@ -310,9 +310,47 @@ func TestAnUnansweredSendIsResolvedByItsHash(t *testing.T) {
 
 func TestAResourceFeeAboveTheCapIsRefused(t *testing.T) {
 	h := newHarness(t)
-	h.engine.MaxResourceFee = 49_999
-	if _, err := h.engine.Prepare(context.Background(), h.account, invoke()); !errors.Is(err, ErrSimulation) {
+	ctx := context.Background()
+	// The simulation asks for 50,000 stroops, which the margin makes 55,000 for a call.
+	h.engine.MaxResourceFee = 54_999
+	if _, err := h.engine.Prepare(ctx, h.account, invoke()); !errors.Is(err, ErrFeeCap) || !errors.Is(err, ErrSimulation) {
 		t.Fatalf("resource fee above the cap: %v", err)
+	}
+
+	// An extension or a restoration takes no margin, as the simulation pads its rent already, and
+	// has a cap of its own when one is set.
+	extend := func() txnbuild.Operation {
+		return &txnbuild.ExtendFootprintTtl{ExtendTo: 1_000, Ext: xdr.TransactionExt{V: 1, SorobanData: &xdr.SorobanTransactionData{}}}
+	}
+	restore := func() txnbuild.Operation {
+		return &txnbuild.RestoreFootprint{Ext: xdr.TransactionExt{V: 1, SorobanData: &xdr.SorobanTransactionData{}}}
+	}
+	for _, op := range []txnbuild.Operation{extend(), restore()} {
+		if p, err := h.engine.Prepare(ctx, h.account, op); err != nil || p.ResourceFee != 50_000 {
+			t.Fatalf("%T under the call cap: %v", op, err)
+		}
+	}
+	h.engine.MaxTTLFee = 49_999
+	if h.engine.TTLFeeCap() != 49_999 {
+		t.Fatalf("the TTL fee cap is %d", h.engine.TTLFeeCap())
+	}
+	for _, op := range []txnbuild.Operation{extend(), restore()} {
+		if _, err := h.engine.Prepare(ctx, h.account, op); !errors.Is(err, ErrFeeCap) {
+			t.Fatalf("%T above its own cap: %v", op, err)
+		}
+	}
+	h.engine.MaxResourceFee, h.engine.MaxTTLFee = 55_000, 50_000
+	if p, err := h.engine.Prepare(ctx, h.account, invoke()); err != nil || p.ResourceFee != 55_000 {
+		t.Fatalf("a call within its cap: %v", err)
+	}
+	for _, op := range []txnbuild.Operation{extend(), restore()} {
+		if _, err := h.engine.Prepare(ctx, h.account, op); err != nil {
+			t.Fatalf("%T within its cap: %v", op, err)
+		}
+	}
+	h.engine.MaxTTLFee = 0
+	if h.engine.TTLFeeCap() != 55_000 {
+		t.Fatalf("without a TTL fee cap, extensions are capped at %d", h.engine.TTLFeeCap())
 	}
 }
 
