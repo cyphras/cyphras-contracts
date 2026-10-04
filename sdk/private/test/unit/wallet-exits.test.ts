@@ -2121,6 +2121,42 @@ describe("exits that other exits race in the same ledger", () => {
     assert.equal(slow.asked(), 3);
   });
 
+  it("cuts a request the second RPC provider leaves unanswered after five seconds, and asks again", async () => {
+    const second = "http://rpc2.test";
+    const world = await createWorld({ limits: SMALL });
+    let hanging = false;
+    let waited: number | undefined;
+    // The second provider does not answer its first request about the failed transaction.
+    const fetch: FetchLike = async (input, init) => {
+      if (new URL(input).origin !== second) return world.fetch(input, init);
+      const body = JSON.parse(String(init?.body));
+      if (hanging && body.method === "getTransaction") {
+        hanging = false;
+        const start = Date.now();
+        await new Promise<void>((resolve) =>
+          init?.signal?.addEventListener("abort", () => resolve()),
+        );
+        waited = Date.now() - start;
+        throw new DOMException("the request was cut", "AbortError");
+      }
+      return world.fetch(RPC, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    world.vault.outflowDay = world.vault.timestamp / 86_400n;
+    world.vault.outflow = 50n * XLM;
+    world.rpc.conflictNext = 1;
+    hanging = true;
+    await selfRelayed(world, alice);
+    assert.equal(sentCalls(world, "transact"), 2);
+    assert.ok(waited !== undefined && waited >= 4_500 && waited < 10_000, `waited ${waited} ms`);
+  });
+
   it("releases again after a failure on the host's storage, and goes no further after any other", async () => {
     const { world, alice } = await funded();
     world.vault.outflowDay = world.vault.timestamp / 86_400n;

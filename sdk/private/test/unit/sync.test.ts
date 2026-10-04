@@ -517,6 +517,20 @@ describe("unchecked ranges", () => {
     );
   });
 
+  it("reads a range's events on past a page that ends at its last ledger", async () => {
+    const through = Array.from({ length: 1_000 }, (_, i) => leafAt(i, 100 + i));
+    const later = Array.from({ length: 500 }, (_, i) => leafAt(1_000 + i, 1_100 + i));
+    const state = emptyState(1);
+    state.nullifierSince = 1_100;
+    state.unchecked = [
+      { from: 100, to: 1_099, leaves: undefined, status: "open", askedAt: undefined },
+    ];
+    const { rpc, pages } = paging([...through, ...later], 5_000);
+    await recheck(state, [rpc], VAULT, 10, 0);
+    assert.deepEqual(state.unchecked, []);
+    assert.equal(pages(), 2);
+  });
+
   it("reads a range's events no further than the first page past both its ledgers and its leaves", async () => {
     // The range's leaves were added at ledgers 110 to 1,609, past its last ledger, and others after.
     const taken = Array.from({ length: 1_500 }, (_, i) => leafAt(4 + i, 110 + i));
