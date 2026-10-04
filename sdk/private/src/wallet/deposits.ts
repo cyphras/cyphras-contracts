@@ -442,10 +442,13 @@ function follow(deposit: Deposit, entry: PendingDepositEntry, attestedUpTo: bigi
   deposit.confirmed = true;
 }
 
-// Records the newest ledger at which a provider showed the deposit in the entry queue.
-function see(deposit: Deposit, read: QueueRead | undefined): void {
+// Records the newest ledger at which a provider showed the deposit in the entry queue, counting no
+// read as newer than `viewLedger`, so a provider cannot hold the deposit off "gone" for good with
+// one read of a ledger the chain has not reached.
+function see(deposit: Deposit, read: QueueRead | undefined, viewLedger: number): void {
   for (const r of read ?? []) {
-    if (r.entry !== undefined) deposit.seenAt = Math.max(deposit.seenAt ?? 0, r.ledger);
+    if (r.entry === undefined) continue;
+    deposit.seenAt = Math.max(deposit.seenAt ?? 0, Math.min(r.ledger, viewLedger));
   }
 }
 
@@ -476,10 +479,12 @@ async function claimId(core: Core, id: number): Promise<void> {
 const INDEXER_CANDIDATES = 4;
 
 // What a sync's reads of the vault show beyond the deposits' entries: the ledger up to which the
-// confirmed tree holds every leaf, and the last deposit every RPC provider shows attested.
+// confirmed tree holds every leaf, the last deposit every RPC provider shows attested, and the
+// oldest ledger among the providers' views of the vault.
 export interface QueueContext {
   readonly treeAt: number;
   readonly attestedUpTo: bigint;
+  readonly viewLedger: number;
 }
 
 // Follows this wallet's deposits through the entry queue. A deposit still being submitted is found
@@ -575,7 +580,7 @@ export async function trackDeposits(
       const found = candidates(deposit).find((id) => holds(alike(reads.get(id)), deposit));
       if (found !== undefined) {
         deposit.id = found;
-        see(deposit, reads.get(found));
+        see(deposit, reads.get(found), context.viewLedger);
         follow(deposit, alike(reads.get(found)) as PendingDepositEntry, context.attestedUpTo);
         continue;
       }
@@ -588,22 +593,25 @@ export async function trackDeposits(
     }
     if (!followed(deposit)) continue;
     const read = reads.get(deposit.id as number);
-    see(deposit, read);
+    see(deposit, read, context.viewLedger);
     const entry = alike(read);
     if (holds(entry, deposit)) {
       follow(deposit, entry as PendingDepositEntry, context.attestedUpTo);
       continue;
     }
-    // Gone from the entry queue only on every provider's read of a ledger past the last one any
-    // provider showed the deposit at, and past its proof's deadline, by which it was made; a
-    // provider that shows it again undoes that. Gone, it is no longer as the chain last showed it.
+    // While every provider shows no entry, the deposit is no longer as the chain last showed it.
+    // It is gone from the entry queue only on every provider's read of a ledger past the last one
+    // any provider showed it at, and past its proof's deadline, by which it was made; a provider
+    // that shows it again undoes that. It is gone by the newest ledger of such a read, the earliest
+    // one over every such read, as one read of a ledger the chain has not reached must not hold
+    // the deposit off for good.
+    const none = read !== undefined && read.every((r) => r.entry === undefined);
     const gone =
-      read !== undefined &&
-      read.every((r) => r.entry === undefined) &&
+      none &&
       Math.min(...read.map((r) => r.ledger)) > Math.max(deposit.deadline, deposit.seenAt ?? 0);
+    if (none) deposit.confirmed = false;
     if (gone) {
-      deposit.goneAt ??= Math.max(...read.map((r) => r.ledger));
-      deposit.confirmed = false;
+      deposit.goneAt = Math.min(deposit.goneAt ?? Infinity, Math.max(...read.map((r) => r.ledger)));
     } else if (read?.some((r) => r.entry !== undefined)) {
       deposit.goneAt = undefined;
     }

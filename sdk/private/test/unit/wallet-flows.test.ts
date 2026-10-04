@@ -84,6 +84,18 @@ const readsQueue = (body: { method?: string; params?: { keys?: string[] } }): bo
     );
   });
 
+// Whether a JSON-RPC request reads the vault's view: its instance, roots and next leaf.
+const readsView = (body: { method?: string; params?: { keys?: string[] } }): boolean =>
+  body.method === "getLedgerEntries" &&
+  (body.params?.keys ?? []).some((k) => {
+    const key = xdr.LedgerKey.fromXDR(k, "base64");
+    return (
+      key.switch().name === "contractData" &&
+      key.contractData().key().switch().name === "scvVec" &&
+      key.contractData().key().vec()?.[0]?.sym().toString() === "Roots"
+    );
+  });
+
 // A busy RPC's reply to a JSON-RPC request.
 const busyReply = (id: number): Response =>
   new Response(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32603, message: "busy" } }));
@@ -1440,6 +1452,164 @@ describe("wallet: a deposit gone from the entry queue", () => {
       await alice.sync();
       [deposit] = await alice.deposits();
       assert.equal(deposit?.state, "admitted", undone);
+    }
+  });
+
+  // A wallet whose deposit 1 is flagged and then refunded, with the indexer down, and whose first
+  // provider labels its reads of one sync a million ledgers past the chain's: its read of the entry
+  // queue while the deposit is still there, or once it is gone, and with `views`, its view of the
+  // vault too.
+  async function inflated(when: "seen" | "gone", views: boolean) {
+    const world = await createWorld();
+    let inflate = false;
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      const res = await world.fetch(url.origin === second ? RPC : input, init);
+      const read = body !== undefined && (readsQueue(body) || (views && readsView(body)));
+      if (!inflate || url.origin !== RPC || !read) return res;
+      if (readsQueue(body)) inflate = false;
+      const reply = (await res.json()) as { result: { latestLedger: number } };
+      reply.result.latestLedger = world.vault.ledger + 1_000_000;
+      return new Response(JSON.stringify(reply));
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 1));
+    world.indexer.down = true;
+    await alice.sync();
+    if (when === "seen") {
+      inflate = true;
+      world.fill(1);
+      await alice.sync();
+    }
+    world.advance(86_400);
+    world.rpc.run("ac".repeat(32), () => world.vault.refund(1));
+    if (when === "gone") inflate = true;
+    for (let i = 0; i < 2; i++) {
+      world.fill(1);
+      await alice.sync();
+    }
+    return alice;
+  }
+
+  for (const [when, views] of [
+    ["seen", false],
+    ["seen", true],
+    ["gone", false],
+    ["gone", true],
+  ] as const) {
+    const label = `${when}${views ? ", with the view of the vault," : ""}`;
+    it(`settles a refund though one read showed it ${label} at a ledger the chain has not reached`, async () => {
+      const alice = await inflated(when, views);
+      const [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, "refunded", label);
+      assert.equal(deposit?.refundKind, "refused", label);
+      assert.equal(deposit?.confirmed, true, label);
+      assert.equal((await alice.balance()).pendingDeposits, 0n, label);
+    });
+  }
+
+  it("is no longer confirmed while every provider shows no entry, before it counts as gone", async () => {
+    const world = await createWorld();
+    let staleAt: number | undefined;
+    const alice = await readsOfQueue(world, () => staleAt);
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    world.advance(121 * 5);
+    // Only the chain speaks.
+    world.indexer.down = true;
+    await alice.sync();
+    let [deposit] = await alice.deposits();
+    assert.equal(deposit?.confirmed, true);
+    // Both providers answer as of the ledger the deposit was last shown at.
+    staleAt = world.vault.ledger;
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.confirmed, false);
+    staleAt = undefined;
+    await alice.sync();
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.confirmed, true);
+  });
+
+  it("settles a refund though the read that found its ID showed it at a ledger the chain has not reached", async () => {
+    const world = await createWorld();
+    let hiding = true;
+    let inflate = false;
+    // While hiding, the second provider neither reports the shield's transaction nor lists events,
+    // so the deposit's ID comes from a candidate; the first provider labels one read of the entry
+    // queue a million ledgers past the chain's.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (hiding && url.origin === second && body?.method === "getTransaction") {
+        return rpcResult(body.id, { status: "NOT_FOUND", latestLedger: world.vault.ledger });
+      }
+      if (hiding && url.origin === second && body?.method === "getEvents") {
+        return busyReply(body.id);
+      }
+      const res = await world.fetch(url.origin === second ? RPC : input, init);
+      if (!inflate || url.origin !== RPC || body === undefined || !readsQueue(body)) return res;
+      inflate = false;
+      const reply = (await res.json()) as { result: { latestLedger: number } };
+      reply.result.latestLedger = world.vault.ledger + 1_000_000;
+      return new Response(JSON.stringify(reply));
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    const receipt = await alice.shield({ amount: 100n * XLM, signer: world.signer("depositor") });
+    assert.equal(receipt.depositId, undefined);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 1));
+    world.indexer.down = true;
+    inflate = true;
+    await alice.sync();
+    hiding = false;
+    let [deposit] = await alice.deposits();
+    assert.equal(deposit?.id, 1);
+    world.advance(86_400);
+    world.rpc.run("ac".repeat(32), () => world.vault.refund(1));
+    for (let i = 0; i < 2; i++) {
+      world.fill(1);
+      await alice.sync();
+    }
+    [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "refunded");
+    assert.equal(deposit?.confirmed, true);
+  });
+
+  it("is not gone while one provider shows it at a ledger past the sync's views, whatever the others show", async () => {
+    const world = await createWorld();
+    let lying = false;
+    // While lying, the second provider shows no entry, and the chain moves on by a ledger before the
+    // first provider answers a read of the entry queue.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (lying && body !== undefined && readsQueue(body)) {
+        if (url.origin === second) {
+          return rpcResult(body.id, { entries: [], latestLedger: world.vault.ledger });
+        }
+        world.fill(1);
+      }
+      return world.fetch(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    await shielded(alice, 10n * XLM, world.signer("depositor"));
+    world.indexer.down = true;
+    world.advance(121 * 5);
+    await alice.sync();
+    lying = true;
+    for (let i = 0; i < 3; i++) {
+      world.advance(60);
+      await alice.sync();
+      const [deposit] = await alice.deposits();
+      assert.equal(deposit?.state, "pending");
     }
   });
 
