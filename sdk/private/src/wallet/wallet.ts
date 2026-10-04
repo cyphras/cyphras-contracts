@@ -94,6 +94,7 @@ import {
   type OwnedNote,
   type Plan,
   type RootCheck,
+  type Route,
   StateStore,
   type UncheckedRange,
   type WalletState,
@@ -268,6 +269,9 @@ export interface PlanView extends Submission {
   readonly amount: bigint;
   readonly to: string;
   readonly createdAt: number;
+  // The relayer it went through, or the account that self-relayed it: where retry sends it again
+  // unless told otherwise.
+  readonly route: Route;
   // The exit of an unshield that waits in the vault's exit queue: the ID transact gave it, what
   // it still owes the recipient, and the exits that owe it, a stranded one until claimed; and
   // whether that rests on the vault's events every RPC provider showed, rather than on the
@@ -952,6 +956,7 @@ export class PrivateWallet {
       amount: p.amount,
       to: p.to,
       createdAt: p.createdAt,
+      route: p.route,
       exitId: p.exit?.id,
       payoutLeft: p.exit === undefined ? undefined : payoutLeft(p.exit),
       exitParts: (p.exit === undefined ? [] : shownParts(p.exit)).map((part) => ({ ...part })),
@@ -1059,8 +1064,11 @@ export class PrivateWallet {
   /**
    * Pays a Stellar address through a relayer or, with selfRelay, from the user's own account.
    * With split, an amount above the vault's single-exit cap becomes an operation whose parts go
-   * one after another; continueOperations sends each next part once it is due.
+   * one after another; continueOperations sends each next part once it is due. Without split it
+   * is always one submission.
    */
+  unshield(request: UnshieldRequest & { readonly split?: false }): Promise<Submission>;
+  unshield(request: UnshieldRequest): Promise<Submission | OperationView>;
   unshield(request: UnshieldRequest): Promise<Submission | OperationView> {
     return this.#run(async () => {
       await this.#sync(false);
@@ -1285,9 +1293,11 @@ export class PrivateWallet {
 
   /**
    * Proves a stalled or dead payment again with the same notes, so at most one of the two can
-   * land. The relayer, the fee cap and self-relay may differ from the first attempt.
+   * land. The relayer, the fee cap and self-relay may differ from the first attempt; by default it
+   * goes the way the plan went: through its relayer first, then the others, or self-relayed, which
+   * needs selfRelay again.
    */
-  retry(planId: string, request: RetryRequest): Promise<Submission> {
+  retry(planId: string, request: RetryRequest = {}): Promise<Submission> {
     return this.#run(async () => {
       await this.#sync(false);
       const { state } = this.#core;
@@ -1296,6 +1306,20 @@ export class PrivateWallet {
       if (!isActive(plan) && plan.state !== "dead") {
         fail("invalid_argument", "only a prepared, submitted or dead plan can be retried");
       }
+      const { route } = plan;
+      if (
+        route.kind === "self" &&
+        request.selfRelay === undefined &&
+        request.relayer === undefined
+      ) {
+        fail("invalid_argument", "the plan was self-relayed; retry needs its signer, or a relayer");
+      }
+      const others = this.#relayerClients(undefined).map((r) => r.url);
+      const relayers =
+        request.relayer ??
+        (route.kind === "relayer"
+          ? [route.url, ...others.filter((url) => url !== route.url)]
+          : undefined);
       const inputs = plan.inputs.map((input) => {
         const note = state.notes.find((n) => n.pos === input.pos);
         if (note === undefined || note.spent !== undefined) {
@@ -1308,7 +1332,7 @@ export class PrivateWallet {
         to: plan.to,
         amount: plan.amount,
         maxFee: request.selfRelay === undefined ? (request.maxFee ?? plan.fee) : 0n,
-        relayers: request.selfRelay === undefined ? this.#relayerClients(request.relayer) : [],
+        relayers: request.selfRelay === undefined ? this.#relayerClients(relayers) : [],
         selfRelay: request.selfRelay,
         confirm: request.confirm,
         notBefore: undefined,

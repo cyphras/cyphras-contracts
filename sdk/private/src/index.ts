@@ -21,7 +21,7 @@ export type { VaultLimitsView } from "./wallet/limits.ts";
 export type { DisclosureCheck, PaymentDisclosure } from "./wallet/disclosure.ts";
 export type { ExitPosition } from "./wallet/exits.ts";
 export type { Verification, ServiceState } from "./wallet/services.ts";
-export type { ExitPart, PlanState } from "./wallet/state.ts";
+export type { ExitPart, PlanState, Route } from "./wallet/state.ts";
 export type { SyncLimits } from "./wallet/sources.ts";
 export type { NetworkFee, NetworkFeeCaps, TransactionSigner } from "./vault/invoke.ts";
 

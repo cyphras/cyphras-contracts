@@ -22,6 +22,7 @@ import {
   loadState,
   saveState,
 } from "../../src/wallet/state.ts";
+import type { Submission } from "../../src/wallet/spend.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
 import {
   INDEXER,
@@ -2495,6 +2496,55 @@ describe("wallet: spends", () => {
       ],
     );
     assert.equal((await alice.balance()).spendable, 59n * XLM);
+  });
+
+  it("retries a payment the way it went unless told otherwise", async () => {
+    const world = await createWorld();
+    const other = "http://relayer2.test";
+    const submitted: string[] = [];
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (url.pathname === "/v1/submit") submitted.push(url.origin);
+      return world.fetch(input.replace(other, RELAYER), init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      relayers: [RELAYER, other],
+    });
+    await shielded(alice, 100n * XLM, world.signer("depositor"));
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const merchant = world.signer("merchant").publicKey;
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: merchant,
+        amount: 10n * XLM,
+        maxFee: 2n * XLM,
+        relayer: other,
+        confirm: confirmAll,
+      }),
+    );
+    const [relayed] = await alice.plans();
+    assert.deepEqual(relayed?.route, { kind: "relayer", url: other });
+    const again: Submission = await alice.retry(relayed?.planId as string, { confirm: confirmAll });
+    assert.equal(again.state, "submitted");
+    assert.deepEqual(submitted, [other, other]);
+    await alice.sync();
+    // A self-relayed payment goes self-relayed again, which needs its signer.
+    const me = world.signer("my account");
+    world.rpc.failNext = 1;
+    await assert.rejects(
+      alice.unshield({ to: merchant, amount: 10n * XLM, selfRelay: me, confirm: confirmAll }),
+    );
+    const self = (await alice.plans()).find((p) => p.route.kind === "self");
+    assert.deepEqual(self?.route, { kind: "self", account: me.publicKey });
+    await assert.rejects(alice.retry(self?.planId as string), isError("invalid_argument"));
+    const retried = await alice.retry(self?.planId as string, {
+      selfRelay: me,
+      confirm: confirmAll,
+    });
+    assert.equal(retried.state, "submitted");
   });
 
   it("self-relays an unshield, warning that the account becomes public", async () => {
