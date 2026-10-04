@@ -258,7 +258,7 @@ export async function shield(
     // A deposit whose envelope never left the device is void. One that may have reached the
     // network stays submitting with its hash, whatever the RPC it went through answered, for a
     // sync to settle.
-    if (err instanceof CyphrasError && deposit.txHash === undefined) {
+    if (deposit.txHash === undefined) {
       deposit.state = "failed";
       await core.save();
     }

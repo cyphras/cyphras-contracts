@@ -370,6 +370,22 @@ describe("wallet: a shield whose sending goes wrong", () => {
     assert.equal((await alice.history()).filter((h) => h.kind === "shield").length, 1);
   });
 
+  it("fails a shield whose signer refused it, which holds no later shield back", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("depositor");
+    const refusing = {
+      publicKey: depositor.publicKey,
+      signTransaction: async (): Promise<string> => {
+        throw new Error("the user refused to sign");
+      },
+    };
+    await assert.rejects(alice.shield({ amount: 10n * XLM, signer: refusing }), /refused to sign/);
+    assert.equal((await alice.deposits())[0]?.state, "failed");
+    const receipt = await alice.shield({ amount: 10n * XLM, signer: depositor });
+    assert.equal(receipt.depositId, 1);
+  });
+
   it("makes another deposit while one is being submitted on the caller's word", async () => {
     const world = await createWorld();
     const fetch = sending(world, async (body, hash, init) => {
