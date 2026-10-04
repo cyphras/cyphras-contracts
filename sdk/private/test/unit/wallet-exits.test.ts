@@ -134,6 +134,36 @@ describe("split unshields whose parts do not plainly land", () => {
     return view;
   }
 
+  it("sends a dead part again with its own notes, though a note that fits it better arrived since", async () => {
+    const world = await createWorld({ limits: SPLIT });
+    const { alice, store } = await withNotes(world);
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: world.signer("exchange").publicKey,
+        amount: 90n * XLM,
+        maxFee: 2n * XLM,
+        split: true,
+        confirm: confirmAll,
+      }),
+    );
+    // 51 XLM: the smallest single note that covers the part and its fee.
+    await alice.shield({ amount: 51n * XLM, signer: world.signer("alice depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    world.advance(121 * 5);
+    world.fill(1);
+    await alice.continueOperations();
+    const kept = (await loadState(new SealedStore(store, storeKeyOf(0)))) as WalletState;
+    const [dead, again] = kept.plans as [Plan, Plan | undefined];
+    assert.equal(dead.state, "dead");
+    assert.equal(again?.retryOf, dead.id);
+    assert.deepEqual(
+      again?.inputs.map((i) => i.pos),
+      dead.inputs.map((i) => i.pos),
+    );
+  });
+
   it("pays a split unshield once when a part's leaves arrive in a batch held aside", async () => {
     const world = await createWorld({ limits: SPLIT });
     const { alice, store } = await withNotes(world);
