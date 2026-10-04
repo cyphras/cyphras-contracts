@@ -30,10 +30,13 @@
     "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
     "@scure/base": "1.2.6",
-    "@scure/bip39": "1.6.0",
-    "@stellar/stellar-base": "15.0.0"
+    "@scure/bip39": "1.6.0"
+  },
+  "peerDependencies": {
+    "@stellar/stellar-base": "^15.0.0"
   },
   "devDependencies": {
-    "@cyphras/private-prover-snarkjs": "0.1.0"
+    "@cyphras/private-prover-snarkjs": "0.1.0",
+    "@stellar/stellar-base": "15.0.0"
   }
 }
