@@ -209,6 +209,27 @@ const bodyOf = (init: RequestInit | undefined) =>
 const rpcResult = (id: number, result: unknown): Response =>
   new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
 
+describe("wallet: a vault whose events span more ledgers than RPC scans at once", () => {
+  it("syncs a fresh wallet over them, cross-checked against RPC and from RPC alone", async () => {
+    const world = await createWorld();
+    for (let i = 0; i < 3; i++) {
+      world.fill(1);
+      world.advance(15_000 * 5);
+    }
+    const alice = await openWallet(world, 0);
+    const checked = await alice.sync();
+    assert.equal(checked.source, "indexer");
+    assert.equal(checked.crossChecked, true);
+    assert.equal(checked.leafCount, 6);
+    world.indexer.down = true;
+    const bob = await openWallet(world, 1);
+    const read = await bob.sync();
+    assert.equal(read.source, "rpc");
+    assert.equal(read.leafCount, 6);
+    assert.equal(read.rootVerified, true);
+  });
+});
+
 describe("wallet: deposits", () => {
   it("shields, follows the deposit through the queue and spends it once admitted", async () => {
     const world = await createWorld();

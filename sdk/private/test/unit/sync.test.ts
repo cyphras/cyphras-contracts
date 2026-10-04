@@ -10,6 +10,7 @@ import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
 import type { Leaf } from "../../src/net/indexer.ts";
 import { SorobanRpc } from "../../src/net/rpc.ts";
 import type { ChainView, RootHistory } from "../../src/vault/state.ts";
+import { eventId, ledgerEnd } from "../support/rpc.ts";
 import {
   type Evidence,
   type LeafChunk,
@@ -28,6 +29,7 @@ import {
   recheck,
   recordEvents,
 } from "../../src/wallet/sync.ts";
+import { RpcEventSource } from "../../src/wallet/sources.ts";
 import { testScalar } from "../helpers.ts";
 import { map } from "../support/vault.ts";
 
@@ -393,7 +395,7 @@ describe("unchecked ranges", () => {
     ledger,
     ledgerClosedAt: "2026-10-04T00:00:00Z",
     contractId: VAULT,
-    id: `${String(ledger).padStart(12, "0")}-${String(900).padStart(8, "0")}`,
+    id: eventId(ledger, 900),
     txHash: TX,
     inSuccessfulContractCall: true,
     topic: [xdr.ScVal.scvSymbol("deposit_pending").toXDR("base64")],
@@ -410,7 +412,7 @@ describe("unchecked ranges", () => {
     ledger: l.ledger,
     ledgerClosedAt: "2026-10-04T00:00:00Z",
     contractId: VAULT,
-    id: `${String(l.ledger).padStart(12, "0")}-${String(i).padStart(8, "0")}`,
+    id: eventId(l.ledger, i + 1),
     txHash: l.txHash,
     inSuccessfulContractCall: true,
     topic: [xdr.ScVal.scvSymbol("new_commitment").toXDR("base64")],
@@ -431,7 +433,7 @@ describe("unchecked ranges", () => {
     const events = [...leaves.map(added), ...others];
     return new SorobanRpc("http://rpc", async (_input, init) => {
       const { id } = JSON.parse(String(init?.body));
-      const result = { events, latestLedger: latest, oldestLedger: 1 };
+      const result = { events, cursor: ledgerEnd(latest), latestLedger: latest, oldestLedger: 1 };
       return new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
     });
   }
@@ -443,12 +445,15 @@ describe("unchecked ranges", () => {
     let served = 0;
     const rpc = new SorobanRpc("http://rpc", async (_input, init) => {
       const { id, params } = JSON.parse(String(init?.body));
-      const from = Number(params.pagination.cursor ?? 0);
-      const page = events.slice(from, from + Number(params.pagination.limit));
+      const after = params.pagination.cursor as string | undefined;
+      const from = after === undefined ? 0 : events.filter((e) => e.id <= after).length;
+      const limit = Number(params.pagination.limit);
+      const page = events.slice(from, from + limit);
       served++;
       const result = {
         events: page,
-        cursor: String(from + page.length),
+        cursor:
+          page.length === limit ? (page[page.length - 1] as { id: string }).id : ledgerEnd(latest),
         latestLedger: latest,
         oldestLedger: 1,
       };
@@ -773,5 +778,103 @@ describe("unchecked ranges", () => {
         (err: unknown) => err instanceof CyphrasError && err.code === "indexer_fault",
       );
     }
+  });
+});
+
+describe("the vault's events from RPC", () => {
+  const VAULT = StrKey.encodeContract(Buffer.alloc(32, 9));
+
+  // The vault adding the leaf at `index`, as the `n`-th event of `ledger`.
+  const added = (index: number, ledger: number, n = 1) => ({
+    type: "contract",
+    ledger,
+    ledgerClosedAt: "2026-10-04T00:00:00Z",
+    contractId: VAULT,
+    id: eventId(ledger, n),
+    txHash: "ab".repeat(32),
+    inSuccessfulContractCall: true,
+    topic: [xdr.ScVal.scvSymbol("new_commitment").toXDR("base64")],
+    value: map([
+      ["index", xdr.ScVal.scvU64(new xdr.Uint64(BigInt(index)))],
+      ["commitment", nativeToScVal(leaf(index), { type: "u256" })],
+      ["encrypted_output", xdr.ScVal.scvBytes(Buffer.alloc(181, index % 256))],
+    ]).toXDR("base64"),
+  });
+
+  // An RPC holding these events up to the ledger `head`, which scans at most 10,000 ledgers a
+  // request, from its start ledger or its cursor's on, as stellar-rpc does. A `stuck` one gives back
+  // the cursor it was given; a `bare` one gives no cursor.
+  function scanning(
+    events: readonly ReturnType<typeof added>[],
+    head: number,
+    quirk: "stuck" | "bare" | undefined = undefined,
+  ) {
+    let served = 0;
+    const rpc = new SorobanRpc("http://rpc", async (_input, init) => {
+      const { id, params } = JSON.parse(String(init?.body));
+      const after = params.pagination.cursor as string | undefined;
+      const from =
+        after === undefined
+          ? (params.startLedger as number)
+          : Number(BigInt(after.split("-")[0] as string) >> 32n);
+      const last = Math.min(head, from + 10_000 - 1);
+      const limit = params.pagination.limit as number;
+      const page = events
+        .filter((e) => (after === undefined ? e.ledger >= from : e.id > after) && e.ledger <= last)
+        .slice(0, limit);
+      served++;
+      const cursor =
+        page.length === limit ? (page[page.length - 1] as { id: string }).id : ledgerEnd(last);
+      const result = {
+        events: page,
+        ...(quirk === "bare" ? {} : { cursor: quirk === "stuck" && after ? after : cursor }),
+        latestLedger: head,
+        oldestLedger: 1,
+      };
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id, result }));
+    });
+    return { rpc, served: () => served };
+  }
+
+  const indices = (events: { readonly leaves: readonly Leaf[] }): number[] =>
+    events.leaves.map((l) => l.index);
+
+  it("reads on past short pages until the cursor reaches the latest ledger", async () => {
+    const { rpc, served } = scanning([added(0, 100), added(1, 25_000), added(2, 31_000)], 35_000);
+    const events = await new RpcEventSource(rpc, VAULT, 100, 10).events();
+    assert.deepEqual(indices(events), [0, 1, 2]);
+    assert.equal(events.latest, 35_000);
+    assert.equal(served(), 4);
+  });
+
+  it("takes as read only the ledgers the cursor shows scanned when the page cap stops it", async () => {
+    const { rpc } = scanning([added(0, 100), added(1, 25_000)], 35_000);
+    const events = await new RpcEventSource(rpc, VAULT, 100, 2).events();
+    assert.deepEqual(indices(events), [0]);
+    assert.equal(events.latest, 20_098);
+  });
+
+  it("takes no ledger as read that a full page stops inside of", async () => {
+    const crowded = Array.from({ length: 1_500 }, (_, i) => added(i, 200, i + 1));
+    const events = [...crowded, added(1_500, 300)];
+    const cut = await new RpcEventSource(scanning(events, 400).rpc, VAULT, 100, 1).events();
+    assert.deepEqual(indices(cut), []);
+    assert.equal(cut.latest, 199);
+    const whole = await new RpcEventSource(scanning(events, 400).rpc, VAULT, 100, 3).events();
+    assert.equal(whole.leaves.length, 1_501);
+    assert.equal(whole.latest, 400);
+  });
+
+  it("stops where the cursor does not move on, and refuses a page with no cursor", async () => {
+    const events = [added(0, 100), added(1, 25_000)];
+    const stuck = scanning(events, 35_000, "stuck");
+    const read = await new RpcEventSource(stuck.rpc, VAULT, 100, 10).events();
+    assert.deepEqual(indices(read), [0]);
+    assert.equal(read.latest, 10_099);
+    assert.equal(stuck.served(), 2);
+    await assert.rejects(
+      new RpcEventSource(scanning(events, 35_000, "bare").rpc, VAULT, 100, 10).events(),
+      (err: unknown) => err instanceof CyphrasError && err.code === "rpc_error",
+    );
   });
 });
