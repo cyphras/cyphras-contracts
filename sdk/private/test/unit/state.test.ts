@@ -54,7 +54,7 @@ describe("stored state", () => {
     older.plans = [
       { evidence: [{ outputs: [3, null] }, { outputs: [null, null] }], exit: { id: 1, parts: [] } },
     ];
-    older.deposits = [{ state: "admitted" }];
+    older.deposits = [{ state: "admitted" }, { state: "cancelled" }];
     await store.write("state", new TextEncoder().encode(JSON.stringify(older)));
     const loaded = await loadState(store);
     assert.deepEqual(loaded?.ledgerTimes, []);
@@ -76,9 +76,16 @@ describe("stored state", () => {
       loaded?.plans[0]?.evidence.map((e) => e.providers),
       [1, 0],
     );
-    // Exits and deposits kept without what they rest on count as the indexer's word.
+    // Exits and deposits kept without what they rest on count as the indexer's word; a deposit
+    // then cancelled was its depositor's cancel.
     assert.equal(loaded?.plans[0]?.exit?.confirmed, false);
-    assert.equal(loaded?.deposits[0]?.confirmed, false);
+    assert.deepEqual(
+      loaded?.deposits.map((d) => [d.confirmed, d.ownReturn]),
+      [
+        [false, undefined],
+        [false, "cancelled"],
+      ],
+    );
   });
 
   it("refuses a number without its sign", async () => {

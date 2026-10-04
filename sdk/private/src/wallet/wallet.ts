@@ -758,11 +758,28 @@ export class PrivateWallet {
     onReads({ view, stats: await live?.stats().catch(() => undefined), pace });
     const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
       xs.filter((x) => x.ledger >= data.since && x.ledger <= data.horizon);
+    const answered = views.filter((v): v is ChainView => v !== undefined);
+    // The confirmed tree holds every leaf of the ledgers before that of a leaf whose ledger a check
+    // confirmed, and, when it holds as many leaves as every provider's view shows, of the ledgers
+    // up to the oldest view.
+    const complete =
+      verified && views.every((v) => v?.roots.nextLeaf === core.state.tree.leafCount);
+    const treeAt = Math.max(
+      core.state.checkedLeafLedger - 1,
+      complete ? Math.min(...answered.map((v) => v.ledger)) : 0,
+    );
     // What a recheck cleared is older than this sync's ledgers, and goes first.
-    await trackDeposits(core, await live?.deposits().catch(() => undefined), [
-      ...(rechecked?.deposits ?? []),
-      ...within(shown?.deposits ?? []),
-    ]);
+    await trackDeposits(
+      core,
+      await live?.deposits().catch(() => undefined),
+      [...(rechecked?.deposits ?? []), ...within(shown?.deposits ?? [])],
+      {
+        treeAt,
+        attestedUpTo: answered
+          .map((v) => v.instance.status.attestedUpTo)
+          .reduce((a, b) => (a < b ? a : b)),
+      },
+    );
     applyExits(
       core.state,
       [

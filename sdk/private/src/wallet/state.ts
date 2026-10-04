@@ -167,9 +167,14 @@ export interface Deposit {
   flag: { readonly reason: number; readonly flaggedAt: number | undefined } | undefined;
   leafIndices: readonly [number, number] | undefined;
   refundReason: number | undefined;
-  // The state and the entry queue's details rest on the wallet's own transactions, the vault's
-  // events every RPC provider showed and the confirmed tree, rather than on the indexer's account.
+  // The state and the entry queue's details rest on every RPC provider's reads of the entry queue,
+  // the wallet's own transactions every provider reports, the vault's events every provider showed
+  // and the confirmed tree, rather than on the indexer's account.
   confirmed: boolean;
+  // The ledger by which every provider showed the deposit gone from the entry queue, and whether
+  // this wallet sent its cancel or refund.
+  goneAt: number | undefined;
+  ownReturn: "cancelled" | "refunded" | undefined;
 }
 
 // A payment spread over several transactions, each within the vault's single-exit cap and sent
@@ -369,11 +374,17 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   for (const e of state.plans.flatMap((p) => p.evidence)) {
     e.providers ??= e.outputs.some((pos) => pos !== undefined) ? 1 : 0;
   }
-  // Exits and deposits kept without saying what they rest on count as the indexer's word.
+  // Exits and deposits kept without saying what they rest on count as the indexer's word; a deposit
+  // then cancelled was by its depositor.
   for (const plan of state.plans) {
     if (plan.exit !== undefined) plan.exit.confirmed ??= false;
   }
-  for (const deposit of state.deposits) deposit.confirmed ??= false;
+  for (const deposit of state.deposits) {
+    if (deposit.confirmed === undefined && deposit.state === "cancelled") {
+      deposit.ownReturn = "cancelled";
+    }
+    deposit.confirmed ??= false;
+  }
   return state;
 }
 

@@ -76,9 +76,9 @@ export interface DepositInfo {
   readonly refundableAt: number | undefined;
   readonly refundReason: number | undefined;
   readonly refundKind: ScreeningKind | undefined;
-  // The state and the entry queue's details rest on the wallet's own transactions, the vault's
-  // events every RPC provider showed and the confirmed tree, rather than on the indexer's account
-  // alone.
+  // The state and the entry queue's details rest on every RPC provider's reads of the entry queue,
+  // the wallet's own transactions every provider reports, the vault's events every provider showed
+  // and the confirmed tree, rather than on the indexer's account alone.
   readonly confirmed: boolean;
 }
 
@@ -204,6 +204,8 @@ export async function shield(
     leafIndices: undefined,
     refundReason: undefined,
     confirmed: true,
+    goneAt: undefined,
+    ownReturn: undefined,
   };
   core.state.deposits.push(deposit);
   await core.save();
@@ -266,13 +268,7 @@ export async function cancelDeposit(
     args: [u64(id)],
     transfers: [],
   });
-  const record = core.state.deposits.find((d) => d.id === id);
-  if (record !== undefined) {
-    record.state = "cancelled";
-    record.refundReason = 0;
-    record.confirmed = true;
-    await core.save();
-  }
+  await returned(core, id, "cancelled", 0, result.hash);
   return result.hash;
 }
 
@@ -300,14 +296,27 @@ export async function refundDeposit(
     args: [u64(id)],
     transfers: [],
   });
-  const record = core.state.deposits.find((d) => d.id === id);
-  if (record !== undefined) {
-    record.state = "refunded";
-    record.refundReason = pending.flag;
-    record.confirmed = true;
-    await core.save();
-  }
+  await returned(core, id, "refunded", pending.flag, result.hash);
   return result.hash;
+}
+
+// Records this wallet's cancel or refund of a deposit, which counts once every RPC provider reports
+// its transaction a success; until then the deposit is followed on the chain.
+async function returned(
+  core: Core,
+  id: number,
+  how: "cancelled" | "refunded",
+  reason: number | undefined,
+  hash: string,
+): Promise<void> {
+  const record = core.state.deposits.find((d) => d.id === id);
+  if (record === undefined) return;
+  const statuses = await askTransaction(invokeContext(core), providers(core), hash);
+  record.state = how;
+  record.refundReason = reason;
+  record.ownReturn = how;
+  record.confirmed = statuses.every((s) => s?.status === "SUCCESS");
+  await core.save();
 }
 
 const providers = (core: Core): SorobanRpc[] =>
@@ -343,31 +352,51 @@ async function depositOutcome(core: Core, hash: string): Promise<number | "faile
   return outcomeOf(statuses);
 }
 
-// The entry queue's entries under these IDs that every RPC provider shows alike, in one read from
-// each; none while a provider cannot answer.
-async function queueEntries(
-  core: Core,
-  ids: readonly number[],
-): Promise<Map<number, PendingDepositEntry>> {
-  const out = new Map<number, PendingDepositEntry>();
+// What every RPC provider shows alike of the entry queue under an ID: its entry, or none, as of the
+// latest ledger they read at.
+interface QueueRead {
+  readonly entry: PendingDepositEntry | undefined;
+  readonly ledger: number;
+}
+
+// Every RPC provider's reads of the entry queue under these IDs, in one read from each: what they
+// show alike under each ID; nothing while a provider cannot answer.
+async function readQueue(core: Core, ids: readonly number[]): Promise<Map<number, QueueRead>> {
+  const out = new Map<number, QueueRead>();
   if (ids.length === 0) return out;
   const { vault, second } = core.services;
-  const reads: Map<bigint, PendingDepositEntry>[] = [];
+  const reads: Awaited<ReturnType<typeof vault.pendings>>[] = [];
   for (const reader of second === undefined ? [vault] : [vault, second.vault]) {
     const read = await reader.pendings(ids.map(BigInt)).catch((err: unknown) => {
       if (err instanceof CyphrasError) return undefined;
       throw err;
     });
     if (read === undefined) return out;
-    reads.push(read.entries);
+    reads.push(read);
   }
   const key = (e: PendingDepositEntry | undefined): string =>
-    JSON.stringify(e, (_k, v: unknown) => (typeof v === "bigint" ? `${v}` : v));
+    JSON.stringify(e, (_k, v: unknown) => (typeof v === "bigint" ? `${v}` : v)) ?? "";
+  const ledger = Math.max(...reads.map((r) => r.ledger));
   for (const id of ids) {
-    const [first, ...rest] = reads.map((r) => r.get(BigInt(id)));
-    if (first !== undefined && rest.every((e) => key(e) === key(first))) out.set(id, first);
+    const [entry, ...rest] = reads.map((r) => r.entries.get(BigInt(id)));
+    if (rest.every((e) => key(e) === key(entry))) out.set(id, { entry, ledger });
   }
   return out;
+}
+
+// The deposit as the entry queue holds it: pending, with the chain's flag, the time from which it
+// can be admitted and whether it is attested.
+function follow(deposit: Deposit, entry: PendingDepositEntry, attestedUpTo: bigint): void {
+  deposit.state = "pending";
+  deposit.flag =
+    entry.flag === undefined
+      ? undefined
+      : { reason: entry.flag, flaggedAt: Number(entry.flaggedAt) };
+  deposit.earliestAdmission = Number(entry.createdAt + entry.delay);
+  deposit.attested = BigInt(deposit.id as number) <= attestedUpTo;
+  deposit.refundReason = undefined;
+  deposit.goneAt = undefined;
+  deposit.confirmed = true;
 }
 
 // Whether the entry queue's entry is this deposit's: its depositor's, of its amount, holding its
@@ -383,7 +412,7 @@ const holds = (entry: PendingDepositEntry | undefined, deposit: Deposit): boolea
 // every RPC provider's entry under it holds the deposit.
 async function claimId(core: Core, id: number): Promise<void> {
   if (core.state.deposits.some((d) => d.id === id)) return;
-  const entry = (await queueEntries(core, [id])).get(id);
+  const entry = (await readQueue(core, [id])).get(id)?.entry;
   const deposit = core.state.deposits.find(
     (d) => d.state === "submitting" && d.id === undefined && holds(entry, d),
   );
@@ -393,17 +422,28 @@ async function claimId(core: Core, id: number): Promise<void> {
   await core.save();
 }
 
+// What a sync's reads of the vault show beyond the deposits' entries: the ledger up to which the
+// confirmed tree holds every leaf, and the last deposit every RPC provider shows attested.
+export interface QueueContext {
+  readonly treeAt: number;
+  readonly attestedUpTo: bigint;
+}
+
 // Follows this wallet's deposits through the entry queue. A deposit still being submitted is found
 // by its commitments in the vault's deposit_pending events, of ledgers every RPC provider showed
 // alike, even when this wallet never learned its transaction; by its transaction as every
 // provider reports it; or under an ID the indexer gives for its depositor and amount, once every
 // provider's entry under that ID holds its commitments. One that cannot land any more, with every
-// ledger up to its deadline checked, failed. A deposit's notes are spendable only once admitted,
-// which is when their leaves appear.
+// ledger up to its deadline checked, failed. Until every source confirms what became of it, a
+// deposit is followed in the entry queue as every provider shows it, where an entry still there
+// outweighs any resolution the indexer gave. One gone from the queue whose notes are not in the
+// confirmed tree of a later ledger went back to its depositor. A deposit's notes are spendable
+// only once admitted, which is when their leaves appear.
 export async function trackDeposits(
   core: Core,
   queue: DepositQueue | undefined,
   events: readonly DepositEvent[],
+  context: QueueContext,
 ): Promise<void> {
   const state: WalletState = core.state;
   const candidates = (d: Deposit): QueuedDeposit[] =>
@@ -413,15 +453,25 @@ export async function trackDeposits(
         e.amount === d.amount &&
         !state.deposits.some((x) => x.id === e.id),
     ) ?? [];
+  // A resolution every source confirmed is final.
+  const followed = (d: Deposit): boolean =>
+    d.id !== undefined &&
+    d.state !== "submitting" &&
+    d.state !== "failed" &&
+    (d.state === "pending" || !d.confirmed);
   const unnamed = state.deposits.filter((d) => d.state === "submitting" && d.id === undefined);
-  const entries = await queueEntries(core, [
-    ...new Set(unnamed.flatMap((d) => candidates(d).map((e) => e.id))),
+  const reads = await readQueue(core, [
+    ...new Set([
+      ...unnamed.flatMap((d) => candidates(d).map((e) => e.id)),
+      ...state.deposits.filter(followed).map((d) => d.id as number),
+    ]),
   ]);
   for (const deposit of state.deposits) {
     // The confirmed tree outweighs whatever else said what became of the deposit.
     if (state.notes.some((n) => deposit.commitments.includes(n.cm))) {
       deposit.state = "admitted";
       deposit.flag = undefined;
+      deposit.goneAt = undefined;
       deposit.confirmed = true;
       continue;
     }
@@ -444,15 +494,10 @@ export async function trackDeposits(
           deposit.state = "pending";
         }
       }
-      const found = candidates(deposit).find((e) => holds(entries.get(e.id), deposit));
+      const found = candidates(deposit).find((e) => holds(reads.get(e.id)?.entry, deposit));
       if (deposit.state === "submitting" && found !== undefined) {
-        const entry = entries.get(found.id) as PendingDepositEntry;
         deposit.id = found.id;
-        deposit.state = "pending";
-        deposit.flag =
-          entry.flag === undefined
-            ? undefined
-            : { reason: entry.flag, flaggedAt: Number(entry.flaggedAt) };
+        follow(deposit, reads.get(found.id)?.entry as PendingDepositEntry, context.attestedUpTo);
         continue;
       }
       if (
@@ -462,17 +507,38 @@ export async function trackDeposits(
         deposit.state = "failed";
       }
     }
-    if (deposit.state !== "pending" || deposit.id === undefined) continue;
-    // The indexer's account of the ID counts only for the depositor and amount of this deposit, so
-    // no other deposit's state shows under it.
+    if (!followed(deposit)) continue;
+    const read = reads.get(deposit.id as number);
+    if (holds(read?.entry, deposit)) {
+      follow(deposit, read?.entry as PendingDepositEntry, context.attestedUpTo);
+      continue;
+    }
+    // Gone from the entry queue, the deposit is no longer as the chain last showed it.
+    if (read !== undefined && read.entry === undefined) {
+      deposit.goneAt ??= read.ledger;
+      deposit.confirmed = false;
+    }
+    const { goneAt } = deposit;
+    if (goneAt !== undefined && context.treeAt >= goneAt) {
+      const cancelled = deposit.ownReturn === "cancelled";
+      deposit.state = cancelled ? "cancelled" : "refunded";
+      deposit.refundReason = cancelled ? 0 : (deposit.refundReason ?? deposit.flag?.reason);
+      deposit.flag = undefined;
+      deposit.confirmed = true;
+      continue;
+    }
+    // While the chain says no more, the indexer's account, which counts only for the depositor and
+    // amount of this deposit, so that no other deposit's state shows under its ID.
     const ours = (d: { id: number; depositor: string; amount: bigint }): boolean =>
       d.id === deposit.id && d.depositor === deposit.depositor && d.amount === deposit.amount;
     const queued = queue?.pending.find(ours);
     const resolved = queue?.resolved.find(ours);
     if (queued !== undefined) {
+      deposit.state = "pending";
       deposit.attested = queued.attested;
       deposit.earliestAdmission = queued.earliestAdmission;
       deposit.flag = queued.flag;
+      deposit.refundReason = undefined;
       deposit.confirmed = false;
     } else if (resolved !== undefined) {
       deposit.state = resolved.outcome;
