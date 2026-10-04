@@ -3,6 +3,10 @@ package main
 import (
 	"maps"
 	"testing"
+
+	"github.com/stellar/go-stellar-sdk/network"
+
+	"github.com/cyphras/cyphras-contracts/services/internal/rpc/rpctest"
 )
 
 func TestOnlyACourtOrderIsHeldFromRefundsByDefault(t *testing.T) {
@@ -25,18 +29,25 @@ func TestOnlyACourtOrderIsHeldFromRefundsByDefault(t *testing.T) {
 	}
 }
 
-func TestTheTTLFeeCapIsFiveLumensUnlessSetToAPositiveFee(t *testing.T) {
+func TestTheEngineCapsExtensionsAtTheTTLFeeCap(t *testing.T) {
+	fake := rpctest.New(network.TestNetworkPassphrase, 1)
 	t.Setenv("TTL_FEE_CAP", "")
-	if limit, err := ttlFeeCap(); err != nil || limit != 50_000_000 {
-		t.Fatalf("by default: %d, %v", limit, err)
+	if e, err := newEngine(fake, network.TestNetworkPassphrase, nil); err != nil || e.MaxTTLFee != 50_000_000 || e.MaxResourceFee != 50_000_000 {
+		t.Fatalf("by default: %+v, %v", e, err)
 	}
 	t.Setenv("TTL_FEE_CAP", "100000000")
-	if limit, err := ttlFeeCap(); err != nil || limit != 100_000_000 {
-		t.Fatalf("set: %d, %v", limit, err)
+	if e, err := newEngine(fake, network.TestNetworkPassphrase, nil); err != nil || e.MaxTTLFee != 100_000_000 || e.TTLFeeCap() != 100_000_000 {
+		t.Fatalf("set: %+v, %v", e, err)
 	}
-	for _, bad := range []string{"0", "-1", "5 XLM"} {
+	for _, ok := range []string{"100000", "4000000000"} {
+		t.Setenv("TTL_FEE_CAP", ok)
+		if _, err := newEngine(fake, network.TestNetworkPassphrase, nil); err != nil {
+			t.Fatalf("%q was refused: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"0", "-1", "99999", "4000000001", "5 XLM"} {
 		t.Setenv("TTL_FEE_CAP", bad)
-		if _, err := ttlFeeCap(); err == nil {
+		if _, err := newEngine(fake, network.TestNetworkPassphrase, nil); err == nil {
 			t.Fatalf("%q was taken", bad)
 		}
 	}

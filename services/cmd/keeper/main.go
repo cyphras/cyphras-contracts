@@ -6,6 +6,7 @@ package main
 
 import (
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
 	"github.com/cyphras/cyphras-contracts/services/internal/keeper"
+	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/service"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
 )
@@ -43,11 +45,8 @@ func main() {
 	if err := base.StartAlerts(ctx, pool); err != nil {
 		service.Fatal(log, "alerts", err)
 	}
-	engine, err := service.Engine(base.RPC, base.Deployment.NetworkPassphrase, base.Log)
+	engine, err := newEngine(base.RPC, base.Deployment.NetworkPassphrase, base.Log)
 	if err != nil {
-		service.Fatal(log, "config", err)
-	}
-	if engine.MaxTTLFee, err = ttlFeeCap(); err != nil {
 		service.Fatal(log, "config", err)
 	}
 	hold, err := holdReasons()
@@ -124,13 +123,23 @@ func holdReasons() (map[uint32]bool, error) {
 // screeningHold is the reason of the screening service's holds.
 const screeningHold = 6
 
-// ttlFeeCap reads TTL_FEE_CAP, the most resource fee, in stroops, one extension or restoration of
-// entries may pay: 5 XLM by default. Their fee is the rent of the entries, which differs from the
-// cost of the vault's calls, so it is capped apart from RESOURCE_FEE_CAP.
-func ttlFeeCap() (int64, error) {
-	limit, err := config.Int("TTL_FEE_CAP", 50_000_000)
-	if err == nil && limit <= 0 {
-		err = errors.New("TTL_FEE_CAP must be positive")
+// newEngine builds the submission engine the services share, with the cap TTL_FEE_CAP sets on the
+// resource fee an extension or restoration of entries declares: 5 XLM by default. Their fee is the
+// rent of the entries, which differs from the cost of the vault's calls, so it is capped apart from
+// RESOURCE_FEE_CAP. The cap lies between 0.01 XLM and 400 XLM, as a transaction's fee field holds
+// at most 429.5 XLM with its inclusion fee.
+func newEngine(c rpc.Client, passphrase string, log *slog.Logger) (*submit.Engine, error) {
+	engine, err := service.Engine(c, passphrase, log)
+	if err != nil {
+		return nil, err
 	}
-	return limit, err
+	limit, err := config.Int("TTL_FEE_CAP", 50_000_000)
+	if err == nil && (limit < 100_000 || limit > 4_000_000_000) {
+		err = errors.New("TTL_FEE_CAP must be 100000 to 4000000000 stroops")
+	}
+	if err != nil {
+		return nil, err
+	}
+	engine.MaxTTLFee = limit
+	return engine, nil
 }
