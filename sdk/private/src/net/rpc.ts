@@ -39,7 +39,9 @@ export interface MetaEvent {
 export interface TransactionStatus {
   readonly status: "SUCCESS" | "FAILED" | "NOT_FOUND";
   readonly ledger: number | undefined;
+  // The ledgers RPC holds transactions of, the oldest when it says.
   readonly latestLedger: number;
+  readonly oldestLedger: number | undefined;
   readonly returnValue: xdr.ScVal | undefined;
   readonly events: readonly MetaEvent[];
   // A failure whose diagnostic events name an error of the host's storage, as of a call that
@@ -213,6 +215,7 @@ export class SorobanRpc {
       status,
       ledger: r.has("ledger") ? r.integer("ledger") : undefined,
       latestLedger: r.integer("latestLedger", 1),
+      oldestLedger: r.has("oldestLedger") ? r.integer("oldestLedger") : undefined,
       returnValue,
       events,
       diagnosed: diagnostics.length > 0,

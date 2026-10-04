@@ -150,11 +150,13 @@ export interface ShieldReceipt {
 }
 
 // Proves a deposit with two dummy inputs and both outputs to the wallet's own address, has the
-// depositor sign it, and submits it through the RPC.
+// depositor sign it, and submits it through the RPC. While another deposit of this wallet is still
+// being submitted, and so may yet land, it goes only `whileSubmitting`.
 export async function shield(
   core: Core,
   amount: bigint,
   signer: TransactionSigner,
+  whileSubmitting: boolean,
 ): Promise<ShieldReceipt> {
   const keys = spendingKeys(core);
   if (core.prover === undefined || core.artifacts === undefined) {
@@ -162,6 +164,12 @@ export async function shield(
   }
   if (!isAccountId(signer.publicKey)) fail("invalid_argument", "the depositor must be a G account");
   if (amount <= 0n) fail("invalid_argument", "the amount must be positive");
+  if (!whileSubmitting && core.state.deposits.some((d) => d.state === "submitting")) {
+    fail(
+      "deposit_submitting",
+      "another deposit of this wallet is still being submitted, and may yet land",
+    );
+  }
   const instance = await core.services.vault.instance();
   await checkDepositLimits(core, instance, signer.publicKey, amount);
 
@@ -238,6 +246,7 @@ export async function shield(
     // deposit stays submitting, and a sync takes its ID from the chain.
     const outcome = outcomeOf(
       await askTransaction(invokeContext(core), providers(core), result.hash),
+      deposit,
     );
     if (typeof outcome === "number") {
       deposit.id = outcome;
@@ -246,12 +255,10 @@ export async function shield(
     await core.save();
     return { depositId: deposit.id, txHash: result.hash };
   } catch (err) {
-    // A deposit whose envelope never left the device, or that the network refused, is void; one
-    // that may have reached the network stays submitting with its hash, for a sync to settle.
-    if (
-      err instanceof CyphrasError &&
-      (deposit.txHash === undefined || err.details["refused"] === true)
-    ) {
+    // A deposit whose envelope never left the device is void. One that may have reached the
+    // network stays submitting with its hash, whatever the RPC it went through answered, for a
+    // sync to settle.
+    if (err instanceof CyphrasError && deposit.txHash === undefined) {
       deposit.state = "failed";
       await core.save();
     }
@@ -331,32 +338,42 @@ const providers = (core: Core): SorobanRpc[] =>
     ? [core.services.rpc]
     : [core.services.rpc, core.services.second.rpc];
 
-// The ID of the deposit a shield transaction made, or its failure, as every RPC provider reports
-// it; none while they differ, cannot answer or do not hold the transaction.
+// What every RPC provider reports of a deposit's shield transaction: the ID it made, once they all
+// report it alike; failed, once every one reports it failed, or missing while it holds every
+// ledger the deposit could have been made in, at a ledger past its proof's deadline, after which
+// it can no longer land; none otherwise.
 function outcomeOf(
   statuses: readonly (TransactionStatus | undefined)[],
+  deposit: Deposit,
 ): number | "failed" | undefined {
-  const outcomes = statuses.map((status) =>
-    status?.status === "FAILED"
-      ? "failed"
-      : status?.status === "SUCCESS" && status.returnValue?.switch().name === "scvU64"
-        ? Number(scValToBigInt(status.returnValue))
-        : undefined,
+  const ended = (s: TransactionStatus | undefined): boolean =>
+    s !== undefined &&
+    s.latestLedger > deposit.deadline &&
+    (s.status === "FAILED" ||
+      (s.status === "NOT_FOUND" && (s.oldestLedger ?? Infinity) <= deposit.builtAt + 1));
+  if (statuses.every(ended)) return "failed";
+  const ids = statuses.map((s) =>
+    s?.status === "SUCCESS" && s.returnValue?.switch().name === "scvU64"
+      ? Number(scValToBigInt(s.returnValue))
+      : undefined,
   );
-  return outcomes.every((o) => o === outcomes[0]) ? outcomes[0] : undefined;
+  return ids.every((id) => id === ids[0]) ? ids[0] : undefined;
 }
 
-async function depositOutcome(core: Core, hash: string): Promise<number | "failed" | undefined> {
+async function depositOutcome(
+  core: Core,
+  deposit: Deposit,
+): Promise<number | "failed" | undefined> {
   const statuses: (TransactionStatus | undefined)[] = [];
   for (const provider of providers(core)) {
     statuses.push(
-      await provider.getTransaction(hash).catch((err: unknown) => {
+      await provider.getTransaction(deposit.txHash as string).catch((err: unknown) => {
         if (err instanceof CyphrasError) return undefined;
         throw err;
       }),
     );
   }
-  return outcomeOf(statuses);
+  return outcomeOf(statuses, deposit);
 }
 
 // What each RPC provider shows of the entry queue under an ID: its entry, or none, and the ledger
@@ -458,8 +475,9 @@ export interface QueueContext {
 // by its commitments in the vault's deposit_pending events, of ledgers every RPC provider showed
 // alike, even when this wallet never learned its transaction; by its transaction as every
 // provider reports it; or under an ID the indexer gives for its depositor and amount, once every
-// provider's entry under that ID holds its commitments. One that cannot land any more, with every
-// ledger up to its deadline checked, failed. Until every source confirms what became of it, a
+// provider's entry under that ID holds its commitments. One that cannot land any more, as every
+// provider reports its transaction or every ledger up to its deadline checked shows, failed,
+// until any of these finds it made after all. Until every source confirms what became of it, a
 // deposit is followed in the entry queue as every provider shows it, where an entry still there
 // outweighs any resolution the indexer gave. One gone from the queue whose notes are not in the
 // confirmed tree of a later ledger went back to its depositor. A deposit's notes are spendable
@@ -484,7 +502,9 @@ export async function trackDeposits(
     d.state !== "submitting" &&
     d.state !== "failed" &&
     (d.state === "pending" || !d.confirmed);
-  const unnamed = state.deposits.filter((d) => d.state === "submitting" && d.id === undefined);
+  const unnamed = state.deposits.filter(
+    (d) => (d.state === "submitting" || d.state === "failed") && d.id === undefined,
+  );
   const reads = await readQueue(core, [
     ...new Set([
       ...unnamed.flatMap((d) => candidates(d).map((e) => e.id)),
@@ -500,18 +520,19 @@ export async function trackDeposits(
       deposit.confirmed = true;
       continue;
     }
+    const made = events.find(
+      (e) =>
+        e.commitments[0] === deposit.commitments[0] && e.commitments[1] === deposit.commitments[1],
+    );
+    // A deposit taken for failed that the vault's events show made after all is being submitted.
+    if (deposit.state === "failed" && made !== undefined) deposit.state = "submitting";
     if (deposit.state === "submitting") {
-      const pending = events.find(
-        (e) =>
-          e.commitments[0] === deposit.commitments[0] &&
-          e.commitments[1] === deposit.commitments[1],
-      );
-      if (pending !== undefined) {
-        deposit.id = pending.id;
-        deposit.txHash = pending.txHash;
+      if (made !== undefined) {
+        deposit.id = made.id;
+        deposit.txHash = made.txHash;
         deposit.state = "pending";
       } else if (deposit.txHash !== undefined) {
-        const outcome = await depositOutcome(core, deposit.txHash);
+        const outcome = await depositOutcome(core, deposit);
         if (outcome === "failed") {
           deposit.state = "failed";
         } else if (outcome !== undefined) {
@@ -519,19 +540,24 @@ export async function trackDeposits(
           deposit.state = "pending";
         }
       }
+    }
+    if (
+      (deposit.state === "submitting" || deposit.state === "failed") &&
+      deposit.id === undefined
+    ) {
       const found = candidates(deposit).find((e) => holds(alike(reads.get(e.id)), deposit));
-      if (deposit.state === "submitting" && found !== undefined) {
+      if (found !== undefined) {
         deposit.id = found.id;
         see(deposit, reads.get(found.id));
         follow(deposit, alike(reads.get(found.id)) as PendingDepositEntry, context.attestedUpTo);
         continue;
       }
-      if (
-        deposit.state === "submitting" &&
-        checkedBetween(state, deposit.builtAt, deposit.deadline)
-      ) {
-        deposit.state = "failed";
-      }
+    }
+    if (
+      deposit.state === "submitting" &&
+      checkedBetween(state, deposit.builtAt, deposit.deadline)
+    ) {
+      deposit.state = "failed";
     }
     if (!followed(deposit)) continue;
     const read = reads.get(deposit.id as number);

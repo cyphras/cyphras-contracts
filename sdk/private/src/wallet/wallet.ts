@@ -888,14 +888,19 @@ export class PrivateWallet {
     }));
   }
 
-  /** Proves a deposit, has the depositor sign it, submits it and returns its deposit ID. */
+  /**
+   * Proves a deposit, has the depositor sign it, submits it and returns its deposit ID. While
+   * another deposit of this wallet is still being submitted, and so may yet land, it fails with
+   * deposit_submitting unless whileSubmitting is set.
+   */
   shield(request: {
     readonly amount: bigint;
     readonly signer: TransactionSigner;
+    readonly whileSubmitting?: boolean;
   }): Promise<ShieldReceipt> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      return shield(this.#core, request.amount, request.signer);
+      return shield(this.#core, request.amount, request.signer, request.whileSubmitting === true);
     });
   }
 

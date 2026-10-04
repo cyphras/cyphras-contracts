@@ -397,8 +397,8 @@ export interface SubmitHooks {
 }
 
 // Builds, simulates, signs and submits one vault call with the signer's account as source, then
-// waits until the transaction is final. A transaction the network refused, or did not take before
-// its time bound passed, fails with details.refused: it never lands.
+// waits until the transaction is final. A transaction the RPC reports the network refused, or did
+// not take before its time bound passed, fails with details.refused.
 export async function invokeVault(
   ctx: InvokeContext,
   signer: TransactionSigner,
