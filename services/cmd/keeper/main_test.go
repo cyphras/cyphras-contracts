@@ -51,4 +51,10 @@ func TestTheEngineCapsExtensionsAtTheTTLFeeCap(t *testing.T) {
 			t.Fatalf("%q was taken", bad)
 		}
 	}
+	// Nor may the inclusion fee cap leave the fee field too little room for the TTL fee cap.
+	t.Setenv("TTL_FEE_CAP", "4000000000")
+	t.Setenv("INCLUSION_FEE_CAP", "100000001")
+	if _, err := newEngine(fake, network.TestNetworkPassphrase, nil); err == nil {
+		t.Fatal("an inclusion fee cap above 10 XLM was taken")
+	}
 }

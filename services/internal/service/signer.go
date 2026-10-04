@@ -97,6 +97,18 @@ func ExitKeys() (uint32, error) {
 	return uint32(n), err
 }
 
+// The bounds of the fee caps, in stroops. An inclusion fee below 100 stroops is under the
+// network's minimum. A transaction's fee field, a uint32 of about 429.5 XLM, holds its inclusion
+// fee and its resource fee together, so the largest caps of the two must fit it together.
+const (
+	MinInclusionFeeCap = 100
+	MaxInclusionFeeCap = 100_000_000
+	MaxResourceFeeCap  = 4_000_000_000
+)
+
+// This fails to compile when the largest caps no longer fit a transaction's fee field together.
+const _ uint32 = MaxInclusionFeeCap + MaxResourceFeeCap
+
 // Engine builds the submission engine from INCLUSION_FEE_CAP and RESOURCE_FEE_CAP, in stroops,
 // and the defaults the services share.
 func Engine(c rpc.Client, passphrase string, log *slog.Logger) (*submit.Engine, error) {
@@ -108,8 +120,11 @@ func Engine(c rpc.Client, passphrase string, log *slog.Logger) (*submit.Engine, 
 	if err != nil {
 		return nil, err
 	}
-	if inclusionCap <= 0 || resourceCap <= 0 {
-		return nil, errors.New("fee caps must be positive")
+	if inclusionCap < MinInclusionFeeCap || inclusionCap > MaxInclusionFeeCap {
+		return nil, fmt.Errorf("INCLUSION_FEE_CAP must be %d to %d stroops", MinInclusionFeeCap, MaxInclusionFeeCap)
+	}
+	if resourceCap <= 0 || resourceCap > MaxResourceFeeCap {
+		return nil, fmt.Errorf("RESOURCE_FEE_CAP must be 1 to %d stroops", MaxResourceFeeCap)
 	}
 	return &submit.Engine{
 		RPC: c, Passphrase: passphrase, MaxInclusionFee: inclusionCap, MaxResourceFee: resourceCap, ResourceMarginPct: 15,

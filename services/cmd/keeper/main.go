@@ -6,6 +6,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -126,16 +127,16 @@ const screeningHold = 6
 // newEngine builds the submission engine the services share, with the cap TTL_FEE_CAP sets on the
 // resource fee an extension or restoration of entries declares: 5 XLM by default. Their fee is the
 // rent of the entries, which differs from the cost of the vault's calls, so it is capped apart from
-// RESOURCE_FEE_CAP. The cap lies between 0.01 XLM and 400 XLM, as a transaction's fee field holds
-// at most 429.5 XLM with its inclusion fee.
+// RESOURCE_FEE_CAP. The cap lies between 0.01 XLM and the largest resource fee cap, 400 XLM, which
+// fits a transaction's fee field with the largest inclusion fee cap.
 func newEngine(c rpc.Client, passphrase string, log *slog.Logger) (*submit.Engine, error) {
 	engine, err := service.Engine(c, passphrase, log)
 	if err != nil {
 		return nil, err
 	}
 	limit, err := config.Int("TTL_FEE_CAP", 50_000_000)
-	if err == nil && (limit < 100_000 || limit > 4_000_000_000) {
-		err = errors.New("TTL_FEE_CAP must be 100000 to 4000000000 stroops")
+	if err == nil && (limit < 100_000 || limit > service.MaxResourceFeeCap) {
+		err = fmt.Errorf("TTL_FEE_CAP must be 100000 to %d stroops", int64(service.MaxResourceFeeCap))
 	}
 	if err != nil {
 		return nil, err
