@@ -1,6 +1,6 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { sha256, sha512 } from "@noble/hashes/sha2";
-import { base64 } from "@scure/base";
+import { base64, base64nopad, base64url, base64urlnopad } from "@scure/base";
 import { generateMnemonic, mnemonicToSeed, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english";
 import { StrKey } from "@stellar/stellar-base";
@@ -29,16 +29,20 @@ export function sep53Digest(message: string): Uint8Array {
   return sha256(concatBytes(utf8(SEP53_PREFIX), utf8(message)));
 }
 
-// The bytes a message given as text may stand for: its UTF-8, and what it decodes to as hex or
-// base64, as some signing APIs take data.
+// The bytes a message given as text may stand for: its UTF-8, and what it decodes to as hex, with
+// or without 0x and white space between bytes, or as base64 or base64url, padded or not, as some
+// signing APIs take data.
 function readings(message: string): Uint8Array[] {
   const out = [utf8(message)];
   const text = message.trim();
-  if (/^([0-9a-fA-F]{2})+$/.test(text)) out.push(hexToBytes(text.toLowerCase()));
-  try {
-    out.push(base64.decode(text));
-  } catch {
-    // not base64
+  const hex = (/^0x/i.test(text) ? text.slice(2) : text).replace(/\s+/g, "");
+  if (/^([0-9a-fA-F]{2})+$/.test(hex)) out.push(hexToBytes(hex.toLowerCase()));
+  for (const codec of [base64, base64nopad, base64url, base64urlnopad]) {
+    try {
+      out.push(codec.decode(text));
+    } catch {
+      // not in this encoding
+    }
   }
   return out;
 }

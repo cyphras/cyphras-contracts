@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, createPrivateKey, sign as nodeSign } from "node:crypto";
 import { describe, it } from "node:test";
 import { ed25519 } from "@noble/curves/ed25519";
-import { base64 } from "@scure/base";
+import { base64, base64nopad, base64url, base64urlnopad } from "@scure/base";
 import { mnemonicToSeedSync, validateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english";
 import { StrKey } from "@stellar/stellar-base";
@@ -141,7 +141,15 @@ describe("the key-derivation message", () => {
       utf8(prefixed),
       digest,
       bytesToHex(digest),
+      `0x${bytesToHex(digest)}`,
+      `0X${bytesToHex(digest).toUpperCase()}`,
+      `0x${bytesToHex(utf8(SIGNATURE_MESSAGE))}`,
+      (bytesToHex(digest).match(/../g) as string[]).join(" "),
       base64.encode(digest),
+      base64nopad.encode(digest),
+      base64url.encode(digest),
+      base64urlnopad.encode(digest),
+      base64nopad.encode(utf8(SIGNATURE_MESSAGE)),
     ]) {
       assert.equal(isKeyDerivationMessage(form), true, String(form).slice(0, 48));
     }
