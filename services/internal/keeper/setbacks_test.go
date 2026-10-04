@@ -225,36 +225,6 @@ func TestAClaimThatFailsOnChainRestsItsExitAndTheOthersGoAhead(t *testing.T) {
 	}
 }
 
-func TestBumpTTLRestoresArchivedEntriesFirstAndSplitsACallTheLimitsRefuse(t *testing.T) {
-	h := newHarness(t)
-	for range 8 {
-		h.shield(10, nil, 0)
-	}
-	h.sync()
-	latest := h.chain.Ledger
-	archived, near, far := latest-1, latest+100_000, latest+3_000_000
-	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Vault)), vaulttest.Instance(vaulttest.InstanceOptions{
-		DelaySmall: 3600, DelayLarge: 86400, Limit: h.limit, Large: 5_000_000_000, Status: h.status, WasmHash: [32]byte{9},
-	}), 10, &archived)
-	for _, key := range mustKey(vault.TreeKeys(vaulttest.Vault)) {
-		h.fake.SetContractData(key, vault.U64(0), 10, &far)
-	}
-	for id := uint64(1); id <= 8; id++ {
-		h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)), vaulttest.Pending(id, vaulttest.Depositor, 10, 0, 3600, nil, 0), 10, &near)
-	}
-	h.fake.SetEntry(vault.CodeKey([32]byte{9}), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeContractCode, ContractCode: &xdr.ContractCodeEntry{Hash: xdr.Hash{9}}}, 10, &far)
-	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Token)), vault.U64(0), 10, &far)
-	h.simFail = func(d string) bool { return strings.HasPrefix(d, "bump_ttl") && strings.Count(d, ",") >= 4 }
-	if err := h.k.TTLCycle(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// The shields' nullifiers are restored and extended after these.
-	want := []string{"restore 1", "bump_ttl [1,2,3,4] []", "bump_ttl [5,6,7,8] []"}
-	if got := h.take(); len(got) < 3 || !equal(got[:3], want) {
-		t.Fatalf("ttl cycle sent %v", got)
-	}
-}
-
 func TestAnAdmitThatWouldAdmitNothingIsNotSent(t *testing.T) {
 	h := newHarness(t)
 	h.shield(10, nil, 0)

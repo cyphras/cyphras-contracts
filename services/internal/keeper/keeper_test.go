@@ -67,6 +67,12 @@ type harness struct {
 	// flaggedAt is when each flagged deposit was flagged, which the simulated vault refunds only a
 	// day after.
 	flaggedAt map[uint64]uint64
+	// rent, when set, prices each ledger an extension adds to an entry's life in the simulated
+	// resource fee; refuse makes the simulation refuse a footprint, as one naming an entry archived
+	// since the keeper read it; playTTL makes sent extensions and restorations change the entries.
+	rent    func(key xdr.LedgerKey, ledgers uint32) int64
+	refuse  func(xdr.LedgerFootprint) bool
+	playTTL bool
 }
 
 // released is what the simulated vault's release(max) returns: how many exits it handles from the
@@ -148,6 +154,9 @@ func newHarness(t *testing.T) *harness {
 		if h.simFail != nil && h.simFail(describe(env)) {
 			return protocol.SimulateTransactionResponse{Error: "resource limit exceeded"}, nil
 		}
+		if data := env.V1.Tx.Ext.SorobanData; h.refuse != nil && data != nil && h.refuse(data.Resources.Footprint) {
+			return protocol.SimulateTransactionResponse{Error: "entry is archived"}, nil
+		}
 		var refunded uint64
 		if _, err := fmt.Sscanf(describe(env), "refund %d", &refunded); err == nil {
 			if at, ok := h.flaggedAt[refunded]; ok && uint64(h.now.Unix()) < at+86_400 {
@@ -159,6 +168,15 @@ func newHarness(t *testing.T) *harness {
 			data = *env.V1.Tx.Ext.SorobanData
 		}
 		encoded, _ := xdr.MarshalBase64(data)
+		fee := int64(100)
+		if op := env.V1.Tx.Operations[0].Body.ExtendFootprintTtlOp; op != nil && h.rent != nil {
+			target := h.fake.Latest + uint32(op.ExtendTo)
+			for _, key := range data.Resources.Footprint.ReadOnly {
+				if until, ok := h.fake.LiveUntil(key); ok && until < target {
+					fee += h.rent(key, target-until)
+				}
+			}
+		}
 		result := protocol.SimulateHostFunctionResult{}
 		var max uint64
 		if _, err := fmt.Sscanf(describe(env), "release %d", &max); err == nil {
@@ -175,7 +193,7 @@ func newHarness(t *testing.T) *harness {
 			ret, _ := xdr.MarshalBase64(vault.Vec(admitted...))
 			result.ReturnValueXDR = &ret
 		}
-		return protocol.SimulateTransactionResponse{TransactionDataXDR: encoded, MinResourceFee: 100, Results: []protocol.SimulateHostFunctionResult{result}}, nil
+		return protocol.SimulateTransactionResponse{TransactionDataXDR: encoded, MinResourceFee: fee, Results: []protocol.SimulateHostFunctionResult{result}}, nil
 	}
 	h.fake.Send = func(req protocol.SendTransactionRequest) (protocol.SendTransactionResponse, error) {
 		var env xdr.TransactionEnvelope
@@ -186,8 +204,11 @@ func newHarness(t *testing.T) *harness {
 		if data := env.V1.Tx.Ext.SorobanData; data != nil {
 			h.footprints = append(h.footprints, data.Resources.Footprint)
 		}
-		hook := h.sentHook
+		hook, play := h.sentHook, h.playTTL
 		h.mu.Unlock()
+		if play {
+			h.playFootprint(env)
+		}
 		if hook != nil {
 			hook(describe(env))
 		}
@@ -221,6 +242,33 @@ func newHarness(t *testing.T) *harness {
 	h.k = k
 	h.f = &follow.Follower{RPC: h.fake, Live: follow.RPCSource{Client: h.fake, Contract: vaulttest.Vault}, Window: 100, Sink: k}
 	return h
+}
+
+// playFootprint plays a sent extension or restoration on the chain as the network does: an
+// extension makes every live entry it names live until its target at least, and a restoration
+// gives every archived entry it names the least life of a persistent entry.
+func (h *harness) playFootprint(env xdr.TransactionEnvelope) {
+	data := env.V1.Tx.Ext.SorobanData
+	if data == nil {
+		return
+	}
+	latest := h.fake.Latest
+	op := env.V1.Tx.Operations[0].Body
+	switch op.Type {
+	case xdr.OperationTypeExtendFootprintTtl:
+		target := latest + uint32(op.ExtendFootprintTtlOp.ExtendTo)
+		for _, key := range data.Resources.Footprint.ReadOnly {
+			if until, ok := h.fake.LiveUntil(key); ok && until >= latest && until < target {
+				h.fake.SetLiveUntil(key, target)
+			}
+		}
+	case xdr.OperationTypeRestoreFootprint:
+		for _, key := range data.Resources.Footprint.ReadWrite {
+			if until, ok := h.fake.LiveUntil(key); ok && until < latest {
+				h.fake.SetLiveUntil(key, latest+rpctest.Mainnet.MinPersistentTTL-1)
+			}
+		}
+	}
 }
 
 func mustKey[T any](k T, err error) T {
@@ -413,7 +461,7 @@ func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 	h.shield(10, nil, 0)
 	h.sync()
 	latest := h.chain.Ledger
-	far, near := latest+3_000_000, latest+100_000
+	far, near, archived := latest+3_000_000, latest+100_000, latest-1
 	for _, key := range mustKey(vault.TreeKeys(vaulttest.Vault)) {
 		h.fake.SetContractData(key, vault.U64(0), 10, &far)
 	}
@@ -423,7 +471,6 @@ func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 	// The code is due, the asset contract is not, and the vault's balance entry is archived.
 	h.fake.SetEntry(vault.CodeKey([32]byte{9}), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeContractCode, ContractCode: &xdr.ContractCodeEntry{Hash: xdr.Hash{9}}}, 10, &near)
 	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Token)), vault.U64(0), 10, &far)
-	archived := latest - 1
 	h.fake.SetContractData(mustKey(vault.BalanceKey(vaulttest.Token, vaulttest.Vault)), vault.U64(0), 10, &archived)
 	// Of the four nullifiers, one is fresh, two are due and one is archived.
 	var nfKeys []xdr.LedgerKey
@@ -434,26 +481,40 @@ func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 	h.fake.SetContractData(nfKeys[0], xdr.ScVal{Type: xdr.ScValTypeScvVoid}, 10, &far)
 	h.fake.SetContractData(nfKeys[1], xdr.ScVal{Type: xdr.ScValTypeScvVoid}, 10, &near)
 	h.fake.SetContractData(nfKeys[2], xdr.ScVal{Type: xdr.ScValTypeScvVoid}, 10, &near)
+	h.fake.SetContractData(nfKeys[3], xdr.ScVal{Type: xdr.ScValTypeScvVoid}, 10, &archived)
+	h.playTTL = true
 
 	if err := h.k.TTLCycle(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"bump_ttl [1] []", "restore 1", "extend 2 to 3110399", "restore 1", "extend 3 to 3110399"}
+	// The code and deposit 1 go to 32 days; the archived entries are restored first, and the
+	// small entries go to the maximum.
+	want := []string{"extend 2 to 552960", "restore 1", "extend 1 to 3110399", "restore 1", "extend 3 to 3110399"}
 	if got := h.take(); !equal(got, want) {
 		t.Fatalf("ttl cycle sent %v", got)
 	}
-	var tracked int
-	_ = h.k.chain.Pool.QueryRow(context.Background(), `SELECT count(*) FROM nullifiers WHERE live_until IS NOT NULL`).Scan(&tracked)
-	if tracked != 4 {
-		t.Fatalf("%d nullifiers tracked", tracked)
+	tracked := func() int {
+		var n int
+		_ = h.k.chain.Pool.QueryRow(context.Background(), `SELECT count(*) FROM nullifiers WHERE live_until IS NOT NULL`).Scan(&n)
+		return n
 	}
-	// The next cycle reads only the nullifiers that may be due.
+	// Only the fresh nullifier's life is known; the next cycle reads how far the others got.
+	if n := tracked(); n != 1 {
+		t.Fatalf("%d nullifiers tracked", n)
+	}
+	if err := h.k.TTLCycle(context.Background()); err != nil || len(h.take()) != 0 {
+		t.Fatalf("the next cycle extended again: %v", err)
+	}
+	if n := tracked(); n != 4 {
+		t.Fatalf("%d nullifiers tracked", n)
+	}
+	// The cycle after reads only the vault's own entries and the asset contract's.
 	before := h.fake.CallCount("getLedgerEntries")
 	if err := h.k.TTLCycle(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if h.fake.CallCount("getLedgerEntries")-before > 6 {
-		t.Fatal("fresh nullifiers were read again")
+	if n := h.fake.CallCount("getLedgerEntries") - before; n != 4 {
+		t.Fatalf("%d reads: fresh nullifiers were read again", n)
 	}
 }
 
@@ -672,36 +733,6 @@ func TestStrandedExitsAreClaimedOnceAPartyCanReceive(t *testing.T) {
 	before := h.fake.CallCount("simulateTransaction")
 	if err := h.k.Claims(context.Background()); err != nil || h.fake.CallCount("simulateTransaction") != before {
 		t.Fatalf("claimed while halted: %v", err)
-	}
-}
-
-func TestBumpTTLIsSplitToFitATransaction(t *testing.T) {
-	h := newHarness(t)
-	var ids []uint64
-	for range 70 {
-		ids = append(ids, h.shield(10, nil, 0))
-	}
-	h.sync()
-	near, far := h.chain.Ledger+100_000, h.chain.Ledger+3_000_000
-	for _, id := range ids {
-		h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, id)), vaulttest.Pending(id, vaulttest.Depositor, 10, 0, 3600, nil, 0), 10, &near)
-	}
-	for _, key := range mustKey(vault.TreeKeys(vaulttest.Vault)) {
-		h.fake.SetContractData(key, vault.U64(0), 10, &far)
-	}
-	h.fake.SetEntry(vault.CodeKey([32]byte{9}), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeContractCode, ContractCode: &xdr.ContractCodeEntry{Hash: xdr.Hash{9}}}, 10, &far)
-	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Token)), vault.U64(0), 10, &far)
-	if err := h.k.TTLCycle(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	var bumps []string
-	for _, s := range h.take() {
-		if strings.HasPrefix(s, "bump_ttl") {
-			bumps = append(bumps, s)
-		}
-	}
-	if len(bumps) != 2 || strings.Count(bumps[0], ",") != 59 || strings.Count(bumps[1], ",") != 9 {
-		t.Fatalf("bump calls %v", bumps)
 	}
 }
 

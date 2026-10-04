@@ -80,6 +80,30 @@ func (f *Fake) DeleteEntry(key xdr.LedgerKey) {
 	delete(f.entries, k)
 }
 
+// LiveUntil returns the last ledger an entry is live in, and whether the entry exists with a TTL.
+func (f *Fake) LiveUntil(key xdr.LedgerKey) (uint32, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, _ := rpc.KeyString(key)
+	e, ok := f.entries[k]
+	if !ok || e.LiveUntilLedgerSeq == nil {
+		return 0, false
+	}
+	return *e.LiveUntilLedgerSeq, true
+}
+
+// SetLiveUntil moves the last ledger an existing entry is live in, as an extension or a
+// restoration does.
+func (f *Fake) SetLiveUntil(key xdr.LedgerKey, liveUntil uint32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, _ := rpc.KeyString(key)
+	if e, ok := f.entries[k]; ok {
+		e.LiveUntilLedgerSeq = &liveUntil
+		f.entries[k] = e
+	}
+}
+
 // SetContractData stores a contract data entry holding val.
 func (f *Fake) SetContractData(key xdr.LedgerKey, val xdr.ScVal, lastModified uint32, liveUntil *uint32) {
 	cd := key.MustContractData()
