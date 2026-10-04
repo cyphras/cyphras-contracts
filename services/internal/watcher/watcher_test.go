@@ -418,6 +418,30 @@ func TestLateAdmissionsAndExpiringEntriesPage(t *testing.T) {
 	}
 }
 
+func TestTheVaultsEntriesNearTheirWriteThresholdWarn(t *testing.T) {
+	h := newHarness(t)
+	h.sync()
+	far := h.chain.Ledger + 3_000_000
+	h.primary.SetEntry(vault.CodeKey([32]byte{9}), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeContractCode, ContractCode: &xdr.ContractCodeEntry{Hash: xdr.Hash{9}}}, 1, &far)
+	h.primary.SetContractData(mustKey(vault.FrontierKey(vaulttest.Vault)), vault.U64(0), 1, &far)
+	h.primary.SetContractData(mustKey(vault.InstanceKey(vaulttest.Token)), vault.U64(0), 1, &far)
+	// With half a day above the 30 days below which users pay its rent, the frontier warns; with 40
+	// days, it does not.
+	for _, c := range []struct {
+		left uint32
+		warn bool
+	}{{30*ledgersPerDay + ledgersPerDay/2, true}, {40 * ledgersPerDay, false}} {
+		until := h.chain.Ledger + c.left
+		h.primary.SetContractData(mustKey(vault.FrontierKey(vaulttest.Vault)), vault.U64(0), 1, &until)
+		if err := h.w.CheckTTL(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if h.w.alerts.Open("renewal_late") != c.warn || h.pages.has("entry_expiring") {
+			t.Fatalf("%d ledgers left: %v", c.left, h.pages.codes())
+		}
+	}
+}
+
 func TestFreezesAndGovernanceAccountChangesPage(t *testing.T) {
 	h := newHarness(t)
 	h.sync()
