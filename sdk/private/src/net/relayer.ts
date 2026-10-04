@@ -94,8 +94,10 @@ export class RelayerClient {
     this.#fetch = fetchFn;
   }
 
-  async health(): Promise<RelayerHealth> {
-    const { body } = await requestJson(this.#fetch, "relayer", joinUrl(this.url, "/v1/health"));
+  async health(timeoutMs?: number): Promise<RelayerHealth> {
+    const { body } = await requestJson(this.#fetch, "relayer", joinUrl(this.url, "/v1/health"), {
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    });
     const f = Fields.of(body, "service_unavailable", "relayer health");
     return {
       ...readIdentity(f),

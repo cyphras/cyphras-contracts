@@ -14,13 +14,16 @@ import { CommitmentTree } from "../merkle.ts";
 import { type Deployment, type DeploymentName, resolveDeployment } from "../deployments.ts";
 import { CyphrasError, fail } from "../errors.ts";
 import {
+  type AddressKey,
   type FullViewingKeys,
   type IncomingKeys,
+  type Network,
   type SpendingKeys,
   addressKeyAt,
   addressKeyFor,
   defaultAddressKey,
   deriveSpendingKeys,
+  isNetwork,
 } from "../keys.ts";
 import { type KeySource, checkSeed } from "../keysource.ts";
 import type { FetchLike } from "../net/http.ts";
@@ -64,7 +67,7 @@ import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } f
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
 import { type VaultLimitsView, vaultLimits } from "./limits.ts";
 import { updatePace } from "./pace.ts";
-import { type Verification, createServices, verify } from "./services.ts";
+import { type Verification, createServices, recheckIndexers, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
   IndexerSource,
@@ -161,6 +164,14 @@ export interface OpenOptions extends ConnectionOptions {
   // Where the SDK reads the verifying key, which every proof is checked against; it reads no other
   // artifact.
   readonly artifacts: ArtifactSource;
+}
+
+/** Options of PrivateWallet.address. */
+export interface AddressOptions {
+  readonly network: Network;
+  readonly keys: KeySource;
+  readonly storage: KeyValueStore;
+  readonly index?: number;
 }
 
 /** Options of PrivateWallet.openViewOnly. */
@@ -294,6 +305,10 @@ const VIEWING_KEY_WARNING =
   "A viewing key reveals the whole history and future of this private account to whoever holds " +
   "it, and cannot be revoked. To prove a single payment, use disclosePayment instead.";
 
+// How long one request of the checks of the services may take when a wallet opens, and when an
+// indexer that did not answer is asked again: a service slower than that is passed over for now.
+const CHECK_MS = 5_000;
+
 // Parts of a split unshield follow the previous part's landing by one to six hours, at random.
 const SPLIT_GAP_MS = { min: 3_600_000, max: 21_600_000 };
 
@@ -354,6 +369,17 @@ function viewStoreKey(decoded: ReturnType<typeof decodeViewingKey>): Uint8Array 
 }
 
 const defaultFetch: FetchLike = (input, init) => globalThis.fetch(input, init);
+
+// The address at a diversifier index, or the default address `self`.
+function addressAt(keys: IncomingKeys, self: AddressKey, index: number | undefined): string {
+  if (index === undefined) return encodeAddress(keys.network, self.d, self.pkd);
+  if (!Number.isInteger(index) || index < 0 || index > 0xffffffff) {
+    fail("invalid_argument", "a diversifier index is a 32-bit integer");
+  }
+  const key = addressKeyAt(keys, index);
+  if (key === undefined) fail("invalid_argument", "this diversifier index has no valid address");
+  return encodeAddress(keys.network, key.d, key.pkd);
+}
 
 // The vault's stored state, or the one in the unscoped records when it fits this vault; or, as the
 // options allow, a fresh one in place of a stored state that is unreadable or older than its
@@ -453,6 +479,25 @@ export class PrivateWallet {
     );
   }
 
+  /**
+   * The cy1 or cyt1 address of a private account at a diversifier index, or its default address,
+   * from its key source alone: no state is loaded, no service is asked and nothing syncs. A mode (b)
+   * key source still has its signer sign, and holds the seed to the one of earlier sessions.
+   */
+  static async address(options: AddressOptions): Promise<string> {
+    if (!isNetwork(options.network)) fail("invalid_argument", "unknown network");
+    const material = await options.keys.resolve({
+      network: options.network,
+      storage: options.storage,
+    });
+    checkSeed(material);
+    const keys = deriveSpendingKeys(material.seed, options.network, material.account);
+    material.seed.fill(0);
+    const address = addressAt(keys, defaultAddressKey(keys), options.index);
+    for (const secret of [keys.storeKey, keys.ovk, keys.dk]) secret.fill(0);
+    return address;
+  }
+
   /** A wallet that syncs and reports from an incoming or full viewing key and cannot spend. */
   static async openViewOnly(options: ViewOnlyOptions): Promise<PrivateWallet> {
     const deployment = resolveDeployment(
@@ -526,7 +571,7 @@ export class PrivateWallet {
       now,
       sleep,
     };
-    const { verification } = await verify(services);
+    const verification = await verify(services, CHECK_MS);
     const limits = { ...DEFAULT_SYNC_LIMITS, ...options.syncLimits };
     return new PrivateWallet(core, fetchFn, states, lock, limits, verification, reset);
   }
@@ -619,7 +664,9 @@ export class PrivateWallet {
 
   async #ensureVerified(): Promise<void> {
     if (this.#verification.state === "unverified") {
-      this.#verification = (await verify(this.#core.services)).verification;
+      this.#verification = await verify(this.#core.services);
+    } else if (this.#verification.indexers.some((i) => i.state === "unavailable")) {
+      this.#verification = await recheckIndexers(this.#core.services, this.#verification, CHECK_MS);
     }
     if (this.#verification.state === "mismatch") {
       fail("deployment_mismatch", this.#verification.reason ?? "a service points elsewhere");
@@ -631,14 +678,7 @@ export class PrivateWallet {
 
   /** The cy1 or cyt1 address at a diversifier index, or the default address. */
   generateAddress(index?: number): string {
-    const { scan, self } = this.#core;
-    if (index === undefined) return encodeAddress(scan.network, self.d, self.pkd);
-    if (!Number.isInteger(index) || index < 0 || index > 0xffffffff) {
-      fail("invalid_argument", "a diversifier index is a 32-bit integer");
-    }
-    const key = addressKeyAt(scan.incoming, index);
-    if (key === undefined) fail("invalid_argument", "this diversifier index has no valid address");
-    return encodeAddress(scan.network, key.d, key.pkd);
+    return addressAt(this.#core.scan.incoming, this.#core.self, index);
   }
 
   #indexer(): IndexerClient | undefined {

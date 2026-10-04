@@ -1,5 +1,6 @@
 export { PrivateWallet } from "./wallet/wallet.ts";
 export type {
+  AddressOptions,
   ConnectionOptions,
   OpenOptions,
   OperationView,

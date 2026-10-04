@@ -106,8 +106,8 @@ export class SorobanRpc {
     return reply.object("result");
   }
 
-  async getNetworkPassphrase(): Promise<string> {
-    return (await this.call("getNetwork")).string("passphrase");
+  async getNetworkPassphrase(timeoutMs?: number): Promise<string> {
+    return (await this.call("getNetwork", undefined, timeoutMs)).string("passphrase");
   }
 
   async getLatestLedger(): Promise<number> {
@@ -115,9 +115,12 @@ export class SorobanRpc {
   }
 
   // An entry modified after the ledger the reply claims to be of contradicts the reply.
-  async getLedgerEntries(keys: readonly xdr.LedgerKey[]): Promise<LedgerEntries> {
+  async getLedgerEntries(
+    keys: readonly xdr.LedgerKey[],
+    timeoutMs?: number,
+  ): Promise<LedgerEntries> {
     const wanted = new Map(keys.map((k) => [keyId(k), k]));
-    const result = await this.call("getLedgerEntries", { keys: [...wanted.keys()] });
+    const result = await this.call("getLedgerEntries", { keys: [...wanted.keys()] }, timeoutMs);
     const latestLedger = result.integer("latestLedger", 1);
     const entries = new Map<string, LedgerEntry>();
     const list = result.has("entries") ? result.array("entries") : [];

@@ -13,6 +13,7 @@ import {
 import type { ArtifactName, ArtifactSource } from "../../src/artifacts.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
+import { keySource } from "../../src/keysource.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
 import {
   type Deposit,
@@ -31,6 +32,7 @@ import {
   createWorld,
   rewritingFetch,
 } from "../support/network.ts";
+import { MNEMONIC } from "../helpers.ts";
 import { keypairFor } from "../support/rpc.ts";
 import { trapdoorArtifacts } from "../support/trapdoor.ts";
 import {
@@ -93,6 +95,80 @@ describe("wallet: opening", () => {
     );
     assert.match(wallet.generateAddress(), /^cyt1/);
     assert.notEqual(wallet.generateAddress(5), wallet.generateAddress());
+  });
+
+  it("gives an account's addresses from its key source alone", async () => {
+    const world = await createWorld();
+    const wallet = await openWallet(world, 0);
+    const storage = new MemoryStore();
+    const keys = keySource.mnemonic(MNEMONIC, { account: 0 });
+    const address = (network: "testnet" | "mainnet", index?: number) =>
+      PrivateWallet.address({
+        network,
+        keys,
+        storage,
+        ...(index === undefined ? {} : { index }),
+      });
+    assert.equal(await address("testnet"), wallet.generateAddress());
+    assert.equal(await address("testnet", 5), wallet.generateAddress(5));
+    assert.notEqual(await address("mainnet"), wallet.generateAddress());
+    assert.deepEqual(storage.keys(), []);
+    await assert.rejects(address("testnet", -1), isError("invalid_argument"));
+    // An unknown network is refused before the key source is asked.
+    const untouched = {
+      mode: "signature" as const,
+      resolve: async () => assert.fail("the key source was asked"),
+    };
+    await assert.rejects(
+      PrivateWallet.address({ network: "devnet" as "testnet", keys: untouched, storage }),
+      isError("invalid_argument"),
+    );
+  });
+
+  it("opens without waiting long for services that do not answer, and asks the indexer again before a sync", async () => {
+    const world = await createWorld();
+    let hanging = true;
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const service = url.origin === INDEXER || url.origin === RELAYER;
+      if (hanging && service && url.pathname === "/v1/health") {
+        return new Promise<Response>((_resolve, reject) =>
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("the request was cut", "AbortError")),
+          ),
+        );
+      }
+      return world.fetch(input, init);
+    };
+    const start = Date.now();
+    const alice = await openWallet({ ...world, fetch }, 0);
+    const took = Date.now() - start;
+    assert.ok(took >= 4_500 && took < 9_000, `took ${took} ms`);
+    const v = alice.verification();
+    assert.deepEqual(
+      [v.state, v.rpc, v.vault, v.indexers[0]?.state, v.relayers[0]?.state],
+      ["verified", "ok", "ok", "unavailable", "unavailable"],
+    );
+    hanging = false;
+    const summary = await alice.sync();
+    assert.equal(summary.source, "indexer");
+    assert.equal(alice.verification().indexers[0]?.state, "ok");
+  });
+
+  it("refuses to sync with an indexer that answers, once asked again, for another vault", async () => {
+    const world = await createWorld();
+    world.indexer.down = true;
+    let elsewhere = false;
+    const fetch = rewritingFetch(world, {
+      "/v1/health": (body) =>
+        elsewhere ? { ...body, vault: StrKey.encodeContract(Buffer.alloc(32, 7)) } : body,
+    });
+    const alice = await openWallet({ ...world, fetch }, 0);
+    assert.equal(alice.verification().indexers[0]?.state, "unavailable");
+    world.indexer.down = false;
+    elsewhere = true;
+    await assert.rejects(alice.sync(), isError("deployment_mismatch"));
+    assert.equal(alice.verification().state, "mismatch");
   });
 });
 
