@@ -162,6 +162,55 @@ async function chooseRelay(
   return fail("service_unavailable", "no relayer is available", { service: "relayer" });
 }
 
+/** The fee a spend would pay now, and the most the wallet's notes can pay with it. */
+export interface SpendQuote {
+  readonly kind: "send" | "unshield";
+  // The relayer that quoted the fee and until when its quote holds, in Unix seconds; neither for a
+  // self-relayed unshield, which pays no fee from the notes.
+  readonly relayer: string | undefined;
+  readonly fee: bigint;
+  readonly validUntil: number | undefined;
+  // The largest amount one transaction can pay after the fee: from the two largest spendable
+  // notes, and for an unshield within the vault's cap for one exit.
+  readonly maxAmount: bigint;
+  // All the spendable notes hold after the fee of one transaction: more than maxAmount when notes
+  // must be consolidated first, or an unshield split.
+  readonly spendable: bigint;
+}
+
+const atLeastZero = (x: bigint): bigint => (x > 0n ? x : 0n);
+
+// The fee of a spend from the first relayer that quotes within the cap, and what the spendable
+// notes, as of the last sync, can pay with it.
+export async function quoteSpend(
+  core: Core,
+  kind: "send" | "unshield",
+  relayers: readonly RelayerClient[] | undefined,
+  maxFee: bigint | undefined,
+): Promise<SpendQuote> {
+  if (kind === "send" && relayers === undefined) {
+    fail("invalid_argument", "transfers cannot be self-relayed");
+  }
+  const { limits } = chainReads(core).view.instance;
+  const cap = maxFee !== undefined && maxFee < limits.maxFee ? maxFee : limits.maxFee;
+  const relay = relayers === undefined ? undefined : await chooseRelay(core, relayers, cap);
+  const fee = relay?.quote.fee ?? 0n;
+  const values = spendableNotes(core.state)
+    .map((n) => n.value)
+    .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+  const pair = (values[0] ?? 0n) + (values[1] ?? 0n);
+  const cappedPair =
+    kind === "unshield" && pair > limits.maxDailyOutflow ? limits.maxDailyOutflow : pair;
+  return {
+    kind,
+    relayer: relay?.client.url,
+    fee,
+    validUntil: relay?.quote.validUntil,
+    maxAmount: atLeastZero(cappedPair - fee),
+    spendable: atLeastZero(values.reduce((s, v) => s + v, 0n) - fee),
+  };
+}
+
 // A payout to an account that does not exist yet creates it. The vault accepts one only in the
 // native asset, and of at least the new account's minimum balance of two base reserves.
 const NEW_ACCOUNT_MIN_PAYOUT = 10_000_000n;

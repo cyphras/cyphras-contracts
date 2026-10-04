@@ -2321,6 +2321,43 @@ describe("wallet: screening", () => {
 });
 
 describe("wallet: spends", () => {
+  it("quotes a spend's fee and the most the notes can pay with it, which a spend of that much pays", async () => {
+    const world = await createWorld({ limits: { maxDailyOutflow: 25n * XLM } });
+    const alice = await openWallet(world, 0);
+    await assert.rejects(alice.quote({ kind: "send" }), isError("tree_unverified"));
+    const depositor = world.signer("depositor");
+    for (const amount of [10n, 20n, 30n]) await shielded(alice, amount * XLM, depositor);
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const send = await alice.quote({ kind: "send" });
+    assert.equal(send.relayer, RELAYER);
+    assert.equal(send.fee, 1n * XLM);
+    assert.ok(send.validUntil !== undefined && send.validUntil > Number(world.vault.timestamp));
+    assert.equal(send.maxAmount, 49n * XLM);
+    assert.equal(send.spendable, 59n * XLM);
+    // An unshield stays within the vault's cap for one exit, whoever pays its fee.
+    const relayed = await alice.quote({ kind: "unshield" });
+    assert.equal(relayed.maxAmount, 24n * XLM);
+    const self = await alice.quote({ kind: "unshield", selfRelay: true });
+    assert.deepEqual(
+      [self.relayer, self.fee, self.validUntil, self.maxAmount, self.spendable],
+      [undefined, 0n, undefined, 25n * XLM, 60n * XLM],
+    );
+    await assert.rejects(
+      alice.quote({ kind: "send", selfRelay: true }),
+      isError("invalid_argument"),
+    );
+    await assert.rejects(alice.quote({ kind: "send", maxFee: 1n }), isError("fee_above_cap"));
+    const bob = await openWallet(world, 1);
+    const sent = await alice.send({
+      to: bob.generateAddress(),
+      amount: send.maxAmount,
+      maxFee: send.fee,
+    });
+    assert.equal(sent.fee, send.fee);
+  });
+
   it("pays a shielded address through a relayer, which names no party but itself", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);

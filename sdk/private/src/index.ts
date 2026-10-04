@@ -4,6 +4,7 @@ export type {
   OpenOptions,
   OperationView,
   PlanView,
+  QuoteRequest,
   RetryRequest,
   SendRequest,
   StateReset,
@@ -11,7 +12,7 @@ export type {
   UnshieldRequest,
   ViewOnlyOptions,
 } from "./wallet/wallet.ts";
-export type { ConfirmSpend, SpendReview, Submission } from "./wallet/spend.ts";
+export type { ConfirmSpend, SpendQuote, SpendReview, Submission } from "./wallet/spend.ts";
 export type { Warning, WarningCode } from "./wallet/nudges.ts";
 export type { Balance, HistoryEntry, HistoryKind } from "./wallet/history.ts";
 export type { DepositInfo, ScreeningKind, ShieldReceipt } from "./wallet/deposits.ts";

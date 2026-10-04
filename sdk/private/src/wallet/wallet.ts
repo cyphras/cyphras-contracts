@@ -74,10 +74,12 @@ import {
 } from "./sources.ts";
 import {
   type ConfirmSpend,
+  type SpendQuote,
   type Submission,
   cancelHeld,
   checkIssuer,
   followHeld,
+  quoteSpend,
   resendConflicted,
   spend,
   submissionOf,
@@ -216,6 +218,14 @@ export interface UnshieldRequest {
   // Pays the asset's issuer, which burns the payout as a classic payment to it would. Refused
   // with destination_is_issuer unless set.
   readonly burnToIssuer?: boolean;
+}
+
+/** What a spend would pay: a send, or an unshield through a relayer or self-relayed. */
+export interface QuoteRequest {
+  readonly kind: "send" | "unshield";
+  readonly relayer?: string | readonly string[];
+  readonly selfRelay?: boolean;
+  readonly maxFee?: bigint;
 }
 
 /** A stalled payment proved again, with the same notes. */
@@ -964,6 +974,22 @@ export class PrivateWallet {
       (url) =>
         services.relayers.find((r) => r.client.url === url)?.client ??
         new RelayerClient(url, this.#fetch),
+    );
+  }
+
+  /**
+   * The fee a send or an unshield would pay now, from the first relayer that quotes within the cap,
+   * or none for a self-relayed unshield, and the most one transaction can pay with it from the
+   * notes spendable as of the last sync: what a wallet shows, with a Max button, before review.
+   */
+  quote(request: QuoteRequest): Promise<SpendQuote> {
+    return this.#run(async () =>
+      quoteSpend(
+        this.#core,
+        request.kind,
+        request.selfRelay === true ? undefined : this.#relayerClients(request.relayer),
+        request.maxFee,
+      ),
     );
   }
 
