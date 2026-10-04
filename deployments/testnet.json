@@ -1,0 +1,27 @@
+{
+  "network": "testnet",
+  "network_passphrase": "Test SDF Network ; September 2015",
+  "vaults": [
+    {
+      "asset": "native",
+      "vault": "CDV4V6W4MGMEVYYXENX2QXZCID7NT2UGAH2EWEBO3JUHO47Q27J7NTLL",
+      "token": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "deploy_ledger": 5012547,
+      "fee_tier": "100000",
+      "urls": {
+        "indexer": "https://private.cyphras.com/testnet/xlm/indexer",
+        "relayer": "https://private.cyphras.com/testnet/xlm/relayer",
+        "screening": "https://private.cyphras.com/testnet/screening"
+      },
+      "domain": "0x13769b40e979190b26903a0102449d200ab1c79d88e873c16c0267b586b4f205",
+      "wasm_hash": "53388b737ddfa1a894b17b344ad16304394b95c42df044a2a65e89d3bde1f046",
+      "verifying_key": "testnet-forgeable",
+      "artifacts": {
+        "wasm": "4dec4f493ac4799652ef091fafa41b958eed06a4446630db7d8a71a21514bbe9",
+        "zkey": "a76755ceafb65b81564f22593497fb4d3babe8431a41c24ea4a31139b9423a0b",
+        "vkey": "526f5befc2ff836621cc6f2f181fa50de3318a6865d6eca2121c678a225e2b9c"
+      },
+      "relayer_fee_address": "GD2BLMN6PYT32NVBDPVGTYDLNJV3RTMLSK3S3HNLRYBA6RXXOCPXFCNX"
+    }
+  ]
+}
