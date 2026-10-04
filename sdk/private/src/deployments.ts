@@ -51,12 +51,34 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-// No v2 vault is deployed yet. The release script fills these in from the deployment files;
-// until then opening a wallet on either refuses. Frozen to the last nested value, so no code in
-// the page can swap a pinned vault, artifact hash or service for another.
+// The vaults this release pins, as deployments/<network>.json records them. Mainnet has no v2 vault
+// yet, so opening a wallet there refuses. Frozen to the last nested value, so no code in the page
+// can swap a pinned vault, artifact hash or service for another.
 export const PINNED_DEPLOYMENTS: Readonly<Record<DeploymentName, Deployment | null>> = deepFreeze({
   "mainnet/xlm": null,
-  "testnet/xlm": null,
+  "testnet/xlm": {
+    id: "testnet/xlm",
+    network: "testnet",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    vault: "CDV4V6W4MGMEVYYXENX2QXZCID7NT2UGAH2EWEBO3JUHO47Q27J7NTLL",
+    asset: { contract: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC", name: "native" },
+    domain: 0x13769b40e979190b26903a0102449d200ab1c79d88e873c16c0267b586b4f205n,
+    deployLedger: 5012547,
+    vaultWasmHash: "53388b737ddfa1a894b17b344ad16304394b95c42df044a2a65e89d3bde1f046",
+    artifacts: {
+      wasm: "4dec4f493ac4799652ef091fafa41b958eed06a4446630db7d8a71a21514bbe9",
+      zkey: "a76755ceafb65b81564f22593497fb4d3babe8431a41c24ea4a31139b9423a0b",
+      vkey: "526f5befc2ff836621cc6f2f181fa50de3318a6865d6eca2121c678a225e2b9c",
+    },
+    indexers: ["https://private.cyphras.com/testnet/xlm/indexer"],
+    relayers: [
+      {
+        url: "https://private.cyphras.com/testnet/xlm/relayer",
+        feeAddress: "GD2BLMN6PYT32NVBDPVGTYDLNJV3RTMLSK3S3HNLRYBA6RXXOCPXFCNX",
+      },
+    ],
+    feeTier: 100000n,
+  },
 });
 
 const HEX64 = /^[0-9a-f]{64}$/;
