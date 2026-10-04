@@ -774,7 +774,7 @@ export class PrivateWallet {
       core,
       await live?.deposits().catch(() => undefined),
       [...(rechecked?.deposits ?? []), ...within(shown?.deposits ?? [])],
-      [events, ...others].flatMap((e) => e?.deposits ?? []),
+      [events, ...others].map((e) => e?.deposits ?? []),
       {
         treeAt,
         attestedUpTo: answered

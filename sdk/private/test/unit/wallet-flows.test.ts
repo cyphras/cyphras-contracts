@@ -376,13 +376,21 @@ describe("wallet: a deposit's ID that some sources hide", () => {
   const second = "http://rpc2.test";
 
   // A wallet whose indexer lists no deposit and whose first provider denies the shield's
-  // transaction once it has answered the shield's own wait, and which `withheld` lets deny events,
-  // or the transaction on the second provider too, after the shield.
-  async function hidden(withheld: { events: boolean; secondReport: boolean }) {
+  // transaction once it has answered the shield's own wait, and which `withheld` lets deny the
+  // events of either provider, or the transaction on the second provider too, after the shield. A
+  // `flooding` first provider lists the events of one request, as of a ledger short of the latest
+  // and with three hundred made-up deposit_pending events that hold the deposit's commitments
+  // before the real one, and denies its events after that.
+  async function hidden(
+    withheld: { events: "first" | "second" | "both" | "none"; secondReport: boolean },
+    flooding = false,
+  ) {
     const world = await createWorld();
     let shieldHash: string | undefined;
     let answered = false;
     let shielding = true;
+    let flooded = false;
+    const reads = { keys: 0 };
     const indexer = rewritingFetch(world, { "/v1/deposits": (body) => ({ ...body, pending: [] }) });
     const fetch: FetchLike = async (input, init) => {
       const url = new URL(input);
@@ -391,6 +399,7 @@ describe("wallet: a deposit's ID that some sources hide", () => {
         const tx = TransactionBuilder.fromXDR(body.params.transaction, Networks.TESTNET);
         shieldHash = tx.hash().toString("hex");
       }
+      if (body !== undefined && readsQueue(body)) reads.keys += body.params.keys.length;
       const asked = body?.method === "getTransaction" && body.params.hash === shieldHash;
       if (asked && url.origin === RPC && !answered) {
         answered = true;
@@ -400,9 +409,20 @@ describe("wallet: a deposit's ID that some sources hide", () => {
       if (asked && (url.origin === RPC || deniedBySecond)) {
         return rpcResult(body.id, { status: "NOT_FOUND", latestLedger: world.vault.ledger });
       }
-      if (body?.method === "getEvents" && (url.origin === RPC || withheld.events)) {
-        const error = { code: -32600, message: "startLedger must be within the ledger range" };
-        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+      if (body?.method === "getEvents") {
+        const first = url.origin === RPC;
+        if (flooding && first && !flooded) {
+          flooded = true;
+          return floodedEvents(await world.fetch(input, init), world.vault.ledger - 1);
+        }
+        const denied =
+          withheld.events === "both" ||
+          withheld.events === (first ? "first" : "second") ||
+          (flooding && first);
+        if (denied) {
+          const error = { code: -32600, message: "startLedger must be within the ledger range" };
+          return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error }));
+        }
       }
       return indexer(url.origin === second ? RPC : input, init);
     };
@@ -413,15 +433,46 @@ describe("wallet: a deposit's ID that some sources hide", () => {
     shielding = false;
     assert.equal(receipt.depositId, undefined);
     world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
-    return { world, alice };
+    return { world, alice, reads };
   }
 
-  // Each source alone: the second provider's events, or its report of the transaction.
+  // A page of events with three hundred made-up deposit_pending events, each like the first real
+  // one but under another ID, listed before it, as of `latestLedger`.
+  async function floodedEvents(res: Response, latestLedger: number): Promise<Response> {
+    const page = (await res.json()) as {
+      result: { events: { topic: string[]; value: string }[]; latestLedger: number };
+    };
+    const { events } = page.result;
+    const at = events.findIndex(
+      (e) =>
+        xdr.ScVal.fromXDR(e.topic[0] as string, "base64")
+          .sym()
+          .toString() === "deposit_pending",
+    );
+    const real = events[at];
+    if (real !== undefined) {
+      const fields = xdr.ScVal.fromXDR(real.value, "base64").map() ?? [];
+      const fakes = Array.from({ length: 300 }, (_, i) => {
+        const id = xdr.ScVal.scvU64(new xdr.Uint64(BigInt(1000 + i)));
+        const value = xdr.ScVal.scvMap(
+          fields.map((f) =>
+            f.key().sym().toString() === "id" ? new xdr.ScMapEntry({ key: f.key(), val: id }) : f,
+          ),
+        );
+        return { ...real, value: value.toXDR("base64") };
+      });
+      events.splice(at, 0, ...fakes);
+    }
+    page.result.latestLedger = latestLedger;
+    return new Response(JSON.stringify(page));
+  }
+
   for (const [source, withheld] of [
-    ["events", { events: false, secondReport: true }],
-    ["report", { events: true, secondReport: false }],
+    ["the second provider's events", { events: "first", secondReport: true }],
+    ["the first provider's events", { events: "second", secondReport: true }],
+    ["the second provider's report", { events: "both", secondReport: false }],
   ] as const) {
-    it(`takes the ID the second provider's ${source} give, once every provider's entry holds the deposit`, async () => {
+    it(`takes the ID from ${source} alone, once every provider's entry holds the deposit`, async () => {
       const { world, alice } = await hidden(withheld);
       for (let i = 0; i < 2; i++) {
         world.advance(3_600);
@@ -434,6 +485,19 @@ describe("wallet: a deposit's ID that some sources hide", () => {
       assert.equal(deposit?.flag?.kind, "legal_hold", source);
     });
   }
+
+  it("takes the ID from the second provider's events, and reads one of the hundreds the first makes up before it", async () => {
+    const { world, alice, reads } = await hidden({ events: "none", secondReport: true }, true);
+    world.advance(3_600);
+    world.fill(1);
+    await alice.sync();
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 1);
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+    // The first ID each provider's events give, on each provider.
+    assert.equal(reads.keys, 2 * 2);
+  });
 });
 
 describe("wallet: reads of the entry queue", () => {

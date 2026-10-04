@@ -498,7 +498,7 @@ export async function trackDeposits(
   core: Core,
   queue: DepositQueue | undefined,
   events: readonly DepositEvent[],
-  heard: readonly DepositEvent[],
+  heard: readonly (readonly DepositEvent[])[],
   context: QueueContext,
 ): Promise<void> {
   const state: WalletState = core.state;
@@ -521,11 +521,12 @@ export async function trackDeposits(
       reports.set(d, await statusesOf(core, d.txHash));
     }
   }
-  // The IDs a deposit without one may have: of the indexer's entries for its depositor and
-  // amount, only the few made nearest its shield, so that a long list costs no more reads.
+  // The IDs a deposit without one may have, a few at most whatever a source lists: of each
+  // provider's events, the first that holds its commitments, as an honest provider shows only one;
+  // of the indexer's entries for its depositor and amount, the few made nearest its shield.
   const candidates = (d: Deposit): number[] => [
     ...new Set([
-      ...heard.filter((e) => holding(e, d)).map((e) => e.id),
+      ...heard.flatMap((shown) => shown.find((e) => holding(e, d))?.id ?? []),
       ...(reports.get(d) ?? []).flatMap((s) => idOf(s) ?? []),
       ...(queue?.pending ?? [])
         .filter((e) => e.depositor === d.depositor && e.amount === d.amount)
