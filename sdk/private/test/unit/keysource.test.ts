@@ -329,4 +329,17 @@ describe("sealed store", () => {
     await backend.set(second, (await backend.get(first)) as Uint8Array);
     await assert.rejects(store.read("b"), (err: unknown) => err instanceof CyphrasError);
   });
+
+  it("refuses a record moved to the same name in another scope", async () => {
+    const backend = new MemoryStore();
+    const key = new Uint8Array(32).fill(3);
+    const one = new SealedStore(backend, key, "vault/one");
+    const two = new SealedStore(backend, key, "vault/two");
+    await one.write("state", utf8("one's"));
+    await two.write("state", utf8("two's"));
+    const [first, second] = backend.keys() as [string, string];
+    await backend.set(second, (await backend.get(first)) as Uint8Array);
+    await assert.rejects(two.read("state"), (err: unknown) => err instanceof CyphrasError);
+    assert.deepEqual(await one.read("state"), utf8("one's"));
+  });
 });

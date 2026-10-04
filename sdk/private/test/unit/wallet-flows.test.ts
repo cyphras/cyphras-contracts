@@ -132,13 +132,23 @@ describe("wallet: opening", () => {
     );
   });
 
-  it("opens without waiting long for services that do not answer, and asks the indexer again before a sync", async () => {
+  it("opens without waiting long for services that do not answer, unverified while the vault does not, and asks again before a sync", async () => {
     const world = await createWorld();
     let hanging = true;
+    // Whether a request reads the vault's instance alone, as the open-time check does.
+    const instanceRead = (body: { method?: string; params?: { keys?: string[] } }): boolean =>
+      body.method === "getLedgerEntries" &&
+      body.params?.keys?.length === 1 &&
+      xdr.LedgerKey.fromXDR(body.params.keys[0] as string, "base64")
+        .contractData()
+        .key()
+        .switch().name === "scvLedgerKeyContractInstance";
     const fetch: FetchLike = async (input, init) => {
       const url = new URL(input);
+      const body = bodyOf(init);
       const service = url.origin === INDEXER || url.origin === RELAYER;
-      if (hanging && service && url.pathname === "/v1/health") {
+      const health = service && url.pathname === "/v1/health";
+      if (hanging && (health || (body !== undefined && instanceRead(body)))) {
         return new Promise<Response>((_resolve, reject) =>
           init?.signal?.addEventListener("abort", () =>
             reject(new DOMException("the request was cut", "AbortError")),
@@ -154,11 +164,12 @@ describe("wallet: opening", () => {
     const v = alice.verification();
     assert.deepEqual(
       [v.state, v.rpc, v.vault, v.indexers[0]?.state, v.relayers[0]?.state],
-      ["verified", "ok", "ok", "unavailable", "unavailable"],
+      ["unverified", "ok", "unavailable", "unavailable", "unavailable"],
     );
     hanging = false;
     const summary = await alice.sync();
     assert.equal(summary.source, "indexer");
+    assert.equal(alice.verification().state, "verified");
     assert.equal(alice.verification().indexers[0]?.state, "ok");
   });
 
@@ -532,6 +543,10 @@ describe("wallet: a shield whose sending goes wrong", () => {
     const deadline = world.vault.ledger + 120;
     world.rpc.oldestLedger = world.vault.ledger + 2;
     world.advance(121 * 5);
+    await alice.sync();
+    assert.equal((await alice.deposits())[0]?.state, "submitting");
+    // Holding the deadline's ledger alone is still holding one it could have been made in.
+    world.rpc.oldestLedger = deadline;
     await alice.sync();
     assert.equal((await alice.deposits())[0]?.state, "submitting");
     // Once it holds none of them, nothing can tell whether the deposit landed.
@@ -2523,6 +2538,24 @@ describe("wallet: spends", () => {
       ],
     );
     assert.equal((await alice.balance()).spendable, 59n * XLM);
+  });
+
+  it("sends nothing on a valid proof of other public inputs", async () => {
+    const { world } = await funded();
+    const honest = new TrapdoorProver();
+    const prover: Prover = {
+      prove: (witness, circuit) =>
+        honest.prove({ ...witness, extDataHash: witness.extDataHash ^ 1n }, circuit),
+    };
+    const alice = await openWallet(world, 0, undefined, undefined, { prover });
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+      isError("proof_invalid"),
+    );
+    assert.equal(world.relayer.submissions.length, 0);
+    assert.deepEqual(await alice.plans(), []);
   });
 
   it("retries a payment the way it went unless told otherwise", async () => {
