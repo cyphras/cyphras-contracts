@@ -153,7 +153,10 @@ export interface ConnectionOptions {
 /** Options of PrivateWallet.open. */
 export interface OpenOptions extends ConnectionOptions {
   readonly keys: KeySource;
+  // Proves with the witness generator and the proving key it loads itself.
   readonly prover: Prover;
+  // Where the SDK reads the verifying key, which every proof is checked against; it reads no other
+  // artifact.
   readonly artifacts: ArtifactSource;
 }
 

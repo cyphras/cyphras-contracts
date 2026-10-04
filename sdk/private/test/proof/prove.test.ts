@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { mnemonicToSeedSync } from "@scure/bip39";
 import * as snarkjs from "snarkjs";
-import { type ArtifactName, PinnedArtifacts } from "../../src/artifacts.ts";
+import { type ArtifactName, PinnedArtifacts, loadCircuit } from "../../src/artifacts.ts";
 import { computeDomain } from "../../src/domain.ts";
 import { decryptIncoming } from "../../src/encryption.ts";
 import { P } from "../../src/field.ts";
@@ -18,7 +18,7 @@ import { type TxProof, fromHostProof } from "../../src/extdata.ts";
 import { parseVerifyingKey, verifyGroth16 } from "../../src/groth16.ts";
 import { NETWORK_PASSPHRASES, defaultAddressKey, deriveSpendingKeys } from "../../src/keys.ts";
 import { CommitmentTree, EMPTY_ROOT } from "../../src/merkle.ts";
-import { snarkjsProver } from "@cyphras/private-prover-snarkjs";
+import { type SnarkjsProver, snarkjsProver } from "@cyphras/private-prover-snarkjs";
 import { type TransactionWitness, publicInputs } from "../../src/prover.ts";
 import { proveTransaction } from "../../src/proving.ts";
 import {
@@ -28,6 +28,7 @@ import {
   buildTransaction,
 } from "../../src/transaction.ts";
 import { utf8 } from "../../src/bytes.ts";
+import { CyphrasError } from "../../src/errors.ts";
 import { MNEMONIC, REPO_ROOT, fixture, testScalar } from "../helpers.ts";
 
 const BUILD = join(REPO_ROOT, "circuits", "build");
@@ -84,10 +85,12 @@ const snarkjsForm = (proof: TxProof): snarkjs.SnarkjsProof => {
 };
 
 describe("proving with the frozen circuit", () => {
-  const prover = snarkjsProver();
+  let prover: SnarkjsProver;
   let artifacts: PinnedArtifacts;
   let vkJson: unknown;
+  let files: Record<ArtifactName, Uint8Array>;
   const timings: number[] = [];
+  const proverLoads: ArtifactName[] = [];
 
   before(async () => {
     for (const path of [WASM, ZKEY]) {
@@ -96,7 +99,7 @@ describe("proving with the frozen circuit", () => {
     // The verifying key comes from the proving key in use, and the pins are the files' own hashes,
     // so a freshly set up dev key works as well as the one the contracts pin.
     vkJson = await snarkjs.zKey.exportVerificationKey(new Uint8Array(readFileSync(ZKEY)));
-    const files: Record<ArtifactName, Uint8Array> = {
+    files = {
       wasm: new Uint8Array(readFileSync(WASM)),
       zkey: new Uint8Array(readFileSync(ZKEY)),
       vkey: utf8(JSON.stringify(vkJson)),
@@ -107,7 +110,25 @@ describe("proving with the frozen circuit", () => {
         createHash("sha256").update(bytes).digest("hex"),
       ]),
     ) as Record<ArtifactName, string>;
-    artifacts = new PinnedArtifacts({ load: async (name) => files[name] }, pins);
+    // The prover reads the witness generator and the proving key; the SDK reads the verifying key
+    // alone.
+    prover = snarkjsProver({
+      artifacts: {
+        load: async (name) => {
+          proverLoads.push(name);
+          return files[name];
+        },
+      },
+    });
+    artifacts = new PinnedArtifacts(
+      {
+        load: async (name) => {
+          if (name !== "vkey") throw new Error(`the SDK read the ${name} artifact`);
+          return files.vkey;
+        },
+      },
+      pins,
+    );
   });
 
   after(async () => {
@@ -129,7 +150,8 @@ describe("proving with the frozen circuit", () => {
   }
 
   it("loads the artifacts through their pins", async () => {
-    await artifacts.proving();
+    const circuit = await loadCircuit({ load: async (name) => files[name] }, artifacts.circuit);
+    assert.deepEqual(circuit, { wasm: files.wasm, zkey: files.zkey });
     assert.deepEqual(await artifacts.verifyingKey(), parseVerifyingKey(vkJson));
   });
 
@@ -237,9 +259,18 @@ describe("proving with the frozen circuit", () => {
     await assert.rejects(proveTransaction(broken, prover, artifacts), /failed/);
   });
 
-  it("reports the proving time", () => {
+  it("proves with no proving key but the pinned one", async () => {
+    const circuit = { ...artifacts.circuit, zkey: "00".repeat(32) };
+    await assert.rejects(prover.prove(shield.witness, circuit), (err: unknown) => {
+      assert.ok(err instanceof CyphrasError && err.code === "artifact_mismatch");
+      return true;
+    });
+  });
+
+  it("reports the proving time, having read the circuit once for each pin it was asked for", () => {
     const mean = timings.reduce((a, b) => a + b, 0) / timings.length;
     console.log(`# mean proving time ${(mean / 1000).toFixed(2)} s over ${timings.length} proofs`);
     assert.ok(timings.length >= 3);
+    assert.deepEqual(proverLoads.sort(), ["wasm", "wasm", "zkey", "zkey"]);
   });
 });

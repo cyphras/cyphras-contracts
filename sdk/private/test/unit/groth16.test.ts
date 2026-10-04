@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { type ArtifactName, PinnedArtifacts, sha256Hex } from "../../src/artifacts.ts";
+import { type ArtifactName, PinnedArtifacts, loadCircuit, sha256Hex } from "../../src/artifacts.ts";
 import { utf8 } from "../../src/bytes.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import { type TxProofJson, fromHostProof, txProofFromJson } from "../../src/extdata.ts";
@@ -121,29 +121,27 @@ describe("pinned artifacts", () => {
     assert.equal(await sha256Hex(files.wasm), hex(files.wasm));
   });
 
-  it("returns the files once their hashes match and caches them", async () => {
+  it("returns the circuit's files once their hashes match, and caches the verifying key", async () => {
     const pins = { wasm: hex(files.wasm), zkey: hex(files.zkey), vkey: VK_SHA256 };
+    assert.deepEqual(await loadCircuit(source, pins), { wasm: files.wasm, zkey: files.zkey });
     const artifacts = new PinnedArtifacts(source, pins);
-    const first = await artifacts.proving();
-    assert.deepEqual(first, { wasm: files.wasm, zkey: files.zkey });
-    await artifacts.proving();
+    assert.deepEqual(artifacts.circuit, { wasm: pins.wasm, zkey: pins.zkey });
+    await artifacts.verifyingKey();
     await artifacts.verifyingKey();
     assert.deepEqual(loads.sort(), ["vkey", "wasm", "zkey"]);
   });
 
   it("stops on a mismatch and reports both hashes", async () => {
     const expected = "00".repeat(32);
-    const artifacts = new PinnedArtifacts(source, {
-      wasm: hex(files.wasm),
-      zkey: expected,
-      vkey: VK_SHA256,
-    });
-    await assert.rejects(artifacts.proving(), (err: unknown) => {
-      assert.ok(err instanceof CyphrasError && err.code === "artifact_mismatch");
-      assert.deepEqual(err.details, { artifact: "zkey", computed: hex(files.zkey), expected });
-      assert.ok(err.message.includes(hex(files.zkey)) && err.message.includes(expected));
-      return true;
-    });
+    await assert.rejects(
+      loadCircuit(source, { wasm: hex(files.wasm), zkey: expected }),
+      (err: unknown) => {
+        assert.ok(err instanceof CyphrasError && err.code === "artifact_mismatch");
+        assert.deepEqual(err.details, { artifact: "zkey", computed: hex(files.zkey), expected });
+        assert.ok(err.message.includes(hex(files.zkey)) && err.message.includes(expected));
+        return true;
+      },
+    );
   });
 
   it("refuses missing pins", () => {

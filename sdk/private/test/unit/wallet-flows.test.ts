@@ -10,6 +10,7 @@ import {
   TransactionBuilder,
   xdr,
 } from "@stellar/stellar-base";
+import type { ArtifactName, ArtifactSource } from "../../src/artifacts.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
 import { MemoryStore, SealedStore } from "../../src/storage.ts";
@@ -31,6 +32,7 @@ import {
   rewritingFetch,
 } from "../support/network.ts";
 import { keypairFor } from "../support/rpc.ts";
+import { trapdoorArtifacts } from "../support/trapdoor.ts";
 import {
   confirmAll,
   isError,
@@ -157,6 +159,22 @@ describe("wallet: deposits", () => {
     const history = await alice.history();
     assert.equal(history[0]?.kind, "shield");
     assert.equal(history[0]?.amount, 100n * XLM);
+  });
+
+  it("reads no artifact but the verifying key, leaving the circuit to the prover", async () => {
+    const world = await createWorld();
+    const read: ArtifactName[] = [];
+    const artifacts: ArtifactSource = {
+      load: async (name) => {
+        read.push(name);
+        return trapdoorArtifacts.load(name);
+      },
+    };
+    const alice = await openWallet(world, 0, undefined, undefined, { artifacts });
+    const depositor = world.signer("depositor");
+    await alice.shield({ amount: 10n * XLM, signer: depositor });
+    await alice.shield({ amount: 20n * XLM, signer: depositor });
+    assert.deepEqual(read, ["vkey"]);
   });
 
   it("refuses a deposit below the vault's minimum before proving", async () => {

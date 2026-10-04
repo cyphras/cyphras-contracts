@@ -34,6 +34,12 @@ export interface CircuitArtifacts {
   readonly zkey: Uint8Array;
 }
 
+/** The pinned SHA-256 of the circuit's witness generator and proving key, as lowercase hex. */
+export interface CircuitPins {
+  readonly wasm: string;
+  readonly zkey: string;
+}
+
 /**
  * A Groth16 proof over BN254 in affine coordinates, with every Fq2 coordinate as [c0, c1], and
  * the public signals the prover computed.
@@ -44,11 +50,12 @@ export interface Groth16Proof extends AffineProof {
 
 /**
  * Proves a transaction on the user's device. Any implementation that produces a Groth16 proof
- * for the same proving key fits; the SDK checks the artifacts before the call and verifies the
- * proof after it.
+ * for the pinned proving key fits. It loads the witness generator and the proving key itself and
+ * proves only with files that match `circuit`, as loadCircuit checks them; the SDK verifies the
+ * proof against the pinned verifying key after the call.
  */
 export interface Prover {
-  prove(witness: TransactionWitness, artifacts: CircuitArtifacts): Promise<Groth16Proof>;
+  prove(witness: TransactionWitness, circuit: CircuitPins): Promise<Groth16Proof>;
 }
 
 // The public inputs in the circuit's order, which is the verifier's.

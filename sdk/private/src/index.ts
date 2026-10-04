@@ -34,9 +34,16 @@ export type {
 export { MemoryStore } from "./storage.ts";
 export type { KeyValueStore } from "./storage.ts";
 
+export { loadCircuit } from "./artifacts.ts";
 export type { ArtifactName, ArtifactPins, ArtifactSource } from "./artifacts.ts";
 export { circuitInputs } from "./prover.ts";
-export type { CircuitArtifacts, Groth16Proof, Prover, TransactionWitness } from "./prover.ts";
+export type {
+  CircuitArtifacts,
+  CircuitPins,
+  Groth16Proof,
+  Prover,
+  TransactionWitness,
+} from "./prover.ts";
 
 export { PINNED_DEPLOYMENTS } from "./deployments.ts";
 export type { Deployment, DeploymentName, RelayerEndpoint } from "./deployments.ts";

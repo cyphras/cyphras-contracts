@@ -3,11 +3,16 @@
 // so everything above the prover runs fast while verification stays real.
 import { bn254 } from "@noble/curves/bn254";
 import { sha256 } from "@noble/hashes/sha2";
-import { type ArtifactName, type ArtifactSource, sha256Hex } from "../../src/artifacts.ts";
+import {
+  type ArtifactName,
+  type ArtifactSource,
+  loadCircuit,
+  sha256Hex,
+} from "../../src/artifacts.ts";
 import { bytesToBigIntBE, utf8 } from "../../src/bytes.ts";
 import { P } from "../../src/field.ts";
 import {
-  type CircuitArtifacts,
+  type CircuitPins,
   type Groth16Proof,
   type Prover,
   type TransactionWitness,
@@ -84,7 +89,8 @@ export class TrapdoorProver implements Prover {
   proofs = 0;
   witnesses: TransactionWitness[] = [];
 
-  async prove(witness: TransactionWitness, artifacts: CircuitArtifacts): Promise<Groth16Proof> {
+  async prove(witness: TransactionWitness, circuit: CircuitPins): Promise<Groth16Proof> {
+    const artifacts = await loadCircuit(trapdoorArtifacts, circuit);
     if (new TextDecoder().decode(artifacts.zkey) !== "trapdoor zkey") {
       throw new Error("unexpected proving key");
     }
