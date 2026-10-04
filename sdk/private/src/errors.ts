@@ -37,20 +37,28 @@ export type ErrorCode =
   | "deposit_submitting"
   | "view_only"
   | "not_found"
-  | "history_unavailable";
+  | "history_unavailable"
+  | "unexpected_error";
 
 export type ErrorDetails = Readonly<Record<string, string | number | boolean>>;
 
 /**
  * The error type for every failure the SDK detects. `details` holds only public values, such as
- * a rule name, a service error code or an artifact hash.
+ * a rule name, a service error code or an artifact hash. "unexpected_error" wraps an error the SDK
+ * did not raise itself, such as a signer's or a store's, as its `cause`, where the SDK must say
+ * what it concerns, such as the plan of a payment that may still land.
  */
 export class CyphrasError extends Error {
   readonly code: ErrorCode;
   readonly details: ErrorDetails;
 
-  constructor(code: ErrorCode, message: string, details: ErrorDetails = {}) {
-    super(message);
+  constructor(
+    code: ErrorCode,
+    message: string,
+    details: ErrorDetails = {},
+    options?: { readonly cause?: unknown },
+  ) {
+    super(message, options);
     this.name = "CyphrasError";
     this.code = code;
     this.details = details;

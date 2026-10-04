@@ -14,7 +14,7 @@ import type { ArtifactName, ArtifactSource } from "../../src/artifacts.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
 import { keySource } from "../../src/keysource.ts";
-import { MemoryStore, SealedStore } from "../../src/storage.ts";
+import { type KeyValueStore, MemoryStore, SealedStore } from "../../src/storage.ts";
 import {
   type Deposit,
   StateStore,
@@ -22,6 +22,8 @@ import {
   loadState,
   saveState,
 } from "../../src/wallet/state.ts";
+import type { Prover } from "../../src/prover.ts";
+import type { TransactionSigner } from "../../src/vault/invoke.ts";
 import type { Submission } from "../../src/wallet/spend.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
 import {
@@ -35,7 +37,7 @@ import {
 } from "../support/network.ts";
 import { MNEMONIC } from "../helpers.ts";
 import { keypairFor } from "../support/rpc.ts";
-import { trapdoorArtifacts } from "../support/trapdoor.ts";
+import { TrapdoorProver, trapdoorArtifacts } from "../support/trapdoor.ts";
 import {
   confirmAll,
   isError,
@@ -2545,6 +2547,72 @@ describe("wallet: spends", () => {
       confirm: confirmAll,
     });
     assert.equal(retried.state, "submitted");
+  });
+
+  it("names the plan in every error once it is among the wallet's, wrapping a signer's or a store's", async () => {
+    for (const stop of ["signer", "store of the plan", "store once sent", "meta"] as const) {
+      const world = await createWorld();
+      const backend = new MemoryStore();
+      let failing = false;
+      let unshielding = false;
+      const storage: KeyValueStore = {
+        get: (key) => backend.get(key),
+        delete: (key) => backend.delete(key),
+        set: async (key, value) => {
+          if (failing) throw new Error("the disk is full");
+          await backend.set(key, value);
+        },
+      };
+      const trapdoor = new TrapdoorProver();
+      const prover: Prover = {
+        prove: async (witness, circuit) => {
+          const proof = await trapdoor.prove(witness, circuit);
+          if (unshielding && stop === "store of the plan") failing = true;
+          return proof;
+        },
+      };
+      // The RPC's report of the self-relayed transaction carries a meta that is not XDR.
+      const fetch: FetchLike = async (input, init) => {
+        const body = bodyOf(init);
+        const res = await world.fetch(input, init);
+        if (!unshielding || stop !== "meta" || body?.method !== "getTransaction") return res;
+        const reply = (await res.json()) as { result: Record<string, unknown> };
+        if (reply.result["status"] !== "SUCCESS") return new Response(JSON.stringify(reply));
+        return rpcResult(body.id, { ...reply.result, resultMetaXdr: "AAAA" });
+      };
+      const alice = await openWallet({ ...world, fetch }, 0, storage, undefined, { prover });
+      await shielded(alice, 100n * XLM, world.signer("depositor"));
+      world.advance(3_601);
+      world.admitAll();
+      await alice.sync();
+      const me = world.signer("my account");
+      const signer: TransactionSigner = {
+        publicKey: me.publicKey,
+        signTransaction: async (envelope, passphrase) => {
+          if (stop === "signer") throw new Error("the user closed the window");
+          if (stop === "store once sent") failing = true;
+          return me.signTransaction(envelope, passphrase);
+        },
+      };
+      unshielding = true;
+      const err: unknown = await alice
+        .unshield({
+          to: world.signer("merchant").publicKey,
+          amount: 10n * XLM,
+          selfRelay: signer,
+          confirm: confirmAll,
+        })
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      failing = false;
+      assert.ok(err instanceof CyphrasError, stop);
+      assert.equal(err.code, stop === "meta" ? "rpc_error" : "unexpected_error", stop);
+      if (err.code === "unexpected_error") assert.ok(err.cause instanceof Error, stop);
+      const plan = (await alice.plans()).find((p) => p.planId === err.details["planId"]);
+      assert.equal(plan?.mustRetry, true, stop);
+    }
   });
 
   it("self-relays an unshield, warning that the account becomes public", async () => {

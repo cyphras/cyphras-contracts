@@ -207,7 +207,12 @@ export class SorobanRpc {
       }
     }
     if (r.has("resultMetaXdr")) {
-      const meta = xdr.TransactionMeta.fromXDR(r.string("resultMetaXdr"), "base64");
+      let meta: xdr.TransactionMeta;
+      try {
+        meta = xdr.TransactionMeta.fromXDR(r.string("resultMetaXdr"), "base64");
+      } catch {
+        return r.fault("the result meta is not TransactionMeta XDR");
+      }
       if (status === "SUCCESS") {
         returnValue = sorobanReturnValue(meta);
         events = contractEvents(meta);

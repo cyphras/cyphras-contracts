@@ -389,10 +389,20 @@ const view = (plan: Plan): Submission => ({
   fee: plan.fee,
 });
 
-// An error raised once a plan was saved names it: the plan keeps its notes until its fate is
-// known, whatever became of its submission.
+// An error raised once a plan is among the wallet's names it: the plan keeps its notes until its
+// fate is known, whatever became of its submission, so the payment goes again only through retry.
+// An error the SDK did not raise itself, as a signer's or a store's, is wrapped to carry it.
 function naming(err: unknown, plan: Plan | undefined): unknown {
-  if (plan === undefined || !(err instanceof CyphrasError) || "planId" in err.details) return err;
+  if (plan === undefined) return err;
+  if (!(err instanceof CyphrasError)) {
+    return new CyphrasError(
+      "unexpected_error",
+      "the payment's submission stopped on an unexpected error; it may still land",
+      { planId: plan.id },
+      { cause: err },
+    );
+  }
+  if ("planId" in err.details) return err;
   return new CyphrasError(err.code, err.message, { ...err.details, planId: plan.id });
 }
 
@@ -550,9 +560,9 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
         destination?.createsAccount ?? false,
       );
       core.state.plans.push(plan);
+      saved = plan;
       intent.onPlan?.(plan);
       await core.save();
-      saved = plan;
 
       if (relay === undefined) {
         return await selfRelay(core, plan, intent.selfRelay as TransactionSigner);
