@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/stellar/go-stellar-sdk/txnbuild"
@@ -18,21 +19,28 @@ import (
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
-// The vault's own writes extend an entry once it has less than 30 days left, at the cost of the
-// transaction that writes it. The keeper renews every entry within renewWithin of expiry, a day
-// before that, so that no user pays the vault's rent while the keeper runs, and pages for an entry
-// within warnWithin of expiry that it could not extend.
+// The vault's own writes extend an entry once it has 30 days or less left, at the cost of the
+// transaction that writes it, and every user transaction writes the vault's instance, which
+// extends the code with it, and its tree entries. The keeper renews those within holdWithin of
+// expiry, so that it may stop for two weeks before a user pays their rent, and every other entry
+// within renewWithin. It pages for an entry within warnWithin of expiry that it could not extend.
 const (
+	holdWithin  = 45 * ledgersPerDay
 	renewWithin = 31 * ledgersPerDay
 	warnWithin  = 14 * ledgersPerDay
-	// renewStep is how far past renewWithin the vault's instance, code and tree entries, pending
-	// deposits and exits are extended, so that each extension pays about a day of their rent rather
-	// than months of it at once.
+	// renewStep is how far past its threshold an entry is extended, unless it goes to the network's
+	// maximum: each extension pays about a day of rent, whatever the threshold.
 	renewStep = ledgersPerDay
-	// minStep is the shortest extension a lone entry is given when the fee cap refuses a longer
-	// one: an hourly cycle that adds less loses ground.
+	// minStep is the shortest extension tried for a lone entry whose longer ones the fee cap
+	// refuses: an hourly cycle that adds less loses ground.
 	minStep = ledgersPerDay / 24
+	// cycleCaps is how many times the TTL fee cap the transactions of one cycle may be charged; the
+	// entries left wait for the next cycle.
+	cycleCaps = 10
 )
+
+// errCycleSpent stops a TTL cycle whose transactions have been charged cycleCaps times the fee cap.
+var errCycleSpent = fmt.Errorf("the cycle's transactions were charged %d times the TTL fee cap", cycleCaps)
 
 // tracked is an entry the cycle looked at.
 type tracked struct {
@@ -48,10 +56,6 @@ type tracked struct {
 
 func (t tracked) gone() bool {
 	return t.optional && t.missing
-}
-
-func (t tracked) due(latest uint32) bool {
-	return !t.gone() && (t.liveUntil == nil || *t.liveUntil < latest+renewWithin)
 }
 
 func (t tracked) urgent(latest uint32) bool {
@@ -81,12 +85,15 @@ func (k *Keeper) read(ctx context.Context, items []tracked) ([]tracked, uint32, 
 	return out, latest, nil
 }
 
+// treeNames names the entries vault.TreeKeys returns, in its order.
+var treeNames = [...]string{"Roots", "Frontier", "NextLeaf"}
+
 // TTLCycle reads the remaining life of every entry the vault depends on, restores the archived
-// ones and extends each one within renewWithin of expiry. The vault's instance and code, the tree,
-// pending deposits and queued and stranded exits are extended renewStep past renewWithin. The asset
-// contract's instance, the vault's balance and the nullifiers are extended to the network's
-// maximum: they are so small that the fee every extension pays to write a TTL is about a day of
-// their rent.
+// ones and extends those near expiry. The vault's instance and code and the tree entries are
+// extended renewStep past holdWithin. Pending deposits and queued and stranded exits, whose rent is
+// lost when the vault deletes them, are extended renewStep past renewWithin. The asset contract's
+// instance, the vault's balance and the nullifiers go to the network's maximum: they are so small
+// that the fee every extension pays to write a TTL is about a day of their rent.
 func (k *Keeper) TTLCycle(ctx context.Context) error {
 	maxTTL, err := rpc.MaxEntryTTL(ctx, k.rpc)
 	if err != nil {
@@ -96,35 +103,45 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	k.charged = 0
 	var failures []string
+	fail := func(err error) {
+		if err != nil {
+			failures = append(failures, err.Error())
+		}
+	}
 
 	instanceKey, _ := vault.InstanceKey(k.cfg.Vault)
-	group := []tracked{{name: "vault instance", key: instanceKey}, {name: "vault code", key: vault.CodeKey(inst.WasmHash)}}
+	own := []tracked{{name: "vault instance", key: instanceKey}, {name: "vault code", key: vault.CodeKey(inst.WasmHash)}}
 	treeKeys, err := vault.TreeKeys(k.cfg.Vault)
 	if err != nil {
 		return err
 	}
-	for _, key := range treeKeys {
-		group = append(group, tracked{name: "tree entry", key: key})
+	for i, key := range treeKeys {
+		own = append(own, tracked{name: treeNames[i], key: key})
 	}
+	var queued []tracked
 	for _, id := range k.pendingIDs() {
 		key, err := vault.PendingKey(k.cfg.Vault, id)
 		if err != nil {
 			return err
 		}
-		group = append(group, tracked{name: fmt.Sprintf("pending deposit %d", id), key: key, optional: true})
+		queued = append(queued, tracked{name: fmt.Sprintf("pending deposit %d", id), key: key, optional: true})
 	}
 	exits, err := k.exitEntries()
 	if err != nil {
 		return err
 	}
-	group, latest, err := k.read(ctx, append(group, exits...))
+	queued = append(queued, exits...)
+	n := len(own)
+	read, latest, err := k.read(ctx, append(own, queued...))
 	if err != nil {
 		return err
 	}
-	if err := k.extend(ctx, group, renewWithin+renewStep, latest); err != nil {
-		failures = append(failures, err.Error())
-	}
+	own, err = k.extend(ctx, read[:n], holdWithin, holdWithin+renewStep, latest)
+	fail(err)
+	queued, err = k.extend(ctx, read[n:], renewWithin, renewWithin+renewStep, latest)
+	fail(err)
 
 	tokenInstance, err := vault.InstanceKey(inst.Config.Token)
 	if err != nil {
@@ -139,17 +156,29 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := k.extend(ctx, others, maxTTL-1, latest); err != nil {
-		failures = append(failures, err.Error())
-	}
+	others, err = k.extend(ctx, others, renewWithin, maxTTL-1, latest)
+	fail(err)
 	nfFailures, err := k.nullifiers(ctx, maxTTL)
 	if err != nil {
-		return err
+		fail(fmt.Errorf("nullifiers: %w", err))
 	}
 	failures = append(failures, nfFailures...)
 
+	// An entry of the vault's own a day below holdWithin has missed a day of renewals, long before
+	// the vault's writes would make users pay for it.
+	var behind []string
+	for _, t := range own {
+		if t.liveUntil == nil || *t.liveUntil < latest+holdWithin-ledgersPerDay {
+			behind = append(behind, t.name)
+		}
+	}
+	if len(behind) > 0 {
+		k.alerts.Raise(ctx, alert.Warning, "ttl_behind", "%s: more than a day below the %d days the keeper holds them at; users pay their rent below 30 days", strings.Join(behind, ", "), holdWithin/ledgersPerDay)
+	} else {
+		k.alerts.Clear(ctx, "ttl_behind", "the vault's instance, code and tree entries are held again")
+	}
 	urgent := 0
-	for _, t := range append(group, others...) {
+	for _, t := range slices.Concat(own, queued, others) {
 		if t.urgent(latest) {
 			urgent++
 		}
@@ -168,71 +197,115 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 	return nil
 }
 
-// restore restores archived entries, in batches.
-func (k *Keeper) restore(ctx context.Context, archived []xdr.LedgerKey) error {
-	return inBatches(archived, k.cfg.MaxExtensions, func(keys []xdr.LedgerKey) error {
-		what := fmt.Sprintf("restore of %d entries", len(keys))
-		if _, err := k.call(ctx, what, func() (txnbuild.Operation, error) {
-			return &txnbuild.RestoreFootprint{Ext: footprint(nil, keys)}, nil
-		}); err != nil {
-			return fmt.Errorf("%s: %w", what, err)
-		}
-		return nil
-	})
-}
-
-// extend restores the archived entries among items, then extends them and those within
-// renewWithin of expiry to `to` ledgers past the ledger each extension lands in, in batches.
-func (k *Keeper) extend(ctx context.Context, items []tracked, to, latest uint32) error {
-	var archived []xdr.LedgerKey
-	var due []tracked
-	for _, t := range items {
+// extend restores the archived entries among items, then extends them and those within renewAt of
+// expiry to `to` ledgers past the ledger each extension lands in, in batches. An entry whose
+// restoration fails is left out, and holds back no other. It returns items with the life their
+// restoration or extension gave them, at the least.
+func (k *Keeper) extend(ctx context.Context, items []tracked, renewAt, to, latest uint32) ([]tracked, error) {
+	out := slices.Clone(items)
+	var archived, due []*tracked
+	for i := range out {
+		t := &out[i]
 		switch {
 		case t.gone():
 		case t.liveUntil == nil:
-			archived = append(archived, t.key)
-			due = append(due, t)
-		case t.due(latest):
+			archived = append(archived, t)
+		case *t.liveUntil < latest+renewAt:
 			due = append(due, t)
 		}
 	}
 	restored := k.restore(ctx, archived)
-	if restored != nil && !errors.Is(restored, submit.ErrSimulation) {
-		return restored
+	for _, t := range archived {
+		if t.liveUntil != nil && *t.liveUntil < latest+renewAt {
+			due = append(due, t)
+		}
 	}
-	return errors.Join(restored, inBatches(due, k.cfg.MaxExtensions, func(batch []tracked) error {
+	extended := inBatches(due, k.cfg.MaxExtensions, func(batch []*tracked) error {
 		return k.extendBatch(ctx, batch, to, latest)
-	}))
+	})
+	return out, errors.Join(restored, extended)
 }
 
-// extendBatch extends a batch of entries to `to` ledgers past the ledger it lands in. A lone entry
-// whose rent the fee cap refuses is extended half as far, down to minStep, so that rent grown past
-// the cap takes more transactions rather than the entry.
-func (k *Keeper) extendBatch(ctx context.Context, batch []tracked, to, latest uint32) error {
-	keys := make([]xdr.LedgerKey, len(batch))
-	for i, t := range batch {
-		keys[i] = t.key
+// restore restores archived entries, in batches, then reads the life the network gave the ones it
+// restored: its least for a persistent entry, which differs between networks.
+func (k *Keeper) restore(ctx context.Context, archived []*tracked) error {
+	var restored []*tracked
+	err := inBatches(archived, k.cfg.MaxExtensions, func(batch []*tracked) error {
+		keys := keysOf(batch)
+		what := fmt.Sprintf("restore of %d entries", len(keys))
+		if err := k.ttlCall(ctx, what, func() (txnbuild.Operation, error) {
+			return &txnbuild.RestoreFootprint{Ext: footprint(nil, keys)}, nil
+		}); err != nil {
+			return fmt.Errorf("%s: %w", what, err)
+		}
+		restored = append(restored, batch...)
+		return nil
+	})
+	if len(restored) == 0 {
+		return err
 	}
+	items := make([]tracked, len(restored))
+	for i, t := range restored {
+		items[i] = *t
+	}
+	read, _, readErr := k.read(ctx, items)
+	if readErr != nil {
+		return errors.Join(err, readErr)
+	}
+	for i, t := range restored {
+		t.liveUntil = read[i].liveUntil
+	}
+	return err
+}
+
+// extendBatch extends a batch of entries to `to` ledgers past the ledger it lands in, and records
+// the life that gives them. A lone entry whose rent the fee cap refuses is extended half as far,
+// and at last exactly minStep past its life, so that rent grown past the cap takes more
+// transactions rather than the entry.
+func (k *Keeper) extendBatch(ctx context.Context, batch []*tracked, to, latest uint32) error {
+	keys := keysOf(batch)
 	what := fmt.Sprintf("extension of %d entries", len(keys))
 	if len(batch) == 1 {
 		what = "extension of the " + batch[0].name
 	}
 	for {
-		_, err := k.call(ctx, what, func() (txnbuild.Operation, error) {
+		err := k.ttlCall(ctx, what, func() (txnbuild.Operation, error) {
 			return &txnbuild.ExtendFootprintTtl{ExtendTo: to, Ext: footprint(keys, nil)}, nil
 		})
 		if err == nil {
+			life := latest + to
+			for _, t := range batch {
+				if *t.liveUntil < life {
+					t.liveUntil = &life
+				}
+			}
 			return nil
 		}
-		left := uint32(0)
-		if until := batch[0].liveUntil; until != nil {
-			left = *until - latest
-		}
-		if len(batch) > 1 || !errors.Is(err, submit.ErrFeeCap) || to <= left || (to-left)/2 < minStep {
+		left := *batch[0].liveUntil - latest
+		if len(batch) > 1 || !errors.Is(err, submit.ErrFeeCap) || to <= left+minStep {
 			return fmt.Errorf("%s: %w", what, err)
 		}
-		to = left + (to-left)/2
+		to = left + max((to-left)/2, minStep)
 	}
+}
+
+// ttlCall runs one extension or restoration, unless the transactions of the cycle have been
+// charged cycleCaps times the fee cap of such transactions already.
+func (k *Keeper) ttlCall(ctx context.Context, what string, build func() (txnbuild.Operation, error)) error {
+	if limit := k.engine.TTLFeeCap(); limit > 0 && k.charged >= cycleCaps*limit {
+		return errCycleSpent
+	}
+	res, err := k.call(ctx, what, build)
+	k.charged += res.FeeCharged
+	return err
+}
+
+func keysOf(batch []*tracked) []xdr.LedgerKey {
+	keys := make([]xdr.LedgerKey, len(batch))
+	for i, t := range batch {
+		keys[i] = t.key
+	}
+	return keys
 }
 
 // inBatches runs items through run in batches of at most size. A batch the simulation refuses, as
@@ -313,6 +386,9 @@ func (k *Keeper) nullifiers(ctx context.Context, maxTTL uint32) ([]string, error
 		list = append(list, nf{seq, key})
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	var failures []string
 	const readBatch = 200
 	for start := 0; start < len(list); start += readBatch {
@@ -325,23 +401,23 @@ func (k *Keeper) nullifiers(ctx context.Context, maxTTL uint32) ([]string, error
 		if err != nil {
 			return nil, err
 		}
-		urgent := 0
-		for _, t := range items {
-			if t.urgent(latest) {
-				urgent++
-			}
-		}
-		if err := k.extend(ctx, items, maxTTL-1, latest); err != nil {
+		items, err = k.extend(ctx, items, renewWithin, maxTTL-1, latest)
+		if err != nil {
 			failures = append(failures, err.Error())
+			urgent := 0
+			for _, t := range items {
+				if t.urgent(latest) {
+					urgent++
+				}
+			}
 			if urgent > 0 {
 				k.alerts.Raise(ctx, alert.Critical, "entry_expiring", "%d nullifier entries are within 14 days of expiry and could not be extended", urgent)
 			}
-			continue
 		}
-		// Only the life of an entry left as it was is known: an extended one is read again in the
-		// next cycle, as the fee cap may have let it get less far than the maximum.
+		// The life recorded for an extended entry is the least its extension gave it, so the entry
+		// is read again no later than it is due.
 		for i, t := range items {
-			if t.due(latest) {
+			if t.liveUntil == nil {
 				continue
 			}
 			if _, err := k.chain.Pool.Exec(ctx, `UPDATE nullifiers SET live_until = $2 WHERE seq = $1`, chunk[i].seq, int64(*t.liveUntil)); err != nil {

@@ -128,6 +128,13 @@ func (f *Fake) SetLatest(latest uint32) {
 	f.Latest = latest
 }
 
+// LatestLedger returns the chain tip.
+func (f *Fake) LatestLedger() uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Latest
+}
+
 // GetHealth implements rpc.Client.
 func (f *Fake) GetHealth(context.Context) (protocol.GetHealthResponse, error) {
 	f.mu.Lock()

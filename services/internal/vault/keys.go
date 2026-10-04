@@ -67,7 +67,7 @@ func StrandedKey(vault string, id uint64) (xdr.LedgerKey, error) {
 	return contractData(vault, enumKey("Stranded", U64(id)), xdr.ContractDataDurabilityPersistent)
 }
 
-// TreeKeys are the tree entries bump_ttl extends.
+// TreeKeys are the keys of the tree entries: Roots, Frontier and NextLeaf, in that order.
 func TreeKeys(vault string) ([]xdr.LedgerKey, error) {
 	var keys []xdr.LedgerKey
 	for _, f := range []func(string) (xdr.LedgerKey, error){RootsKey, FrontierKey, NextLeafKey} {

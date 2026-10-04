@@ -68,11 +68,15 @@ type harness struct {
 	// day after.
 	flaggedAt map[uint64]uint64
 	// rent, when set, prices each ledger an extension adds to an entry's life in the simulated
-	// resource fee; refuse makes the simulation refuse a footprint, as one naming an entry archived
-	// since the keeper read it; playTTL makes sent extensions and restorations change the entries.
-	rent    func(key xdr.LedgerKey, ledgers uint32) int64
-	refuse  func(xdr.LedgerFootprint) bool
-	playTTL bool
+	// resource fee; refuse makes the simulation refuse a footprint; playTTL makes sent extensions
+	// and restorations change the entries, a restoration giving an entry restoreTTL ledgers, or
+	// mainnet's least life of a persistent entry when that is zero.
+	rent       func(key xdr.LedgerKey, ledgers uint32) int64
+	refuse     func(xdr.LedgerFootprint) bool
+	playTTL    bool
+	restoreTTL uint32
+	// lastFee is the fee the last sent transaction offered, which its result reports charged.
+	lastFee int64
 }
 
 // released is what the simulated vault's release(max) returns: how many exits it handles from the
@@ -157,6 +161,15 @@ func newHarness(t *testing.T) *harness {
 		if data := env.V1.Tx.Ext.SorobanData; h.refuse != nil && data != nil && h.refuse(data.Resources.Footprint) {
 			return protocol.SimulateTransactionResponse{Error: "entry is archived"}, nil
 		}
+		latest := h.fake.LatestLedger()
+		// As the RPC does, an extension that names an archived entry is refused.
+		if op := env.V1.Tx.Operations[0].Body.ExtendFootprintTtlOp; op != nil {
+			for _, key := range env.V1.Tx.Ext.SorobanData.Resources.Footprint.ReadOnly {
+				if until, ok := h.fake.LiveUntil(key); ok && until < latest {
+					return protocol.SimulateTransactionResponse{Error: "an archived entry must be restored before it is extended"}, nil
+				}
+			}
+		}
 		var refunded uint64
 		if _, err := fmt.Sscanf(describe(env), "refund %d", &refunded); err == nil {
 			if at, ok := h.flaggedAt[refunded]; ok && uint64(h.now.Unix()) < at+86_400 {
@@ -170,7 +183,7 @@ func newHarness(t *testing.T) *harness {
 		encoded, _ := xdr.MarshalBase64(data)
 		fee := int64(100)
 		if op := env.V1.Tx.Operations[0].Body.ExtendFootprintTtlOp; op != nil && h.rent != nil {
-			target := h.fake.Latest + uint32(op.ExtendTo)
+			target := latest + uint32(op.ExtendTo)
 			for _, key := range data.Resources.Footprint.ReadOnly {
 				if until, ok := h.fake.LiveUntil(key); ok && until < target {
 					fee += h.rent(key, target-until)
@@ -201,6 +214,7 @@ func newHarness(t *testing.T) *harness {
 		h.mu.Lock()
 		h.sent = append(h.sent, describe(env))
 		h.last = describe(env)
+		h.lastFee = int64(env.V1.Tx.Fee)
 		if data := env.V1.Tx.Ext.SorobanData; data != nil {
 			h.footprints = append(h.footprints, data.Resources.Footprint)
 		}
@@ -218,18 +232,19 @@ func newHarness(t *testing.T) *harness {
 		h.mu.Lock()
 		failed := h.chainFail != nil && h.chainFail(h.last)
 		conflict := h.conflict != nil && h.conflict(h.last)
+		fee := xdr.Int64(h.lastFee)
 		h.mu.Unlock()
 		if conflict {
 			return conflictOnChain(), nil
 		}
 		if failed {
-			r, _ := xdr.MarshalBase64(xdr.TransactionResult{Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxFailed, Results: &[]xdr.OperationResult{}}})
+			r, _ := xdr.MarshalBase64(xdr.TransactionResult{FeeCharged: fee, Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxFailed, Results: &[]xdr.OperationResult{}}})
 			return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusFailed, ResultXDR: r}}, nil
 		}
-		r, _ := xdr.MarshalBase64(xdr.TransactionResult{Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxSuccess, Results: &[]xdr.OperationResult{}}})
+		r, _ := xdr.MarshalBase64(xdr.TransactionResult{FeeCharged: fee, Result: xdr.TransactionResultResult{Code: xdr.TransactionResultCodeTxSuccess, Results: &[]xdr.OperationResult{}}})
 		return protocol.GetTransactionResponse{TransactionDetails: protocol.TransactionDetails{Status: protocol.TransactionStatusSuccess, ResultXDR: r}}, nil
 	}
-	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, Validity: time.Minute, Poll: time.Millisecond, Now: func() time.Time { return h.now }}
+	engine := &submit.Engine{RPC: h.fake, Passphrase: passphrase, ResourceMarginPct: 15, Validity: time.Minute, Poll: time.Millisecond, Now: func() time.Time { return h.now }}
 	alerts := &alert.Alerter{Service: "keeper", Channels: []alert.Channel{h}, Cooldown: time.Hour, Now: func() time.Time { return h.now }}
 	k, err := New(context.Background(), Config{
 		Vault: vaulttest.Vault, DeployLedger: 10, Asset: "native", MaxAdmissions: 16, MaxExtensions: 50, MaxReleases: 10, RefundDelay: 24 * time.Hour,
@@ -252,7 +267,11 @@ func (h *harness) playFootprint(env xdr.TransactionEnvelope) {
 	if data == nil {
 		return
 	}
-	latest := h.fake.Latest
+	latest := h.fake.LatestLedger()
+	restored := h.restoreTTL
+	if restored == 0 {
+		restored = rpctest.Mainnet.MinPersistentTTL
+	}
 	op := env.V1.Tx.Operations[0].Body
 	switch op.Type {
 	case xdr.OperationTypeExtendFootprintTtl:
@@ -265,7 +284,7 @@ func (h *harness) playFootprint(env xdr.TransactionEnvelope) {
 	case xdr.OperationTypeRestoreFootprint:
 		for _, key := range data.Resources.Footprint.ReadWrite {
 			if until, ok := h.fake.LiveUntil(key); ok && until < latest {
-				h.fake.SetLiveUntil(key, latest+rpctest.Mainnet.MinPersistentTTL-1)
+				h.fake.SetLiveUntil(key, latest+restored-1)
 			}
 		}
 	}
@@ -468,9 +487,9 @@ func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 	// Deposit 1 is close to expiry, deposit 2 is not.
 	h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, 1)), vaulttest.Pending(1, vaulttest.Depositor, 10, 0, 3600, nil, 0), 10, &near)
 	h.fake.SetContractData(mustKey(vault.PendingKey(vaulttest.Vault, 2)), vaulttest.Pending(2, vaulttest.Depositor, 10, 0, 3600, nil, 0), 10, &far)
-	// The code is due, the asset contract is not, and the vault's balance entry is archived.
+	// The code and the asset contract are due, and the vault's balance entry is archived.
 	h.fake.SetEntry(vault.CodeKey([32]byte{9}), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeContractCode, ContractCode: &xdr.ContractCodeEntry{Hash: xdr.Hash{9}}}, 10, &near)
-	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Token)), vault.U64(0), 10, &far)
+	h.fake.SetContractData(mustKey(vault.InstanceKey(vaulttest.Token)), vault.U64(0), 10, &near)
 	h.fake.SetContractData(mustKey(vault.BalanceKey(vaulttest.Token, vaulttest.Vault)), vault.U64(0), 10, &archived)
 	// Of the four nullifiers, one is fresh, two are due and one is archived.
 	var nfKeys []xdr.LedgerKey
@@ -487,9 +506,10 @@ func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 	if err := h.k.TTLCycle(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// The code and deposit 1 go to 32 days; the archived entries are restored first, and the
-	// small entries go to the maximum.
-	want := []string{"extend 2 to 552960", "restore 1", "extend 1 to 3110399", "restore 1", "extend 3 to 3110399"}
+	// The code goes to 46 days and deposit 1 to 32. The archived balance entry and nullifier are
+	// restored, for the 120 days that need no extension, and the asset contract and the other two
+	// due nullifiers go to the maximum.
+	want := []string{"extend 1 to 794880", "extend 1 to 552960", "restore 1", "extend 1 to 3110399", "restore 1", "extend 2 to 3110399"}
 	if got := h.take(); !equal(got, want) {
 		t.Fatalf("ttl cycle sent %v", got)
 	}
@@ -498,20 +518,30 @@ func TestTheTTLCycleExtendsEveryEntryNearExpiry(t *testing.T) {
 		_ = h.k.chain.Pool.QueryRow(context.Background(), `SELECT count(*) FROM nullifiers WHERE live_until IS NOT NULL`).Scan(&n)
 		return n
 	}
-	// Only the fresh nullifier's life is known; the next cycle reads how far the others got.
-	if n := tracked(); n != 1 {
-		t.Fatalf("%d nullifiers tracked", n)
-	}
-	if err := h.k.TTLCycle(context.Background()); err != nil || len(h.take()) != 0 {
-		t.Fatalf("the next cycle extended again: %v", err)
-	}
 	if n := tracked(); n != 4 {
 		t.Fatalf("%d nullifiers tracked", n)
 	}
-	// The cycle after reads only the vault's own entries and the asset contract's.
-	before := h.fake.CallCount("getLedgerEntries")
-	if err := h.k.TTLCycle(context.Background()); err != nil {
+	// No recorded life is beyond the entry's own, so none is read again later than it is due.
+	rows, err := h.k.chain.Pool.Query(context.Background(), `SELECT nullifier, live_until FROM nullifiers`)
+	if err != nil {
 		t.Fatal(err)
+	}
+	for rows.Next() {
+		var raw []byte
+		var until int64
+		if err := rows.Scan(&raw, &until); err != nil {
+			t.Fatal(err)
+		}
+		e, _ := fr.SetBytes([32]byte(raw))
+		if actual, _ := h.fake.LiveUntil(mustKey(vault.NullifierKey(vaulttest.Vault, e.Bytes()))); until > int64(actual) {
+			t.Fatalf("a nullifier recorded live until %d lives until %d", until, actual)
+		}
+	}
+	rows.Close()
+	// The next cycle reads only the vault's own entries and the asset contract's, and sends nothing.
+	before := h.fake.CallCount("getLedgerEntries")
+	if err := h.k.TTLCycle(context.Background()); err != nil || len(h.take()) != 0 {
+		t.Fatalf("the next cycle extended again: %v", err)
 	}
 	if n := h.fake.CallCount("getLedgerEntries") - before; n != 4 {
 		t.Fatalf("%d reads: fresh nullifiers were read again", n)

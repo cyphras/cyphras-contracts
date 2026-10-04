@@ -71,6 +71,9 @@ type Keeper struct {
 	lastCycle time.Time
 	claims    map[uint64]claimTry
 	idle      *releaseIdle
+
+	// charged is what the current TTL cycle's transactions were charged; only the cycle uses it.
+	charged int64
 }
 
 // New loads the stored chain state.
