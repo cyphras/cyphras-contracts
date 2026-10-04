@@ -673,6 +673,67 @@ describe("wallet: reads of the entry queue", () => {
     assert.equal(deposit?.flag?.kind, "legal_hold");
     assert.equal(deposit?.confirmed, true);
   });
+  it("reads the deposits it follows before any candidate, in requests of at most 200 keys", async () => {
+    const world = await createWorld();
+    const store = new MemoryStore();
+    const wallet = await openWallet(world, 0, store);
+    await shielded(wallet, 10n * XLM, world.signer("depositor"));
+    // Deposit 1 first, then 199 more deposits to follow, and one being submitted whose only
+    // candidate is an entry the indexer makes up.
+    const sealed = new SealedStore(store, storeKeyOf(0));
+    const kept = (await loadState(sealed)) as WalletState;
+    const own = kept.deposits[0] as Deposit;
+    const others = Array.from({ length: 199 }, (_, i) => ({
+      ...own,
+      id: 1000 + i,
+      commitments: [BigInt(i + 1), BigInt(i + 2)] as const,
+    }));
+    const unnamed = {
+      ...own,
+      id: undefined,
+      amount: own.amount + 1n,
+      state: "submitting" as const,
+      txHash: undefined,
+      commitments: [7n, 8n] as const,
+    };
+    kept.deposits = [own, ...others, unnamed];
+    await saveState(sealed, kept);
+    world.rpc.run("ab".repeat(32), () => world.vault.flag(1, 100));
+    const candidate = xdr.LedgerKey.contractData(
+      new xdr.LedgerKeyContractData({
+        contract: new Address(world.vault.address).toScAddress(),
+        key: xdr.ScVal.scvVec([
+          xdr.ScVal.scvSymbol("Pending"),
+          xdr.ScVal.scvU64(new xdr.Uint64(5000n)),
+        ]),
+        durability: xdr.ContractDataDurability.persistent(),
+      }),
+    ).toXDR("base64");
+    // The first provider refuses any request that reads the made-up candidate.
+    const indexer = rewritingFetch(world, {
+      "/v1/deposits": (body) => {
+        const pending = body["pending"] as Record<string, unknown>[];
+        const first = pending.find((d) => d["id"] === 1) as Record<string, unknown>;
+        const madeUp = { ...first, id: 5000, amount: unnamed.amount.toString() };
+        return { ...body, pending: [...pending, madeUp] };
+      },
+    });
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      if (url.origin === RPC && body !== undefined && readsQueue(body)) {
+        if ((body.params.keys as string[]).includes(candidate)) return tooMany(body.id);
+      }
+      return indexer(url.origin === second ? RPC : input, init);
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, store, undefined, {
+      secondRpcUrl: second,
+    });
+    await alice.sync();
+    const deposit = (await alice.deposits()).find((d) => d.id === 1);
+    assert.equal(deposit?.flag?.kind, "legal_hold");
+    assert.equal(deposit?.confirmed, true);
+  });
 });
 
 describe("wallet: a deposit taken for failed", () => {
