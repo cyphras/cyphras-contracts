@@ -124,6 +124,8 @@ export interface VaultEvents {
   // Close times RPC reported: of the oldest ledger it holds, of the first event's ledger and of
   // the head.
   readonly times: readonly LedgerTime[];
+  // The close time RPC reported of every ledger with an event of the vault the read took.
+  readonly closeTimes: readonly LedgerTime[];
 }
 
 // What a read of the vault's events needs no more of: the events after a ledger, once the leaves
@@ -193,6 +195,7 @@ export class RpcEventSource implements ChainSource {
     const exits: ExitEvent[] = [];
     const deposits: DepositEvent[] = [];
     const times: LedgerTime[] = [];
+    const closeTimes = new Map<number, number>();
     const time = (ledger: number, at: number | undefined): void => {
       if (at !== undefined) times.push({ ledger, at });
     };
@@ -231,6 +234,7 @@ export class RpcEventSource implements ChainSource {
       headTime = page.latestCloseTime;
       for (const event of page.events) {
         if (!event.successful || event.contractId !== this.#vault) continue;
+        if (event.closedAt !== undefined) closeTimes.set(event.ledger, event.closedAt);
         const decoded = decodeVaultEvent(event);
         if (decoded.kind === "new_commitment") {
           leafEnd = Math.max(leafEnd, decoded.index + 1);
@@ -288,6 +292,7 @@ export class RpcEventSource implements ChainSource {
       latest,
       head,
       times,
+      closeTimes: [...closeTimes].map(([ledger, at]) => ({ ledger, at })),
     };
   }
 

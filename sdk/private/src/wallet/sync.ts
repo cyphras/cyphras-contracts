@@ -9,6 +9,7 @@ import type { Leaf, SpentNullifier } from "../net/indexer.ts";
 import type { SorobanRpc } from "../net/rpc.ts";
 import { nullifier } from "../notes.ts";
 import type { ChainView, RootHistory, VaultReader } from "../vault/state.ts";
+import { recordCloseTimes } from "./pace.ts";
 import { type ChainSource, RpcEventSource, type VaultEvents } from "./sources.ts";
 import {
   ACTIVE_STATES,
@@ -118,6 +119,8 @@ export interface CrossCheck {
   readonly verified: boolean;
   // The vault's events RPC returned for the range and after it, if it held them.
   readonly events: VaultEvents | undefined;
+  // RPC no longer holds the ledger the range starts at.
+  readonly gone: boolean;
 }
 
 const leafKey = (l: Leaf): string =>
@@ -170,11 +173,13 @@ export async function crossCheck(
   try {
     events = await new RpcEventSource(rpc, vault, data.since, maxPages).events();
   } catch (err) {
-    if (err instanceof CyphrasError) return { verified: false, events: undefined };
+    if (err instanceof CyphrasError) {
+      return { verified: false, events: undefined, gone: err.code === "history_unavailable" };
+    }
     throw err;
   }
   // RPC stopped short of the horizon, at its page cap or behind the source: nothing is proven.
-  if (events.latest < data.horizon) return { verified: false, events };
+  if (events.latest < data.horizon) return { verified: false, events, gone: false };
   const differ = (): never =>
     fail("indexer_fault", "the indexer's leaves or nullifiers differ from the vault's events");
   const onChain = new Map(events.leaves.map((l) => [l.index, l]));
@@ -191,7 +196,7 @@ export async function crossCheck(
   const served = new Set(data.nullifiers.map(nfKey));
   const chainNfs = new Set(events.nullifiers.filter(within).map(nfKey));
   if (served.size !== chainNfs.size || [...served].some((k) => !chainNfs.has(k))) differ();
-  return { verified: true, events };
+  return { verified: true, events, gone: false };
 }
 
 // The local root must be one of the vault's last 256 roots, read from the ledger.
@@ -561,6 +566,10 @@ export async function recheck(
       busy ||= err.code !== "history_unavailable";
     }
   }
+  recordCloseTimes(
+    state,
+    held.flatMap((e) => e.closeTimes),
+  );
   if (held.length === 0) {
     if (!busy) state.unchecked[at] = { ...range, status: "lost" };
     return undefined;

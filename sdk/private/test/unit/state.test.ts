@@ -28,7 +28,7 @@ describe("stored state", () => {
     );
   });
 
-  it("loads a state from before close times, checked ledgers, digests, counts of providers, range statuses and confirmed exits", async () => {
+  it("loads a state from before close times, checked ledgers, digests, counts of providers, range statuses, confirmed exits, the times of history entries and payouts", async () => {
     const store = new SealedStore(new MemoryStore(), testBytes("state/key", 2, 32));
     const state = emptyState(10);
     state.unchecked = [
@@ -47,6 +47,10 @@ describe("stored state", () => {
     const older = JSON.parse(text);
     delete older.ledgerTimes;
     delete older.checkedLeafLedger;
+    delete older.closeTimes;
+    delete older.closeTimesTo;
+    delete older.closeTimesUntil;
+    delete older.payouts;
     older.unchecked.forEach((range: Record<string, unknown>, i: number) => {
       delete range["status"];
       range["lost"] = i === 1;
@@ -69,6 +73,10 @@ describe("stored state", () => {
     const loaded = await loadState(store);
     assert.deepEqual(loaded?.ledgerTimes, []);
     assert.equal(loaded?.checkedLeafLedger, 0);
+    assert.deepEqual(loaded?.closeTimes, []);
+    assert.equal(loaded?.closeTimesTo, 0);
+    assert.equal(loaded?.closeTimesUntil, 0);
+    assert.deepEqual(loaded?.payouts, []);
     // A range kept as lost on the first provider's word is open again; leaves kept without the
     // digests a recheck compares can no longer be checked, and leaves staged without them are
     // taken again.
@@ -97,6 +105,19 @@ describe("stored state", () => {
         [false, "cancelled"],
       ],
     );
+  });
+
+  it("takes close times kept without when they were read as read when RPC said they closed", async () => {
+    const store = new SealedStore(new MemoryStore(), testBytes("state/key", 3, 32));
+    const state = emptyState(10);
+    state.ledgerTimes = [{ ledger: 500, at: 1_700_000_000, seen: 1_700_000_090 }];
+    await saveState(store, state);
+    const older = JSON.parse(new TextDecoder().decode((await store.read("state")) as Uint8Array));
+    delete older.ledgerTimes[0].seen;
+    await store.write("state", new TextEncoder().encode(JSON.stringify(older)));
+    assert.deepEqual((await loadState(store))?.ledgerTimes, [
+      { ledger: 500, at: 1_700_000_000, seen: 1_700_000_000 },
+    ]);
   });
 
   it("refuses a number without its sign", async () => {

@@ -69,9 +69,9 @@ import {
   verifyDisclosure,
 } from "./disclosure.ts";
 import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } from "./exits.ts";
-import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
+import { type Balance, type HistoryEntry, balanceOf, historyOf, recordPayouts } from "./history.ts";
 import { type VaultLimitsView, vaultLimits } from "./limits.ts";
-import { updatePace } from "./pace.ts";
+import { closedBy, readCloseTimes, recordCloseTimes, updatePace } from "./pace.ts";
 import { type Verification, createServices, recheckIndexers, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
@@ -82,6 +82,7 @@ import {
 } from "./sources.ts";
 import {
   type ConfirmSpend,
+  type HeldQuotes,
   type SpendQuote,
   type Submission,
   cancelHeld,
@@ -248,6 +249,8 @@ export interface QuoteRequest {
   readonly relayer?: string | readonly string[];
   readonly selfRelay?: boolean;
   readonly maxFee?: bigint;
+  // Asks the relayer again rather than show a quote it gave this wallet that still holds.
+  readonly fresh?: boolean;
 }
 
 /** A stalled payment proved again, with the same notes. */
@@ -300,6 +303,20 @@ export interface PlanView extends Submission {
   // Its deadline has passed, and the wallet cannot tell yet whether it landed, as it lacks part of
   // the vault's tree. The safe choice is retry: both spend the same notes, so at most one pays.
   readonly needsUserDecision: boolean;
+  // The plan it proves again with the same notes, and the first plan of that line of retries,
+  // which every plan of it shares: a wallet counts a family once.
+  readonly retryOf: string | undefined;
+  readonly familyId: string;
+  // What the plan's real notes hold, and the change that returns to the wallet after the amount
+  // and the fee.
+  readonly inputValue: bigint;
+  readonly change: bigint;
+  // The last ledger its proof can land in, and an estimate of the time by which that ledger will
+  // have closed, at the slowest pace of recent ledgers from when the last sync read them, in
+  // milliseconds since the epoch; undefined until a sync has read close times. Only mustRetry
+  // tells whether the payment may be made again.
+  readonly deadline: number;
+  readonly deadlineBy: number | undefined;
 }
 
 /**
@@ -495,6 +512,7 @@ export class PrivateWallet {
   #queue: Promise<unknown> = Promise.resolve();
   // The last sync found data that contradicts the chain; nothing of it was kept.
   #fault = false;
+  readonly #quotes: HeldQuotes = new Map();
 
   private constructor(
     core: Core,
@@ -772,13 +790,18 @@ export class PrivateWallet {
     const core = this.#core;
     const draft = structuredClone(core.state);
     if (full) {
-      const { revision, plans, deposits, operations } = draft;
+      const { revision, plans, deposits, operations, payouts } = draft;
+      const { closeTimes, closeTimesTo, closeTimesUntil } = draft;
       resetEvidence(plans);
       Object.assign(draft, emptyState(core.deployment.deployLedger), {
         revision,
         plans,
         deposits,
         operations,
+        closeTimes,
+        closeTimesTo,
+        closeTimesUntil,
+        payouts,
       });
     }
     let summary: SyncSummary;
@@ -852,6 +875,11 @@ export class PrivateWallet {
       crossChecked = matches.every((m) => m.verified);
       checked = crossChecked;
       events = matches[0]?.events;
+      // RPC no longer holds where this sync started, so its own read gave no close times: they are
+      // left to a read of every ledger it holds, up to this sync's horizon.
+      if (matches[0]?.gone === true) {
+        core.state.closeTimesUntil = Math.max(core.state.closeTimesUntil, data.horizon);
+      }
       others = matches.slice(1).flatMap((m) => (m.events === undefined ? [] : [m.events]));
     } else {
       events = await source.events();
@@ -895,7 +923,7 @@ export class PrivateWallet {
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
     if (verified) advancePlans(core.state, views as [ChainView, ...ChainView[]]);
     const live = source.kind === "indexer" ? indexer : undefined;
-    const pace = updatePace(core.state, events?.times ?? []);
+    const pace = updatePace(core.state, events?.times ?? [], core.now() / 1000);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
     onReads({ view, stats: await live?.stats().catch(() => undefined), pace });
     const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
@@ -936,7 +964,13 @@ export class PrivateWallet {
       await live?.exits().catch(() => undefined),
       view.ledger,
     );
+    recordPayouts(core.state, [...(rechecked?.exits ?? []), ...within(shown?.exits ?? [])]);
     await this.#pollRelayers(core, view.ledger, pace);
+    recordCloseTimes(
+      core.state,
+      [events, ...others].flatMap((e) => e?.closeTimes ?? []),
+    );
+    await readCloseTimes(core.state, core.services.rpc, vault, view.ledger, limits.eventPages);
     return {
       leafCount: core.state.tree.leafCount,
       staged:
@@ -1013,23 +1047,46 @@ export class PrivateWallet {
 
   /** This wallet's spends and their states in the submission state machine. */
   async plans(): Promise<PlanView[]> {
-    return this.#core.state.plans.map((p) => ({
-      ...submissionOf(p),
-      kind: p.kind,
-      amount: p.amount,
-      to: p.to,
-      createdAt: p.createdAt,
-      route: p.route,
-      exitId: p.exit?.id,
-      payoutLeft: p.exit === undefined ? undefined : payoutLeft(p.exit),
-      exitParts: (p.exit === undefined ? [] : shownParts(p.exit)).map((part) => ({ ...part })),
-      exitConfirmed:
-        p.exit === undefined ? undefined : p.exit.confirmed && p.exit.account === undefined,
-      operationId: p.operationId,
-      relayerStatus: p.relayerStatus,
-      mustRetry: isActive(p) || p.state === "dead",
-      needsUserDecision: isActive(p) && (this.#core.state.rootCheck?.ledger ?? 0) >= p.deadline,
-    }));
+    const { state } = this.#core;
+    const byId = new Map(state.plans.map((p) => [p.id, p]));
+    const family = (p: Plan): string => {
+      const seen = new Set<string>();
+      let first = p;
+      while (first.retryOf !== undefined && !seen.has(first.id)) {
+        seen.add(first.id);
+        const earlier = byId.get(first.retryOf);
+        if (earlier === undefined) break;
+        first = earlier;
+      }
+      return first.id;
+    };
+    return state.plans.map((p) => {
+      const inputValue = p.inputs.reduce((s, i) => s + i.value, 0n);
+      const by = closedBy(state, p.deadline);
+      return {
+        ...submissionOf(p),
+        kind: p.kind,
+        amount: p.amount,
+        to: p.to,
+        createdAt: p.createdAt,
+        route: p.route,
+        exitId: p.exit?.id,
+        payoutLeft: p.exit === undefined ? undefined : payoutLeft(p.exit),
+        exitParts: (p.exit === undefined ? [] : shownParts(p.exit)).map((part) => ({ ...part })),
+        exitConfirmed:
+          p.exit === undefined ? undefined : p.exit.confirmed && p.exit.account === undefined,
+        operationId: p.operationId,
+        relayerStatus: p.relayerStatus,
+        mustRetry: isActive(p) || p.state === "dead",
+        needsUserDecision: isActive(p) && (state.rootCheck?.ledger ?? 0) >= p.deadline,
+        retryOf: p.retryOf,
+        familyId: family(p),
+        inputValue,
+        change: inputValue - p.amount - p.fee,
+        deadline: p.deadline,
+        deadlineBy: by === undefined ? undefined : by * 1000,
+      };
+    });
   }
 
   /**
@@ -1089,16 +1146,17 @@ export class PrivateWallet {
    * The fee a send or an unshield would pay now, from the first relayer that quotes within the cap,
    * or none for a self-relayed unshield, and the most one transaction can pay with it from the
    * notes spendable as of the last sync: what a wallet shows, with a Max button, before review.
+   * Before the first sync only the fee is quoted. A relayer's quote is shown again, without asking
+   * the relayer, while it holds for at least another minute, unless `fresh` is set.
    */
   quote(request: QuoteRequest): Promise<SpendQuote> {
-    return this.#run(async () =>
-      quoteSpend(
-        this.#core,
-        request.kind,
-        request.selfRelay === true ? undefined : this.#relayerClients(request.relayer),
-        request.maxFee,
-      ),
-    );
+    return this.#run(async () => {
+      if (this.#core.chain === undefined) await this.#ensureVerified();
+      const relayers =
+        request.selfRelay === true ? undefined : this.#relayerClients(request.relayer);
+      if (request.fresh === true) relayers?.forEach((r) => this.#quotes.delete(r.url));
+      return quoteSpend(this.#core, request.kind, relayers, request.maxFee, this.#quotes);
+    });
   }
 
   /** Pays a shielded address through a relayer. */

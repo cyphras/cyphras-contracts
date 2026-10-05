@@ -22,6 +22,7 @@ export type VaultEvent =
       readonly id: number;
       readonly payout: bigint;
       readonly fee: bigint;
+      readonly recipient: string;
     }
   // A part payment by release of the exit at the head of the queue, and what it still owes.
   | {
@@ -45,8 +46,15 @@ export type VaultEvent =
       readonly payout: bigint;
       readonly fee: bigint;
     }
-  // exitId is set when release completes an exit, and absent when transact paid at once.
-  | { readonly kind: "settled"; readonly exitId: number | undefined }
+  // exitId is set when release completes an exit, and absent when transact paid at once. The
+  // amounts are what this payment moved: of an exit paid in parts, its last part.
+  | {
+      readonly kind: "settled";
+      readonly exitId: number | undefined;
+      readonly payout: bigint;
+      readonly fee: bigint;
+      readonly recipient: string;
+    }
   | { readonly kind: "other"; readonly topic: string };
 
 export function decodeVaultEvent(event: Pick<ContractEvent, "topic" | "value">): VaultEvent {
@@ -82,6 +90,7 @@ export function decodeVaultEvent(event: Pick<ContractEvent, "topic" | "value">):
         id: Number(data.u64("id")),
         payout: -data.i128("ext_amount"),
         fee: data.i128("fee"),
+        recipient: data.address("recipient"),
       };
     }
     case "exit_paid": {
@@ -113,8 +122,15 @@ export function decodeVaultEvent(event: Pick<ContractEvent, "topic" | "value">):
       };
     }
     case "settled": {
-      const exitId = new Struct(event.value, topic).optionU64("exit_id");
-      return { kind: topic, exitId: exitId === undefined ? undefined : Number(exitId) };
+      const data = new Struct(event.value, topic);
+      const exitId = data.optionU64("exit_id");
+      return {
+        kind: topic,
+        exitId: exitId === undefined ? undefined : Number(exitId),
+        payout: -data.i128("ext_amount"),
+        fee: data.i128("fee"),
+        recipient: data.address("recipient"),
+      };
     }
     default:
       return { kind: "other", topic };

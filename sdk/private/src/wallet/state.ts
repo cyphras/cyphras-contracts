@@ -264,10 +264,25 @@ export interface UncheckedRange {
   readonly askedAt: number | undefined;
 }
 
+// Where a transaction that spent this wallet's notes paid out, as the vault's checked events of
+// the transaction show it: the recipient, payout and fee of the exit it paid at once or queued.
+export interface Payout {
+  readonly txHash: string;
+  readonly to: string;
+  readonly amount: bigint;
+  readonly fee: bigint;
+}
+
 // A ledger and the Unix second it closed at.
 export interface LedgerTime {
   readonly ledger: number;
   readonly at: number;
+}
+
+// A close time kept for the pace of ledgers, with the Unix second of the wallet's clock at which a
+// sync read it.
+export interface KeptTime extends LedgerTime {
+  readonly seen: number;
 }
 
 export interface RootCheck {
@@ -298,7 +313,15 @@ export interface WalletState {
   operations: Operation[];
   rootCheck: RootCheck | undefined;
   // Close times of the last hour that RPC reported, from which the pace of ledgers is taken.
-  ledgerTimes: LedgerTime[];
+  ledgerTimes: KeptTime[];
+  // The close time of each ledger a history entry of this wallet names, as RPC reported it with
+  // the vault's events, by ledger. A sync whose own read of the vault's events RPC could not serve,
+  // as it no longer held where the sync started, leaves the close times of the ledgers up to
+  // `closeTimesUntil` to a read of every ledger RPC holds, which has gone up to `closeTimesTo`.
+  closeTimes: LedgerTime[];
+  closeTimesTo: number;
+  closeTimesUntil: number;
+  payouts: Payout[];
 }
 
 export function emptyState(deployLedger: number): WalletState {
@@ -319,6 +342,10 @@ export function emptyState(deployLedger: number): WalletState {
     operations: [],
     rootCheck: undefined,
     ledgerTimes: [],
+    closeTimes: [],
+    closeTimesTo: 0,
+    closeTimesUntil: 0,
+    payouts: [],
   };
 }
 
@@ -360,12 +387,18 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   if (bytes === undefined) return undefined;
   const state = JSON.parse(new TextDecoder().decode(bytes), reviver) as WalletState;
   if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
-  // A state need not hold close times yet, nor a checked leaf's ledger; its next syncs record them.
+  // A state need not hold close times yet, nor a checked leaf's ledger, nor where its spends paid
+  // out: its next syncs record those they read. Close times kept without when the wallet read them
+  // count as read when they say they closed.
   // Leaves it took unchecked without digests a recheck compares up to the last of them can no
   // longer be checked, and leaves it staged without them the next sync takes again. A range kept
   // as lost without a status was given up on the first RPC provider's word alone, and is open again
   // for every provider to be asked.
-  state.ledgerTimes ??= [];
+  state.ledgerTimes = (state.ledgerTimes ?? []).map((t) => ({ ...t, seen: t.seen ?? t.at }));
+  state.closeTimes ??= [];
+  state.closeTimesTo ??= 0;
+  state.closeTimesUntil ??= 0;
+  state.payouts ??= [];
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {
     const { lost: _lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };

@@ -28,6 +28,7 @@ import {
 } from "../../src/wallet/state.ts";
 import type { Prover } from "../../src/prover.ts";
 import type { TransactionSigner } from "../../src/vault/invoke.ts";
+import type { HistoryEntry } from "../../src/wallet/history.ts";
 import type { Submission } from "../../src/wallet/spend.ts";
 import { PrivateWallet } from "../../src/wallet/wallet.ts";
 import {
@@ -132,7 +133,7 @@ describe("wallet: opening", () => {
     );
   });
 
-  it("opens without waiting long for services that do not answer, unverified while the vault does not, and asks again before a sync", async () => {
+  it("opens without waiting long for services that do not answer, unverified while the vault does not, and asks again before a quote or a sync", async () => {
     const world = await createWorld();
     let hanging = true;
     // Whether a request reads the vault's instance alone, as the open-time check does.
@@ -167,6 +168,8 @@ describe("wallet: opening", () => {
       ["unverified", "ok", "unavailable", "unavailable", "unavailable"],
     );
     hanging = false;
+    await alice.quote({ kind: "send" });
+    assert.equal(alice.verification().state, "verified");
     const summary = await alice.sync();
     assert.equal(summary.source, "indexer");
     assert.equal(alice.verification().state, "verified");
@@ -2440,10 +2443,33 @@ describe("wallet: screening", () => {
 });
 
 describe("wallet: spends", () => {
+  it("refuses a quote above the vault's max fee before the first sync, whatever cap the caller gives", async () => {
+    const world = await createWorld();
+    // A relayer that quotes more than the vault lets a transaction pay.
+    const fetch: FetchLike = async (input, init) => {
+      const res = await world.fetch(input, init);
+      const url = new URL(input);
+      if (url.origin !== RELAYER || url.pathname !== "/v1/quote") return res;
+      return new Response(JSON.stringify({ ...(await res.json()), fee: String(6n * XLM) }));
+    };
+    const alice = await openWallet({ ...world, fetch }, 0);
+    await assert.rejects(
+      alice.quote({ kind: "send", maxFee: 10n * XLM }),
+      isError("fee_above_cap"),
+    );
+  });
+
   it("quotes a spend's fee and the most the notes can pay with it, which a spend of that much pays", async () => {
     const world = await createWorld({ limits: { maxDailyOutflow: 25n * XLM } });
     const alice = await openWallet(world, 0);
-    await assert.rejects(alice.quote({ kind: "send" }), isError("tree_unverified"));
+    // Before a sync, the fee alone.
+    const early = await alice.quote({ kind: "send" });
+    assert.deepEqual(
+      [early.relayer, early.fee, early.maxAmount, early.spendable],
+      [RELAYER, 1n * XLM, undefined, undefined],
+    );
+    assert.ok(early.validUntil !== undefined && early.validUntil > Number(world.vault.timestamp));
+    await assert.rejects(alice.quote({ kind: "send", maxFee: 1n }), isError("fee_above_cap"));
     const depositor = world.signer("depositor");
     for (const amount of [10n, 20n, 30n]) await shielded(alice, amount * XLM, depositor);
     world.advance(3_601);
@@ -2475,6 +2501,53 @@ describe("wallet: spends", () => {
       maxFee: send.fee,
     });
     assert.equal(sent.fee, send.fee);
+  });
+
+  it("shows a relayer's quote again while it holds for another minute, asking neither the relayer nor RPC", async () => {
+    const { world, alice } = await funded();
+    const asked = () => world.requests.filter((r) => r.startsWith(RELAYER)).length;
+    const first = await alice.quote({ kind: "send" });
+    world.advance(200);
+    const [relayer, rpc] = [asked(), world.rpc.calls.length];
+    const again = await alice.quote({ kind: "unshield" });
+    assert.deepEqual([asked(), world.rpc.calls.length], [relayer, rpc]);
+    assert.deepEqual([again.fee, again.validUntil], [first.fee, first.validUntil]);
+    // A lower cap than the quote, or a call that asks for a fresh one, asks the relayer.
+    await assert.rejects(alice.quote({ kind: "send", maxFee: 1n }), isError("fee_above_cap"));
+    assert.equal(asked(), relayer + 2);
+    const fresh = await alice.quote({ kind: "send", fresh: true });
+    assert.equal(asked(), relayer + 4);
+    assert.ok((fresh.validUntil as number) > (first.validUntil as number));
+    // So does one once the quote holds for less than a minute.
+    world.advance((fresh.validUntil as number) - Number(world.vault.timestamp) - 59);
+    await alice.quote({ kind: "send" });
+    assert.equal(asked(), relayer + 6);
+  });
+
+  it("holds each relayer's quote apart, and takes a fresh one for every spend", async () => {
+    const { world } = await funded();
+    const other = "http://relayer2.test";
+    const asked: string[] = [];
+    // A second relayer, which the first one's service answers for.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (url.origin === RELAYER || url.origin === other) asked.push(url.origin + url.pathname);
+      return world.fetch(url.origin === other ? `${RELAYER}${url.pathname}` : input, init);
+    };
+    const wallet = await openWallet({ ...world, fetch }, 0);
+    await wallet.sync();
+    await wallet.quote({ kind: "send" });
+    const quoted = await wallet.quote({ kind: "send", relayer: other });
+    assert.equal(quoted.relayer, other);
+    assert.deepEqual(
+      asked.filter((r) => r.endsWith("/v1/quote")),
+      [`${RELAYER}/v1/quote`, `${other}/v1/quote`],
+    );
+    const bob = await openWallet(world, 1);
+    for (const amount of [5n * XLM, 6n * XLM]) {
+      await wallet.send({ to: bob.generateAddress(), amount, maxFee: 2n * XLM });
+    }
+    assert.equal(asked.filter((r) => r === `${RELAYER}/v1/quote`).length, 3);
   });
 
   it("pays a shielded address through a relayer, which names no party but itself", async () => {
@@ -3208,6 +3281,127 @@ describe("wallet: spends", () => {
     assert.ok(world.rpc.accounts.has(base));
   });
 
+  it("shows each plan's line of retries, what its notes hold and give back, and its deadline", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("depositor");
+    await shielded(alice, 100n * XLM, depositor);
+    await shielded(alice, 30n * XLM, depositor);
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    // A send the relayer refuses for its fee goes again with the same note; a stalled unshield
+    // is retried.
+    world.relayer.failures.push({ error: "fee_too_low" });
+    await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: world.signer("merchant").publicKey,
+        amount: 5n * XLM,
+        maxFee: 2n * XLM,
+        confirm: confirmAll,
+      }),
+    );
+    const [, , stalled] = await alice.plans();
+    world.relayer.failures.push({ error: "unavailable" });
+    const retried = await alice
+      .retry(stalled?.planId as string, { confirm: confirmAll })
+      .catch((err: CyphrasError) => err.details["planId"]);
+    const [, , , pending] = await alice.plans();
+    await alice.retry(pending?.planId as string, { confirm: confirmAll });
+    const [refused, sent, unshield, again, last] = await alice.plans();
+    assert.deepEqual(
+      [refused, sent, unshield, again, last].map((p) => [p?.retryOf, p?.familyId]),
+      [
+        [undefined, refused?.planId],
+        [refused?.planId, refused?.planId],
+        [undefined, unshield?.planId],
+        [unshield?.planId, unshield?.planId],
+        [again?.planId, unshield?.planId],
+      ],
+    );
+    assert.equal(again?.planId, retried);
+    assert.deepEqual(
+      [sent?.inputValue, sent?.amount, sent?.fee, sent?.change],
+      [30n * XLM, 10n * XLM, 1n * XLM, 19n * XLM],
+    );
+    // The unshield spends the send's change, the smallest note that covers it.
+    assert.deepEqual(
+      [again?.inputValue, again?.amount, again?.fee, again?.change],
+      [19n * XLM, 5n * XLM, 1n * XLM, 13n * XLM],
+    );
+    // At the pace of the RPC's close times, the deadline's ledger closes by its own close time.
+    for (const plan of [refused, sent, unshield, again]) {
+      assert.equal(plan?.deadlineBy, world.rpc.closeTime(plan?.deadline as number) * 1000);
+    }
+  });
+
+  it("puts a plan's deadline no earlier than the sync saw ledgers close, whatever RPC says of when", async () => {
+    const world = await createWorld();
+    let early = false;
+    // RPC says every ledger closed an hour before it did.
+    const fetch: FetchLike = async (input, init) => {
+      const res = await world.fetch(input, init);
+      if (!early || new URL(input).origin !== RPC || bodyOf(init)?.method !== "getEvents") {
+        return res;
+      }
+      const reply = await res.json();
+      const shift = (iso: string) => new Date(Date.parse(iso) - 3_600_000).toISOString();
+      for (const e of reply.result.events) e.ledgerClosedAt = shift(e.ledgerClosedAt);
+      for (const key of ["latestLedgerCloseTime", "oldestLedgerCloseTime"]) {
+        reply.result[key] = String(Number(reply.result[key]) - 3_600);
+      }
+      return new Response(JSON.stringify(reply));
+    };
+    const alice = await openWallet({ ...world, fetch }, 0);
+    await alice.shield({ amount: 50n * XLM, signer: world.signer("depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    early = true;
+    world.relayer.failures.push({ error: "unavailable" });
+    const bob = await openWallet(world, 1);
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    world.advance(400);
+    world.fill(1);
+    const [seen, head] = [world.clock(), world.vault.ledger];
+    await alice.sync();
+    const [plan] = await alice.plans();
+    // The newest ledger had closed when the sync read it, and each ledger after it takes at least
+    // five seconds by the wallet's account.
+    assert.ok(plan !== undefined && plan.deadline > head);
+    assert.ok((plan.deadlineBy as number) >= seen + 5_000 * (plan.deadline - head));
+  });
+
+  it("counts every note a plan spends in what its notes hold", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("depositor");
+    await shielded(alice, 50n * XLM, depositor);
+    await shielded(alice, 30n * XLM, depositor);
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    await alice.send({
+      to: bob.generateAddress(),
+      amount: 70n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    const [plan] = await alice.plans();
+    assert.deepEqual([plan?.inputValue, plan?.change], [80n * XLM, 9n * XLM]);
+  });
+
   it("refuses a quote above the smallest cap and proves again when the relayer wants more", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
@@ -3600,6 +3794,241 @@ describe("wallet: state kept per vault", () => {
     assert.equal(kept.stateReset(), undefined);
     assert.equal((await kept.deposits()).length, 1);
     assert.equal(await storage.get(location), undefined);
+  });
+});
+
+describe("wallet: when history entries happened", () => {
+  // The close time RPC reports of each entry's ledger, in milliseconds.
+  const closedAt = (world: World, entries: readonly HistoryEntry[]) =>
+    entries.map((h) => [
+      h.kind,
+      h.closedAt,
+      h.ledger === undefined ? undefined : world.rpc.closeTime(h.ledger) * 1000,
+    ]);
+  // The start ledgers of the requests that ask RPC, at its newest ledger, for the oldest it holds,
+  // with which a read of every ledger it holds starts.
+  const watchProbes = (world: World): number[] => {
+    const probes: number[] = [];
+    const handle = world.rpc.handle.bind(world.rpc);
+    world.rpc.handle = (method, params) => {
+      const page = params["pagination"] as { limit?: number } | undefined;
+      if (method === "getEvents" && page?.limit === 1) probes.push(params["startLedger"] as number);
+      return handle(method, params);
+    };
+    return probes;
+  };
+  // A connection to the world's services that logs every request a wallet makes, as the services
+  // see it, and lets `rewrite` change RPC's replies to getEvents.
+  const logged = (world: World, rewrite?: (result: Record<string, unknown>) => void) => {
+    const log: [string, unknown][] = [];
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      log.push([`${url.origin}${url.pathname}${url.search}`, { ...body, id: undefined }]);
+      const res = await world.fetch(input, init);
+      if (rewrite === undefined || url.origin !== RPC || body?.method !== "getEvents") return res;
+      const reply = await res.json();
+      rewrite(reply.result);
+      return new Response(JSON.stringify(reply));
+    };
+    return { log, world: { ...world, fetch } };
+  };
+  // The start ledger and the page size of each read of the vault's events a log holds.
+  const eventReads = (log: readonly [string, unknown][]) =>
+    log.flatMap(([, body]) => {
+      const b = body as { method?: string; params?: Record<string, unknown> };
+      if (b.method !== "getEvents") return [];
+      const page = b.params?.["pagination"] as { limit: number };
+      return [[b.params?.["startLedger"] as number | undefined, page.limit]];
+    });
+
+  it("gives every entry with a ledger the time it closed, through a reopen and a rescan", async () => {
+    const { world, alice } = await funded();
+    const probes = watchProbes(world);
+    const bob = await openWallet(world, 1);
+    world.advance(600);
+    await alice.send({ to: bob.generateAddress(), amount: 30n * XLM, maxFee: 2n * XLM });
+    world.advance(600);
+    await alice.unshield({
+      to: world.signer("payee").publicKey,
+      amount: 20n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    await alice.sync();
+    await bob.sync();
+    const timed = (entries: readonly HistoryEntry[]) => {
+      for (const [, at, closed] of closedAt(world, entries)) assert.equal(at, closed);
+      return entries.filter((h) => h.closedAt !== undefined).map((h) => h.kind);
+    };
+    assert.deepEqual(timed(await alice.history()), ["unshield", "send"]);
+    assert.deepEqual(timed(await bob.history()), ["receive"]);
+    const storage = new MemoryStore();
+    const restored = await openWallet(world, 0, storage);
+    await restored.sync();
+    const recovered = await restored.history();
+    assert.deepEqual(timed(recovered), ["unshield", "send", "shield"]);
+    assert.ok(recovered.every((h) => h.recovered));
+    const reopened = await openWallet(world, 0, storage);
+    assert.deepEqual(closedAt(world, await reopened.history()), closedAt(world, recovered));
+    await reopened.rescan();
+    assert.deepEqual(closedAt(world, await reopened.history()), closedAt(world, recovered));
+    // Every time came from the syncs' own reads.
+    assert.deepEqual(probes, []);
+  });
+
+  it("takes the times another provider's reads give when the first provider's give none", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    await alice.send({ to: bob.generateAddress(), amount: 30n * XLM, maxFee: 2n * XLM });
+    const second = "http://rpc2.test";
+    // The first provider's events say nothing of when their ledgers closed.
+    const fetch: FetchLike = async (input, init) => {
+      const origin = new URL(input).origin;
+      const res = await world.fetch(origin === second ? RPC : input, init);
+      if (origin !== RPC || bodyOf(init)?.method !== "getEvents") return res;
+      const reply = await res.json();
+      reply.result.events = reply.result.events.map(
+        ({ ledgerClosedAt: _closed, ...event }: Record<string, unknown>) => event,
+      );
+      return new Response(JSON.stringify(reply));
+    };
+    const restored = await openWallet({ ...world, fetch }, 0, new MemoryStore(), undefined, {
+      secondRpcUrl: second,
+    });
+    await restored.sync();
+    const history = await restored.history();
+    assert.deepEqual(
+      history.map((h) => h.closedAt),
+      history.map((h) => world.rpc.closeTime(h.ledger as number) * 1000),
+    );
+  });
+
+  it("makes the same reads whatever it holds when RPC leaves a ledger's close time out", async () => {
+    const world = await createWorld();
+    let target: number | undefined;
+    // RPC leaves out the close time of the ledger of a payment to one of two wallets.
+    const drop = (result: Record<string, unknown>) => {
+      for (const e of result["events"] as Record<string, unknown>[]) {
+        if (e["ledger"] === target) delete e["ledgerClosedAt"];
+      }
+    };
+    const [a, c] = [logged(world, drop), logged(world, drop)];
+    const alice = await openWallet(a.world, 0);
+    const carol = await openWallet(c.world, 2);
+    const bob = await openWallet(world, 1);
+    await bob.shield({ amount: 50n * XLM, signer: world.signer("bob depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await bob.sync();
+    await alice.sync();
+    await carol.sync();
+    a.log.length = 0;
+    c.log.length = 0;
+    await bob.send({ to: alice.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    target = world.vault.ledger;
+    world.fill(1);
+    await alice.sync();
+    await carol.sync();
+    assert.equal((await alice.balance()).spendable, 10n * XLM);
+    assert.deepEqual(
+      (await alice.history()).map((h) => [h.kind, h.closedAt]),
+      [["receive", undefined]],
+    );
+    assert.ok(eventReads(a.log).length > 0);
+    assert.deepEqual(a.log, c.log);
+  });
+
+  it("reads the times of every ledger RPC holds, whatever it holds, once RPC no longer holds where a sync starts", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.advance(7_200);
+    await alice.send({ to: bob.generateAddress(), amount: 30n * XLM, maxFee: 2n * XLM });
+    const sentAt = world.vault.ledger;
+    // RPC holds the payment's ledger and a few before it, but no longer the deposit's.
+    world.rpc.oldestLedger = sentAt - 3;
+    const [a, c] = [logged(world), logged(world)];
+    const restored = await openWallet(a.world, 0);
+    const empty = await openWallet(c.world, 2);
+    await restored.sync();
+    await empty.sync();
+    // A wallet that holds nothing reads just as one with a history.
+    assert.deepEqual(a.log, c.log);
+    const history = await restored.history();
+    assert.deepEqual(closedAt(world, history), [
+      ["send", world.rpc.closeTime(sentAt) * 1000, world.rpc.closeTime(sentAt) * 1000],
+      ["shield", undefined, world.rpc.closeTime(history[1]?.ledger as number) * 1000],
+    ]);
+    // The sync's own read and the recheck's start where the wallet started, which RPC no longer
+    // holds; the newest ledger tells the oldest it holds, from which the times are read.
+    const deployed = world.deployment.deployLedger;
+    const head = world.vault.ledger;
+    assert.deepEqual(
+      eventReads(a.log).filter(([start]) => start !== undefined),
+      [
+        [deployed, 1000],
+        [deployed, 1000],
+        [head, 1],
+        [sentAt - 3, 1000],
+      ],
+    );
+    world.fill(1);
+    let before = a.log.length;
+    await restored.sync();
+    // A later sync reads only its own ledgers: the deposit's time stays unknown.
+    assert.equal(eventReads(a.log.slice(before)).length, 1);
+    const kept = closedAt(world, await restored.history());
+    assert.equal(kept[1]?.[1], undefined);
+    // A rescan, whose own read RPC cannot serve either, keeps the times read before and reads for
+    // times only past the ledgers read before.
+    before = a.log.length;
+    await restored.rescan();
+    assert.deepEqual(closedAt(world, await restored.history()), kept);
+    assert.deepEqual(eventReads(a.log.slice(before)), [
+      [deployed, 1000],
+      [deployed, 1000],
+      [world.vault.ledger, 1],
+      [head + 1, 1000],
+    ]);
+  });
+
+  it("reads close times two pages a sync, going on where the last read stopped, up to where it is due", async () => {
+    const { world, alice } = await funded();
+    const bob = await openWallet(world, 1);
+    world.advance(20_000);
+    await alice.send({ to: bob.generateAddress(), amount: 30n * XLM, maxFee: 2n * XLM });
+    const sentAt = world.vault.ledger;
+    world.rpc.oldestLedger = sentAt - 2_200;
+    world.rpc.scanLedgers = 500;
+    let busy = false;
+    const { log, world: busyWorld } = logged(world);
+    const fetch: FetchLike = async (input, init) => {
+      const body = bodyOf(init);
+      if (busy && new URL(input).origin === RPC && body?.method === "getEvents") {
+        return busyReply(body.id as number);
+      }
+      return busyWorld.fetch(input, init);
+    };
+    const restored = await openWallet({ ...world, fetch }, 0);
+    const sendTime = async () =>
+      (await restored.history()).find((h) => h.kind === "send")?.closedAt;
+    // Each sync reads a thousand ledgers on from the last, though the chain goes on far past them.
+    await restored.sync();
+    world.advance(10_000);
+    assert.equal(await sendTime(), undefined);
+    // A rescan while RPC is busy leaves the read due.
+    busy = true;
+    await restored.rescan();
+    busy = false;
+    await restored.sync();
+    assert.equal(await sendTime(), undefined);
+    const before = log.length;
+    await restored.sync();
+    assert.equal(await sendTime(), world.rpc.closeTime(sentAt) * 1000);
+    // The last read stops on the first page that reaches where the read was due to.
+    const reads = eventReads(log.slice(before));
+    const probe = reads.findIndex(([, limit]) => limit === 1);
+    assert.equal(reads.slice(probe + 1).length, 1);
   });
 });
 
