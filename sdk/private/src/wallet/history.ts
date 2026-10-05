@@ -1,5 +1,6 @@
 import { confirmedInputs, lockedPositions, spendableNotes } from "./core.ts";
 import { payoutLeft } from "./exits.ts";
+import type { ExitEvent } from "./sources.ts";
 import type { WalletState } from "./state.ts";
 
 /** Spendable value, value in pending deposits, value locked in unconfirmed submissions. */
@@ -35,9 +36,11 @@ export type HistoryKind = "shield" | "cancel" | "refund" | "receive" | "send" | 
 export interface HistoryEntry {
   readonly kind: HistoryKind;
   readonly amount: bigint;
-  // Undefined when only the chain is known and it does not separate fee from amount.
+  // Undefined when only the chain is known and it does not separate fee from amount, which then
+  // includes the fee.
   readonly fee: bigint | undefined;
-  // The shielded address paid, the Stellar address unshielded to, or the depositor.
+  // The shielded address paid, the Stellar address unshielded to, or the depositor; undefined for
+  // an unshield rebuilt from the chain whose payout no checked event of the vault showed.
   readonly counterparty: string | undefined;
   readonly txHash: string | undefined;
   readonly ledger: number | undefined;
@@ -68,6 +71,23 @@ const entry = (
   recovered: false,
   ...e,
 });
+
+// Keeps where each transaction that spent this wallet's notes paid out, from the vault's checked
+// events: the exit it paid at once or queued names the recipient, payout and fee. A transfer pays
+// out nothing.
+export function recordPayouts(state: WalletState, checked: readonly ExitEvent[]): void {
+  const spends = new Set(
+    state.notes.flatMap((n) => (n.spent === undefined ? [] : [n.spent.txHash])),
+  );
+  const kept = new Map(state.payouts.map((p) => [p.txHash, p]));
+  for (const e of checked) {
+    const exit = e.kind === "exit_queued" || e.kind === "settled";
+    if (exit && e.payout > 0n && spends.has(e.txHash)) {
+      kept.set(e.txHash, { txHash: e.txHash, to: e.recipient, amount: e.payout, fee: e.fee });
+    }
+  }
+  state.payouts = [...kept.values()];
+}
 
 // Local records first: deposits and plans this wallet made. Every other transaction that
 // touched the wallet is classified from what its keys reveal, which is what a restored wallet
@@ -121,6 +141,7 @@ export function historyOf(state: WalletState): HistoryEntry[] {
   }
 
   const planned = confirmedInputs(state);
+  const payouts = new Map(state.payouts.map((p) => [p.txHash, p]));
   const txs = new Set<string>();
   for (const n of state.notes) {
     if (!depositCommitments.has(n.cm)) txs.add(n.txHash);
@@ -178,10 +199,14 @@ export function historyOf(state: WalletState): HistoryEntry[] {
         }),
       );
     } else {
+      // An unshield's checked payout separates its amount from its fee.
+      const payout = payouts.get(tx);
       out.push(
         entry({
           kind: outflow > 0n ? "unshield" : "self",
-          amount: outflow,
+          amount: payout?.amount ?? outflow,
+          fee: payout?.fee,
+          counterparty: payout?.to,
           txHash: tx,
           ledger,
           state: "confirmed",

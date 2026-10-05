@@ -69,7 +69,7 @@ import {
   verifyDisclosure,
 } from "./disclosure.ts";
 import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } from "./exits.ts";
-import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
+import { type Balance, type HistoryEntry, balanceOf, historyOf, recordPayouts } from "./history.ts";
 import { type VaultLimitsView, vaultLimits } from "./limits.ts";
 import { closedBy, readCloseTimes, recordCloseTimes, updatePace } from "./pace.ts";
 import { type Verification, createServices, recheckIndexers, verify } from "./services.ts";
@@ -785,7 +785,7 @@ export class PrivateWallet {
     const core = this.#core;
     const draft = structuredClone(core.state);
     if (full) {
-      const { revision, plans, deposits, operations, closeTimes, closeTimesTo } = draft;
+      const { revision, plans, deposits, operations, closeTimes, closeTimesTo, payouts } = draft;
       resetEvidence(plans);
       Object.assign(draft, emptyState(core.deployment.deployLedger), {
         revision,
@@ -794,6 +794,7 @@ export class PrivateWallet {
         operations,
         closeTimes,
         closeTimesTo,
+        payouts,
       });
     }
     let summary: SyncSummary;
@@ -951,6 +952,7 @@ export class PrivateWallet {
       await live?.exits().catch(() => undefined),
       view.ledger,
     );
+    recordPayouts(core.state, [...(rechecked?.exits ?? []), ...within(shown?.exits ?? [])]);
     await this.#pollRelayers(core, view.ledger, pace);
     recordCloseTimes(
       core.state,

@@ -264,6 +264,15 @@ export interface UncheckedRange {
   readonly askedAt: number | undefined;
 }
 
+// Where a transaction that spent this wallet's notes paid out, as the vault's checked events of
+// the transaction show it: the recipient, payout and fee of the exit it paid at once or queued.
+export interface Payout {
+  readonly txHash: string;
+  readonly to: string;
+  readonly amount: bigint;
+  readonly fee: bigint;
+}
+
 // A ledger and the Unix second it closed at.
 export interface LedgerTime {
   readonly ledger: number;
@@ -304,6 +313,7 @@ export interface WalletState {
   // history lacked has gone, after which a ledger still without one is one RPC no longer held.
   closeTimes: LedgerTime[];
   closeTimesTo: number;
+  payouts: Payout[];
 }
 
 export function emptyState(deployLedger: number): WalletState {
@@ -326,6 +336,7 @@ export function emptyState(deployLedger: number): WalletState {
     ledgerTimes: [],
     closeTimes: [],
     closeTimesTo: 0,
+    payouts: [],
   };
 }
 
@@ -367,7 +378,8 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   if (bytes === undefined) return undefined;
   const state = JSON.parse(new TextDecoder().decode(bytes), reviver) as WalletState;
   if (state.version !== 2) fail("storage_unreadable", "the stored state has an unknown version");
-  // A state need not hold close times yet, nor a checked leaf's ledger; its next syncs record them.
+  // A state need not hold close times yet, nor a checked leaf's ledger, nor where its spends paid
+  // out: its next syncs record those they read.
   // Leaves it took unchecked without digests a recheck compares up to the last of them can no
   // longer be checked, and leaves it staged without them the next sync takes again. A range kept
   // as lost without a status was given up on the first RPC provider's word alone, and is open again
@@ -375,6 +387,7 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   state.ledgerTimes ??= [];
   state.closeTimes ??= [];
   state.closeTimesTo ??= 0;
+  state.payouts ??= [];
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {
     const { lost: _lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };

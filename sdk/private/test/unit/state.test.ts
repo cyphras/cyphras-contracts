@@ -28,7 +28,7 @@ describe("stored state", () => {
     );
   });
 
-  it("loads a state from before close times, checked ledgers, digests, counts of providers, range statuses, confirmed exits and the times of history entries", async () => {
+  it("loads a state from before close times, checked ledgers, digests, counts of providers, range statuses, confirmed exits, the times of history entries and payouts", async () => {
     const store = new SealedStore(new MemoryStore(), testBytes("state/key", 2, 32));
     const state = emptyState(10);
     state.unchecked = [
@@ -49,6 +49,7 @@ describe("stored state", () => {
     delete older.checkedLeafLedger;
     delete older.closeTimes;
     delete older.closeTimesTo;
+    delete older.payouts;
     older.unchecked.forEach((range: Record<string, unknown>, i: number) => {
       delete range["status"];
       range["lost"] = i === 1;
@@ -73,6 +74,7 @@ describe("stored state", () => {
     assert.equal(loaded?.checkedLeafLedger, 0);
     assert.deepEqual(loaded?.closeTimes, []);
     assert.equal(loaded?.closeTimesTo, 0);
+    assert.deepEqual(loaded?.payouts, []);
     // A range kept as lost on the first provider's word is open again; leaves kept without the
     // digests a recheck compares can no longer be checked, and leaves staged without them are
     // taken again.
