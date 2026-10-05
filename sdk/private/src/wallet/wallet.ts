@@ -71,7 +71,7 @@ import {
 import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
 import { type VaultLimitsView, vaultLimits } from "./limits.ts";
-import { updatePace } from "./pace.ts";
+import { closedBy, updatePace } from "./pace.ts";
 import { type Verification, createServices, recheckIndexers, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
@@ -300,6 +300,19 @@ export interface PlanView extends Submission {
   // Its deadline has passed, and the wallet cannot tell yet whether it landed, as it lacks part of
   // the vault's tree. The safe choice is retry: both spend the same notes, so at most one pays.
   readonly needsUserDecision: boolean;
+  // The plan it proves again with the same notes, and the first plan of that line of retries,
+  // which every plan of it shares: a wallet counts a family once.
+  readonly retryOf: string | undefined;
+  readonly familyId: string;
+  // What the plan's real notes hold, and the change that returns to the wallet after the amount
+  // and the fee.
+  readonly inputValue: bigint;
+  readonly change: bigint;
+  // The last ledger its proof can land in, and the time by which that ledger will have closed at
+  // the slowest pace of recent ledgers, in milliseconds since the epoch; undefined until a sync
+  // has read close times.
+  readonly deadline: number;
+  readonly deadlineBy: number | undefined;
 }
 
 /**
@@ -1013,23 +1026,46 @@ export class PrivateWallet {
 
   /** This wallet's spends and their states in the submission state machine. */
   async plans(): Promise<PlanView[]> {
-    return this.#core.state.plans.map((p) => ({
-      ...submissionOf(p),
-      kind: p.kind,
-      amount: p.amount,
-      to: p.to,
-      createdAt: p.createdAt,
-      route: p.route,
-      exitId: p.exit?.id,
-      payoutLeft: p.exit === undefined ? undefined : payoutLeft(p.exit),
-      exitParts: (p.exit === undefined ? [] : shownParts(p.exit)).map((part) => ({ ...part })),
-      exitConfirmed:
-        p.exit === undefined ? undefined : p.exit.confirmed && p.exit.account === undefined,
-      operationId: p.operationId,
-      relayerStatus: p.relayerStatus,
-      mustRetry: isActive(p) || p.state === "dead",
-      needsUserDecision: isActive(p) && (this.#core.state.rootCheck?.ledger ?? 0) >= p.deadline,
-    }));
+    const { state } = this.#core;
+    const byId = new Map(state.plans.map((p) => [p.id, p]));
+    const family = (p: Plan): string => {
+      const seen = new Set<string>();
+      let first = p;
+      while (first.retryOf !== undefined && !seen.has(first.id)) {
+        seen.add(first.id);
+        const earlier = byId.get(first.retryOf);
+        if (earlier === undefined) break;
+        first = earlier;
+      }
+      return first.id;
+    };
+    return state.plans.map((p) => {
+      const inputValue = p.inputs.reduce((s, i) => s + i.value, 0n);
+      const by = closedBy(state, p.deadline);
+      return {
+        ...submissionOf(p),
+        kind: p.kind,
+        amount: p.amount,
+        to: p.to,
+        createdAt: p.createdAt,
+        route: p.route,
+        exitId: p.exit?.id,
+        payoutLeft: p.exit === undefined ? undefined : payoutLeft(p.exit),
+        exitParts: (p.exit === undefined ? [] : shownParts(p.exit)).map((part) => ({ ...part })),
+        exitConfirmed:
+          p.exit === undefined ? undefined : p.exit.confirmed && p.exit.account === undefined,
+        operationId: p.operationId,
+        relayerStatus: p.relayerStatus,
+        mustRetry: isActive(p) || p.state === "dead",
+        needsUserDecision: isActive(p) && (state.rootCheck?.ledger ?? 0) >= p.deadline,
+        retryOf: p.retryOf,
+        familyId: family(p),
+        inputValue,
+        change: inputValue - p.amount - p.fee,
+        deadline: p.deadline,
+        deadlineBy: by === undefined ? undefined : by * 1000,
+      };
+    });
   }
 
   /**

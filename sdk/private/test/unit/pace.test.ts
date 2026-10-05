@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { updatePace } from "../../src/wallet/pace.ts";
+import { closedBy, updatePace } from "../../src/wallet/pace.ts";
 import { emptyState } from "../../src/wallet/state.ts";
 
 const at = (ledger: number, seconds: number) => ({ ledger, at: 1_700_000_000 + seconds });
@@ -36,5 +36,17 @@ describe("ledger pace", () => {
     assert.deepEqual(state.ledgerTimes, [at(10_000, 40_000), at(10_100, 40_400)]);
     updatePace(state, [at(11_000, 40_400 + 3_601)]);
     assert.deepEqual(state.ledgerTimes, [at(11_000, 44_001)]);
+  });
+
+  it("tells by when a ledger closes, at the slowest pace kept and never faster than five seconds", () => {
+    const state = emptyState(1);
+    assert.equal(closedBy(state, 100), undefined);
+    // Four seconds a ledger, then six.
+    state.ledgerTimes = [at(1_000, 0), at(1_060, 240), at(1_120, 600)];
+    assert.equal(closedBy(state, 1_220), at(1_120, 600 + 100 * 6).at);
+    // A ledger before the newest kept had closed by then.
+    assert.equal(closedBy(state, 1_100), at(1_120, 600).at);
+    state.ledgerTimes = [at(1_000, 0), at(1_060, 240)];
+    assert.equal(closedBy(state, 1_160), at(1_060, 240 + 100 * 5).at);
   });
 });

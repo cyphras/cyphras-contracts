@@ -3208,6 +3208,88 @@ describe("wallet: spends", () => {
     assert.ok(world.rpc.accounts.has(base));
   });
 
+  it("shows each plan's line of retries, what its notes hold and give back, and its deadline", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("depositor");
+    await shielded(alice, 100n * XLM, depositor);
+    await shielded(alice, 30n * XLM, depositor);
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    // A send the relayer refuses for its fee goes again with the same note; a stalled unshield
+    // is retried.
+    world.relayer.failures.push({ error: "fee_too_low" });
+    await alice.send({
+      to: bob.generateAddress(),
+      amount: 10n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    world.relayer.failures.push({ error: "unavailable" });
+    await assert.rejects(
+      alice.unshield({
+        to: world.signer("merchant").publicKey,
+        amount: 5n * XLM,
+        maxFee: 2n * XLM,
+        confirm: confirmAll,
+      }),
+    );
+    const [, , stalled] = await alice.plans();
+    world.relayer.failures.push({ error: "unavailable" });
+    const retried = await alice
+      .retry(stalled?.planId as string, { confirm: confirmAll })
+      .catch((err: CyphrasError) => err.details["planId"]);
+    const [, , , pending] = await alice.plans();
+    await alice.retry(pending?.planId as string, { confirm: confirmAll });
+    const [refused, sent, unshield, again, last] = await alice.plans();
+    assert.deepEqual(
+      [refused, sent, unshield, again, last].map((p) => [p?.retryOf, p?.familyId]),
+      [
+        [undefined, refused?.planId],
+        [refused?.planId, refused?.planId],
+        [undefined, unshield?.planId],
+        [unshield?.planId, unshield?.planId],
+        [again?.planId, unshield?.planId],
+      ],
+    );
+    assert.equal(again?.planId, retried);
+    assert.deepEqual(
+      [sent?.inputValue, sent?.amount, sent?.fee, sent?.change],
+      [30n * XLM, 10n * XLM, 1n * XLM, 19n * XLM],
+    );
+    // The unshield spends the send's change, the smallest note that covers it.
+    assert.deepEqual(
+      [again?.inputValue, again?.amount, again?.fee, again?.change],
+      [19n * XLM, 5n * XLM, 1n * XLM, 13n * XLM],
+    );
+    // At the pace of the RPC's close times, the deadline's ledger closes by its own close time.
+    for (const plan of [refused, sent, unshield, again]) {
+      assert.equal(plan?.deadlineBy, world.rpc.closeTime(plan?.deadline as number) * 1000);
+    }
+  });
+
+  it("counts every note a plan spends in what its notes hold", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("depositor");
+    await shielded(alice, 50n * XLM, depositor);
+    await shielded(alice, 30n * XLM, depositor);
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const bob = await openWallet(world, 1);
+    await alice.send({
+      to: bob.generateAddress(),
+      amount: 70n * XLM,
+      maxFee: 2n * XLM,
+      confirm: confirmAll,
+    });
+    const [plan] = await alice.plans();
+    assert.deepEqual([plan?.inputValue, plan?.change], [80n * XLM, 9n * XLM]);
+  });
+
   it("refuses a quote above the smallest cap and proves again when the relayer wants more", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);

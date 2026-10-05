@@ -41,3 +41,18 @@ export function updatePace(state: WalletState, reported: readonly LedgerTime[]):
   state.ledgerTimes = kept;
   return paceOf(times, newest);
 }
+
+// The Unix second by which `ledger` will have closed, from the newest close time kept on, at the
+// slowest pace the spans between kept close times show and never faster than the network aims at:
+// a time a wallet can truthfully say a ledger closes by. Undefined until a sync has read close times.
+export function closedBy(state: WalletState, ledger: number): number | undefined {
+  const times = state.ledgerTimes;
+  const newest = times[times.length - 1];
+  if (newest === undefined) return undefined;
+  let pace = FALLBACK_SECONDS;
+  for (let i = 1; i < times.length; i++) {
+    const [a, b] = [times[i - 1] as LedgerTime, times[i] as LedgerTime];
+    pace = Math.max(pace, (b.at - a.at) / (b.ledger - a.ledger));
+  }
+  return newest.at + Math.max(0, ledger - newest.ledger) * pace;
+}
