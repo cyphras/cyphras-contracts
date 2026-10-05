@@ -58,7 +58,10 @@ Requires Node.js 22.18 or later, or a browser; `@stellar/stellar-base` 15 is a p
 dependency. Below, `words` is a mnemonic, `artifacts` loads the circuit files
 `transaction.wasm`, `transaction.zkey` and `verification_key.json`, which the SDK checks
 against the hashes the deployment pins, and `signer` is the Stellar account that pays a
-deposit in.
+deposit in. The testnet files are attached to the [`testnet-artifacts-v2`][artifacts]
+release; a browser app bundles or serves its own copy.
+
+[artifacts]: https://github.com/cyphras/cyphras-contracts/releases/tag/testnet-artifacts-v2
 
 ```ts
 import { MemoryStore, PrivateWallet, keySource } from "@cyphras/private";

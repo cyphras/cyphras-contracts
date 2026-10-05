@@ -7,10 +7,11 @@
 // From sdk/, after `npm ci` and `npm run build` (Node.js 22.18 or later):
 //
 //   node examples/private-transfer.ts --addresses-only
-//   CYPHRAS_ARTIFACTS=<directory or URL> node examples/private-transfer.ts [--unshield]
+//   node examples/private-transfer.ts [--unshield]
 //
-// CYPHRAS_ARTIFACTS holds the testnet circuit files transaction.wasm, transaction.zkey and
-// verification_key.json; the SDK checks each against the hash the deployment pins. A deposit
+// The testnet circuit files transaction.wasm, transaction.zkey and verification_key.json load
+// from the testnet-artifacts-v2 release, or from the directory or URL in CYPHRAS_ARTIFACTS; the
+// SDK checks each against the hash the deployment pins. A deposit
 // waits in the vault's entry queue for screening and its delay, about 10 minutes on testnet.
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -28,6 +29,8 @@ import {
 import { snarkjsProver } from "@cyphras/private-prover-snarkjs";
 
 const RPC_URL = "https://soroban-testnet.stellar.org";
+const TESTNET_ARTIFACTS =
+  "https://github.com/cyphras/cyphras-contracts/releases/download/testnet-artifacts-v2/";
 const XLM = 10_000_000n;
 const FILES: Readonly<Record<ArtifactName, string>> = {
   wasm: "transaction.wasm",
@@ -47,10 +50,7 @@ console.log("alice", await addressOf(alice));
 console.log("bob  ", await addressOf(bob));
 if (args.has("--addresses-only")) process.exit(0);
 
-const where = process.env["CYPHRAS_ARTIFACTS"];
-if (where === undefined) {
-  throw new Error("set CYPHRAS_ARTIFACTS to the directory or URL of the testnet circuit files");
-}
+const where = process.env["CYPHRAS_ARTIFACTS"] ?? TESTNET_ARTIFACTS;
 const artifacts: ArtifactSource = {
   async load(name) {
     const file = FILES[name];
