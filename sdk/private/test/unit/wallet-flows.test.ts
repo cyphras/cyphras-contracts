@@ -3343,6 +3343,45 @@ describe("wallet: spends", () => {
     }
   });
 
+  it("puts a plan's deadline no earlier than the sync saw ledgers close, whatever RPC says of when", async () => {
+    const world = await createWorld();
+    let early = false;
+    // RPC says every ledger closed an hour before it did.
+    const fetch: FetchLike = async (input, init) => {
+      const res = await world.fetch(input, init);
+      if (!early || new URL(input).origin !== RPC || bodyOf(init)?.method !== "getEvents") {
+        return res;
+      }
+      const reply = await res.json();
+      const shift = (iso: string) => new Date(Date.parse(iso) - 3_600_000).toISOString();
+      for (const e of reply.result.events) e.ledgerClosedAt = shift(e.ledgerClosedAt);
+      for (const key of ["latestLedgerCloseTime", "oldestLedgerCloseTime"]) {
+        reply.result[key] = String(Number(reply.result[key]) - 3_600);
+      }
+      return new Response(JSON.stringify(reply));
+    };
+    const alice = await openWallet({ ...world, fetch }, 0);
+    await alice.shield({ amount: 50n * XLM, signer: world.signer("depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    early = true;
+    world.relayer.failures.push({ error: "unavailable" });
+    const bob = await openWallet(world, 1);
+    await assert.rejects(
+      alice.send({ to: bob.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM }),
+    );
+    world.advance(400);
+    world.fill(1);
+    const [seen, head] = [world.clock(), world.vault.ledger];
+    await alice.sync();
+    const [plan] = await alice.plans();
+    // The newest ledger had closed when the sync read it, and each ledger after it takes at least
+    // five seconds by the wallet's account.
+    assert.ok(plan !== undefined && plan.deadline > head);
+    assert.ok((plan.deadlineBy as number) >= seen + 5_000 * (plan.deadline - head));
+  });
+
   it("counts every note a plan spends in what its notes hold", async () => {
     const world = await createWorld();
     const alice = await openWallet(world, 0);

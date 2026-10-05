@@ -107,6 +107,19 @@ describe("stored state", () => {
     );
   });
 
+  it("takes close times kept without when they were read as read when RPC said they closed", async () => {
+    const store = new SealedStore(new MemoryStore(), testBytes("state/key", 3, 32));
+    const state = emptyState(10);
+    state.ledgerTimes = [{ ledger: 500, at: 1_700_000_000, seen: 1_700_000_090 }];
+    await saveState(store, state);
+    const older = JSON.parse(new TextDecoder().decode((await store.read("state")) as Uint8Array));
+    delete older.ledgerTimes[0].seen;
+    await store.write("state", new TextEncoder().encode(JSON.stringify(older)));
+    assert.deepEqual((await loadState(store))?.ledgerTimes, [
+      { ledger: 500, at: 1_700_000_000, seen: 1_700_000_000 },
+    ]);
+  });
+
   it("refuses a number without its sign", async () => {
     const backend = new MemoryStore();
     const store = new SealedStore(backend, testBytes("state/key", 1, 32));

@@ -171,9 +171,10 @@ export class MockRpc {
     this.passphrase = passphrase;
   }
 
-  // Unix seconds at which a ledger closed, as RPC reports it.
+  // Unix seconds at which a ledger closed, as RPC reports it: on the vault's clock at ledger 100,
+  // at the pace the hook sets from there.
   closeTime(ledger: number): number {
-    return 1_700_000_000 + this.secondsPerLedger * ledger;
+    return 1_759_000_000 + this.secondsPerLedger * (ledger - 100);
   }
 
   // An account the native asset contract created with a payment, whose key no test holds.

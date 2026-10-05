@@ -311,9 +311,10 @@ export interface PlanView extends Submission {
   // and the fee.
   readonly inputValue: bigint;
   readonly change: bigint;
-  // The last ledger its proof can land in, and the time by which that ledger will have closed at
-  // the slowest pace of recent ledgers, in milliseconds since the epoch; undefined until a sync
-  // has read close times.
+  // The last ledger its proof can land in, and an estimate of the time by which that ledger will
+  // have closed, at the slowest pace of recent ledgers from when the last sync read them, in
+  // milliseconds since the epoch; undefined until a sync has read close times. Only mustRetry
+  // tells whether the payment may be made again.
   readonly deadline: number;
   readonly deadlineBy: number | undefined;
 }
@@ -922,7 +923,7 @@ export class PrivateWallet {
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
     if (verified) advancePlans(core.state, views as [ChainView, ...ChainView[]]);
     const live = source.kind === "indexer" ? indexer : undefined;
-    const pace = updatePace(core.state, events?.times ?? []);
+    const pace = updatePace(core.state, events?.times ?? [], core.now() / 1000);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
     onReads({ view, stats: await live?.stats().catch(() => undefined), pace });
     const within = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>

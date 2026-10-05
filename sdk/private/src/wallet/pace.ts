@@ -1,6 +1,6 @@
 import type { SorobanRpc } from "../net/rpc.ts";
 import { RpcEventSource } from "./sources.ts";
-import type { LedgerTime, WalletState } from "./state.ts";
+import type { KeptTime, LedgerTime, WalletState } from "./state.ts";
 
 // The pace the network aims at, taken when no close times give one, and the most a wallet takes:
 // a slower pace would shorten held deadlines that a relayer's own estimate may not allow.
@@ -27,13 +27,20 @@ function paceOf(times: readonly LedgerTime[], newest: LedgerTime): number {
   return Math.max(pace, MIN_SECONDS);
 }
 
-// Takes the close times RPC reported in this sync with those kept from the last hour's syncs, and
-// returns the pace of ledgers they give. Kept times are spaced by the span a pace needs.
-export function updatePace(state: WalletState, reported: readonly LedgerTime[]): number {
-  const times = [...state.ledgerTimes, ...reported].sort((a, b) => a.ledger - b.ledger);
+// Takes the close times RPC reported in this sync, read at the Unix second `seen` of the wallet's
+// clock, with those kept from the last hour's syncs, and returns the pace of ledgers they give.
+// Kept times are spaced by the span a pace needs.
+export function updatePace(
+  state: WalletState,
+  reported: readonly LedgerTime[],
+  seen: number,
+): number {
+  const times = [...state.ledgerTimes, ...reported.map((t) => ({ ...t, seen }))].sort(
+    (a, b) => a.ledger - b.ledger,
+  );
   const newest = times[times.length - 1];
   if (newest === undefined) return FALLBACK_SECONDS;
-  const kept: LedgerTime[] = [];
+  const kept: KeptTime[] = [];
   for (const t of times) {
     const last = kept[kept.length - 1];
     if (
@@ -47,9 +54,11 @@ export function updatePace(state: WalletState, reported: readonly LedgerTime[]):
   return paceOf(times, newest);
 }
 
-// The Unix second by which `ledger` will have closed, from the newest close time kept on, at the
-// slowest pace the spans between kept close times show and never faster than the network aims at:
-// a time a wallet can truthfully say a ledger closes by. Undefined until a sync has read close times.
+// The Unix second by which `ledger` will have closed, at the slowest pace the spans between kept
+// close times show and never faster than the network aims at, from the newest kept close time or,
+// when later, the moment the wallet read it: the ledger had closed by then, whatever RPC said of
+// when. An estimate, which a network that slows down outruns. Undefined until a sync has read close
+// times.
 export function closedBy(state: WalletState, ledger: number): number | undefined {
   const times = state.ledgerTimes;
   const newest = times[times.length - 1];
@@ -59,7 +68,7 @@ export function closedBy(state: WalletState, ledger: number): number | undefined
     const [a, b] = [times[i - 1] as LedgerTime, times[i] as LedgerTime];
     pace = Math.max(pace, (b.at - a.at) / (b.ledger - a.ledger));
   }
-  return newest.at + Math.max(0, ledger - newest.ledger) * pace;
+  return Math.max(newest.at, newest.seen) + Math.max(0, ledger - newest.ledger) * pace;
 }
 
 // The ledgers the wallet's history names, or will name once what a sync staged and what plans'

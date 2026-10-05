@@ -10,50 +10,70 @@ import {
 } from "../../src/wallet/state.ts";
 
 const at = (ledger: number, seconds: number) => ({ ledger, at: 1_700_000_000 + seconds });
+// A close time as kept: read when the wallet's clock showed `seen` seconds past the same moment.
+const kept = (ledger: number, seconds: number, seen = seconds) => ({
+  ...at(ledger, seconds),
+  seen: 1_700_000_000 + seen,
+});
+const SEEN = 1_700_000_000;
 
 describe("ledger pace", () => {
   it("takes five seconds a ledger until close times span 60 ledgers", () => {
     const state = emptyState(1);
-    assert.equal(updatePace(state, []), 5);
-    assert.equal(updatePace(state, [at(100, 0), at(159, 59 * 2)]), 5);
-    assert.equal(updatePace(state, [at(100, 0), at(160, 60 * 4)]), 4);
+    assert.equal(updatePace(state, [], SEEN), 5);
+    assert.equal(updatePace(state, [at(100, 0), at(159, 59 * 2)], SEEN), 5);
+    assert.equal(updatePace(state, [at(100, 0), at(160, 60 * 4)], SEEN), 4);
   });
 
   it("takes the fastest pace over the spans the close times give, but never slower than five seconds", () => {
     const state = emptyState(1);
     // A week at six seconds, then the last hour at four.
     const times = [at(1_000, 0), at(101_800, 604_800), at(102_700, 604_800 + 3_600)];
-    assert.equal(updatePace(state, times), 4);
-    assert.equal(updatePace(emptyState(1), [at(1_000, 0), at(2_000, 6_000)]), 5);
+    assert.equal(updatePace(state, times, SEEN), 4);
+    assert.equal(updatePace(emptyState(1), [at(1_000, 0), at(2_000, 6_000)], SEEN), 5);
     // Close times that claim faster ledgers than half the fallback, or that run backwards, give a
     // pace no faster than that.
-    assert.equal(updatePace(emptyState(1), [at(1_000, 0), at(2_000, 1_000)]), 2.5);
-    assert.equal(updatePace(emptyState(1), [at(1_000, 600), at(2_000, 0)]), 2.5);
+    assert.equal(updatePace(emptyState(1), [at(1_000, 0), at(2_000, 1_000)], SEEN), 2.5);
+    assert.equal(updatePace(emptyState(1), [at(1_000, 600), at(2_000, 0)], SEEN), 2.5);
   });
 
-  it("keeps the close times of the last hour, spaced by 60 ledgers, for the next sync", () => {
+  it("keeps the close times of the last hour, spaced by 60 ledgers, with when each sync read them", () => {
     const state = emptyState(1);
-    updatePace(state, [at(1_000, 0), at(10_000, 40_000)]);
-    assert.deepEqual(state.ledgerTimes, [at(10_000, 40_000)]);
-    updatePace(state, [at(10_030, 40_120)]);
-    assert.deepEqual(state.ledgerTimes, [at(10_000, 40_000)]);
+    updatePace(state, [at(1_000, 0), at(10_000, 40_000)], SEEN + 40_010);
+    assert.deepEqual(state.ledgerTimes, [kept(10_000, 40_000, 40_010)]);
+    updatePace(state, [at(10_030, 40_120)], SEEN + 40_130);
+    assert.deepEqual(state.ledgerTimes, [kept(10_000, 40_000, 40_010)]);
     // A later sync, whose reply alone spans too few ledgers, takes the pace from the kept time.
-    assert.equal(updatePace(state, [at(10_100, 40_000 + 100 * 4)]), 4);
-    assert.deepEqual(state.ledgerTimes, [at(10_000, 40_000), at(10_100, 40_400)]);
-    updatePace(state, [at(11_000, 40_400 + 3_601)]);
-    assert.deepEqual(state.ledgerTimes, [at(11_000, 44_001)]);
+    assert.equal(updatePace(state, [at(10_100, 40_000 + 100 * 4)], SEEN + 40_405), 4);
+    assert.deepEqual(state.ledgerTimes, [
+      kept(10_000, 40_000, 40_010),
+      kept(10_100, 40_400, 40_405),
+    ]);
+    updatePace(state, [at(11_000, 40_400 + 3_601)], SEEN + 44_002);
+    assert.deepEqual(state.ledgerTimes, [kept(11_000, 44_001, 44_002)]);
   });
 
   it("tells by when a ledger closes, at the slowest pace kept and never faster than five seconds", () => {
     const state = emptyState(1);
     assert.equal(closedBy(state, 100), undefined);
     // Four seconds a ledger, then six.
-    state.ledgerTimes = [at(1_000, 0), at(1_060, 240), at(1_120, 600)];
+    state.ledgerTimes = [kept(1_000, 0), kept(1_060, 240), kept(1_120, 600)];
     assert.equal(closedBy(state, 1_220), at(1_120, 600 + 100 * 6).at);
     // A ledger before the newest kept had closed by then.
     assert.equal(closedBy(state, 1_100), at(1_120, 600).at);
-    state.ledgerTimes = [at(1_000, 0), at(1_060, 240)];
+    state.ledgerTimes = [kept(1_000, 0), kept(1_060, 240)];
     assert.equal(closedBy(state, 1_160), at(1_060, 240 + 100 * 5).at);
+  });
+
+  it("tells it from when the wallet read the newest close time, when that is later than RPC said", () => {
+    const state = emptyState(1);
+    // RPC said the newest ledger closed an hour before the wallet read it.
+    state.ledgerTimes = [kept(1_000, 0), kept(1_060, 300, 3_900)];
+    assert.equal(closedBy(state, 1_160), at(1_060, 3_900 + 100 * 5).at);
+    assert.equal(closedBy(state, 1_000), at(1_060, 3_900).at);
+    // A clock behind RPC's times leaves them as RPC said.
+    state.ledgerTimes = [kept(1_000, 0), kept(1_060, 300, 200)];
+    assert.equal(closedBy(state, 1_160), at(1_060, 300 + 100 * 5).at);
   });
 
   it("keeps the close times of the ledgers the history names or will name, the first told of each", () => {
