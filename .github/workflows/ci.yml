@@ -82,6 +82,10 @@ jobs:
       - run: npm run typecheck
       - run: npm run format:check
       - run: npm test
+      # The sample runs against live testnet and waits for a deposit's admission, so CI only
+      # typechecks it, against the packages as built.
+      - run: npm run build
+      - run: npm run typecheck:examples
       # Real proofs need the frozen circuit and a dev proving key, set up fresh here; the proof
       # tests verify against the key exported from it.
       - name: Install circom 2.2.3
