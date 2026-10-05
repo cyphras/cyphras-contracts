@@ -1,1 +1,3 @@
 dist/
+# Each package's npm README, written at pack time from the repository README.
+/*/README.md

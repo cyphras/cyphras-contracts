@@ -1,14 +1,34 @@
 {
   "name": "@cyphras/private",
   "version": "0.1.0",
-  "private": true,
-  "license": "UNLICENSED",
-  "description": "SDK for Cyphras private payments v2: shielded keys and addresses, note encryption, local Groth16 proving and wallet sync for the shielded pool on Stellar",
+  "description": "Wallet SDK for Cyphras private payments on Stellar, with zero-knowledge proofs made on the user's device",
+  "keywords": [
+    "stellar",
+    "soroban",
+    "privacy",
+    "zero-knowledge",
+    "groth16",
+    "shielded",
+    "wallet"
+  ],
+  "homepage": "https://github.com/cyphras/cyphras-contracts/tree/HEAD/sdk/private",
+  "bugs": {
+    "url": "https://github.com/cyphras/cyphras-contracts/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cyphras/cyphras-contracts.git",
+    "directory": "sdk/private"
+  },
+  "license": "Apache-2.0",
+  "author": "Cyphras",
   "type": "module",
   "sideEffects": false,
   "engines": {
     "node": ">=22.18.0"
   },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -16,13 +36,20 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test \"test/unit/**/*.test.ts\"",
-    "test:proof": "node --import ./test/support/sources.ts --test --test-timeout=900000 \"test/proof/**/*.test.ts\""
+    "test:proof": "node --import ./test/support/sources.ts --test --test-timeout=900000 \"test/proof/**/*.test.ts\"",
+    "prepack": "npm run build && node ../scripts/readme.ts",
+    "postpack": "node ../scripts/readme.ts --remove"
   },
   "dependencies": {
     "@noble/ciphers": "1.3.0",
