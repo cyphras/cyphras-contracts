@@ -1,7 +1,9 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
-    "customConditions": ["cyphras-source"]
+    "paths": {
+      "@cyphras/private": ["../private/src/index.ts"]
+    }
   },
   "include": ["src"]
 }
