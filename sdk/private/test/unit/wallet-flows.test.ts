@@ -133,7 +133,7 @@ describe("wallet: opening", () => {
     );
   });
 
-  it("opens without waiting long for services that do not answer, unverified while the vault does not, and asks again before a sync", async () => {
+  it("opens without waiting long for services that do not answer, unverified while the vault does not, and asks again before a quote or a sync", async () => {
     const world = await createWorld();
     let hanging = true;
     // Whether a request reads the vault's instance alone, as the open-time check does.
@@ -168,6 +168,8 @@ describe("wallet: opening", () => {
       ["unverified", "ok", "unavailable", "unavailable", "unavailable"],
     );
     hanging = false;
+    await alice.quote({ kind: "send" });
+    assert.equal(alice.verification().state, "verified");
     const summary = await alice.sync();
     assert.equal(summary.source, "indexer");
     assert.equal(alice.verification().state, "verified");
@@ -2441,10 +2443,33 @@ describe("wallet: screening", () => {
 });
 
 describe("wallet: spends", () => {
+  it("refuses a quote above the vault's max fee before the first sync, whatever cap the caller gives", async () => {
+    const world = await createWorld();
+    // A relayer that quotes more than the vault lets a transaction pay.
+    const fetch: FetchLike = async (input, init) => {
+      const res = await world.fetch(input, init);
+      const url = new URL(input);
+      if (url.origin !== RELAYER || url.pathname !== "/v1/quote") return res;
+      return new Response(JSON.stringify({ ...(await res.json()), fee: String(6n * XLM) }));
+    };
+    const alice = await openWallet({ ...world, fetch }, 0);
+    await assert.rejects(
+      alice.quote({ kind: "send", maxFee: 10n * XLM }),
+      isError("fee_above_cap"),
+    );
+  });
+
   it("quotes a spend's fee and the most the notes can pay with it, which a spend of that much pays", async () => {
     const world = await createWorld({ limits: { maxDailyOutflow: 25n * XLM } });
     const alice = await openWallet(world, 0);
-    await assert.rejects(alice.quote({ kind: "send" }), isError("tree_unverified"));
+    // Before a sync, the fee alone.
+    const early = await alice.quote({ kind: "send" });
+    assert.deepEqual(
+      [early.relayer, early.fee, early.maxAmount, early.spendable],
+      [RELAYER, 1n * XLM, undefined, undefined],
+    );
+    assert.ok(early.validUntil !== undefined && early.validUntil > Number(world.vault.timestamp));
+    await assert.rejects(alice.quote({ kind: "send", maxFee: 1n }), isError("fee_above_cap"));
     const depositor = world.signer("depositor");
     for (const amount of [10n, 20n, 30n]) await shielded(alice, amount * XLM, depositor);
     world.advance(3_601);

@@ -171,17 +171,19 @@ export interface SpendQuote {
   readonly fee: bigint;
   readonly validUntil: number | undefined;
   // The largest amount one transaction can pay after the fee: from the two largest spendable
-  // notes, and for an unshield within the vault's cap for one exit.
-  readonly maxAmount: bigint;
+  // notes, and for an unshield within the vault's cap for one exit. Undefined until the wallet has
+  // synced, before which only the fee is quoted.
+  readonly maxAmount: bigint | undefined;
   // All the spendable notes hold after the fee of one transaction: more than maxAmount when notes
-  // must be consolidated first, or an unshield split.
-  readonly spendable: bigint;
+  // must be consolidated first, or an unshield split. Undefined until the wallet has synced.
+  readonly spendable: bigint | undefined;
 }
 
 const atLeastZero = (x: bigint): bigint => (x > 0n ? x : 0n);
 
 // The fee of a spend from the first relayer that quotes within the cap, and what the spendable
-// notes, as of the last sync, can pay with it.
+// notes, as of the last sync, can pay with it. Before a sync the vault's limits come from a read of
+// its instance, and only the fee is quoted.
 export async function quoteSpend(
   core: Core,
   kind: "send" | "unshield",
@@ -191,10 +193,13 @@ export async function quoteSpend(
   if (kind === "send" && relayers === undefined) {
     fail("invalid_argument", "transfers cannot be self-relayed");
   }
-  const { limits } = chainReads(core).view.instance;
+  const reads = core.chain;
+  const { limits } = reads?.view.instance ?? (await core.services.vault.instance());
   const cap = maxFee !== undefined && maxFee < limits.maxFee ? maxFee : limits.maxFee;
   const relay = relayers === undefined ? undefined : await chooseRelay(core, relayers, cap);
   const fee = relay?.quote.fee ?? 0n;
+  const quoted = { kind, relayer: relay?.client.url, fee, validUntil: relay?.quote.validUntil };
+  if (reads === undefined) return { ...quoted, maxAmount: undefined, spendable: undefined };
   const values = spendableNotes(core.state)
     .map((n) => n.value)
     .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
@@ -202,10 +207,7 @@ export async function quoteSpend(
   const cappedPair =
     kind === "unshield" && pair > limits.maxDailyOutflow ? limits.maxDailyOutflow : pair;
   return {
-    kind,
-    relayer: relay?.client.url,
-    fee,
-    validUntil: relay?.quote.validUntil,
+    ...quoted,
     maxAmount: atLeastZero(cappedPair - fee),
     spendable: atLeastZero(values.reduce((s, v) => s + v, 0n) - fee),
   };

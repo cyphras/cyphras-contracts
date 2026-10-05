@@ -1134,16 +1134,15 @@ export class PrivateWallet {
    * The fee a send or an unshield would pay now, from the first relayer that quotes within the cap,
    * or none for a self-relayed unshield, and the most one transaction can pay with it from the
    * notes spendable as of the last sync: what a wallet shows, with a Max button, before review.
+   * Before the first sync only the fee is quoted.
    */
   quote(request: QuoteRequest): Promise<SpendQuote> {
-    return this.#run(async () =>
-      quoteSpend(
-        this.#core,
-        request.kind,
-        request.selfRelay === true ? undefined : this.#relayerClients(request.relayer),
-        request.maxFee,
-      ),
-    );
+    return this.#run(async () => {
+      if (this.#core.chain === undefined) await this.#ensureVerified();
+      const relayers =
+        request.selfRelay === true ? undefined : this.#relayerClients(request.relayer);
+      return quoteSpend(this.#core, request.kind, relayers, request.maxFee);
+    });
   }
 
   /** Pays a shielded address through a relayer. */
