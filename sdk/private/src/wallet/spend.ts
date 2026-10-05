@@ -123,14 +123,31 @@ function checkQuote(core: Core, quote: Quote, feeAddress: string, cap: bigint): 
   }
 }
 
-// The first relayer that reports the pinned vault and network and quotes within the cap.
+// Quotes relayers gave, by relayer, that the wallet shows again while they hold rather than ask
+// the relayer each time a payment is set up: every request tells it a payment may follow.
+export type HeldQuotes = Map<string, { readonly quote: Quote; readonly feeAddress: string }>;
+
+// A held quote is shown again only while it holds at least this long: time to review and send.
+const HELD_QUOTE_MS = 60_000;
+
+// The first relayer that reports the pinned vault and network and quotes within the cap, or holds
+// such a quote in `held`, which keeps each quote taken.
 async function chooseRelay(
   core: Core,
   candidates: readonly RelayerClient[],
   cap: bigint,
+  held?: HeldQuotes,
 ): Promise<Relay> {
   let last: unknown;
   for (const client of candidates) {
+    const kept = held?.get(client.url);
+    if (
+      kept !== undefined &&
+      kept.quote.validUntil * 1000 - HELD_QUOTE_MS >= core.now() &&
+      kept.quote.fee <= cap
+    ) {
+      return { client, ...kept };
+    }
     try {
       const health = await client.health();
       const pinned = core.deployment.relayers.find((r) => r.url === client.url);
@@ -151,6 +168,7 @@ async function chooseRelay(
         fail("service_unavailable", "the relayer is not ready", { service: "relayer" });
       const quote = await client.quote();
       checkQuote(core, quote, health.feeAddress, cap);
+      held?.set(client.url, { quote, feeAddress: health.feeAddress });
       return { client, quote, feeAddress: health.feeAddress };
     } catch (err) {
       if (!(err instanceof CyphrasError)) throw err;
@@ -181,14 +199,15 @@ export interface SpendQuote {
 
 const atLeastZero = (x: bigint): bigint => (x > 0n ? x : 0n);
 
-// The fee of a spend from the first relayer that quotes within the cap, and what the spendable
-// notes, as of the last sync, can pay with it. Before a sync the vault's limits come from a read of
-// its instance, and only the fee is quoted.
+// The fee of a spend from the first relayer that quotes within the cap, or holds such a quote, and
+// what the spendable notes, as of the last sync, can pay with it. Before a sync the vault's limits
+// come from a read of its instance, and only the fee is quoted.
 export async function quoteSpend(
   core: Core,
   kind: "send" | "unshield",
   relayers: readonly RelayerClient[] | undefined,
   maxFee: bigint | undefined,
+  held: HeldQuotes,
 ): Promise<SpendQuote> {
   if (kind === "send" && relayers === undefined) {
     fail("invalid_argument", "transfers cannot be self-relayed");
@@ -196,7 +215,7 @@ export async function quoteSpend(
   const reads = core.chain;
   const { limits } = reads?.view.instance ?? (await core.services.vault.instance());
   const cap = maxFee !== undefined && maxFee < limits.maxFee ? maxFee : limits.maxFee;
-  const relay = relayers === undefined ? undefined : await chooseRelay(core, relayers, cap);
+  const relay = relayers === undefined ? undefined : await chooseRelay(core, relayers, cap, held);
   const fee = relay?.quote.fee ?? 0n;
   const quoted = { kind, relayer: relay?.client.url, fee, validUntil: relay?.quote.validUntil };
   if (reads === undefined) return { ...quoted, maxAmount: undefined, spendable: undefined };

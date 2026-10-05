@@ -82,6 +82,7 @@ import {
 } from "./sources.ts";
 import {
   type ConfirmSpend,
+  type HeldQuotes,
   type SpendQuote,
   type Submission,
   cancelHeld,
@@ -248,6 +249,8 @@ export interface QuoteRequest {
   readonly relayer?: string | readonly string[];
   readonly selfRelay?: boolean;
   readonly maxFee?: bigint;
+  // Asks the relayer again rather than show a quote it gave this wallet that still holds.
+  readonly fresh?: boolean;
 }
 
 /** A stalled payment proved again, with the same notes. */
@@ -508,6 +511,7 @@ export class PrivateWallet {
   #queue: Promise<unknown> = Promise.resolve();
   // The last sync found data that contradicts the chain; nothing of it was kept.
   #fault = false;
+  readonly #quotes: HeldQuotes = new Map();
 
   private constructor(
     core: Core,
@@ -1134,14 +1138,16 @@ export class PrivateWallet {
    * The fee a send or an unshield would pay now, from the first relayer that quotes within the cap,
    * or none for a self-relayed unshield, and the most one transaction can pay with it from the
    * notes spendable as of the last sync: what a wallet shows, with a Max button, before review.
-   * Before the first sync only the fee is quoted.
+   * Before the first sync only the fee is quoted. A relayer's quote is shown again, without asking
+   * the relayer, while it holds for at least another minute, unless `fresh` is set.
    */
   quote(request: QuoteRequest): Promise<SpendQuote> {
     return this.#run(async () => {
       if (this.#core.chain === undefined) await this.#ensureVerified();
       const relayers =
         request.selfRelay === true ? undefined : this.#relayerClients(request.relayer);
-      return quoteSpend(this.#core, request.kind, relayers, request.maxFee);
+      if (request.fresh === true) relayers?.forEach((r) => this.#quotes.delete(r.url));
+      return quoteSpend(this.#core, request.kind, relayers, request.maxFee, this.#quotes);
     });
   }
 

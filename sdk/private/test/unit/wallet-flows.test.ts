@@ -2503,6 +2503,53 @@ describe("wallet: spends", () => {
     assert.equal(sent.fee, send.fee);
   });
 
+  it("shows a relayer's quote again while it holds for another minute, asking neither the relayer nor RPC", async () => {
+    const { world, alice } = await funded();
+    const asked = () => world.requests.filter((r) => r.startsWith(RELAYER)).length;
+    const first = await alice.quote({ kind: "send" });
+    world.advance(200);
+    const [relayer, rpc] = [asked(), world.rpc.calls.length];
+    const again = await alice.quote({ kind: "unshield" });
+    assert.deepEqual([asked(), world.rpc.calls.length], [relayer, rpc]);
+    assert.deepEqual([again.fee, again.validUntil], [first.fee, first.validUntil]);
+    // A lower cap than the quote, or a call that asks for a fresh one, asks the relayer.
+    await assert.rejects(alice.quote({ kind: "send", maxFee: 1n }), isError("fee_above_cap"));
+    assert.equal(asked(), relayer + 2);
+    const fresh = await alice.quote({ kind: "send", fresh: true });
+    assert.equal(asked(), relayer + 4);
+    assert.ok((fresh.validUntil as number) > (first.validUntil as number));
+    // So does one once the quote holds for less than a minute.
+    world.advance((fresh.validUntil as number) - Number(world.vault.timestamp) - 59);
+    await alice.quote({ kind: "send" });
+    assert.equal(asked(), relayer + 6);
+  });
+
+  it("holds each relayer's quote apart, and takes a fresh one for every spend", async () => {
+    const { world } = await funded();
+    const other = "http://relayer2.test";
+    const asked: string[] = [];
+    // A second relayer, which the first one's service answers for.
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      if (url.origin === RELAYER || url.origin === other) asked.push(url.origin + url.pathname);
+      return world.fetch(url.origin === other ? `${RELAYER}${url.pathname}` : input, init);
+    };
+    const wallet = await openWallet({ ...world, fetch }, 0);
+    await wallet.sync();
+    await wallet.quote({ kind: "send" });
+    const quoted = await wallet.quote({ kind: "send", relayer: other });
+    assert.equal(quoted.relayer, other);
+    assert.deepEqual(
+      asked.filter((r) => r.endsWith("/v1/quote")),
+      [`${RELAYER}/v1/quote`, `${other}/v1/quote`],
+    );
+    const bob = await openWallet(world, 1);
+    for (const amount of [5n * XLM, 6n * XLM]) {
+      await wallet.send({ to: bob.generateAddress(), amount, maxFee: 2n * XLM });
+    }
+    assert.equal(asked.filter((r) => r === `${RELAYER}/v1/quote`).length, 3);
+  });
+
   it("pays a shielded address through a relayer, which names no party but itself", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
