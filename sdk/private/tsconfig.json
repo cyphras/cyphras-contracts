@@ -1,7 +1,10 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
-    "customConditions": ["cyphras-source"]
+    "paths": {
+      "@cyphras/private": ["./src/index.ts"],
+      "@cyphras/private-prover-snarkjs": ["../prover-snarkjs/src/index.ts"]
+    }
   },
   "include": ["src", "test", "scripts"]
 }

@@ -1,32 +1,58 @@
 {
   "name": "@cyphras/private-prover-snarkjs",
   "version": "0.1.0",
-  "private": true,
-  "license": "UNLICENSED",
-  "description": "The default prover of @cyphras/private: snarkjs Groth16 over the pinned circuit artifacts",
+  "description": "The snarkjs Groth16 prover for @cyphras/private",
+  "keywords": [
+    "stellar",
+    "soroban",
+    "privacy",
+    "zero-knowledge",
+    "groth16",
+    "snarkjs",
+    "prover"
+  ],
+  "homepage": "https://github.com/cyphras/cyphras-contracts/tree/HEAD/sdk/prover-snarkjs",
+  "bugs": {
+    "url": "https://github.com/cyphras/cyphras-contracts/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cyphras/cyphras-contracts.git",
+    "directory": "sdk/prover-snarkjs"
+  },
+  "license": "GPL-3.0-only",
+  "author": "Cyphras",
   "type": "module",
   "sideEffects": false,
   "engines": {
     "node": ">=22.18.0"
   },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "cyphras-source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE",
+    "README.md"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json"
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "prepack": "npm run build && node ../scripts/readme.ts",
+    "postpack": "node ../scripts/readme.ts --remove"
   },
   "dependencies": {
     "snarkjs": "0.7.6"
   },
   "peerDependencies": {
-    "@cyphras/private": "0.1.0"
+    "@cyphras/private": "^0.1.0"
   }
 }

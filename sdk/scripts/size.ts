@@ -17,6 +17,8 @@ writeFileSync(
   `export * from ${JSON.stringify(CORE)};\nexport * from ${JSON.stringify(PROVER)};\n`,
 );
 
+// The prover's import of the core resolves to the core's source, which is what "both" bundles, or
+// stays out of the bundle when the core is external.
 async function size(
   entry: string,
   external: string[] = [],
@@ -28,8 +30,7 @@ async function size(
     format: "esm",
     platform: "browser",
     target: "es2022",
-    conditions: ["cyphras-source"],
-    external,
+    ...(external.length === 0 ? { alias: { "@cyphras/private": CORE } } : { external }),
     write: false,
     logLevel: "error",
   });

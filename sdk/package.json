@@ -15,10 +15,11 @@
   "scripts": {
     "build": "npm run build --workspace @cyphras/private --workspace @cyphras/private-prover-snarkjs",
     "typecheck": "npm run typecheck --workspaces",
+    "typecheck:examples": "tsc -p examples/tsconfig.json",
     "test": "npm test --workspace @cyphras/private",
     "test:proof": "npm run test:proof --workspace @cyphras/private",
-    "format": "prettier --write \"*/src/**/*.ts\" \"*/test/**/*.ts\" \"*/scripts/**/*.ts\" \"scripts/**/*.ts\"",
-    "format:check": "prettier --check \"*/src/**/*.ts\" \"*/test/**/*.ts\" \"*/scripts/**/*.ts\" \"scripts/**/*.ts\"",
+    "format": "prettier --write \"*/src/**/*.ts\" \"*/test/**/*.ts\" \"*/scripts/**/*.ts\" \"scripts/**/*.ts\" \"examples/**/*.ts\"",
+    "format:check": "prettier --check \"*/src/**/*.ts\" \"*/test/**/*.ts\" \"*/scripts/**/*.ts\" \"scripts/**/*.ts\" \"examples/**/*.ts\"",
     "size": "node scripts/size.ts"
   },
   "devDependencies": {
