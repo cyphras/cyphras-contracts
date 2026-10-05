@@ -789,7 +789,8 @@ export class PrivateWallet {
     const core = this.#core;
     const draft = structuredClone(core.state);
     if (full) {
-      const { revision, plans, deposits, operations, closeTimes, closeTimesTo, payouts } = draft;
+      const { revision, plans, deposits, operations, payouts } = draft;
+      const { closeTimes, closeTimesTo, closeTimesUntil } = draft;
       resetEvidence(plans);
       Object.assign(draft, emptyState(core.deployment.deployLedger), {
         revision,
@@ -798,6 +799,7 @@ export class PrivateWallet {
         operations,
         closeTimes,
         closeTimesTo,
+        closeTimesUntil,
         payouts,
       });
     }
@@ -872,6 +874,11 @@ export class PrivateWallet {
       crossChecked = matches.every((m) => m.verified);
       checked = crossChecked;
       events = matches[0]?.events;
+      // RPC no longer holds where this sync started, so its own read gave no close times: they are
+      // left to a read of every ledger it holds, up to this sync's horizon.
+      if (matches[0]?.gone === true) {
+        core.state.closeTimesUntil = Math.max(core.state.closeTimesUntil, data.horizon);
+      }
       others = matches.slice(1).flatMap((m) => (m.events === undefined ? [] : [m.events]));
     } else {
       events = await source.events();

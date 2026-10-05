@@ -309,10 +309,12 @@ export interface WalletState {
   // Close times of the last hour that RPC reported, from which the pace of ledgers is taken.
   ledgerTimes: LedgerTime[];
   // The close time of each ledger a history entry of this wallet names, as RPC reported it with
-  // the vault's events, by ledger; and the ledger up to which a read for the close times the
-  // history lacked has gone, after which a ledger still without one is one RPC no longer held.
+  // the vault's events, by ledger. A sync whose own read of the vault's events RPC could not serve,
+  // as it no longer held where the sync started, leaves the close times of the ledgers up to
+  // `closeTimesUntil` to a read of every ledger RPC holds, which has gone up to `closeTimesTo`.
   closeTimes: LedgerTime[];
   closeTimesTo: number;
+  closeTimesUntil: number;
   payouts: Payout[];
 }
 
@@ -336,6 +338,7 @@ export function emptyState(deployLedger: number): WalletState {
     ledgerTimes: [],
     closeTimes: [],
     closeTimesTo: 0,
+    closeTimesUntil: 0,
     payouts: [],
   };
 }
@@ -387,6 +390,7 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   state.ledgerTimes ??= [];
   state.closeTimes ??= [];
   state.closeTimesTo ??= 0;
+  state.closeTimesUntil ??= 0;
   state.payouts ??= [];
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {

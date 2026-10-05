@@ -3778,6 +3778,30 @@ describe("wallet: when history entries happened", () => {
     };
     return probes;
   };
+  // A connection to the world's services that logs every request a wallet makes, as the services
+  // see it, and lets `rewrite` change RPC's replies to getEvents.
+  const logged = (world: World, rewrite?: (result: Record<string, unknown>) => void) => {
+    const log: [string, unknown][] = [];
+    const fetch: FetchLike = async (input, init) => {
+      const url = new URL(input);
+      const body = bodyOf(init);
+      log.push([`${url.origin}${url.pathname}${url.search}`, { ...body, id: undefined }]);
+      const res = await world.fetch(input, init);
+      if (rewrite === undefined || url.origin !== RPC || body?.method !== "getEvents") return res;
+      const reply = await res.json();
+      rewrite(reply.result);
+      return new Response(JSON.stringify(reply));
+    };
+    return { log, world: { ...world, fetch } };
+  };
+  // The start ledger and the page size of each read of the vault's events a log holds.
+  const eventReads = (log: readonly [string, unknown][]) =>
+    log.flatMap(([, body]) => {
+      const b = body as { method?: string; params?: Record<string, unknown> };
+      if (b.method !== "getEvents") return [];
+      const page = b.params?.["pagination"] as { limit: number };
+      return [[b.params?.["startLedger"] as number | undefined, page.limit]];
+    });
 
   it("gives every entry with a ledger the time it closed, through a reopen and a rescan", async () => {
     const { world, alice } = await funded();
@@ -3841,7 +3865,42 @@ describe("wallet: when history entries happened", () => {
     );
   });
 
-  it("reads the times a restored wallet lacks over every ledger RPC holds, never from the ledger of an entry", async () => {
+  it("makes the same reads whatever it holds when RPC leaves a ledger's close time out", async () => {
+    const world = await createWorld();
+    let target: number | undefined;
+    // RPC leaves out the close time of the ledger of a payment to one of two wallets.
+    const drop = (result: Record<string, unknown>) => {
+      for (const e of result["events"] as Record<string, unknown>[]) {
+        if (e["ledger"] === target) delete e["ledgerClosedAt"];
+      }
+    };
+    const [a, c] = [logged(world, drop), logged(world, drop)];
+    const alice = await openWallet(a.world, 0);
+    const carol = await openWallet(c.world, 2);
+    const bob = await openWallet(world, 1);
+    await bob.shield({ amount: 50n * XLM, signer: world.signer("bob depositor") });
+    world.advance(3_601);
+    world.admitAll();
+    await bob.sync();
+    await alice.sync();
+    await carol.sync();
+    a.log.length = 0;
+    c.log.length = 0;
+    await bob.send({ to: alice.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
+    target = world.vault.ledger;
+    world.fill(1);
+    await alice.sync();
+    await carol.sync();
+    assert.equal((await alice.balance()).spendable, 10n * XLM);
+    assert.deepEqual(
+      (await alice.history()).map((h) => [h.kind, h.closedAt]),
+      [["receive", undefined]],
+    );
+    assert.ok(eventReads(a.log).length > 0);
+    assert.deepEqual(a.log, c.log);
+  });
+
+  it("reads the times of every ledger RPC holds, whatever it holds, once RPC no longer holds where a sync starts", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
     world.advance(7_200);
@@ -3849,68 +3908,88 @@ describe("wallet: when history entries happened", () => {
     const sentAt = world.vault.ledger;
     // RPC holds the payment's ledger and a few before it, but no longer the deposit's.
     world.rpc.oldestLedger = sentAt - 3;
-    const reads: [number | undefined, number][] = [];
-    const fetch: FetchLike = async (input, init) => {
-      const body =
-        init?.body === undefined || init.body === null ? {} : JSON.parse(String(init.body));
-      if (body.method === "getEvents") {
-        reads.push([body.params.startLedger, body.params.pagination.limit]);
-      }
-      return world.fetch(input, init);
-    };
-    const restored = await openWallet({ ...world, fetch }, 0);
+    const [a, c] = [logged(world), logged(world)];
+    const restored = await openWallet(a.world, 0);
+    const empty = await openWallet(c.world, 2);
     await restored.sync();
+    await empty.sync();
+    // A wallet that holds nothing reads just as one with a history.
+    assert.deepEqual(a.log, c.log);
     const history = await restored.history();
     assert.deepEqual(closedAt(world, history), [
       ["send", world.rpc.closeTime(sentAt) * 1000, world.rpc.closeTime(sentAt) * 1000],
       ["shield", undefined, world.rpc.closeTime(history[1]?.ledger as number) * 1000],
     ]);
-    // The sync's own reads and the recheck's start where the wallet started, which RPC no longer
+    // The sync's own read and the recheck's start where the wallet started, which RPC no longer
     // holds; the newest ledger tells the oldest it holds, from which the times are read.
     const deployed = world.deployment.deployLedger;
+    const head = world.vault.ledger;
     assert.deepEqual(
-      reads.filter(([start]) => start !== undefined),
+      eventReads(a.log).filter(([start]) => start !== undefined),
       [
         [deployed, 1000],
         [deployed, 1000],
-        [world.vault.ledger, 1],
+        [head, 1],
         [sentAt - 3, 1000],
       ],
     );
     world.fill(1);
-    const before = reads.length;
+    let before = a.log.length;
     await restored.sync();
     // A later sync reads only its own ledgers: the deposit's time stays unknown.
-    assert.equal(reads.slice(before).length, 1);
+    assert.equal(eventReads(a.log.slice(before)).length, 1);
     const kept = closedAt(world, await restored.history());
     assert.equal(kept[1]?.[1], undefined);
-    // A rescan keeps the times read before, and reads no ledgers for those it lacks again.
-    const rescanned = reads.length;
+    // A rescan, whose own read RPC cannot serve either, keeps the times read before and reads for
+    // times only past the ledgers read before.
+    before = a.log.length;
     await restored.rescan();
     assert.deepEqual(closedAt(world, await restored.history()), kept);
-    assert.ok(reads.slice(rescanned).every(([, limit]) => limit !== 1));
+    assert.deepEqual(eventReads(a.log.slice(before)), [
+      [deployed, 1000],
+      [deployed, 1000],
+      [world.vault.ledger, 1],
+      [head + 1, 1000],
+    ]);
   });
 
-  it("goes on with a read of times its page cap stopped where it stopped", async () => {
+  it("reads close times two pages a sync, going on where the last read stopped, up to where it is due", async () => {
     const { world, alice } = await funded();
     const bob = await openWallet(world, 1);
     world.advance(20_000);
     await alice.send({ to: bob.generateAddress(), amount: 30n * XLM, maxFee: 2n * XLM });
     const sentAt = world.vault.ledger;
-    world.rpc.oldestLedger = sentAt - 2_500;
+    world.rpc.oldestLedger = sentAt - 2_200;
     world.rpc.scanLedgers = 500;
-    const restored = await openWallet(world, 0, new MemoryStore(), undefined, {
-      syncLimits: { eventPages: 2 },
-    });
+    let busy = false;
+    const { log, world: busyWorld } = logged(world);
+    const fetch: FetchLike = async (input, init) => {
+      const body = bodyOf(init);
+      if (busy && new URL(input).origin === RPC && body?.method === "getEvents") {
+        return busyReply(body.id as number);
+      }
+      return busyWorld.fetch(input, init);
+    };
+    const restored = await openWallet({ ...world, fetch }, 0);
     const sendTime = async () =>
       (await restored.history()).find((h) => h.kind === "send")?.closedAt;
-    // Each sync reads a thousand ledgers on from the last.
+    // Each sync reads a thousand ledgers on from the last, though the chain goes on far past them.
+    await restored.sync();
+    world.advance(10_000);
+    assert.equal(await sendTime(), undefined);
+    // A rescan while RPC is busy leaves the read due.
+    busy = true;
+    await restored.rescan();
+    busy = false;
     await restored.sync();
     assert.equal(await sendTime(), undefined);
-    await restored.sync();
-    assert.equal(await sendTime(), undefined);
+    const before = log.length;
     await restored.sync();
     assert.equal(await sendTime(), world.rpc.closeTime(sentAt) * 1000);
+    // The last read stops on the first page that reaches where the read was due to.
+    const reads = eventReads(log.slice(before));
+    const probe = reads.findIndex(([, limit]) => limit === 1);
+    assert.equal(reads.slice(probe + 1).length, 1);
   });
 });
 

@@ -12,6 +12,9 @@ const MIN_SECONDS = FALLBACK_SECONDS / 2;
 const MIN_SPAN = 60;
 // How far back the close times kept between syncs reach.
 const KEPT_SECONDS = 3_600;
+// The pages of the vault's events a sync reads for close times at most, so that the read holds the
+// account's other operations up only briefly.
+const CLOSE_TIME_PAGES = 2;
 
 // The seconds per ledger up to the newest close time: the fastest from any time at least 60
 // ledgers before it.
@@ -85,10 +88,11 @@ export function recordCloseTimes(state: WalletState, reported: readonly LedgerTi
     .sort((a, b) => a.ledger - b.ledger);
 }
 
-// Reads the close times the wallet's history lacks from the vault's events of every ledger RPC
-// holds after those a read like this one covered before, learning the oldest it holds from a read
-// at `head`. Such a read names no ledger of the wallet's own, as asking for one ledger's time
-// would; a ledger RPC no longer holds keeps none. The times are only shown, so a read that fails is
+// Goes on with a read of the vault's events for close times, while one is due: from the oldest
+// ledger RPC holds, which a read at `head` tells, or from where the last read stopped, up to
+// `closeTimesUntil`, at most two pages a sync. Whether it reads and what depends only on how this
+// wallet's syncs went, never on what it holds, so the reads tell RPC nothing of the wallet's notes;
+// a ledger RPC no longer holds keeps no time. The times are only shown, so a read that fails is
 // tried again on the next sync.
 export async function readCloseTimes(
   state: WalletState,
@@ -97,21 +101,15 @@ export async function readCloseTimes(
   head: number,
   maxPages: number,
 ): Promise<void> {
-  const known = new Set(state.closeTimes.map((t) => t.ledger));
-  const lacking = [...historyLedgers(state)].some(
-    (ledger) => ledger > state.closeTimesTo && !known.has(ledger),
-  );
-  if (!lacking) return;
+  if (state.closeTimesTo >= state.closeTimesUntil) return;
+  const end = { ledger: state.closeTimesUntil, leafEnd: undefined };
+  const pages = Math.min(CLOSE_TIME_PAGES, maxPages);
   const read = await rpc
     .getEvents({ contractId: vault, startLedger: head, limit: 1 })
-    .then(({ oldestLedger }) =>
-      new RpcEventSource(
-        rpc,
-        vault,
-        Math.max(oldestLedger, state.closeTimesTo + 1),
-        maxPages,
-      ).events(),
-    )
+    .then(({ oldestLedger }) => {
+      const start = Math.max(oldestLedger, state.closeTimesTo + 1);
+      return new RpcEventSource(rpc, vault, start, pages, end).events();
+    })
     .catch(() => undefined);
   if (read === undefined) return;
   recordCloseTimes(state, read.closeTimes);

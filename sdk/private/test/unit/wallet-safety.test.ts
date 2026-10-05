@@ -345,10 +345,14 @@ describe("wallet safety: cross-checks with RPC events", () => {
     // More events in one ledger than one page holds.
     world.fill(600);
     const alice = await openWallet(world, 0, store, undefined, { syncLimits: { eventPages: 1 } });
+    const asked = world.rpc.calls.filter((m) => m === "getEvents").length;
     const summary = await alice.sync();
     assert.equal(summary.rootVerified, true);
     assert.equal(summary.crossChecked, false);
     assert.ok(summary.uncheckedLedgers > 0);
+    // RPC still holds where the sync started: one page for the sync's ledgers and one for the
+    // recheck's, and no read for close times.
+    assert.equal(world.rpc.calls.filter((m) => m === "getEvents").length, asked + 2);
   });
 
   it("confirms the indexer's new leaves and nullifiers against the vault's events", async () => {
@@ -727,6 +731,7 @@ describe("wallet safety: a second RPC provider", () => {
     const world = await createWorld();
     let stale: string | undefined;
     let behind: number | undefined;
+    let probes = 0;
     // The first provider gives its view of the vault and its events as of the ledger `behind`, while
     // the indexer and the second provider follow the chain.
     const first: FetchLike = async (input, init) => {
@@ -735,6 +740,7 @@ describe("wallet safety: a second RPC provider", () => {
       if (behind !== undefined && view && stale !== undefined) {
         return new Response(JSON.stringify({ ...JSON.parse(stale), id: body.id }));
       }
+      if (body.method === "getEvents" && body.params.pagination.limit === 1) probes++;
       const res = await world.fetch(input, init);
       if (view && behind === undefined) stale = await res.clone().text();
       if (behind === undefined || body.method !== "getEvents") return res;
@@ -761,6 +767,8 @@ describe("wallet safety: a second RPC provider", () => {
     const summary = await wallet.sync();
     assert.equal(summary.rootVerified, true);
     assert.equal(summary.crossChecked, true);
+    // A provider behind the sync's ledgers still holds where it started: no read for close times.
+    assert.equal(probes, 0);
   });
 
   it("takes no landing from leaves past what the second RPC provider holds", async () => {

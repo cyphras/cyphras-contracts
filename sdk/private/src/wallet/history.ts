@@ -46,9 +46,10 @@ export interface HistoryEntry {
   readonly ledger: number | undefined;
   // Milliseconds since the epoch, for operations this wallet made itself.
   readonly time: number | undefined;
-  // Milliseconds since the epoch at which the entry's ledger closed, as RPC reported it with the
-  // vault's events; undefined for an entry without a ledger, and for one whose ledger no RPC
-  // provider held any more when the wallet synced it.
+  // Milliseconds since the epoch at which the entry's ledger closed, as the first RPC provider to
+  // report it with the vault's events said, unconfirmed: no other provider's word is checked
+  // against it. Undefined for an entry without a ledger, and for one whose close time no provider
+  // reported while it held the ledger.
   readonly closedAt: number | undefined;
   readonly state: string;
   readonly depositId: number | undefined;

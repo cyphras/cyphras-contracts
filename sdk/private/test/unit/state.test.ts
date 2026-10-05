@@ -49,6 +49,7 @@ describe("stored state", () => {
     delete older.checkedLeafLedger;
     delete older.closeTimes;
     delete older.closeTimesTo;
+    delete older.closeTimesUntil;
     delete older.payouts;
     older.unchecked.forEach((range: Record<string, unknown>, i: number) => {
       delete range["status"];
@@ -74,6 +75,7 @@ describe("stored state", () => {
     assert.equal(loaded?.checkedLeafLedger, 0);
     assert.deepEqual(loaded?.closeTimes, []);
     assert.equal(loaded?.closeTimesTo, 0);
+    assert.equal(loaded?.closeTimesUntil, 0);
     assert.deepEqual(loaded?.payouts, []);
     // A range kept as lost on the first provider's word is open again; leaves kept without the
     // digests a recheck compares can no longer be checked, and leaves staged without them are
