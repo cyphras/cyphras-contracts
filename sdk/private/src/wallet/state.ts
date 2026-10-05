@@ -299,6 +299,11 @@ export interface WalletState {
   rootCheck: RootCheck | undefined;
   // Close times of the last hour that RPC reported, from which the pace of ledgers is taken.
   ledgerTimes: LedgerTime[];
+  // The close time of each ledger a history entry of this wallet names, as RPC reported it with
+  // the vault's events, by ledger; and the ledger up to which a read for the close times the
+  // history lacked has gone, after which a ledger still without one is one RPC no longer held.
+  closeTimes: LedgerTime[];
+  closeTimesTo: number;
 }
 
 export function emptyState(deployLedger: number): WalletState {
@@ -319,6 +324,8 @@ export function emptyState(deployLedger: number): WalletState {
     operations: [],
     rootCheck: undefined,
     ledgerTimes: [],
+    closeTimes: [],
+    closeTimesTo: 0,
   };
 }
 
@@ -366,6 +373,8 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   // as lost without a status was given up on the first RPC provider's word alone, and is open again
   // for every provider to be asked.
   state.ledgerTimes ??= [];
+  state.closeTimes ??= [];
+  state.closeTimesTo ??= 0;
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {
     const { lost: _lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };

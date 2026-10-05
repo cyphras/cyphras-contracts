@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { closedBy, updatePace } from "../../src/wallet/pace.ts";
-import { emptyState } from "../../src/wallet/state.ts";
+import { closedBy, recordCloseTimes, updatePace } from "../../src/wallet/pace.ts";
+import {
+  type OwnedNote,
+  type Plan,
+  type SentNote,
+  type Staging,
+  emptyState,
+} from "../../src/wallet/state.ts";
 
 const at = (ledger: number, seconds: number) => ({ ledger, at: 1_700_000_000 + seconds });
 
@@ -48,5 +54,36 @@ describe("ledger pace", () => {
     assert.equal(closedBy(state, 1_100), at(1_120, 600).at);
     state.ledgerTimes = [at(1_000, 0), at(1_060, 240)];
     assert.equal(closedBy(state, 1_160), at(1_060, 240 + 100 * 5).at);
+  });
+
+  it("keeps the close times of the ledgers the history names or will name, the first told of each", () => {
+    const state = emptyState(1);
+    const note = (ledger: number, spent?: number) =>
+      ({
+        ledger,
+        spent: spent === undefined ? undefined : { txHash: "t", ledger: spent },
+      }) as OwnedNote;
+    state.notes = [note(10, 12), note(11)];
+    state.sent = [{ ledger: 14 } as SentNote];
+    state.plans = [{ evidence: [{ ledger: 16 }] } as unknown as Plan];
+    state.staging = {
+      notes: [note(18, 19)],
+      sent: [{ ledger: 20 } as SentNote],
+      found: [{ ledger: 22 }],
+    } as unknown as Staging;
+    const reported = Array.from({ length: 15 }, (_, i) => at(10 + i, i * 5));
+    recordCloseTimes(state, [...reported].reverse());
+    const named = [10, 11, 12, 14, 16, 18, 19, 20, 22];
+    assert.deepEqual(
+      state.closeTimes,
+      named.map((l) => at(l, (l - 10) * 5)),
+    );
+    // A time already kept stands, and so does the first of two reports of one ledger.
+    state.notes.push(note(30));
+    recordCloseTimes(state, [at(10, 999), at(30, 100), at(30, 200)]);
+    assert.deepEqual(
+      state.closeTimes,
+      [...named, 30].map((l) => at(l, l === 30 ? 100 : (l - 10) * 5)),
+    );
   });
 });

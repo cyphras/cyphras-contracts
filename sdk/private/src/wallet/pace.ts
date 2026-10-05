@@ -1,3 +1,5 @@
+import type { SorobanRpc } from "../net/rpc.ts";
+import { RpcEventSource } from "./sources.ts";
 import type { LedgerTime, WalletState } from "./state.ts";
 
 // The pace the network aims at, taken when no close times give one, and the most a wallet takes:
@@ -55,4 +57,63 @@ export function closedBy(state: WalletState, ledger: number): number | undefined
     pace = Math.max(pace, (b.at - a.at) / (b.ledger - a.ledger));
   }
   return newest.at + Math.max(0, ledger - newest.ledger) * pace;
+}
+
+// The ledgers the wallet's history names, or will name once what a sync staged and what plans'
+// evidence shows is confirmed.
+function historyLedgers(state: WalletState): Set<number> {
+  const notes = [...state.notes, ...(state.staging?.notes ?? [])];
+  const sent = [...state.sent, ...(state.staging?.sent ?? [])];
+  return new Set([
+    ...notes.flatMap((n) => (n.spent === undefined ? [n.ledger] : [n.ledger, n.spent.ledger])),
+    ...sent.map((s) => s.ledger),
+    ...(state.staging?.found ?? []).map((f) => f.ledger),
+    ...state.plans.flatMap((p) => p.evidence.map((e) => e.ledger)),
+  ]);
+}
+
+// Keeps the close times RPC reported with the vault's events of the ledgers the wallet's history
+// names that it holds none for yet.
+export function recordCloseTimes(state: WalletState, reported: readonly LedgerTime[]): void {
+  const named = historyLedgers(state);
+  const known = new Map(state.closeTimes.map((t) => [t.ledger, t.at]));
+  for (const t of reported) {
+    if (named.has(t.ledger) && !known.has(t.ledger)) known.set(t.ledger, t.at);
+  }
+  state.closeTimes = [...known]
+    .map(([ledger, at]) => ({ ledger, at }))
+    .sort((a, b) => a.ledger - b.ledger);
+}
+
+// Reads the close times the wallet's history lacks from the vault's events of every ledger RPC
+// holds after those a read like this one covered before, learning the oldest it holds from a read
+// at `head`. Such a read names no ledger of the wallet's own, as asking for one ledger's time
+// would; a ledger RPC no longer holds keeps none. The times are only shown, so a read that fails is
+// tried again on the next sync.
+export async function readCloseTimes(
+  state: WalletState,
+  rpc: SorobanRpc,
+  vault: string,
+  head: number,
+  maxPages: number,
+): Promise<void> {
+  const known = new Set(state.closeTimes.map((t) => t.ledger));
+  const lacking = [...historyLedgers(state)].some(
+    (ledger) => ledger > state.closeTimesTo && !known.has(ledger),
+  );
+  if (!lacking) return;
+  const read = await rpc
+    .getEvents({ contractId: vault, startLedger: head, limit: 1 })
+    .then(({ oldestLedger }) =>
+      new RpcEventSource(
+        rpc,
+        vault,
+        Math.max(oldestLedger, state.closeTimesTo + 1),
+        maxPages,
+      ).events(),
+    )
+    .catch(() => undefined);
+  if (read === undefined) return;
+  recordCloseTimes(state, read.closeTimes);
+  state.closeTimesTo = read.latest;
 }

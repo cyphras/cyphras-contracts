@@ -43,6 +43,10 @@ export interface HistoryEntry {
   readonly ledger: number | undefined;
   // Milliseconds since the epoch, for operations this wallet made itself.
   readonly time: number | undefined;
+  // Milliseconds since the epoch at which the entry's ledger closed, as RPC reported it with the
+  // vault's events; undefined for an entry without a ledger, and for one whose ledger no RPC
+  // provider held any more when the wallet synced it.
+  readonly closedAt: number | undefined;
   readonly state: string;
   readonly depositId: number | undefined;
   readonly leafIndex: number | undefined;
@@ -58,6 +62,7 @@ const entry = (
   txHash: undefined,
   ledger: undefined,
   time: undefined,
+  closedAt: undefined,
   depositId: undefined,
   leafIndex: undefined,
   recovered: false,
@@ -185,7 +190,10 @@ export function historyOf(state: WalletState): HistoryEntry[] {
       );
     }
   }
-  return out.sort(
-    (a, b) => (b.ledger ?? Infinity) - (a.ledger ?? Infinity) || (b.time ?? 0) - (a.time ?? 0),
-  );
+  const closed = new Map(state.closeTimes.map((t) => [t.ledger, t.at * 1000]));
+  return out
+    .map((e) => (e.ledger === undefined ? e : { ...e, closedAt: closed.get(e.ledger) }))
+    .sort(
+      (a, b) => (b.ledger ?? Infinity) - (a.ledger ?? Infinity) || (b.time ?? 0) - (a.time ?? 0),
+    );
 }

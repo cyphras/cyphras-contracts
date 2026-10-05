@@ -71,7 +71,7 @@ import {
 import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } from "./exits.ts";
 import { type Balance, type HistoryEntry, balanceOf, historyOf } from "./history.ts";
 import { type VaultLimitsView, vaultLimits } from "./limits.ts";
-import { closedBy, updatePace } from "./pace.ts";
+import { closedBy, readCloseTimes, recordCloseTimes, updatePace } from "./pace.ts";
 import { type Verification, createServices, recheckIndexers, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
@@ -785,13 +785,15 @@ export class PrivateWallet {
     const core = this.#core;
     const draft = structuredClone(core.state);
     if (full) {
-      const { revision, plans, deposits, operations } = draft;
+      const { revision, plans, deposits, operations, closeTimes, closeTimesTo } = draft;
       resetEvidence(plans);
       Object.assign(draft, emptyState(core.deployment.deployLedger), {
         revision,
         plans,
         deposits,
         operations,
+        closeTimes,
+        closeTimesTo,
       });
     }
     let summary: SyncSummary;
@@ -950,6 +952,11 @@ export class PrivateWallet {
       view.ledger,
     );
     await this.#pollRelayers(core, view.ledger, pace);
+    recordCloseTimes(
+      core.state,
+      [events, ...others].flatMap((e) => e?.closeTimes ?? []),
+    );
+    await readCloseTimes(core.state, core.services.rpc, vault, view.ledger, limits.eventPages);
     return {
       leafCount: core.state.tree.leafCount,
       staged:

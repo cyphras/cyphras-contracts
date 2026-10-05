@@ -1941,11 +1941,19 @@ describe("wallet safety: unchecked ledgers", () => {
     const unchecked = await alice.sync();
     assert.equal(unchecked.crossChecked, false);
     assert.ok(unchecked.uncheckedLedgers > 0);
+    const send = (await alice.history()).find((h) => h.kind === "send");
+    assert.equal(send?.closedAt, undefined);
     rpc.down = false;
     world.fill(1);
+    const asked = world.rpc.calls.filter((m) => m === "getEvents").length;
     const next = await alice.sync();
     assert.equal(next.crossChecked, true);
     assert.equal(next.uncheckedLedgers, 0);
+    // The recheck's reads gave the payment's time, with no other read for it: one page for the
+    // sync's own ledgers and one for the recheck's.
+    const sent = (await alice.history()).find((h) => h.kind === "send");
+    assert.equal(sent?.closedAt, world.rpc.closeTime(send?.ledger as number) * 1000);
+    assert.equal(world.rpc.calls.filter((m) => m === "getEvents").length, asked + 2);
   });
 
   it("finds a spend an indexer hid while RPC could not check it", async () => {

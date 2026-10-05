@@ -9,6 +9,7 @@ import type { Leaf, SpentNullifier } from "../net/indexer.ts";
 import type { SorobanRpc } from "../net/rpc.ts";
 import { nullifier } from "../notes.ts";
 import type { ChainView, RootHistory, VaultReader } from "../vault/state.ts";
+import { recordCloseTimes } from "./pace.ts";
 import { type ChainSource, RpcEventSource, type VaultEvents } from "./sources.ts";
 import {
   ACTIVE_STATES,
@@ -561,6 +562,10 @@ export async function recheck(
       busy ||= err.code !== "history_unavailable";
     }
   }
+  recordCloseTimes(
+    state,
+    held.flatMap((e) => e.closeTimes),
+  );
   if (held.length === 0) {
     if (!busy) state.unchecked[at] = { ...range, status: "lost" };
     return undefined;
