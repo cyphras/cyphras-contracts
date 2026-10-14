@@ -68,18 +68,6 @@ describe("wallet: opening", () => {
     const world = await createWorld();
     await assert.rejects(
       PrivateWallet.open({
-        deployment: "mainnet/xlm",
-        keys: (await import("../../src/keysource.ts")).keySource.random(),
-        prover: { prove: async () => assert.fail("no proof expected") },
-        artifacts: { load: async () => new Uint8Array() },
-        storage: new MemoryStore(),
-        rpcUrl: RPC,
-        fetch: world.fetch,
-      }),
-      isError("deployment_not_pinned"),
-    );
-    await assert.rejects(
-      PrivateWallet.open({
         deployment: world.deployment,
         keys: (await import("../../src/keysource.ts")).keySource.random(),
         prover: { prove: async () => assert.fail("no proof expected") },

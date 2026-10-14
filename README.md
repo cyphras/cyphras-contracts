@@ -33,6 +33,11 @@ The default build embeds the forgeable testnet verifying key. `--features mainne
 the ceremony key pinned in `contracts/verifier/build/check.rs`. The vault's proof fixtures
 come from `npm run fixtures:contracts` in `circuits/`, after `npm run setup:testnet-forgeable`.
 
+The mainnet vault build uses rustc 1.96.0 with
+`RUSTFLAGS=--remap-path-prefix=<your CARGO_HOME>=/cargo` and
+`cargo build --target wasm32v1-none --release --locked --features mainnet`, and reproduces
+the deployed vault's `wasm_hash` in `deployments/mainnet.json`.
+
 ## Circuits
 
 Requires Node.js and circom 2.2.3. From `circuits/`: `npm ci`, `npm run compile` (fails unless
@@ -46,8 +51,11 @@ a sync that checks the tree against the vault's roots, and deposits, private tra
 withdrawals. Proofs are made on the user's device, so no service sees a key or a witness.
 `@cyphras/private-prover-snarkjs` is the default prover.
 
-Testnet only for now. The mainnet entry of `PINNED_DEPLOYMENTS` stays empty until the
-trusted-setup ceremony, and opening a wallet on mainnet fails until then.
+`PINNED_DEPLOYMENTS` pins the XLM vaults `mainnet/xlm` and `testnet/xlm`. The mainnet
+circuit files `transaction.wasm`, `transaction_final.zkey` and `verification_key.json` are
+attached to the [`mainnet-ceremony-v2-2026-10-14`][ceremony] release.
+
+[ceremony]: https://github.com/cyphras/cyphras-contracts/releases/tag/mainnet-ceremony-v2-2026-10-14
 
 ```
 npm install @cyphras/private @cyphras/private-prover-snarkjs @stellar/stellar-base

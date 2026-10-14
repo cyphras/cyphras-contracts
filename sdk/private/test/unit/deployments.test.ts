@@ -43,50 +43,50 @@ const testnetPin = (): Deployment => {
 };
 
 describe("pinned deployments", () => {
-  it("pins the testnet XLM vault, and refuses mainnet until a vault is deployed there", () => {
+  it("pins the testnet and mainnet XLM vaults, and no other", () => {
     assert.deepEqual(Object.keys(PINNED_DEPLOYMENTS).sort(), ["mainnet/xlm", "testnet/xlm"]);
-    assert.equal(PINNED_DEPLOYMENTS["mainnet/xlm"], null);
-    assert.throws(
-      () => resolveDeployment("mainnet/xlm", true),
-      (err: unknown) => {
-        assert.ok(isCode("deployment_not_pinned")(err));
-        assert.match((err as Error).message, /not deployed/);
-        return true;
-      },
-    );
-    const pinned = testnetPin();
-    assert.doesNotThrow(() => checkDeployment(pinned, true));
-    assert.equal(resolveDeployment("testnet/xlm", false), pinned);
+    for (const name of ["mainnet/xlm", "testnet/xlm"] as const) {
+      const pinned = PINNED_DEPLOYMENTS[name];
+      assert.ok(pinned !== null);
+      assert.doesNotThrow(() => checkDeployment(pinned, true));
+      assert.equal(resolveDeployment(name, false), pinned);
+    }
+    assert.equal(PINNED_DEPLOYMENTS["mainnet/xlm"]?.recommendSecondRpc, true);
     assert.throws(
       () => resolveDeployment("devnet/xlm" as "mainnet/xlm", true),
       isCode("invalid_argument"),
     );
   });
 
-  it("pins the testnet XLM vault as deployments/testnet.json records it", () => {
-    const file = readJson<DeploymentFile>(join(REPO_ROOT, "deployments", "testnet.json"));
-    const vaults = file.vaults.filter((v) => v.asset === "native");
-    assert.equal(vaults.length, 1);
-    const v = vaults[0] as DeploymentFile["vaults"][0];
-    const pinned = testnetPin();
-    assert.equal(pinned.network, file.network);
-    assert.equal(pinned.networkPassphrase, file.network_passphrase);
-    assert.equal(pinned.vault, v.vault);
-    assert.deepEqual(pinned.asset, { contract: v.token, name: v.asset });
-    assert.equal(pinned.domain, BigInt(v.domain));
-    assert.equal(pinned.domain, computeDomain("testnet", "native"));
-    assert.equal(pinned.deployLedger, v.deploy_ledger);
-    assert.equal(pinned.vaultWasmHash, v.wasm_hash);
-    assert.deepEqual(pinned.artifacts, v.artifacts);
-    assert.deepEqual(pinned.indexers, [v.urls.indexer]);
-    assert.deepEqual(pinned.relayers, [{ url: v.urls.relayer, feeAddress: v.relayer_fee_address }]);
-    assert.equal(pinned.feeTier, BigInt(v.fee_tier));
-    // The verifying key pin is the key the vault's verifier was built with, hashed here again.
-    const key = readFileSync(
-      join(REPO_ROOT, "contracts", "verifier", "keys", v.verifying_key, "verification_key.json"),
-    );
-    assert.equal(createHash("sha256").update(key).digest("hex"), pinned.artifacts.vkey);
-  });
+  for (const network of ["testnet", "mainnet"] as const) {
+    it(`pins the ${network} XLM vault as deployments/${network}.json records it`, () => {
+      const file = readJson<DeploymentFile>(join(REPO_ROOT, "deployments", `${network}.json`));
+      const vaults = file.vaults.filter((v) => v.asset === "native");
+      assert.equal(vaults.length, 1);
+      const v = vaults[0] as DeploymentFile["vaults"][0];
+      const pinned = PINNED_DEPLOYMENTS[`${network}/xlm`];
+      assert.ok(pinned !== null);
+      assert.equal(pinned.network, file.network);
+      assert.equal(pinned.networkPassphrase, file.network_passphrase);
+      assert.equal(pinned.vault, v.vault);
+      assert.deepEqual(pinned.asset, { contract: v.token, name: v.asset });
+      assert.equal(pinned.domain, BigInt(v.domain));
+      assert.equal(pinned.domain, computeDomain(network, "native"));
+      assert.equal(pinned.deployLedger, v.deploy_ledger);
+      assert.equal(pinned.vaultWasmHash, v.wasm_hash);
+      assert.deepEqual(pinned.artifacts, v.artifacts);
+      assert.deepEqual(pinned.indexers, [v.urls.indexer]);
+      assert.deepEqual(pinned.relayers, [
+        { url: v.urls.relayer, feeAddress: v.relayer_fee_address },
+      ]);
+      assert.equal(pinned.feeTier, BigInt(v.fee_tier));
+      // The verifying key pin is the key the vault's verifier was built with, hashed here again.
+      const key = readFileSync(
+        join(REPO_ROOT, "contracts", "verifier", "keys", v.verifying_key, "verification_key.json"),
+      );
+      assert.equal(createHash("sha256").update(key).digest("hex"), pinned.artifacts.vkey);
+    });
+  }
 
   it("cannot be changed at run time", async () => {
     const { deployment } = await createWorld();

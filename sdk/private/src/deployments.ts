@@ -51,11 +51,34 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-// The vaults this release pins, as deployments/<network>.json records them. Mainnet has no v2 vault
-// yet, so opening a wallet there refuses. Frozen to the last nested value, so no code in the page
-// can swap a pinned vault, artifact hash or service for another.
+// The vaults this release pins, as deployments/<network>.json records them. Frozen to the last
+// nested value, so no code in the page can swap a pinned vault, artifact hash or service for
+// another.
 export const PINNED_DEPLOYMENTS: Readonly<Record<DeploymentName, Deployment | null>> = deepFreeze({
-  "mainnet/xlm": null,
+  "mainnet/xlm": {
+    id: "mainnet/xlm",
+    network: "mainnet",
+    networkPassphrase: "Public Global Stellar Network ; September 2015",
+    vault: "CDE6MIQAS4P3YXAH6SFFYUP5XPPVPXXAVCTO5ATEUUTJW376KUTKQK7Z",
+    asset: { contract: "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA", name: "native" },
+    domain: 0x00f58a95d4597b23c196b75fd9239ef748f320ac02e2da084d66b3d57a51a06an,
+    deployLedger: 64939550,
+    vaultWasmHash: "4e4d40ce20b2b761edfc79299229458452f576ef128d9c5798af4e6d4bf2354e",
+    artifacts: {
+      wasm: "4dec4f493ac4799652ef091fafa41b958eed06a4446630db7d8a71a21514bbe9",
+      zkey: "f0f72d62384fac5f37db670c76e476fd6e385b4015fba4af5a9daa3a298369ee",
+      vkey: "1194da670701c822fcf390c82d97fd3f7e7c8773546e83def31be0681979768e",
+    },
+    indexers: ["https://private.cyphras.com/mainnet/xlm/indexer"],
+    relayers: [
+      {
+        url: "https://private.cyphras.com/mainnet/xlm/relayer",
+        feeAddress: "GALMWLCGL3OBQQR5J2X4YDHTHTYUQGOMMQ5DBLDAHRF2WOYMCLBVDPNO",
+      },
+    ],
+    feeTier: 100000n,
+    recommendSecondRpc: true,
+  },
   "testnet/xlm": {
     id: "testnet/xlm",
     network: "testnet",
