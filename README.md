@@ -30,9 +30,8 @@ cargo build --target wasm32v1-none --release
 ```
 
 The default build embeds the forgeable testnet verifying key. `--features mainnet` embeds
-the ceremony key pinned in `contracts/verifier/build/check.rs` and fails until one is
-pinned. The vault's proof fixtures come from `npm run fixtures:contracts` in `circuits/`,
-after `npm run setup:testnet-forgeable`.
+the ceremony key pinned in `contracts/verifier/build/check.rs`. The vault's proof fixtures
+come from `npm run fixtures:contracts` in `circuits/`, after `npm run setup:testnet-forgeable`.
 
 ## Circuits
 
