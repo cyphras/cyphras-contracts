@@ -11,6 +11,7 @@ use num_bigint::BigUint;
 use serde_json::{json, Value};
 
 const FORGEABLE: &[u8] = include_bytes!("../keys/testnet-forgeable/verification_key.json");
+const MAINNET: &[u8] = include_bytes!("../keys/mainnet/verification_key.json");
 // The key snarkjs exported after one phase-2 contribution in a dry run of the ceremony.
 const DRY_RUN: &[u8] = include_bytes!("dry_run_verification_key.json");
 
@@ -102,11 +103,19 @@ fn a_key_from_a_fresh_phase_2_contribution_passes_the_mainnet_checks_under_its_o
 }
 
 #[test]
+fn the_mainnet_build_accepts_the_pinned_ceremony_key() {
+    let key = check::mainnet(MAINNET, FORGEABLE, check::MAINNET_SHA256).unwrap();
+    assert_eq!(key.ic.len(), check::PUBLIC_INPUTS + 1);
+    assert_eq!(
+        check::MAINNET_SHA256,
+        Some(check::sha256_hex(MAINNET).as_str())
+    );
+}
+
+#[test]
 fn the_mainnet_build_needs_a_pin_and_a_matching_key() {
     let key = bytes(&synthetic_key(17));
-    let err = check::mainnet(&key, FORGEABLE, check::MAINNET_SHA256)
-        .err()
-        .unwrap();
+    let err = check::mainnet(&key, FORGEABLE, None).err().unwrap();
     assert!(err.contains("no mainnet verifying key is pinned"), "{err}");
 
     let other = check::sha256_hex(&bytes(&synthetic_key(19)));

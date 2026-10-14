@@ -15,9 +15,10 @@ pub const PUBLIC_INPUTS: usize = 8;
 pub const FORGEABLE_SHA256: &str =
     "526f5befc2ff836621cc6f2f181fa50de3318a6865d6eca2121c678a225e2b9c";
 
-// SHA-256 of keys/mainnet/verification_key.json, set from the multi-party ceremony output. Until
-// then a mainnet build fails.
-pub const MAINNET_SHA256: Option<&str> = None;
+// SHA-256 of keys/mainnet/verification_key.json, the key exported from the final zkey of the
+// multi-party ceremony.
+pub const MAINNET_SHA256: Option<&str> =
+    Some("1194da670701c822fcf390c82d97fd3f7e7c8773546e83def31be0681979768e");
 
 pub struct Key {
     pub alpha: [u8; 64],
