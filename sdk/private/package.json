@@ -1,6 +1,6 @@
 {
   "name": "@cyphras/private",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Wallet SDK for Cyphras private payments on Stellar, with zero-knowledge proofs made on the user's device",
   "keywords": [
     "stellar",
