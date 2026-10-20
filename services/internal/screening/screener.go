@@ -918,6 +918,28 @@ type Health struct {
 	AlertLanes []alert.LaneState `json:"alert_lanes"`
 }
 
+// PublicHealth is the part of Health anyone may read: everything but the review queue, whose size
+// and age only an operator needs.
+type PublicHealth struct {
+	Ready          bool              `json:"ready"`
+	Code           string            `json:"code,omitempty"`
+	Vault          string            `json:"vault"`
+	NetworkID      string            `json:"network_id"`
+	PolicyVersion  string            `json:"policy_version"`
+	LatestLedger   uint32            `json:"latest_ledger"`
+	IngestedLedger uint32            `json:"ingested_ledger"`
+	AttestedUpTo   uint64            `json:"attested_up_to"`
+	AlertLanes     []alert.LaneState `json:"alert_lanes"`
+}
+
+// Public is the part of h that /v1/health serves.
+func (h Health) Public() PublicHealth {
+	return PublicHealth{
+		Ready: h.Ready, Code: h.Code, Vault: h.Vault, NetworkID: h.NetworkID, PolicyVersion: h.PolicyVersion,
+		LatestLedger: h.LatestLedger, IngestedLedger: h.IngestedLedger, AttestedUpTo: h.AttestedUpTo, AlertLanes: h.AlertLanes,
+	}
+}
+
 // Not-ready codes of the health endpoint.
 const (
 	CodeSourcesStale = "sources_stale"

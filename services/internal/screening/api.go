@@ -44,11 +44,13 @@ func (s *Screener) Public(reports, checks *httpapi.Limiter) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
 		h := s.Health()
-		status := http.StatusOK
-		if !h.Ready {
-			status = http.StatusServiceUnavailable
-		}
-		httpapi.JSON(w, status, h)
+		httpapi.JSON(w, healthStatus(h.Ready), h.Public())
+	})
+	// nginx keeps every /internal/ path off the public routes, so only processes on the host see the
+	// review queue.
+	mux.HandleFunc("GET /internal/v1/health", func(w http.ResponseWriter, r *http.Request) {
+		h := s.Health()
+		httpapi.JSON(w, healthStatus(h.Ready), h)
 	})
 	mux.HandleFunc("GET /v1/policy", func(w http.ResponseWriter, r *http.Request) {
 		httpapi.JSON(w, http.StatusOK, map[string]any{
@@ -197,4 +199,11 @@ func (s *Screener) Internal(relayerSHA256, keeperSHA256 [32]byte) http.Handler {
 		}
 	})
 	return mux
+}
+
+func healthStatus(ready bool) int {
+	if !ready {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusOK
 }

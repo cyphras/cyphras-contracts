@@ -627,3 +627,35 @@ func TestAContractDepositorIsReviewedAndAnUnflagIsRechecked(t *testing.T) {
 		t.Fatal("a deposit the checks still refuse was unflagged")
 	}
 }
+
+// The review queue is for the host only; the rest of the health report, alert lanes included, is
+// what a watcher on another host reads.
+func TestPublicHealthLeavesTheReviewQueueToTheHost(t *testing.T) {
+	h := newHarness(t)
+	api := h.s.Public(httpapi.NewLimiter(1, 1), httpapi.NewLimiter(1, 1))
+	read := func(path string) map[string]any {
+		rec := httptest.NewRecorder()
+		api.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s: %v %s", path, err, rec.Body.String())
+		}
+		return body
+	}
+	public := read("/v1/health")
+	for _, key := range []string{"review_queue", "oldest_review_seconds"} {
+		if _, ok := public[key]; ok {
+			t.Fatalf("public health carries %s: %v", key, public)
+		}
+	}
+	if public["vault"] == nil || public["policy_version"] == nil {
+		t.Fatalf("public health lost its identity: %v", public)
+	}
+	if _, ok := public["alert_lanes"]; !ok {
+		t.Fatalf("public health lost the alert lanes: %v", public)
+	}
+	internal := read("/internal/v1/health")
+	if _, ok := internal["review_queue"]; !ok {
+		t.Fatalf("internal health lacks the review queue: %v", internal)
+	}
+}

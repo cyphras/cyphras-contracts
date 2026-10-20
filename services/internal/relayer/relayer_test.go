@@ -608,8 +608,19 @@ func TestADelayedRequestIsHeldThenSent(t *testing.T) {
 func TestHealthAndQuoteReportIdentity(t *testing.T) {
 	h := newHarness(t, vault.Status{})
 	_, health := h.get("/v1/health")
-	if health["ready"] != true || health["fee_address"] != feeAddress || health["ready_channels"].(float64) != 2 || health["network_id"] != "cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472" || health["max_daily_outflow"] != "1000000000000" {
+	if health["ready"] != true || health["fee_address"] != feeAddress || health["max_fee"] == nil || health["paused"] != false || health["network_id"] != "cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472" || health["alert_lanes"] == nil {
 		t.Fatalf("health %v", health)
+	}
+	// What wallets and a watcher read stays public; the channel counts, the guard and the outflow
+	// cap are for the host only.
+	for _, key := range []string{"ready_channels", "channels", "guarded", "max_daily_outflow"} {
+		if _, ok := health[key]; ok {
+			t.Fatalf("public health carries %s: %v", key, health)
+		}
+	}
+	_, internal := h.get("/internal/v1/health")
+	if internal["ready_channels"].(float64) != 2 || internal["channels"] == nil || internal["guarded"] != false || internal["max_daily_outflow"] != "1000000000000" || internal["fee_address"] != feeAddress {
+		t.Fatalf("internal health %v", internal)
 	}
 	before := h.fake.CallCount("getFeeStats")
 	_, quote := h.get("/v1/quote")

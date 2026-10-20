@@ -224,8 +224,16 @@ func TestTheIndexerServesWhatItReconciled(t *testing.T) {
 	h.drain()
 	h.ix.Probe(context.Background())
 	code, body := h.get("/v1/health")
-	if code != http.StatusOK || body["ready"] != true || body["leaf_count"].(float64) != 8 || body["nullifier_count"].(float64) != 12 {
+	if code != http.StatusOK || body["ready"] != true || body["leaf_count"].(float64) != 8 || body["root"] == "" || body["ingested_ledger"] == nil {
 		t.Fatalf("health %d %v", code, body)
+	}
+	for _, key := range []string{"nullifier_count", "pending_count", "reconciled_ledger", "deploy_ledger"} {
+		if _, ok := body[key]; ok {
+			t.Fatalf("public health carries %s: %v", key, body)
+		}
+	}
+	if code, internal := h.get("/internal/v1/health"); code != http.StatusOK || internal["nullifier_count"].(float64) != 12 || internal["root"] != body["root"] {
+		t.Fatalf("internal health %d %v", code, internal)
 	}
 	if body["network_id"] != "cee0302d59844d32bdca915c8203dd44b33fbb7edc19051ea37abedf28ecd472" || body["vault"] != vaulttest.Vault {
 		t.Fatal("identity")

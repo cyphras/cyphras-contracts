@@ -188,7 +188,11 @@ func TestPrivateVhostStripsClientIdentityOnEveryRoute(t *testing.T) {
 			t.Errorf("location %s proxies without the identity-stripping snippet", path)
 		}
 	}
-	for _, path := range []string{"/", "/mainnet/screening/internal/", "/testnet/screening/internal/"} {
+	for _, path := range []string{
+		"/", "/mainnet/screening/internal/", "/testnet/screening/internal/",
+		"/mainnet/xlm/indexer/internal/", "/testnet/xlm/indexer/internal/",
+		"/mainnet/xlm/relayer/internal/", "/testnet/xlm/relayer/internal/",
+	} {
 		if strings.TrimSpace(seen[path]) != "return 404;" {
 			t.Errorf("location %s = %q, want only return 404", path, seen[path])
 		}

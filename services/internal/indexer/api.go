@@ -23,6 +23,7 @@ const resolvedWindow = 7 * 24 * time.Hour
 func (ix *Indexer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", ix.health)
+	mux.HandleFunc("GET /internal/v1/health", ix.internalHealth)
 	mux.HandleFunc("GET /v1/leaves", ix.leaves)
 	mux.HandleFunc("GET /v1/nullifiers", ix.nullifiers)
 	mux.HandleFunc("GET /v1/deposits", ix.memo("deposits", ix.deposits))
@@ -34,11 +35,21 @@ func (ix *Indexer) Handler() http.Handler {
 
 func (ix *Indexer) health(w http.ResponseWriter, _ *http.Request) {
 	h := ix.Health()
-	status := http.StatusOK
-	if !h.Ready {
-		status = http.StatusServiceUnavailable
+	httpapi.JSON(w, healthStatus(h.Ready), h.Public())
+}
+
+// internalHealth serves the whole health report. nginx keeps every /internal/ path off the public
+// routes, so only processes on the host reach it.
+func (ix *Indexer) internalHealth(w http.ResponseWriter, _ *http.Request) {
+	h := ix.Health()
+	httpapi.JSON(w, healthStatus(h.Ready), h)
+}
+
+func healthStatus(ready bool) int {
+	if !ready {
+		return http.StatusServiceUnavailable
 	}
-	httpapi.JSON(w, status, h)
+	return http.StatusOK
 }
 
 // serving answers with the not-ready code unless the data may be served.
