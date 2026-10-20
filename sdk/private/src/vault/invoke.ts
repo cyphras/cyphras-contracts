@@ -8,7 +8,7 @@ import {
   xdr,
 } from "@stellar/stellar-base";
 import { bytesToHex } from "../bytes.ts";
-import { CyphrasError, type ErrorDetails, fail } from "../errors.ts";
+import { CyphrasError, type ErrorDetails, fail, isDeclinedSignature } from "../errors.ts";
 import { type MetaEvent, type SorobanRpc, type TransactionStatus, keyId } from "../net/rpc.ts";
 import { vaultErrorName } from "./errors.ts";
 import { accountKey } from "./state.ts";
@@ -375,6 +375,9 @@ function checkAuth(
 }
 
 function signedEnvelope(value: unknown): string {
+  if (isDeclinedSignature(value, "signedTxXdr")) {
+    return fail("signer_rejected", "the signer declined to sign the transaction");
+  }
   if (typeof value === "string") return value;
   if (typeof value === "object" && value !== null) {
     const signed = (value as Record<string, unknown>)["signedTxXdr"];

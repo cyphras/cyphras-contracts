@@ -34,6 +34,7 @@ export type ErrorCode =
   | "destination_invalid"
   | "destination_is_issuer"
   | "signer_mismatch"
+  | "signer_rejected"
   | "transaction_failed"
   | "deposit_submitting"
   | "view_only"
@@ -68,4 +69,18 @@ export class CyphrasError extends Error {
 
 export function fail(code: ErrorCode, message: string, details?: ErrorDetails): never {
   throw new CyphrasError(code, message, details);
+}
+
+/**
+ * Whether a signer's reply is a decline rather than a malformed or wrong signature: a truthy
+ * `error` field, or `field` present but `null` or an empty string. Checked before any parsing of
+ * the reply, so a decline never reaches the malformed- or mismatched-signature checks.
+ */
+export function isDeclinedSignature(value: unknown, field: string): boolean {
+  if (typeof value === "string") return value === "";
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  if (record["error"]) return true;
+  const signed = record[field];
+  return signed === null || signed === "";
 }

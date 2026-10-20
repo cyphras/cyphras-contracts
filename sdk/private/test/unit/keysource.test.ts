@@ -258,6 +258,16 @@ describe("key sources", () => {
     await rejects(keySource.signature(short).resolve(context), "signature_invalid");
   });
 
+  it("(b) maps a signer that declines to signer_rejected, whatever shape it declines in", async () => {
+    for (const reply of [{ error: "User rejected the request" }, { signedMessage: null }, ""]) {
+      const s = signer(SECRET, () => reply);
+      await rejects(
+        keySource.signature(s).resolve({ network: "mainnet", storage: new MemoryStore() }),
+        "signer_rejected",
+      );
+    }
+  });
+
   it("(b) refuses a signer that is not deterministic", async () => {
     // A valid signature with a different nonce: R' = r'B, S' = r' + H(R', A, M) a.
     const flaky = signer(SECRET, (digest, call) =>

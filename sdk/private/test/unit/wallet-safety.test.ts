@@ -337,6 +337,41 @@ describe("wallet safety: services that lie", () => {
     assert.equal(world.vault.pending.size, 0);
     assert.equal((await alice.deposits())[0]?.state, "failed");
   });
+
+  it("maps a signer that declines to signer_rejected, whatever shape it declines in", async () => {
+    for (const reply of [
+      { error: "User rejected the request" },
+      { signedTxXdr: "" },
+      { signedTxXdr: null },
+    ]) {
+      const world = await createWorld();
+      const alice = await openWallet(world, 0);
+      const declining = {
+        publicKey: world.signer("depositor").publicKey,
+        signTransaction: async (): Promise<unknown> => reply,
+      };
+      await assert.rejects(
+        alice.shield({ amount: 10n * XLM, signer: declining }),
+        isError("signer_rejected"),
+      );
+      assert.equal(world.vault.pending.size, 0);
+    }
+  });
+
+  it("QA probe: accepts a real signature from a signer whose reply also carries error: null", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const honest = world.signer("depositor");
+    const wallet = {
+      publicKey: honest.publicKey,
+      signTransaction: async (envelope: string, passphrase: string) => {
+        const signed = await honest.signTransaction(envelope, passphrase);
+        return { signedTxXdr: signed, error: null };
+      },
+    };
+    await alice.shield({ amount: 10n * XLM, signer: wallet });
+    assert.equal(world.vault.pending.size, 1);
+  });
 });
 
 describe("wallet safety: cross-checks with RPC events", () => {
