@@ -9,17 +9,32 @@ import { fail, isDeclinedSignature } from "./errors.ts";
 import { type Network, SEED_LENGTH, checkAccount, deriveStoreKey } from "./keys.ts";
 import { type KeyValueStore, openRecord, sealRecord } from "./storage.ts";
 
-/**
- * The message a Stellar wallet signs under SEP-53 to derive a mode (b) private account: ASCII,
- * lines separated by a single LF, no trailing newline.
- */
-export const SIGNATURE_MESSAGE = [
-  "Cyphras private account v2",
-  "",
+const MESSAGE_BODY = [
   "Signing this message creates the key to a Cyphras private balance.",
   "Anyone who obtains this signature can spend that balance.",
   "Only sign it in an app you trust.",
-].join("\n");
+];
+
+/**
+ * The message a Stellar wallet signs under SEP-53 to derive a mode (b) private account on
+ * `network`: ASCII, lines separated by a single LF, no trailing newline. It names the network, so a
+ * signature given on testnet does not open the same account on mainnet.
+ */
+export function signatureMessage(network: Network): string {
+  return ["Cyphras private account v2", `Network: Stellar ${network}`, "", ...MESSAGE_BODY].join(
+    "\n",
+  );
+}
+
+// SDK 0.1 asked for this message on both networks. Apps built on it still ask for it, so a wallet
+// warns before it signs this one too.
+const NETWORKLESS_MESSAGE = ["Cyphras private account v2", "", ...MESSAGE_BODY].join("\n");
+
+const KEY_DERIVATION_MESSAGES = [
+  signatureMessage("mainnet"),
+  signatureMessage("testnet"),
+  NETWORKLESS_MESSAGE,
+];
 
 const SEP53_PREFIX = "Stellar Signed Message:\n";
 const SIG_SEED_LABEL = utf8("cyphras/v2/sig-seed");
@@ -60,17 +75,18 @@ function normalized(bytes: Uint8Array): string {
 }
 
 /**
- * Whether signing `message` for a site would hand it the key to a mode (b) private account:
- * SIGNATURE_MESSAGE whatever its line endings or the white space around its lines, as text, as
- * UTF-8 bytes or as hex or base64, with the SEP-53 prefix or without it, or its SEP-53 digest, of
- * which a raw signature is the same signature. A wallet that signs messages for sites should warn
- * before it signs any of them.
+ * Whether signing `message` for a site would hand it the key to a mode (b) private account: the
+ * signature message of either network, or the network-free one SDK 0.1 asked for, whatever its
+ * line endings or the white space around its lines, as text, as UTF-8 bytes or as hex or base64,
+ * with the SEP-53 prefix or without it, or its SEP-53 digest, of which a raw signature is the same
+ * signature. A wallet that signs messages for sites should warn before it signs any of them.
  */
 export function isKeyDerivationMessage(message: string | Uint8Array): boolean {
-  const digest = sep53Digest(SIGNATURE_MESSAGE);
-  return (typeof message === "string" ? readings(message) : [message]).some(
-    (bytes) => equalBytes(bytes, digest) || normalized(bytes) === SIGNATURE_MESSAGE,
-  );
+  const forms = typeof message === "string" ? readings(message) : [message];
+  return KEY_DERIVATION_MESSAGES.some((known) => {
+    const digest = sep53Digest(known);
+    return forms.some((bytes) => equalBytes(bytes, digest) || normalized(bytes) === known);
+  });
 }
 
 // Strict RFC 8032 verification: a non-canonical S would be a second encoding of one signature,
@@ -168,8 +184,9 @@ function signatureBytes(value: unknown, depth = 0): Uint8Array | undefined {
   return undefined;
 }
 
-async function signedSeedMessage(signer: MessageSigner): Promise<Uint8Array> {
-  const reply = await signer.signMessage(SIGNATURE_MESSAGE);
+async function signedSeedMessage(signer: MessageSigner, network: Network): Promise<Uint8Array> {
+  const message = signatureMessage(network);
+  const reply = await signer.signMessage(message);
   if (isDeclinedSignature(reply, "signedMessage")) {
     fail("signer_rejected", "the signer declined to sign the message");
   }
@@ -177,7 +194,7 @@ async function signedSeedMessage(signer: MessageSigner): Promise<Uint8Array> {
   if (signature === undefined) {
     fail("signature_invalid", "the wallet did not return a 64-byte ed25519 signature");
   }
-  if (!verifySep53(signer.publicKey, SIGNATURE_MESSAGE, signature)) {
+  if (!verifySep53(signer.publicKey, message, signature)) {
     signature.fill(0);
     fail(
       "signature_invalid",
@@ -203,11 +220,11 @@ function signatureSource(signer: MessageSigner): KeySource {
       }
       const location = markerLocation(network, signer.publicKey);
       const marker = await storage.get(location);
-      const first = await signedSeedMessage(signer);
+      const first = await signedSeedMessage(signer, network);
       if (marker === undefined) {
         // RFC 8032 signatures are deterministic, but not every signer follows it; a second
         // request shows whether this one does before any funds depend on it.
-        const second = await signedSeedMessage(signer);
+        const second = await signedSeedMessage(signer, network);
         const same = equalBytes(first, second);
         second.fill(0);
         if (!same) {
@@ -260,8 +277,8 @@ export const keySource = {
 
   /**
    * Mode (b): SHA-512("cyphras/v2/sig-seed" || signature) of the SEP-53 signature of
-   * SIGNATURE_MESSAGE, account 0. The signature is a secret: anyone who obtains it can spend
-   * the balance.
+   * signatureMessage(network), account 0, so each network has its own account. The signature is a
+   * secret: anyone who obtains it can spend the balance.
    */
   signature(signer: MessageSigner): KeySource {
     return signatureSource(signer);

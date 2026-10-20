@@ -12,10 +12,10 @@ import { CyphrasError } from "../../src/errors.ts";
 import { defaultAddressKey, deriveSpendingKeys } from "../../src/keys.ts";
 import {
   type MessageSigner,
-  SIGNATURE_MESSAGE,
   isKeyDerivationMessage,
   keySource,
   sep53Digest,
+  signatureMessage,
   signatureSeed,
   verifySep53,
 } from "../../src/keysource.ts";
@@ -23,17 +23,24 @@ import { MemoryStore, SealedStore } from "../../src/storage.ts";
 import { SEP5_ACCOUNT_0, sigSeedVectors, slip10Ed25519 } from "../../scripts/vectors.ts";
 import { MNEMONIC, sdkVectors } from "../helpers.ts";
 
-interface SigSeedVectors {
+interface NetworkVectors {
   message: string;
   message_length: number;
   message_sha256: string;
   sep53_digest: string;
-  signer: { mnemonic: string; path: string; account: string };
   signature: string;
   signature_base64: string;
   seed: string;
-  default_addresses: { mainnet: string; testnet: string };
+  default_address: string;
 }
+
+interface SigSeedVectors {
+  signer: { mnemonic: string; path: string; account: string };
+  mainnet: NetworkVectors;
+  testnet: NetworkVectors;
+}
+
+const NETWORKS = ["mainnet", "testnet"] as const;
 
 const VECTORS = sdkVectors<SigSeedVectors>("sig-seed.json");
 const SECRET = slip10Ed25519(mnemonicToSeedSync(MNEMONIC), SEP5_ACCOUNT_0);
@@ -68,14 +75,33 @@ describe("signature seed vectors", () => {
     assert.deepEqual(VECTORS, JSON.parse(JSON.stringify(sigSeedVectors())));
   });
 
-  it("pins the message the signature key source signs", () => {
-    assert.equal(VECTORS.message, SIGNATURE_MESSAGE);
-    assert.equal(utf8(SIGNATURE_MESSAGE).length, 186);
+  it("pins the message the signature key source signs on each network", () => {
+    const pinned = {
+      mainnet: [211, "0bf58e49e97c20e12f2d6bfc2cdd49e3e6d0052a2522500cd05114107d1eb571"],
+      testnet: [211, "ab5374d0c196f433c5e0e747335794236383c6662c20ddc7e0491cc7dd2ef935"],
+    } as const;
+    for (const network of NETWORKS) {
+      const message = signatureMessage(network);
+      assert.equal(VECTORS[network].message, message);
+      assert.equal(utf8(message).length, pinned[network][0]);
+      assert.equal(VECTORS[network].message_sha256, pinned[network][1]);
+      assert.ok(/^[\x20-\x7e\n]+$/.test(message) && !message.endsWith("\n"));
+      assert.ok(message.split("\n")[1] === `Network: Stellar ${network}`);
+    }
+  });
+
+  it("gives each network its own signature, seed and account", () => {
+    assert.notEqual(VECTORS.mainnet.sep53_digest, VECTORS.testnet.sep53_digest);
+    assert.notEqual(VECTORS.mainnet.seed, VECTORS.testnet.seed);
+    const testnetSignature = hexToBytes(VECTORS.testnet.signature);
     assert.equal(
-      VECTORS.message_sha256,
-      "21aa4daff79f21d43d0e96dfdcc4487df30826ca3d2be1fdcd5e7b3a086f0a54",
+      verifySep53(VECTORS.signer.account, signatureMessage("mainnet"), testnetSignature),
+      false,
     );
-    assert.ok(/^[\x20-\x7e\n]+$/.test(SIGNATURE_MESSAGE) && !SIGNATURE_MESSAGE.endsWith("\n"));
+    assert.equal(
+      verifySep53(VECTORS.signer.account, signatureMessage("testnet"), testnetSignature),
+      true,
+    );
   });
 
   it("derives the SEP-0005 accounts of the test mnemonic", () => {
@@ -96,75 +122,85 @@ describe("signature seed vectors", () => {
       d: Buffer.from(SECRET).toString("base64url"),
       x: Buffer.from(publicKey).toString("base64url"),
     };
-    const digest = hexToBytes(VECTORS.sep53_digest);
-    const expected = Buffer.concat([
-      Buffer.from("Stellar Signed Message:\n"),
-      Buffer.from(SIGNATURE_MESSAGE),
-    ]);
-    assert.equal(bytesToHex(sep53Digest(SIGNATURE_MESSAGE)), VECTORS.sep53_digest);
-    assert.equal(
-      bytesToHex(sep53Digest(SIGNATURE_MESSAGE)),
-      createHash("sha256").update(expected).digest("hex"),
-    );
-    const signature = nodeSign(null, digest, createPrivateKey({ key: jwk, format: "jwk" }));
-    assert.equal(signature.toString("hex"), VECTORS.signature);
-    assert.equal(Buffer.from(signature).toString("base64"), VECTORS.signature_base64);
-    assert.ok(verifySep53(VECTORS.signer.account, SIGNATURE_MESSAGE, signature));
+    for (const network of NETWORKS) {
+      const v = VECTORS[network];
+      const message = signatureMessage(network);
+      const expected = Buffer.concat([
+        Buffer.from("Stellar Signed Message:\n"),
+        Buffer.from(message),
+      ]);
+      assert.equal(bytesToHex(sep53Digest(message)), v.sep53_digest);
+      assert.equal(v.sep53_digest, createHash("sha256").update(expected).digest("hex"));
+      const signature = nodeSign(
+        null,
+        hexToBytes(v.sep53_digest),
+        createPrivateKey({ key: jwk, format: "jwk" }),
+      );
+      assert.equal(signature.toString("hex"), v.signature);
+      assert.equal(Buffer.from(signature).toString("base64"), v.signature_base64);
+      assert.ok(verifySep53(VECTORS.signer.account, message, signature));
+    }
   });
 
-  it("derives the seed and its default addresses", () => {
-    const seed = signatureSeed(hexToBytes(VECTORS.signature));
-    assert.equal(bytesToHex(seed), VECTORS.seed);
-    for (const network of ["mainnet", "testnet"] as const) {
+  it("derives the seed and its default address", () => {
+    for (const network of NETWORKS) {
+      const seed = signatureSeed(hexToBytes(VECTORS[network].signature));
+      assert.equal(bytesToHex(seed), VECTORS[network].seed);
       const key = defaultAddressKey(deriveSpendingKeys(seed, network, 0));
-      assert.equal(encodeAddress(network, key.d, key.pkd), VECTORS.default_addresses[network]);
+      assert.equal(encodeAddress(network, key.d, key.pkd), VECTORS[network].default_address);
     }
   });
 });
 
-describe("the key-derivation message", () => {
-  const prefixed = `Stellar Signed Message:\n${SIGNATURE_MESSAGE}`;
-  const digest = sep53Digest(SIGNATURE_MESSAGE);
+// The message SDK 0.1 asked for on both networks, which a wallet still warns about.
+const NETWORKLESS = signatureMessage("mainnet").replace("\nNetwork: Stellar mainnet", "");
 
+describe("the key-derivation message", () => {
   it("is recognized in every form a signer could be asked to sign it in", () => {
-    for (const form of [
-      SIGNATURE_MESSAGE,
-      SIGNATURE_MESSAGE.replace(/\n/g, "\r\n"),
-      SIGNATURE_MESSAGE.replace(/\n/g, "\r"),
-      `\n  ${SIGNATURE_MESSAGE}  \n`,
-      SIGNATURE_MESSAGE.split("\n").join(" \n"),
-      utf8(SIGNATURE_MESSAGE),
-      bytesToHex(utf8(SIGNATURE_MESSAGE)),
-      bytesToHex(utf8(SIGNATURE_MESSAGE)).toUpperCase(),
-      base64.encode(utf8(SIGNATURE_MESSAGE)),
-      prefixed,
-      utf8(prefixed),
-      digest,
-      bytesToHex(digest),
-      `0x${bytesToHex(digest)}`,
-      `0X${bytesToHex(digest).toUpperCase()}`,
-      `0x${bytesToHex(utf8(SIGNATURE_MESSAGE))}`,
-      (bytesToHex(digest).match(/../g) as string[]).join(" "),
-      base64.encode(digest),
-      base64nopad.encode(digest),
-      base64url.encode(digest),
-      base64urlnopad.encode(digest),
-      base64nopad.encode(utf8(SIGNATURE_MESSAGE)),
-    ]) {
-      assert.equal(isKeyDerivationMessage(form), true, String(form).slice(0, 48));
+    for (const message of [signatureMessage("mainnet"), signatureMessage("testnet"), NETWORKLESS]) {
+      const prefixed = `Stellar Signed Message:\n${message}`;
+      const digest = sep53Digest(message);
+      for (const form of [
+        message,
+        message.replace(/\n/g, "\r\n"),
+        message.replace(/\n/g, "\r"),
+        `\n  ${message}  \n`,
+        message.split("\n").join(" \n"),
+        utf8(message),
+        bytesToHex(utf8(message)),
+        bytesToHex(utf8(message)).toUpperCase(),
+        base64.encode(utf8(message)),
+        prefixed,
+        utf8(prefixed),
+        digest,
+        bytesToHex(digest),
+        `0x${bytesToHex(digest)}`,
+        `0X${bytesToHex(digest).toUpperCase()}`,
+        `0x${bytesToHex(utf8(message))}`,
+        (bytesToHex(digest).match(/../g) as string[]).join(" "),
+        base64.encode(digest),
+        base64nopad.encode(digest),
+        base64url.encode(digest),
+        base64urlnopad.encode(digest),
+        base64nopad.encode(utf8(message)),
+      ]) {
+        assert.equal(isKeyDerivationMessage(form), true, String(form).slice(0, 48));
+      }
     }
   });
 
   it("is not taken for another message", () => {
+    const message = signatureMessage("mainnet");
     for (const other of [
       "",
       "Sign in to example.com",
-      SIGNATURE_MESSAGE.replace("v2", "v3"),
-      `Sign in\n\n${SIGNATURE_MESSAGE}`,
-      SIGNATURE_MESSAGE.toUpperCase(),
+      message.replace("v2", "v3"),
+      message.replace("mainnet", "futurenet"),
+      `Sign in\n\n${message}`,
+      message.toUpperCase(),
       new Uint8Array(32),
-      utf8(SIGNATURE_MESSAGE).subarray(1),
-      sep53Digest(prefixed),
+      utf8(message).subarray(1),
+      sep53Digest(`Stellar Signed Message:\n${message}`),
     ]) {
       assert.equal(isKeyDerivationMessage(other), false, String(other).slice(0, 48));
     }
@@ -212,7 +248,7 @@ describe("key sources", () => {
     const storage = new MemoryStore();
     const s = signer(SECRET);
     const first = await keySource.signature(s).resolve({ network: "mainnet", storage });
-    assert.equal(bytesToHex(first.seed), VECTORS.seed);
+    assert.equal(bytesToHex(first.seed), VECTORS.mainnet.seed);
     assert.equal(first.account, 0);
     assert.equal(s.calls, 2);
     const later = await keySource.signature(s).resolve({ network: "mainnet", storage });
@@ -232,7 +268,7 @@ describe("key sources", () => {
       const material = await keySource
         .signature(s)
         .resolve({ network: "mainnet", storage: new MemoryStore() });
-      assert.equal(bytesToHex(material.seed), VECTORS.seed);
+      assert.equal(bytesToHex(material.seed), VECTORS.mainnet.seed);
     }
   });
 
@@ -244,12 +280,12 @@ describe("key sources", () => {
     const forged = Uint8Array.from([...le(1n), ...new Uint8Array(32)]);
     for (const y of [0n, 2n ** 255n - 19n]) {
       const key = StrKey.encodeEd25519PublicKey(Buffer.from(le(y)));
-      assert.equal(verifySep53(key, SIGNATURE_MESSAGE, forged), false);
+      assert.equal(verifySep53(key, signatureMessage("mainnet"), forged), false);
     }
   });
 
   it("(b) refuses a signature without the SEP-53 prefix", async () => {
-    const raw = signer(SECRET, () => ed25519.sign(utf8(SIGNATURE_MESSAGE), SECRET));
+    const raw = signer(SECRET, () => ed25519.sign(utf8(signatureMessage("testnet")), SECRET));
     await rejects(keySource.signature(raw).resolve(context), "signature_invalid");
     const other = signer(SECRET);
     const wrongKey = { ...other, publicKey: SEP5_TEST_5[1] as string };
@@ -294,6 +330,23 @@ describe("key sources", () => {
     // the other network keeps its own record
     changed = false;
     await keySource.signature(s).resolve({ network: "mainnet", storage });
+  });
+
+  it("(b) signs each network's message and yields that network's vector seed", async () => {
+    for (const network of NETWORKS) {
+      const asked: string[] = [];
+      const s = signer(SECRET);
+      const signMessage = s.signMessage.bind(s);
+      s.signMessage = async (message: string) => {
+        asked.push(message);
+        return signMessage(message);
+      };
+      const material = await keySource
+        .signature(s)
+        .resolve({ network, storage: new MemoryStore() });
+      assert.deepEqual(new Set(asked), new Set([signatureMessage(network)]));
+      assert.equal(bytesToHex(material.seed), VECTORS[network].seed);
+    }
   });
 });
 

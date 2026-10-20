@@ -23,7 +23,7 @@ import {
 import { encryptOutput } from "../src/encryption.ts";
 import { P } from "../src/field.ts";
 import { addressKeyAt, defaultAddressKey, deriveSpendingKeys } from "../src/keys.ts";
-import { SIGNATURE_MESSAGE, sep53Digest, signatureSeed } from "../src/keysource.ts";
+import { sep53Digest, signatureMessage, signatureSeed } from "../src/keysource.ts";
 import { noteCommitment } from "../src/notes.ts";
 
 export const MNEMONIC =
@@ -131,32 +131,36 @@ export const SEP5_ACCOUNT_0 = [44, 148, 0];
 export function sigSeedVectors(): object {
   const secret = slip10Ed25519(mnemonicToSeedSync(MNEMONIC), SEP5_ACCOUNT_0);
   const account = StrKey.encodeEd25519PublicKey(Buffer.from(ed25519.getPublicKey(secret)));
-  const digest = sep53Digest(SIGNATURE_MESSAGE);
-  const signature = ed25519.sign(digest, secret);
-  const seed = signatureSeed(signature);
-  const address = (network: "mainnet" | "testnet"): string => {
+  const perNetwork = (network: "mainnet" | "testnet"): object => {
+    const message = signatureMessage(network);
+    const digest = sep53Digest(message);
+    const signature = ed25519.sign(digest, secret);
+    const seed = signatureSeed(signature);
     const key = defaultAddressKey(deriveSpendingKeys(seed, network, 0));
-    return encodeAddress(network, key.d, key.pkd);
+    return {
+      message,
+      message_length: utf8(message).length,
+      message_sha256: bytesToHex(sha256(utf8(message))),
+      sep53_digest: bytesToHex(digest),
+      signature: bytesToHex(signature),
+      signature_base64: base64.encode(signature),
+      seed: bytesToHex(seed),
+      default_address: encodeAddress(network, key.d, key.pkd),
+    };
   };
   return {
     description:
-      "Signature seed vectors for key source (b): the message, the SEP-53 digest a Stellar " +
-      "wallet signs, the signature of a test account and the seed it yields.",
+      "Signature seed vectors for key source (b): per network, the message, the SEP-53 digest a " +
+      "Stellar wallet signs, the signature of a test account and the seed it yields.",
     derivation:
       'seed = SHA-512("cyphras/v2/sig-seed" || signature), with the 64-byte signature R || S',
-    message: SIGNATURE_MESSAGE,
-    message_length: utf8(SIGNATURE_MESSAGE).length,
-    message_sha256: bytesToHex(sha256(utf8(SIGNATURE_MESSAGE))),
-    sep53_digest: bytesToHex(digest),
     signer: {
       mnemonic: MNEMONIC,
       path: "m/44'/148'/0'",
       account,
     },
-    signature: bytesToHex(signature),
-    signature_base64: base64.encode(signature),
-    seed: bytesToHex(seed),
-    default_addresses: { mainnet: address("mainnet"), testnet: address("testnet") },
+    mainnet: perNetwork("mainnet"),
+    testnet: perNetwork("testnet"),
   };
 }
 
