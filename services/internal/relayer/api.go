@@ -16,24 +16,13 @@ import (
 func (r *Relayer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, req *http.Request) {
-		inst, _, _ := r.view()
-		paused := r.brk.open(r.now())
-		body := map[string]any{
-			"ready": inst != nil && r.channels.ready() > 0 && !paused, "vault": r.cfg.Vault, "network_id": hex.EncodeToString(r.cfg.NetworkID[:]),
-			"fee_address": r.cfg.FeeAddress, "ready_channels": r.channels.ready(), "channels": r.channels.total, "paused": paused,
-			"guarded": r.guarded(), "alert_lanes": r.alerts.Lanes(r.now()),
-		}
-		status := http.StatusOK
-		if inst == nil {
-			status = http.StatusServiceUnavailable
-		} else {
-			body["max_fee"] = inst.Limits.MaxFee.String()
-			// The largest exit, payout and fee together, the vault accepts; larger ones are split.
-			body["max_daily_outflow"] = inst.Limits.MaxDailyOutflow.String()
-		}
-		if r.channels.ready() == 0 || paused {
-			status = http.StatusServiceUnavailable
-		}
+		status, body := r.health(false)
+		httpapi.JSON(w, status, body)
+	})
+	// nginx keeps every /internal/ path off the public routes, so only processes on the host see the
+	// channel counts, the guard and the outflow cap.
+	mux.HandleFunc("GET /internal/v1/health", func(w http.ResponseWriter, req *http.Request) {
+		status, body := r.health(true)
 		httpapi.JSON(w, status, body)
 	})
 	mux.HandleFunc("GET /v1/quote", func(w http.ResponseWriter, req *http.Request) {
@@ -150,4 +139,35 @@ func (r *Relayer) Run(every time.Duration) {
 		case <-t.C:
 		}
 	}
+}
+
+// health builds the health report. The public one carries what wallets read (the fee address, the
+// fee cap and whether the relayer is paused) and the alert lanes a watcher checks; full adds what
+// only an operator needs.
+func (r *Relayer) health(full bool) (int, map[string]any) {
+	inst, _, _ := r.view()
+	paused := r.brk.open(r.now())
+	body := map[string]any{
+		"ready": inst != nil && r.channels.ready() > 0 && !paused, "vault": r.cfg.Vault, "network_id": hex.EncodeToString(r.cfg.NetworkID[:]),
+		"fee_address": r.cfg.FeeAddress, "paused": paused, "alert_lanes": r.alerts.Lanes(r.now()),
+	}
+	if full {
+		body["ready_channels"] = r.channels.ready()
+		body["channels"] = r.channels.total
+		body["guarded"] = r.guarded()
+	}
+	status := http.StatusOK
+	if inst == nil {
+		status = http.StatusServiceUnavailable
+	} else {
+		body["max_fee"] = inst.Limits.MaxFee.String()
+		if full {
+			// The largest exit, payout and fee together, the vault accepts; larger ones are split.
+			body["max_daily_outflow"] = inst.Limits.MaxDailyOutflow.String()
+		}
+	}
+	if r.channels.ready() == 0 || paused {
+		status = http.StatusServiceUnavailable
+	}
+	return status, body
 }

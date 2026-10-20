@@ -330,12 +330,12 @@ func TestRacesNeverPauseRelayingButGuardIt(t *testing.T) {
 	}
 	lose(2, failedRace())
 	lose(2, failedReceive())
-	if code, health := h.get("/v1/health"); code != http.StatusOK || health["ready"] != true || health["guarded"] != false || health["alert_lanes"] == nil {
+	if code, health := h.get("/internal/v1/health"); code != http.StatusOK || health["ready"] != true || health["guarded"] != false || health["alert_lanes"] == nil {
 		t.Fatalf("after four races: %d %v", code, health)
 	}
 	// The fifth race puts relaying in its guarded mode: twice the deadline margin, still relaying.
 	lose(1, failedRace())
-	if code, health := h.get("/v1/health"); code != http.StatusOK || health["ready"] != true || health["paused"] != false || health["guarded"] != true {
+	if code, health := h.get("/internal/v1/health"); code != http.StatusOK || health["ready"] != true || health["paused"] != false || health["guarded"] != true {
 		t.Fatalf("after five races: %d %v", code, health)
 	}
 	if !h.r.alerts.Open("relaying_guarded") || h.r.alerts.Open("relaying_paused") {

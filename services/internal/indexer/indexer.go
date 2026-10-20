@@ -653,6 +653,29 @@ type Health struct {
 	AlertLanes []alert.LaneState `json:"alert_lanes"`
 }
 
+// PublicHealth is what anyone may read: readiness, identity, how far the indexer has read, the leaf
+// count and root a watcher checks against its own, and the alert lanes it checks are alive. The
+// counts and ledgers only an operator needs stay on the internal health.
+type PublicHealth struct {
+	Ready          bool              `json:"ready"`
+	Code           string            `json:"code,omitempty"`
+	Vault          string            `json:"vault"`
+	NetworkID      string            `json:"network_id"`
+	LatestLedger   uint32            `json:"latest_ledger"`
+	IngestedLedger uint32            `json:"ingested_ledger"`
+	LeafCount      uint64            `json:"leaf_count"`
+	Root           string            `json:"root"`
+	AlertLanes     []alert.LaneState `json:"alert_lanes"`
+}
+
+// Public is the part of h that /v1/health serves.
+func (h Health) Public() PublicHealth {
+	return PublicHealth{
+		Ready: h.Ready, Code: h.Code, Vault: h.Vault, NetworkID: h.NetworkID, LatestLedger: h.LatestLedger,
+		IngestedLedger: h.IngestedLedger, LeafCount: h.LeafCount, Root: h.Root, AlertLanes: h.AlertLanes,
+	}
+}
+
 // Health reports readiness. A failed or stale probe is never read as "no lag".
 func (ix *Indexer) Health() Health {
 	ix.mu.RLock()

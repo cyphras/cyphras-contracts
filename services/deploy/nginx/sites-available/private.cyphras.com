@@ -11,6 +11,12 @@ server {
   add_header Strict-Transport-Security "max-age=63072000" always;
 
   # Cyphras private payments v2, testnet XLM vault (compose project cyphras-testnet-xlm).
+  location /testnet/xlm/indexer/internal/ {
+    return 404;
+  }
+  location /testnet/xlm/relayer/internal/ {
+    return 404;
+  }
   location = /testnet/xlm/indexer/v1/stream {
     include snippets/cyphras-v2-proxy.conf;
     client_max_body_size 8k;
@@ -62,6 +68,12 @@ server {
   }
 
   # Cyphras private payments v2, mainnet XLM vault (compose project cyphras-mainnet-xlm).
+  location /mainnet/xlm/indexer/internal/ {
+    return 404;
+  }
+  location /mainnet/xlm/relayer/internal/ {
+    return 404;
+  }
   location = /mainnet/xlm/indexer/v1/stream {
     include snippets/cyphras-v2-proxy.conf;
     client_max_body_size 8k;
