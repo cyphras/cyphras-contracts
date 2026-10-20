@@ -59,7 +59,7 @@
     "@scure/bip39": "1.6.0"
   },
   "peerDependencies": {
-    "@stellar/stellar-base": "^15.0.0"
+    "@stellar/stellar-base": ">=13.0.0 <16.0.0"
   },
   "devDependencies": {
     "@cyphras/private-prover-snarkjs": "0.1.0",
