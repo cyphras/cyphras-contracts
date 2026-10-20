@@ -585,6 +585,31 @@ func TestACopyArchivedJustBeforeItsWindowIsAppliedIsJudged(t *testing.T) {
 	}
 }
 
+// unclosedTip answers like an RPC node behind the load balancer that has not closed the tip yet.
+type unclosedTip struct{}
+
+func (unclosedTip) Events(_ context.Context, from, _ uint32) ([]vault.RawEvent, error) {
+	return nil, fmt.Errorf("%w: ledger %d", follow.ErrAhead, from)
+}
+
+func TestATipALaggingNodeHasNotClosedIsCopiedOnTheNextPoll(t *testing.T) {
+	h := newHarness(t)
+	h.activity()
+	h.ready()
+	h.fake.SetLatest(h.chain.Ledger + 5)
+	before := h.ix.archivedTo
+	copied, err := h.ix.ArchiveStep(context.Background(), unclosedTip{})
+	if err != nil || copied {
+		t.Fatalf("a lagging node: copied %v, err %v", copied, err)
+	}
+	if h.ix.archivedTo != before {
+		t.Fatalf("archived to %d from a node that had nothing", h.ix.archivedTo)
+	}
+	if len(h.pages.alerts) != 0 {
+		t.Fatalf("a lagging node paged %+v", h.pages.alerts)
+	}
+}
+
 // oversized serves an event larger than any the vault emits for the first ledger asked.
 type oversized struct{}
 

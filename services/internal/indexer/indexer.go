@@ -607,6 +607,9 @@ func (ix *Indexer) ArchiveStep(ctx context.Context, src follow.Source) (bool, er
 	}
 	to := min(next+archiveWindow-1, h.LatestLedger)
 	raw, err := src.Events(ctx, next, to)
+	if errors.Is(err, follow.ErrAhead) {
+		return false, nil // a node behind the load balancer has not closed it yet; the next poll copies it
+	}
 	if err != nil {
 		return false, err
 	}
