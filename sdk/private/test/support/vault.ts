@@ -439,6 +439,40 @@ export class MockVault {
     return BigInt(id);
   }
 
+  // A deposit another wallet's transaction put in the entry queue, backed by that wallet's proof.
+  shieldOther(depositor: string, amount: bigint): number {
+    const id = this.nextDepositId++;
+    this.tvl += amount;
+    this.pendingTotal += amount;
+    const commitments: [bigint, bigint] = [
+      BigInt(id) * 2n ** 200n + 1n,
+      BigInt(id) * 2n ** 200n + 2n,
+    ];
+    this.pending.set(id, {
+      depositor,
+      amount,
+      commitments,
+      ciphertexts: [new Uint8Array(181), new Uint8Array(181)],
+      createdAt: this.timestamp,
+      delay: this.#delay(amount),
+      flag: undefined,
+      flaggedAt: 0n,
+    });
+    const day = this.timestamp / DAY;
+    const key = `${depositor}/${day}`;
+    this.dayTotals.set(key, (this.dayTotals.get(key) ?? 0n) + amount);
+    this.#emit("deposit_pending", [
+      ["id", u64(id)],
+      ["depositor", new Address(depositor).toScVal()],
+      ["amount", i128(amount)],
+      ["commitment0", u256(commitments[0])],
+      ["commitment1", u256(commitments[1])],
+      ["created_at", u64(this.timestamp)],
+    ]);
+    this.transfers.push({ from: depositor, to: this.address, amount });
+    return id;
+  }
+
   #delay(amount: bigint): bigint {
     return amount >= this.limits.largeDepositThreshold ? this.delayLarge : this.delaySmall;
   }

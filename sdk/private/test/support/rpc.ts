@@ -548,21 +548,22 @@ export class MockRpc {
     }
   }
 
-  // What a call writes that depends on the vault's state now: the exit at the queue's tail it
-  // queues, or the native balances an exit paid at once moves.
+  // What a call writes that depends on the vault's state now: the entry queue's next deposit, the
+  // exit at the exit queue's tail it queues, or the native balances an exit paid at once moves.
   #written(fn: string, args: xdr.ScVal[]): xdr.LedgerKey[] {
     const v = this.vault;
-    const exit = (id: number): xdr.LedgerKey =>
+    const queued = (name: string, id: number): xdr.LedgerKey =>
       xdr.LedgerKey.contractData(
         new xdr.LedgerKeyContractData({
           contract: new Address(v.address).toScAddress(),
           key: xdr.ScVal.scvVec([
-            xdr.ScVal.scvSymbol("Exit"),
+            xdr.ScVal.scvSymbol(name),
             xdr.ScVal.scvU64(new xdr.Uint64(BigInt(id))),
           ]),
           durability: xdr.ContractDataDurability.persistent(),
         }),
       );
+    const exit = (id: number): xdr.LedgerKey => queued("Exit", id);
     const balance = (holder: string): xdr.LedgerKey =>
       StrKey.isValidContract(holder)
         ? xdr.LedgerKey.contractData(
@@ -578,6 +579,22 @@ export class MockRpc {
         : xdr.LedgerKey.account(
             new xdr.LedgerKeyAccount({ accountId: Keypair.fromPublicKey(holder).xdrAccountId() }),
           );
+    if (fn === "shield") {
+      return [
+        queued("Pending", v.nextDepositId),
+        xdr.LedgerKey.contractData(
+          new xdr.LedgerKeyContractData({
+            contract: new Address(v.address).toScAddress(),
+            key: xdr.ScVal.scvVec([
+              xdr.ScVal.scvSymbol("DepositorDay"),
+              new Address(addressOf(args[2])).toScVal(),
+              xdr.ScVal.scvU64(new xdr.Uint64(v.timestamp / 86_400n)),
+            ]),
+            durability: xdr.ContractDataDurability.temporary(),
+          }),
+        ),
+      ];
+    }
     if (fn === "claim") return [exit(v.exitTail)];
     if (fn !== "transact") return [];
     const ext = decodeExtData(args[1] as xdr.ScVal);

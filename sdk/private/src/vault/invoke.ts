@@ -61,15 +61,17 @@ export interface Extra {
 }
 
 // A call the signer authorizes as the transaction source: the vault function, and the token
-// transfers it may make from the signer's account. A call on the exit queue, whose path the vault
-// decides in the ledger it lands in, names what it may need beyond its simulation, from the
-// footprint the simulation found; another transaction in the same ledger can still move the queue
-// past it, and such a call that fails on the host's storage goes again after a fresh simulation.
+// transfers it may make from the signer's account. A call on one of the vault's queues, whose path
+// the vault decides in the ledger it lands in, names what it may need beyond its simulation, from
+// the footprint the simulation found; another transaction in the same ledger can still move the
+// queue past it, and such a call that fails on the host's storage goes again after a fresh
+// simulation, at most `attempts` times in all.
 export interface VaultCall {
   readonly fn: string;
   readonly args: readonly xdr.ScVal[];
   readonly transfers: readonly { readonly token: string; readonly args: readonly xdr.ScVal[] }[];
   readonly extend?: (footprint: xdr.LedgerFootprint) => Promise<Extra>;
+  readonly attempts?: number;
 }
 
 export interface InvokeContext {
@@ -95,7 +97,8 @@ export interface InvokeResult {
 const TIMEOUT_SECONDS = 300;
 const MIN_INCLUSION_FEE = 100n;
 const POLL_MS = 1_500;
-// How often a call on the exit queue goes in all while it fails on the host's storage.
+// How often a call on one of the vault's queues goes in all while it fails on the host's storage,
+// where the call itself names no other count.
 const ATTEMPTS = 5;
 // A provider asked about a transaction it does not hold yet is asked again, at most this many
 // times and for this long in all, with each request cut off after ASK_REQUEST_MS: one that hangs
@@ -410,11 +413,14 @@ export async function invokeVault(
     if (outcome.result !== undefined) return outcome.result;
     const failed = (message: string, details: ErrorDetails = {}): CyphrasError =>
       new CyphrasError("transaction_failed", message, { hash: outcome.hash, ...details });
-    // A call on the exit queue that failed on the host's storage touched an entry the queue moved
-    // to past the room its footprint was given: a fresh simulation sees where it moved. With a
-    // second provider, the first one's word alone does not send it again.
-    if (call.extend === undefined || !outcome.conflict || attempt === ATTEMPTS) {
+    // A call on one of the vault's queues that failed on the host's storage touched an entry the
+    // queue moved to past the room its footprint was given: a fresh simulation sees where it moved.
+    // With a second provider, the first one's word alone does not send it again.
+    if (call.extend === undefined || !outcome.conflict) {
       throw failed("the transaction failed on chain");
+    }
+    if (attempt === (call.attempts ?? ATTEMPTS)) {
+      throw failed("the transaction failed on chain", { conflict: true });
     }
     const doubt = await secondDoubt(ctx, outcome.hash);
     if (doubt !== undefined) throw failed(DOUBTS[doubt], { secondProvider: doubt });

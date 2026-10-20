@@ -41,7 +41,8 @@ import {
   rewritingFetch,
 } from "../support/network.ts";
 import { MNEMONIC } from "../helpers.ts";
-import { keypairFor } from "../support/rpc.ts";
+import { decodeExtData, decodeTxProof, keypairFor } from "../support/rpc.ts";
+import { ERROR, VaultError } from "../support/vault.ts";
 import { TrapdoorProver, trapdoorArtifacts } from "../support/trapdoor.ts";
 import {
   confirmAll,
@@ -607,6 +608,189 @@ describe("wallet: a shield whose sending goes wrong", () => {
     });
     assert.equal(again.depositId, 2);
     assert.equal(world.vault.pending.size, 2);
+  });
+});
+
+describe("wallet: deposits other deposits race in the same ledger", () => {
+  const DAY = 86_400n;
+
+  // Other wallets' deposits, each its own transaction, put in the entry queue before this wallet's
+  // next shield is applied.
+  const othersFirst =
+    (world: World, count: number): (() => void) =>
+    () => {
+      for (let i = 0; i < count; i++) {
+        world.rpc.run(String(i).padStart(64, "d"), () =>
+          world.vault.shieldOther(world.signer(`other ${i}`).publicKey, 1n * XLM),
+        );
+      }
+    };
+
+  // The contract call each transaction this wallet sent carries, as XDR.
+  const sentCalls = (world: World): string[] =>
+    world.rpc.sent.flatMap((tx) => {
+      const op = tx.operations[0];
+      return op?.type === "invokeHostFunction" ? [op.func.invokeContract().toXDR("base64")] : [];
+    });
+
+  const callArgs = (world: World, nth: number): xdr.ScVal[] => {
+    const op = world.rpc.sent[nth]?.operations[0];
+    return op?.type === "invokeHostFunction" ? op.func.invokeContract().args() : [];
+  };
+
+  const mine = (world: World, depositor: string): number =>
+    [...world.vault.pending.values()].filter((p) => p.depositor === depositor).length;
+
+  const paid = (world: World, depositor: string): number =>
+    world.vault.transfers.filter((t) => t.from === depositor).length;
+
+  // The entry-queue IDs a shield's footprint declares, and how many entries it declares in all.
+  const declared = (world: World, nth: number): { ids: bigint[]; entries: number } => {
+    const keys =
+      world.rpc.sent[nth]?.toEnvelope().v1().tx().ext().sorobanData().resources().footprint() ??
+      new xdr.LedgerFootprint({ readOnly: [], readWrite: [] });
+    const ids = keys
+      .readWrite()
+      .filter((k) => k.switch().name === "contractData")
+      .map((k) => k.contractData().key())
+      .filter((k) => k.switch().name === "scvVec" && k.vec()?.[0]?.sym().toString() === "Pending")
+      .map((k) => BigInt((k.vec()?.[1] as xdr.ScVal).u64().toString()));
+    return { ids, entries: keys.readWrite().length + keys.readOnly().length };
+  };
+
+  it("gives a deposit room for the entry queue's next IDs, and no more", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    await alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") });
+    // The ID the simulation took and the four after it, beside this depositor's day total.
+    assert.deepEqual(declared(world, 0), { ids: [1n, 2n, 3n, 4n, 5n], entries: 6 });
+    // The simulated 1,000 stroops, four entries written more at 2,500, and 336 bytes of keys sent
+    // at 406 and kept at 4,059 per 1,024, over the 150 stroops quoted for inclusion.
+    assert.deepEqual(world.rpc.sentFees, [12_616n]);
+  });
+
+  it("lands a deposit the entry queue moved one ID past its simulation, in one submission", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("depositor");
+    world.rpc.enforceFootprint = true;
+    world.rpc.beforeApply = othersFirst(world, 1);
+    const receipt = await alice.shield({ amount: 10n * XLM, signer: depositor });
+    assert.equal(receipt.depositId, 2);
+    assert.equal(world.rpc.sent.length, 1);
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "pending");
+    assert.equal(deposit?.id, 2);
+    assert.equal(mine(world, depositor.publicKey), 1);
+    assert.equal(paid(world, depositor.publicKey), 1);
+  });
+
+  it("sends the same proof again after a fresh simulation when the queue moved past its room", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("depositor");
+    world.rpc.enforceFootprint = true;
+    world.rpc.beforeApply = othersFirst(world, 5);
+    const receipt = await alice.shield({ amount: 10n * XLM, signer: depositor });
+    assert.equal(receipt.depositId, 6);
+    assert.equal(world.rpc.sent.length, 2);
+    assert.deepEqual(declared(world, 1).ids, [6n, 7n, 8n, 9n, 10n]);
+    // Both attempts carry the one proof, so the vault's nullifiers let at most one of them land.
+    const [first, second] = sentCalls(world);
+    assert.equal(first, second);
+    assert.equal(mine(world, depositor.publicKey), 1);
+    assert.equal(paid(world, depositor.publicKey), 1);
+    const args = callArgs(world, 1);
+    assert.throws(
+      () =>
+        world.vault.shield(
+          decodeTxProof(args[0] as xdr.ScVal),
+          decodeExtData(args[1] as xdr.ScVal),
+          depositor.publicKey,
+        ),
+      (err: unknown) => err instanceof VaultError && err.code === ERROR.NullifierSpent,
+    );
+  });
+
+  it("sends a deposit again when the UTC day turned between its simulation and its ledger", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const depositor = world.signer("depositor");
+    world.advance(Number(DAY - (world.vault.timestamp % DAY) - 1n));
+    world.rpc.enforceFootprint = true;
+    world.rpc.beforeApply = () => world.advance(2);
+    const receipt = await alice.shield({ amount: 10n * XLM, signer: depositor });
+    assert.equal(receipt.depositId, 1);
+    assert.equal(world.rpc.sent.length, 2);
+    assert.equal(mine(world, depositor.publicKey), 1);
+  });
+
+  it("gives up after two attempts that fail on the host's storage, and makes no deposit", async () => {
+    const world = await createWorld();
+    const store = new MemoryStore();
+    const alice = await openWallet(world, 0, store);
+    const depositor = world.signer("depositor");
+    world.rpc.enforceFootprint = true;
+    const always = (): void => {
+      othersFirst(world, 5)();
+      world.rpc.beforeApply = always;
+    };
+    world.rpc.beforeApply = always;
+    await assert.rejects(
+      alice.shield({ amount: 50n * XLM, signer: depositor }),
+      (err: unknown) =>
+        err instanceof CyphrasError &&
+        err.code === "transaction_failed" &&
+        err.details["conflict"] === true,
+    );
+    world.rpc.beforeApply = undefined;
+    assert.equal(world.rpc.sent.length, 2);
+    const [deposit] = await alice.deposits();
+    assert.equal(deposit?.state, "submitting");
+    assert.notEqual(deposit?.txHash, undefined);
+    assert.equal(deposit?.id, undefined);
+    // Only the ten deposits of other wallets landed, and nothing left this depositor.
+    assert.equal(world.vault.pending.size, 10);
+    assert.equal(world.vault.tvl, 10n * XLM);
+    assert.equal(paid(world, depositor.publicKey), 0);
+    // Reopened from the same store, a second deposit of the same amount is refused while the first
+    // may yet land, and once its proof's deadline has passed the record settles as failed.
+    const resumed = await openWallet(world, 0, store);
+    await assert.rejects(
+      resumed.shield({ amount: 50n * XLM, signer: depositor }),
+      isError("deposit_submitting"),
+    );
+    assert.equal(paid(world, depositor.publicKey), 0);
+    world.advance(121 * 5);
+    await resumed.sync();
+    assert.equal((await resumed.deposits())[0]?.state, "failed");
+    assert.equal(world.vault.pending.size, 10);
+  });
+
+  it("sends a deposit again only once a second RPC provider reports its failure too", async () => {
+    const second = "http://rpc2.test";
+    const world = await createWorld();
+    // The second provider holds the failure but returns no diagnostic events to show why.
+    const fetch: FetchLike = async (input, init) => {
+      if (new URL(input).origin !== second) return world.fetch(input, init);
+      const res = await world.fetch(RPC, init);
+      const body = bodyOf(init);
+      if (body?.method !== "getTransaction") return res;
+      const reply = await res.json();
+      if (reply.result?.status !== "FAILED") return new Response(JSON.stringify(reply));
+      return rpcResult(reply.id, { ...reply.result, diagnosticEventsXdr: undefined });
+    };
+    const alice = await openWallet({ ...world, fetch }, 0, undefined, undefined, {
+      secondRpcUrl: second,
+    });
+    world.rpc.enforceFootprint = true;
+    world.rpc.beforeApply = othersFirst(world, 5);
+    await assert.rejects(
+      alice.shield({ amount: 10n * XLM, signer: world.signer("depositor") }),
+      (err: unknown) =>
+        err instanceof CyphrasError && err.details["secondProvider"] === "no_diagnostics",
+    );
+    assert.equal(world.rpc.sent.length, 1);
   });
 });
 

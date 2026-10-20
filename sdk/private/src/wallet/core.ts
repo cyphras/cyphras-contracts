@@ -14,6 +14,8 @@ import {
   balanceKey,
   exitKey,
   payKeys,
+  pendingDeposit,
+  pendingKey,
   queuedExit,
   strandedKey,
 } from "../vault/state.ts";
@@ -64,12 +66,15 @@ export function invokeContext(core: Core): InvokeContext {
 }
 
 // The vault decides in the ledger a call lands in, not at its simulation, whether an exit is paid at
-// once or queued, which IDs the queue's next exits take and which exits release pays, so a call
-// simulated against one state of the exit queue may need entries of another. These are the rooms
-// the relayer gives its calls on the queue, given alike to the wallet's own.
+// once or queued, which IDs the queue's next exits take, which exits release pays and which ID the
+// entry queue gives a deposit, so a call simulated against one state of either queue may need
+// entries of another. These are the rooms the relayer gives its calls on the exit queue, given
+// alike to the wallet's own and to its deposits.
 
-// How many exits queued, or released, ahead of a call in the ledger it lands in leave it room.
+// How many exits queued, or released, ahead of a call in the ledger it lands in leave it room, and
+// how many deposits made ahead of a shield leave it room for the ID its own takes.
 const EXIT_KEYS = 4n;
+const PENDING_KEYS = 4n;
 // What the other path of a call on the exit queue may take beyond its simulation: an exit or
 // stranded exit entry with its key, about 330 bytes; a contract's balance entry in the asset
 // contract, about 225 bytes; paying an exit at once rather than queueing it, two transfers in the
@@ -85,6 +90,9 @@ type Room = (footprint: xdr.LedgerFootprint) => Promise<Extra>;
 
 const exitKeys = (vault: string, first: bigint): xdr.LedgerKey[] =>
   Array.from({ length: Number(EXIT_KEYS) + 1 }, (_, i) => exitKey(vault, first + BigInt(i)));
+
+const pendingKeys = (vault: string, after: bigint): xdr.LedgerKey[] =>
+  Array.from({ length: Number(PENDING_KEYS) }, (_, i) => pendingKey(vault, after + 1n + BigInt(i)));
 
 // The other path's entries with what it may take: the bytes of an exit entry and of each of the
 // asset contract's balance entries among `balances`.
@@ -143,6 +151,19 @@ export function claimRoom(core: Core): Room {
     return tail === undefined
       ? NO_ROOM
       : { ...NO_ROOM, readWrite: exitKeys(core.deployment.vault, tail) };
+  };
+}
+
+// The room a shield is given: the entries of the PENDING_KEYS deposit IDs after the one its
+// simulation took, so as many deposits made ahead of it in the same ledger still leave it room.
+// Whichever ID it lands on, it writes one entry of the same size, which its simulation already
+// prices; only the entries its footprint declares grow.
+export function depositRoom(core: Core): Room {
+  return async (footprint) => {
+    const id = pendingDeposit(core.deployment.vault, footprint);
+    return id === undefined
+      ? NO_ROOM
+      : { ...NO_ROOM, readWrite: pendingKeys(core.deployment.vault, id) };
   };
 }
 
