@@ -83,7 +83,7 @@ func tokens(line string) []string {
 // mapKey reads a map the rate limits key clients by and returns it as a function.
 func mapKey(t *testing.T, name string) func(string) string {
 	t.Helper()
-	conf, err := os.ReadFile("nginx/cyphras-services.conf")
+	conf, err := os.ReadFile("nginx/conf.d/cyphras-v2-zones.conf")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,5 +154,48 @@ func TestEveryAddressOfASlash64AndASlash48GetsOneRateLimitKey(t *testing.T) {
 	}
 	if client("203.0.113.7") != "$binary_remote_addr" || site("203.0.113.7") != "$binary_remote_addr" {
 		t.Fatal("an IPv4 address is not keyed on itself")
+	}
+}
+
+// The vhost is the privacy boundary of the services: every route that reaches one strips what
+// identifies the client, keeps no access log, and nothing else is served.
+func TestPrivateVhostStripsClientIdentityOnEveryRoute(t *testing.T) {
+	vhost, err := os.ReadFile("nginx/sites-available/private.cyphras.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snippet, err := os.ReadFile("nginx/snippets/cyphras-v2-proxy.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range []string{
+		"access_log off;",
+		`proxy_set_header X-Forwarded-For "";`, `proxy_set_header X-Real-IP "";`, `proxy_set_header Forwarded "";`,
+		`proxy_set_header User-Agent "";`, `proxy_set_header Referer "";`, `proxy_set_header Cookie "";`,
+		`proxy_set_header Authorization "";`,
+	} {
+		if !strings.Contains(string(snippet), "\n"+line+"\n") {
+			t.Errorf("the proxy snippet lacks %q", line)
+		}
+	}
+
+	locations := regexp.MustCompile(`location ([^{]+)\{([^}]*)\}`).FindAllStringSubmatch(string(vhost), -1)
+	seen := map[string]string{}
+	for _, l := range locations {
+		path, body := strings.TrimSpace(l[1]), l[2]
+		seen[path] = body
+		if strings.Contains(body, "proxy_pass") && !strings.Contains(body, "include snippets/cyphras-v2-proxy.conf;") {
+			t.Errorf("location %s proxies without the identity-stripping snippet", path)
+		}
+	}
+	for _, path := range []string{"/", "/mainnet/screening/internal/", "/testnet/screening/internal/"} {
+		if strings.TrimSpace(seen[path]) != "return 404;" {
+			t.Errorf("location %s = %q, want only return 404", path, seen[path])
+		}
+	}
+	for _, line := range []string{"server_tokens off;", `add_header Strict-Transport-Security "max-age=63072000" always;`} {
+		if !strings.Contains(string(vhost), line) {
+			t.Errorf("the vhost lacks %q", line)
+		}
 	}
 }
