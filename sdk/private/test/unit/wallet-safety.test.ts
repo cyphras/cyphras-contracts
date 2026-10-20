@@ -2404,8 +2404,10 @@ describe("wallet safety: network fees", () => {
     const world = await createWorld();
     const alice = await openWallet(world, 0);
     await alice.shield({ amount: 10n * XLM, signer: world.signer("d") });
-    // the mock RPC quotes 150 stroops for inclusion and simulates 1,000 for resources
-    assert.deepEqual(world.rpc.sentFees, [1_150n]);
+    // The mock RPC quotes 150 stroops for inclusion and simulates 1,000 for resources, and the
+    // deposit's room for the entry queue's next IDs adds 11,466: four entries written more at
+    // 2,500, and 336 bytes of keys sent at 406 and kept at 4,059 per 1,024.
+    assert.deepEqual(world.rpc.sentFees, [12_616n]);
   });
 
   it("shows the fee to a signer that confirms it, and signs nothing it declines", async () => {
@@ -2429,7 +2431,7 @@ describe("wallet safety: network fees", () => {
       alice.shield({ amount: 10n * XLM, signer: declining }),
       isError("not_confirmed"),
     );
-    assert.deepEqual(shown, [1_150n]);
+    assert.deepEqual(shown, [12_616n]);
     assert.equal(signed, false);
     assert.equal(world.vault.pending.size, 0);
   });

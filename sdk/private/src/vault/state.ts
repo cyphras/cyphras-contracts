@@ -59,11 +59,14 @@ function trustlineKey(account: string, assetName: string): xdr.LedgerKey {
 
 const u64 = (n: bigint): xdr.ScVal => xdr.ScVal.scvU64(new xdr.Uint64(n));
 
-// The entries of the exit the vault queued with an ID, and of the exit it set aside as stranded.
+// The entries of the exit the vault queued with an ID, of the exit it set aside as stranded, and of
+// the deposit it put in the entry queue under an ID.
 export const exitKey = (vault: string, id: bigint): xdr.LedgerKey =>
   contractDataKey(vault, dataKey("Exit", u64(id)));
 export const strandedKey = (vault: string, id: bigint): xdr.LedgerKey =>
   contractDataKey(vault, dataKey("Stranded", u64(id)));
+export const pendingKey = (vault: string, id: bigint): xdr.LedgerKey =>
+  contractDataKey(vault, dataKey("Pending", u64(id)));
 
 // The asset contract's entry of a contract's balance.
 export const balanceKey = (token: string, holder: string): xdr.LedgerKey =>
@@ -79,10 +82,14 @@ export function payKeys(token: string, assetName: string, address: string): xdr.
   return assetName.endsWith(`:${account}`) ? [] : [trustlineKey(account, assetName)];
 }
 
-// The ID of the exit a simulated footprint writes, the queue's tail when the simulation queued one:
-// the largest ID among the vault's exit entries it holds as read-write.
-export function queuedExit(vault: string, footprint: xdr.LedgerFootprint): bigint | undefined {
-  let tail: bigint | undefined;
+// The largest ID among the vault's entries of one keyed variant that a simulated footprint holds as
+// read-write.
+function queuedId(
+  vault: string,
+  footprint: xdr.LedgerFootprint,
+  variant: string,
+): bigint | undefined {
+  let last: bigint | undefined;
   const contract = new Address(vault).toScAddress().toXDR("base64");
   for (const key of footprint.readWrite()) {
     if (key.switch().name !== "contractData") continue;
@@ -93,16 +100,26 @@ export function queuedExit(vault: string, footprint: xdr.LedgerFootprint): bigin
     if (
       vec.length !== 2 ||
       name?.switch().name !== "scvSymbol" ||
-      name.sym().toString() !== "Exit"
+      name.sym().toString() !== variant
     ) {
       continue;
     }
     if (id?.switch().name !== "scvU64") continue;
     const value = BigInt(id.u64().toString());
-    if (tail === undefined || value > tail) tail = value;
+    if (last === undefined || value > last) last = value;
   }
-  return tail;
+  return last;
 }
+
+// The ID of the exit a simulated footprint writes, the queue's tail when the simulation queued one:
+// the largest ID among the vault's exit entries it holds as read-write.
+export const queuedExit = (vault: string, footprint: xdr.LedgerFootprint): bigint | undefined =>
+  queuedId(vault, footprint, "Exit");
+
+// The ID of the deposit a simulated footprint writes: the one the entry queue gave the simulated
+// shield, the largest among the vault's pending entries it holds as read-write.
+export const pendingDeposit = (vault: string, footprint: xdr.LedgerFootprint): bigint | undefined =>
+  queuedId(vault, footprint, "Pending");
 
 // An exit in the vault's queue: who it pays and what it still owes them.
 export interface QueuedExitEntry {

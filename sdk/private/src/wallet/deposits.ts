@@ -9,7 +9,7 @@ import { proveTransaction } from "../proving.ts";
 import { buildTransaction } from "../transaction.ts";
 import { type TransactionSigner, askTransaction, invokeVault } from "../vault/invoke.ts";
 import type { PendingDepositEntry, VaultInstance } from "../vault/state.ts";
-import { type Core, invokeContext, spendingKeys } from "./core.ts";
+import { type Core, depositRoom, invokeContext, spendingKeys } from "./core.ts";
 import { DEADLINE_LEDGERS } from "./spend.ts";
 import type { DepositEvent } from "./sources.ts";
 import { checkedBetween } from "./sync.ts";
@@ -149,6 +149,12 @@ export interface ShieldReceipt {
   readonly txHash: string;
 }
 
+// Every attempt of a deposit asks its depositor for a signature and costs them a fee, so one that
+// fails on the host's storage past the room its footprint was given goes once more, after a fresh
+// simulation, and no further. Each attempt carries the same proof, whose nullifiers the vault
+// spends once, so at most one of them can make a deposit.
+const SHIELD_ATTEMPTS = 2;
+
 // Proves a deposit with two dummy inputs and both outputs to the wallet's own address, has the
 // depositor sign it, and submits it through the RPC. While another deposit of this wallet is still
 // being submitted, and so may yet land, it goes only `whileSubmitting`.
@@ -234,6 +240,8 @@ export async function shield(
             args: [depositor, vault, nativeToScVal(amount, { type: "i128" })],
           },
         ],
+        extend: depositRoom(core),
+        attempts: SHIELD_ATTEMPTS,
       },
       {
         onSending: async (hash) => {

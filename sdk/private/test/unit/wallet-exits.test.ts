@@ -2269,8 +2269,8 @@ describe("exits that other exits race in the same ledger", () => {
     world.rpc.diagnosticsInMeta = false;
     await alice.sync();
     assert.equal((await alice.plans())[0]?.state, "settled");
-    // A deposit that fails on chain goes no further either.
-    world.rpc.conflictNext = 1;
+    // A deposit the vault refuses goes no further either.
+    world.rpc.failNext = 1;
     await assert.rejects(
       alice.shield({ amount: 10n * XLM, signer: world.signer("alice depositor") }),
       isError("transaction_failed"),
