@@ -357,6 +357,21 @@ describe("wallet safety: services that lie", () => {
       assert.equal(world.vault.pending.size, 0);
     }
   });
+
+  it("QA probe: accepts a real signature from a signer whose reply also carries error: null", async () => {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    const honest = world.signer("depositor");
+    const wallet = {
+      publicKey: honest.publicKey,
+      signTransaction: async (envelope: string, passphrase: string) => {
+        const signed = await honest.signTransaction(envelope, passphrase);
+        return { signedTxXdr: signed, error: null };
+      },
+    };
+    await alice.shield({ amount: 10n * XLM, signer: wallet });
+    assert.equal(world.vault.pending.size, 1);
+  });
 });
 
 describe("wallet safety: cross-checks with RPC events", () => {

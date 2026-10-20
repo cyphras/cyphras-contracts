@@ -72,7 +72,7 @@ export function fail(code: ErrorCode, message: string, details?: ErrorDetails): 
 }
 
 /**
- * Whether a signer's reply is a decline rather than a malformed or wrong signature: an explicit
+ * Whether a signer's reply is a decline rather than a malformed or wrong signature: a truthy
  * `error` field, or `field` present but `null` or an empty string. Checked before any parsing of
  * the reply, so a decline never reaches the malformed- or mismatched-signature checks.
  */
@@ -80,7 +80,7 @@ export function isDeclinedSignature(value: unknown, field: string): boolean {
   if (typeof value === "string") return value === "";
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
-  if ("error" in record && record["error"] !== undefined) return true;
+  if (record["error"]) return true;
   const signed = record[field];
   return signed === null || signed === "";
 }
