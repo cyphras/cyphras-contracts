@@ -5,7 +5,7 @@ import { generateMnemonic, mnemonicToSeed, validateMnemonic } from "@scure/bip39
 import { wordlist } from "@scure/bip39/wordlists/english";
 import { StrKey } from "@stellar/stellar-base";
 import { bytesToHex, concatBytes, equalBytes, hexToBytes, utf8 } from "./bytes.ts";
-import { fail } from "./errors.ts";
+import { fail, isDeclinedSignature } from "./errors.ts";
 import { type Network, SEED_LENGTH, checkAccount, deriveStoreKey } from "./keys.ts";
 import { type KeyValueStore, openRecord, sealRecord } from "./storage.ts";
 
@@ -169,7 +169,11 @@ function signatureBytes(value: unknown, depth = 0): Uint8Array | undefined {
 }
 
 async function signedSeedMessage(signer: MessageSigner): Promise<Uint8Array> {
-  const signature = signatureBytes(await signer.signMessage(SIGNATURE_MESSAGE));
+  const reply = await signer.signMessage(SIGNATURE_MESSAGE);
+  if (isDeclinedSignature(reply, "signedMessage")) {
+    fail("signer_rejected", "the signer declined to sign the message");
+  }
+  const signature = signatureBytes(reply);
   if (signature === undefined) {
     fail("signature_invalid", "the wallet did not return a 64-byte ed25519 signature");
   }

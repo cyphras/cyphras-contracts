@@ -337,6 +337,26 @@ describe("wallet safety: services that lie", () => {
     assert.equal(world.vault.pending.size, 0);
     assert.equal((await alice.deposits())[0]?.state, "failed");
   });
+
+  it("maps a signer that declines to signer_rejected, whatever shape it declines in", async () => {
+    for (const reply of [
+      { error: "User rejected the request" },
+      { signedTxXdr: "" },
+      { signedTxXdr: null },
+    ]) {
+      const world = await createWorld();
+      const alice = await openWallet(world, 0);
+      const declining = {
+        publicKey: world.signer("depositor").publicKey,
+        signTransaction: async (): Promise<unknown> => reply,
+      };
+      await assert.rejects(
+        alice.shield({ amount: 10n * XLM, signer: declining }),
+        isError("signer_rejected"),
+      );
+      assert.equal(world.vault.pending.size, 0);
+    }
+  });
 });
 
 describe("wallet safety: cross-checks with RPC events", () => {
