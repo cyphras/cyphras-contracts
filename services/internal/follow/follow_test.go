@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
@@ -100,6 +101,49 @@ func TestARangeTheRPCNoLongerKeepsIsPastItsRetention(t *testing.T) {
 	f.Fail["getEvents"] = errors.New("rpc down")
 	if _, err := src.Events(context.Background(), 60, 70); err == nil || errors.Is(err, ErrRetention) {
 		t.Fatalf("a failure in range: %v", err)
+	}
+}
+
+// A node that has not closed the start ledger refuses it with the same words as one that no longer
+// keeps it; only the range it names tells the two apart.
+func TestALedgerPastTheAnsweringNodesTipIsAheadNotAFailure(t *testing.T) {
+	c := activity()
+	f := rpctest.New(passphrase, 100)
+	load(f, c.Events)
+	f.Oldest = 50
+	src := RPCSource{Client: f, Contract: vaulttest.Vault, PageLimit: 7}
+	_, err := src.Events(context.Background(), 101, 101)
+	if !errors.Is(err, ErrAhead) {
+		t.Fatalf("a ledger past the tip: %v", err)
+	}
+	if _, err := src.Events(context.Background(), 10, 40); errors.Is(err, ErrAhead) || !errors.Is(err, ErrRetention) {
+		t.Fatalf("a ledger before the oldest stays past retention: %v", err)
+	}
+}
+
+// aheadHealth answers getHealth a ledger ahead of the node that serves getEvents, as a load
+// balancer can.
+type aheadHealth struct{ *rpctest.Fake }
+
+func (a aheadHealth) GetHealth(ctx context.Context) (protocol.GetHealthResponse, error) {
+	h, err := a.Fake.GetHealth(ctx)
+	h.LatestLedger++
+	return h, err
+}
+
+func TestTheFollowerWaitsQuietlyWhenGetEventsLagsGetHealth(t *testing.T) {
+	f := rpctest.New(passphrase, 100)
+	sink := &memSink{cursor: 100}
+	fol := &Follower{RPC: aheadHealth{f}, Live: RPCSource{Client: f, Contract: vaulttest.Vault}, Window: 10, Sink: sink}
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
+	var reported []error
+	fol.Run(ctx, 100*time.Millisecond, func(err error) { reported = append(reported, err) })
+	if len(reported) != 0 {
+		t.Fatalf("a wait for the next ledger was reported as an error: %v", reported[0])
+	}
+	if f.Calls["getEvents"] < 2 {
+		t.Fatalf("the follower stopped polling: %d getEvents calls", f.Calls["getEvents"])
 	}
 }
 

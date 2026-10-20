@@ -118,6 +118,9 @@ func (f *Follower) Run(ctx context.Context, poll time.Duration, onError func(err
 	for ctx.Err() == nil {
 		progressed, err := f.Step(ctx)
 		switch {
+		case errors.Is(err, ErrAhead):
+			backoff = poll
+			sleep(ctx, poll)
 		case err != nil:
 			if ctx.Err() != nil {
 				return

@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"time"
 
 	protocol "github.com/stellar/go-stellar-sdk/protocols/rpc"
@@ -27,7 +29,25 @@ var (
 	// ErrRange reports a range whose first ledger comes after its last, or an RPC whose oldest
 	// ledger comes after its latest.
 	ErrRange = errors.New("follow: a ledger range that ends before it starts")
+	// ErrAhead reports a start ledger the RPC node that answered has not closed yet. Behind a load
+	// balancer, getHealth can come from a node a ledger ahead of the one that serves getEvents, so
+	// this only means waiting for the next ledger.
+	ErrAhead = errors.New("follow: ledger not closed yet on the node that answered")
 )
+
+// nodeRange reads the range stellar-rpc names when it refuses a start ledger.
+var nodeRange = regexp.MustCompile(`startLedger must be within the ledger range: (\d+) - (\d+)`)
+
+// aheadOfNode reports whether err refuses from because it is past the answering node's latest
+// ledger, as opposed to before its oldest.
+func aheadOfNode(err error, from uint32) bool {
+	m := nodeRange.FindStringSubmatch(err.Error())
+	if m == nil {
+		return false
+	}
+	latest, perr := strconv.ParseUint(m[2], 10, 32)
+	return perr == nil && uint64(from) > latest
+}
 
 // RPCSource reads getEvents, following the cursor inside each range, so a full page only means
 // there is another page.
@@ -65,6 +85,9 @@ func (s RPCSource) Events(ctx context.Context, from, to uint32) ([]vault.RawEven
 	for {
 		resp, err := s.Client.GetEvents(ctx, req)
 		if err != nil {
+			if aheadOfNode(err, from) {
+				return nil, fmt.Errorf("%w: ledger %d", ErrAhead, from)
+			}
 			// An RPC refuses a start ledger it no longer keeps with an error worded its own way, so
 			// its health tells that apart from a failure.
 			if h, herr := s.Client.GetHealth(ctx); herr == nil && from < h.OldestLedger {
