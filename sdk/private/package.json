@@ -1,6 +1,6 @@
 {
   "name": "@cyphras/private",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Wallet SDK for Cyphras private payments on Stellar, with zero-knowledge proofs made on the user's device",
   "keywords": [
     "stellar",
@@ -62,7 +62,7 @@
     "@stellar/stellar-base": "^15.0.0"
   },
   "devDependencies": {
-    "@cyphras/private-prover-snarkjs": "0.1.0",
+    "@cyphras/private-prover-snarkjs": "0.1.1",
     "@stellar/stellar-base": "15.0.0"
   }
 }
