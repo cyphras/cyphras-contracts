@@ -98,8 +98,14 @@ func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 		if _, err := os.Stat(name); errors.Is(err, os.ErrNotExist) {
 			created = true
 		}
-		f, err := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o600)
+		f, err := os.OpenFile(name, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o644)
 		if err != nil {
+			return err
+		}
+		// The events are public and the keeper reads them as another user, so the mode is set past
+		// the umask, on existing files too.
+		if err := f.Chmod(0o644); err != nil {
+			f.Close()
 			return err
 		}
 		if err := appendWrite(f, write, events, lo, hi, w.TooLarge); err != nil {

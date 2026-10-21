@@ -57,6 +57,27 @@ func TestEventsRoundTripAcrossWindowsAndRewrites(t *testing.T) {
 	}
 }
 
+func TestTheArchiveIsReadableByTheServicesThatMountIt(t *testing.T) {
+	dir := t.TempDir()
+	old := filepath.Join(dir, "0000000000.jsonl")
+	if err := os.WriteFile(old, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w := Writer{Dir: dir}
+	if err := w.Append([]vault.RawEvent{event(3, 1, 0), event(WindowLedgers+3, 1, 0)}, 0, WindowLedgers+5); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{old, path(dir, WindowLedgers)} {
+		info, err := os.Stat(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o644 {
+			t.Fatalf("%s has mode %v", filepath.Base(name), info.Mode().Perm())
+		}
+	}
+}
+
 func TestATornLineCannotSwallowTheNextWrite(t *testing.T) {
 	dir := t.TempDir()
 	w := Writer{Dir: dir}
