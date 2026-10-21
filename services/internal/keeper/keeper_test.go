@@ -768,6 +768,25 @@ func TestStrandedExitsAreClaimedOnceAPartyCanReceive(t *testing.T) {
 	}
 }
 
+func TestUnflagMissesApartDoNotPage(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	var down error
+	h.k.cfg.Unflags = func(context.Context) (map[uint64]uint64, error) { return nil, down }
+	for _, miss := range []bool{true, false, true, false} {
+		down = nil
+		if miss {
+			down = errors.New("screening restarting")
+		}
+		if err := h.k.Refund(ctx); (err != nil) != miss {
+			t.Fatalf("miss %v: %v", miss, err)
+		}
+	}
+	if h.has("refunds_wait") {
+		t.Fatal("misses with a read between them paged")
+	}
+}
+
 func TestARefundWaitsForAQueuedCorrection(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
@@ -787,10 +806,13 @@ func TestARefundWaitsForAQueuedCorrection(t *testing.T) {
 	if got := h.take(); !equal(got, []string{"refund 2"}) {
 		t.Fatalf("refunds %v", got)
 	}
-	// Unread, the list holds back every refund.
+	// Unread, the list holds back every refund. One miss, as a restart causes, does not page.
 	down = errors.New("screening down")
 	h.now = h.now.Add(10 * time.Minute)
 	h.sync()
+	if err := h.k.Refund(ctx); err == nil || len(h.take()) != 0 || h.has("refunds_wait") {
+		t.Fatalf("one miss: refunded or paged: %v", err)
+	}
 	if err := h.k.Refund(ctx); err == nil || len(h.take()) != 0 || !h.has("refunds_wait") {
 		t.Fatalf("refunded without the list: %v", err)
 	}

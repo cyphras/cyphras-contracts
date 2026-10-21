@@ -74,6 +74,9 @@ type Keeper struct {
 
 	// charged is what the current TTL cycle's transactions were charged; only the cycle uses it.
 	charged int64
+	// unflagMisses counts refund runs in a row that could not read the unflag list; only the
+	// refund job uses it.
+	unflagMisses int
 }
 
 // New loads the stored chain state.
@@ -300,9 +303,13 @@ func (k *Keeper) Refund(ctx context.Context) error {
 	if k.cfg.Unflags != nil {
 		// Without the list no refund goes, as one could preempt an operator's correction.
 		if unflags, err = k.cfg.Unflags(ctx); err != nil {
-			k.alerts.Raise(ctx, alert.Warning, "refunds_wait", "refunds wait: the deposits with an unflag queued cannot be read from the screening service: %v", err)
+			// One miss is a restart of the keeper or screening; a refund waits hours anyway.
+			if k.unflagMisses++; k.unflagMisses >= 2 {
+				k.alerts.Raise(ctx, alert.Warning, "refunds_wait", "refunds wait: the deposits with an unflag queued cannot be read from the screening service: %v", err)
+			}
 			return err
 		}
+		k.unflagMisses = 0
 		k.alerts.Clear(ctx, "refunds_wait", "refunds go again")
 	}
 	for _, p := range pending {
