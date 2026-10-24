@@ -297,6 +297,7 @@ func TestAMirrorRemovesTheWindowFilesTheManifestDoesNotList(t *testing.T) {
 
 func TestAMirrorTakesTheManifestByteForByte(t *testing.T) {
 	remote := published(t, 2)
+	writeManifestFile(t, remote, readManifestFile(t, remote))
 	dir := t.TempDir()
 	if _, err := Mirror(context.Background(), DirFetcher(remote), dir, pin()); err != nil {
 		t.Fatal(err)
