@@ -191,6 +191,9 @@ func parseEvent(line []byte, n int, vaultID string) (vault.RawEvent, error) {
 	if err := e.Valid(); err != nil {
 		return vault.RawEvent{}, invalid("line %d: %v", n, err)
 	}
+	if e.ClosedAt > maxExactInteger {
+		return vault.RawEvent{}, invalid("line %d: closed_at %d is more than a JavaScript number holds exactly", n, e.ClosedAt)
+	}
 	for _, s := range append([]string{e.Value}, e.Topics...) {
 		if !canonicalXDR(s) {
 			return vault.RawEvent{}, invalid("line %d is not in canonical form: a topic or value is not the base64 of its own XDR", n)

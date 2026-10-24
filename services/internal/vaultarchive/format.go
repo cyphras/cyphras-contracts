@@ -33,6 +33,10 @@ const (
 	MaxLineBytes     = 1 << 20
 )
 
+// maxExactInteger is the largest integer a JavaScript number holds exactly, which readers in that
+// language need every number of the format to stay under.
+const maxExactInteger = 1<<53 - 1
+
 // ErrInvalid reports an archive, or part of one, that breaks a rule of the format.
 var ErrInvalid = errors.New("vault archive: invalid")
 

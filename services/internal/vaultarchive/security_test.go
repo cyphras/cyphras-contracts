@@ -87,3 +87,26 @@ func TestAnEventWrittenWithOtherSpareBitsInItsBase64IsNotCanonical(t *testing.T)
 		mustInvalid(t, "a respelled "+name, err, "not in canonical form")
 	}
 }
+
+func TestATimeBeyondWhatAJavaScriptNumberHoldsIsRefusedByReaderAndWriter(t *testing.T) {
+	const largest, past = "9007199254740991", "9007199254740992"
+	dir, _ := good(t)
+	rewrite(t, dir, 0, func(l []string) []string {
+		l[0] = strings.Replace(l[0], `"closed_at":1728000000`, `"closed_at":`+largest, 1)
+		return l
+	})
+	if _, err := Load(context.Background(), DirFetcher(dir), Expect{}); err != nil {
+		t.Fatalf("the largest exact time: %v", err)
+	}
+	rewrite(t, dir, 0, func(l []string) []string {
+		l[0] = strings.Replace(l[0], `"closed_at":`+largest, `"closed_at":`+past, 1)
+		return l
+	})
+	_, err := Load(context.Background(), DirFetcher(dir), Expect{})
+	mustInvalid(t, "a time past 2^53", err, "closed_at")
+
+	late := sample()[0]
+	late.ClosedAt = 1 << 53
+	_, err = Build(context.Background(), fixedSource{late}, t.TempDir(), head(), 0, WindowLedgers-1)
+	mustInvalid(t, "the writer", err, "closed_at")
+}
