@@ -166,6 +166,9 @@ func holds(ctx context.Context, dir string, w Window) bool {
 	if err != nil {
 		return false
 	}
+	if int64(len(compressed)) > maxCompressed(w) {
+		return false
+	}
 	data, err := gunzip(compressed)
 	if err != nil {
 		return false

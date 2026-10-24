@@ -317,6 +317,10 @@ func TestAReaderRefusesEveryBreakOfTheFormat(t *testing.T) {
 			}
 		}},
 		{"a window that expands without end", "expands past", func(t *testing.T, dir string) {
+			// The manifest claims the largest window, so only the expanded size can refuse it.
+			m := readManifestFile(t, dir)
+			m.Windows[0].Bytes = MaxWindowBytes
+			writeManifestFile(t, dir, m)
 			var packed bytes.Buffer
 			zw := gzip.NewWriter(&packed)
 			if _, err := zw.Write(make([]byte, MaxWindowBytes+1)); err != nil {
