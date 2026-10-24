@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
-	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 	"github.com/cyphras/cyphras-contracts/services/internal/vaultarchive"
 )
@@ -211,13 +209,6 @@ func TestExportsRunningAtOnceLeaveAnArchiveThatLoads(t *testing.T) {
 	wg.Wait()
 	if got, err := do(t, "verify", "--dir", out, "--format-only", "--deployment", deployment); err != nil || !strings.Contains(got, "format checks passed") {
 		t.Fatalf("the published directory does not verify: %q, %v", got, err)
-	}
-	var events []vault.RawEvent
-	for _, e := range sample() {
-		events = append(events, e)
-	}
-	if len(events) == 0 {
-		t.Fatal(fmt.Sprint("no events"))
 	}
 }
 
