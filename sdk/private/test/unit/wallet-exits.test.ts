@@ -2434,7 +2434,7 @@ describe("exits that other exits race in the same ledger", () => {
       assert.deepEqual(ids(lastData(world)?.resources().footprint().readWrite()), ids(written));
     }
     // The cap bounds the fee with its padding.
-    const capped = { ...context, feeCaps: { inclusion: 100_000n, resource: 1_000_000n } };
+    const capped = { ...context, feeCaps: { ...DEFAULT_NETWORK_FEE_CAPS, resource: 1_000_000n } };
     await assert.rejects(invokeVault(capped, signer, call), isError("fee_above_cap"));
   });
 

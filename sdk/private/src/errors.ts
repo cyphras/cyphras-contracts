@@ -36,6 +36,7 @@ export type ErrorCode =
   | "signer_mismatch"
   | "signer_rejected"
   | "transaction_failed"
+  | "restore_failed"
   | "deposit_submitting"
   | "view_only"
   | "not_found"
