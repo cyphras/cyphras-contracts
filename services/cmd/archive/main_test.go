@@ -159,15 +159,17 @@ func ledgerMeta(t *testing.T, seq uint32, events []vault.RawEvent) xdr.LedgerClo
 	}}
 }
 
-// ledgerArchive serves the ledgers of the first windows as a SEP-54 archive with a file per
-// window, and returns its base URL.
+// perFile is the number of ledgers in each file of the SEP-54 archive the tests serve.
+const perFile = 64
+
+// ledgerArchive serves the ledgers of the first windows as a SEP-54 archive with files of perFile
+// ledgers, and returns its base URL.
 func ledgerArchive(t *testing.T, events []vault.RawEvent, windows int) string {
 	t.Helper()
 	files := map[string][]byte{}
-	for w := range windows {
-		start := uint32(w) * window
-		batch := xdr.LedgerCloseMetaBatch{StartSequence: xdr.Uint32(max(start, 1)), EndSequence: xdr.Uint32(start + window - 1)}
-		for seq := max(start, 1); seq < start+window; seq++ {
+	for start := uint32(0); start < uint32(windows)*window; start += perFile {
+		batch := xdr.LedgerCloseMetaBatch{StartSequence: xdr.Uint32(max(start, 1)), EndSequence: xdr.Uint32(start + perFile - 1)}
+		for seq := max(start, 1); seq < start+perFile; seq++ {
 			var in []vault.RawEvent
 			for _, e := range events {
 				if e.Ledger == seq {
@@ -191,9 +193,9 @@ func ledgerArchive(t *testing.T, events []vault.RawEvent, windows int) string {
 		if err := enc.Close(); err != nil {
 			t.Fatal(err)
 		}
-		files[fmt.Sprintf("/pubnet/%08X--%d-%d.xdr.zst", math.MaxUint32-start, start, start+window-1)] = compressed.Bytes()
+		files[fmt.Sprintf("/pubnet/%08X--%d-%d.xdr.zst", math.MaxUint32-start, start, start+perFile-1)] = compressed.Bytes()
 	}
-	files["/pubnet/.config.json"] = []byte(fmt.Sprintf(`{"networkPassphrase":%q,"compression":"zstd","ledgersPerBatch":%d,"batchesPerPartition":1}`, passphrase, window))
+	files["/pubnet/.config.json"] = []byte(fmt.Sprintf(`{"networkPassphrase":%q,"compression":"zstd","ledgersPerBatch":%d,"batchesPerPartition":1}`, passphrase, perFile))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if body, ok := files[r.URL.Path]; ok {
 			_, _ = w.Write(body)

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -42,8 +41,14 @@ var archiveClient = &http.Client{Timeout: 2 * time.Minute}
 
 const (
 	maxCompressed = 256 << 20
-	// maxLedgerMeta bounds the decompressed metadata of one ledger, far above what a ledger holds.
-	maxLedgerMeta = 64 << 20
+	// maxBatchMeta bounds the decompressed metadata of one file, far above what the ledgers of a
+	// file hold, whatever the archive's configuration says.
+	maxBatchMeta = 256 << 20
+
+	// The most ledgers per file and files per partition a layout may claim; the public archive
+	// uses one and 64,000.
+	maxLedgersPerBatch     = 64
+	maxBatchesPerPartition = 64_000
 )
 
 type archiveSchema struct {
@@ -58,10 +63,10 @@ type archiveSchema struct {
 func (s archiveSchema) objectKey(ledger uint32) string {
 	var key string
 	if s.BatchesPerPartition > 1 {
-		size := s.LedgersPerBatch * s.BatchesPerPartition
-		start := ledger / size * size
-		end := uint32(min(uint64(start)+uint64(size)-1, math.MaxUint32))
-		key = fmt.Sprintf("%08X--%d-%d/", math.MaxUint32-start, start, end)
+		size := uint64(s.LedgersPerBatch) * uint64(s.BatchesPerPartition)
+		start := uint64(ledger) / size * size
+		end := min(start+size-1, math.MaxUint32)
+		key = fmt.Sprintf("%08X--%d-%d/", math.MaxUint32-uint32(start), start, end)
 	}
 	start := ledger / s.LedgersPerBatch * s.LedgersPerBatch
 	end := start + s.LedgersPerBatch - 1
@@ -134,8 +139,10 @@ func (a *LedgerArchive) load(ctx context.Context) (archiveSchema, error) {
 		return archiveSchema{}, fmt.Errorf("archive holds %q", schema.NetworkPassphrase)
 	case schema.Compression != "zstd":
 		return archiveSchema{}, fmt.Errorf("archive compression %q", schema.Compression)
-	case schema.LedgersPerBatch == 0:
-		return archiveSchema{}, errors.New("archive has no batch size")
+	case schema.LedgersPerBatch < 1 || schema.LedgersPerBatch > maxLedgersPerBatch:
+		return archiveSchema{}, fmt.Errorf("archive has %d ledgers per file", schema.LedgersPerBatch)
+	case schema.BatchesPerPartition < 1 || schema.BatchesPerPartition > maxBatchesPerPartition:
+		return archiveSchema{}, fmt.Errorf("archive has %d files per partition", schema.BatchesPerPartition)
 	}
 	a.schema, a.loaded = schema, true
 	return schema, nil
@@ -212,7 +219,7 @@ func (a *LedgerArchive) file(ctx context.Context, schema archiveSchema, first, f
 		return nil, err
 	}
 	defer dec.Close()
-	raw, err := readAll(dec, int64(schema.LedgersPerBatch)*maxLedgerMeta)
+	raw, err := readAll(dec, maxBatchMeta)
 	if err != nil {
 		return nil, fmt.Errorf("ledger batch %d: %w", first, err)
 	}
