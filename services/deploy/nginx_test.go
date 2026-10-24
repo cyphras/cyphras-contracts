@@ -3,7 +3,9 @@ package deploy
 import (
 	"fmt"
 	"math/rand/v2"
+	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 	"testing"
@@ -204,6 +206,23 @@ func locations(t *testing.T, vhost string) []location {
 	return out
 }
 
+// normalise reads a URI as nginx does before it picks a location: percent-escapes decoded, runs of
+// slashes merged, and . and .. segments resolved.
+func normalise(uri string) string {
+	p, err := url.PathUnescape(uri)
+	if err != nil {
+		return uri
+	}
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
+	clean := path.Clean(p)
+	if strings.HasSuffix(p, "/") && clean != "/" {
+		clean += "/"
+	}
+	return clean
+}
+
 // route picks the location nginx would serve a URI from: an exact match, else the longest prefix
 // if it is marked ^~, else the first matching regex in file order, else the longest prefix.
 func route(locs []location, uri string) (*location, map[string]string) {
@@ -254,8 +273,13 @@ func TestPrivateVhostServesThePublishedArchiveReadOnly(t *testing.T) {
 			base + "/manifest.json":               dir + "/manifest.json",
 			base + "/windows/0000017280.jsonl.gz": dir + "/windows/0000017280.jsonl.gz",
 		}
+		// The same files by other spellings of the URI, which nginx normalises before it routes.
+		served[base+"/windows/../manifest.json"] = dir + "/manifest.json"
+		served[base+"//./manifest.json"] = dir + "/manifest.json"
+		served[base+"/%6danifest.json"] = dir + "/manifest.json"
+		served[base+"/windows%2f0000017280.jsonl.gz"] = dir + "/windows/0000017280.jsonl.gz"
 		for uri, file := range served {
-			l, names := route(locs, uri)
+			l, names := route(locs, normalise(uri))
 			if l == nil {
 				t.Fatalf("%s is not routed", uri)
 			}
@@ -289,7 +313,7 @@ func TestPrivateVhostServesThePublishedArchiveReadOnly(t *testing.T) {
 				}
 			}
 			cache := `add_header Cache-Control "public, max-age=60";`
-			if strings.HasSuffix(uri, ".gz") {
+			if strings.HasSuffix(file, ".gz") {
 				cache = `add_header Cache-Control "public, max-age=31536000, immutable";`
 			}
 			if !strings.Contains(l.body, cache+"\n") {
@@ -301,9 +325,10 @@ func TestPrivateVhostServesThePublishedArchiveReadOnly(t *testing.T) {
 			base + "/manifest.json.bak", base + "/Manifest.json", base + "/index.html", base + "/windows/0000017280.jsonl",
 			base + "/windows/17280.jsonl.gz", base + "/windows/00000172800.jsonl.gz", base + "/windows/0000017280.jsonl.gz/",
 			base + "/windows/0000017280.jsonl.gz.sig", base + "/windows/000001728a.jsonl.gz", base + "/windows/x/0000017280.jsonl.gz",
-			base + "/windows/../manifest.json", base + "/.git/config", base + "/windows/.0000017280.jsonl.gz",
+			base + "/.git/config", base + "/windows/.0000017280.jsonl.gz", base + "/windows/../../../etc/passwd",
+			base + "/%2e%2e/manifest.json",
 		} {
-			l, _ := route(locs, uri)
+			l, _ := route(locs, normalise(uri))
 			if l == nil || strings.TrimSpace(l.body) != "return 404;" {
 				t.Errorf("%s is not answered with 404: %+v", uri, l)
 			}
