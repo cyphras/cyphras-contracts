@@ -220,3 +220,27 @@ func TestExportsRunningAtOnceLeaveAnArchiveThatLoads(t *testing.T) {
 		t.Fatal(fmt.Sprint("no events"))
 	}
 }
+
+func TestAnArchiveIsNotFetchedOverPlainHTTPFromAnotherMachine(t *testing.T) {
+	_, deployment := exportSample(t)
+	out := filepath.Join(t.TempDir(), "copy")
+	for _, base := range []string{"http://archive.example.invalid/mainnet/xlm/archive", "ftp://127.0.0.1/archive", "//127.0.0.1/archive", "archive"} {
+		_, err := do(t, "fetch", "--url", base, "--out", out, "--deployment", deployment)
+		if err == nil || !strings.Contains(err.Error(), "https") {
+			t.Errorf("fetch from %s: %v", base, err)
+		}
+		_, err = do(t, "verify", "--url", base, "--format-only")
+		if err == nil || !strings.Contains(err.Error(), "https") {
+			t.Errorf("verify from %s: %v", base, err)
+		}
+	}
+	for _, base := range []string{"http://127.0.0.1:1/archive", "http://localhost:1/archive", "http://[::1]:1/archive"} {
+		_, err := do(t, "fetch", "--url", base, "--out", out, "--deployment", deployment)
+		if err != nil && strings.Contains(err.Error(), "https") {
+			t.Errorf("fetch from the machine itself, %s: %v", base, err)
+		}
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("a refused fetch left a directory: %v", err)
+	}
+}
