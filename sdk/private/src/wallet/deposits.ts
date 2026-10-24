@@ -7,7 +7,12 @@ import type { DepositQueue } from "../net/indexer.ts";
 import type { SorobanRpc, TransactionStatus } from "../net/rpc.ts";
 import { proveTransaction } from "../proving.ts";
 import { buildTransaction } from "../transaction.ts";
-import { type TransactionSigner, askTransaction, invokeVault } from "../vault/invoke.ts";
+import {
+  type NetworkFeeCaps,
+  type TransactionSigner,
+  askTransaction,
+  invokeVault,
+} from "../vault/invoke.ts";
 import type { PendingDepositEntry, VaultInstance } from "../vault/state.ts";
 import { type Core, depositRoom, invokeContext, spendingKeys } from "./core.ts";
 import { DEADLINE_LEDGERS } from "./spend.ts";
@@ -163,6 +168,7 @@ export async function shield(
   amount: bigint,
   signer: TransactionSigner,
   whileSubmitting: boolean,
+  caps?: Partial<NetworkFeeCaps>,
 ): Promise<ShieldReceipt> {
   const keys = spendingKeys(core);
   if (core.prover === undefined || core.artifacts === undefined) {
@@ -229,7 +235,7 @@ export async function shield(
   const depositor = new Address(signer.publicKey).toScVal();
   try {
     const result = await invokeVault(
-      invokeContext(core),
+      invokeContext(core, caps),
       signer,
       {
         fn: "shield",
@@ -278,6 +284,7 @@ export async function cancelDeposit(
   core: Core,
   id: number,
   signer: TransactionSigner,
+  caps?: Partial<NetworkFeeCaps>,
 ): Promise<string> {
   const pending = await core.services.vault.pending(BigInt(id));
   if (pending === undefined) fail("not_found", "no pending deposit has that ID");
@@ -285,7 +292,7 @@ export async function cancelDeposit(
     fail("invalid_argument", "only the depositor can cancel a deposit");
   }
   await claimId(core, id);
-  const result = await invokeVault(invokeContext(core), signer, {
+  const result = await invokeVault(invokeContext(core, caps), signer, {
     fn: "cancel",
     args: [u64(id)],
     transfers: [],
@@ -298,6 +305,7 @@ export async function refundDeposit(
   core: Core,
   id: number,
   signer: TransactionSigner,
+  caps?: Partial<NetworkFeeCaps>,
 ): Promise<string> {
   const pending = await core.services.vault.pending(BigInt(id));
   if (pending === undefined) fail("not_found", "no pending deposit has that ID");
@@ -313,7 +321,7 @@ export async function refundDeposit(
     );
   }
   await claimId(core, id);
-  const result = await invokeVault(invokeContext(core), signer, {
+  const result = await invokeVault(invokeContext(core, caps), signer, {
     fn: "refund",
     args: [u64(id)],
     transfers: [],

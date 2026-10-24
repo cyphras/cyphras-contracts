@@ -37,12 +37,15 @@ import { RelayerClient } from "../net/relayer.ts";
 import type { Prover } from "../prover.ts";
 import { type AccountLock, lockName, soleInstance, webLock } from "../lock.ts";
 import { type KeyValueStore, SealedStore } from "../storage.ts";
-import type { ChainView } from "../vault/state.ts";
+import { type ChainView, vaultKeys } from "../vault/state.ts";
+import { SorobanRpc } from "../net/rpc.ts";
 import {
   DEFAULT_NETWORK_FEE_CAPS,
   type NetworkFeeCaps,
   type TransactionSigner,
+  type VaultRestore,
   invokeVault,
+  restoreEntries,
 } from "../vault/invoke.ts";
 import {
   type ChainReads,
@@ -234,6 +237,9 @@ export interface UnshieldRequest {
   readonly maxFee?: bigint;
   readonly relayer?: string | readonly string[];
   readonly selfRelay?: TransactionSigner;
+  // Caps of a self-relayed unshield's own transaction over the wallet's, as after the user agreed
+  // to the fee a fee_above_cap error reported.
+  readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   readonly confirm?: ConfirmSpend;
   readonly notBefore?: number;
   // Splits an amount above the vault's single-exit cap into transactions spread over time.
@@ -258,6 +264,8 @@ export interface RetryRequest {
   readonly maxFee?: bigint;
   readonly relayer?: string | readonly string[];
   readonly selfRelay?: TransactionSigner;
+  // Caps of a self-relayed retry's own transaction over the wallet's.
+  readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   readonly confirm?: ConfirmSpend;
 }
 
@@ -695,6 +703,45 @@ export class PrivateWallet {
     );
   }
 
+  /**
+   * Restores the vault's code, instance, tree and balance in the asset contract where they are
+   * archived, with one RestoreFootprint transaction that `signer` sends and pays for. No wallet or
+   * proof is needed, so anyone can pay the restore once for every user. Its fee counts against
+   * `networkFeeCaps.resource` plus `networkFeeCaps.restore`, which is 0 unless set.
+   */
+  static async restoreVault(
+    signer: TransactionSigner,
+    options: Pick<
+      ConnectionOptions,
+      | "deployment"
+      | "allowUnpinnedDeployment"
+      | "rpcUrl"
+      | "fetch"
+      | "networkFeeCaps"
+      | "clock"
+      | "sleep"
+    >,
+  ): Promise<VaultRestore> {
+    const deployment = resolveDeployment(
+      options.deployment,
+      options.allowUnpinnedDeployment ?? false,
+    );
+    return restoreEntries(
+      {
+        rpc: new SorobanRpc(options.rpcUrl, options.fetch ?? defaultFetch),
+        networkPassphrase: deployment.networkPassphrase,
+        vault: deployment.vault,
+        feeCaps: { ...DEFAULT_NETWORK_FEE_CAPS, ...options.networkFeeCaps },
+        now: options.clock ?? (() => Date.now()),
+        sleep:
+          options.sleep ??
+          ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+      },
+      signer,
+      vaultKeys(deployment.vault, deployment.vaultWasmHash, deployment.asset.contract),
+    );
+  }
+
   // Runs one operation at a time: in this instance through its queue, and across the instances
   // that share the store through the account lock. Each starts from the latest saved state.
   #run<T>(task: () => Promise<T>): Promise<T> {
@@ -1108,26 +1155,41 @@ export class PrivateWallet {
     readonly amount: bigint;
     readonly signer: TransactionSigner;
     readonly whileSubmitting?: boolean;
+    readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   }): Promise<ShieldReceipt> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      return shield(this.#core, request.amount, request.signer, request.whileSubmitting === true);
+      return shield(
+        this.#core,
+        request.amount,
+        request.signer,
+        request.whileSubmitting === true,
+        request.networkFeeCaps,
+      );
     });
   }
 
   /** Cancels a deposit that is not yet admitted; the signer must be its depositor. */
-  cancelDeposit(id: number, signer: TransactionSigner): Promise<{ readonly txHash: string }> {
+  cancelDeposit(
+    id: number,
+    signer: TransactionSigner,
+    networkFeeCaps?: Partial<NetworkFeeCaps>,
+  ): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      return { txHash: await cancelDeposit(this.#core, id, signer) };
+      return { txHash: await cancelDeposit(this.#core, id, signer, networkFeeCaps) };
     });
   }
 
   /** Claims the refund of a flagged deposit; any account can submit it, the funds go to the depositor. */
-  refundDeposit(id: number, signer: TransactionSigner): Promise<{ readonly txHash: string }> {
+  refundDeposit(
+    id: number,
+    signer: TransactionSigner,
+    networkFeeCaps?: Partial<NetworkFeeCaps>,
+  ): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      return { txHash: await refundDeposit(this.#core, id, signer) };
+      return { txHash: await refundDeposit(this.#core, id, signer, networkFeeCaps) };
     });
   }
 
@@ -1170,6 +1232,7 @@ export class PrivateWallet {
         maxFee: request.maxFee,
         relayers: this.#relayerClients(request.relayer),
         selfRelay: undefined,
+        feeCaps: undefined,
         confirm: request.confirm,
         notBefore: request.notBefore,
         inputs: undefined,
@@ -1208,6 +1271,7 @@ export class PrivateWallet {
         maxFee,
         relayers: request.selfRelay === undefined ? this.#relayerClients(request.relayer) : [],
         selfRelay: request.selfRelay,
+        feeCaps: request.networkFeeCaps,
         confirm: request.confirm,
         notBefore: request.notBefore,
         inputs: undefined,
@@ -1284,6 +1348,7 @@ export class PrivateWallet {
       maxFee: op.maxFee,
       relayers: op.route.kind === "relayers" ? this.#relayerClients(op.route.urls) : [],
       selfRelay: signer,
+      feeCaps: undefined,
       // Later parts were confirmed with the whole operation; their warnings cannot stop them.
       confirm: confirm ?? (() => true),
       notBefore: undefined,
@@ -1455,6 +1520,7 @@ export class PrivateWallet {
         maxFee: request.selfRelay === undefined ? (request.maxFee ?? plan.fee) : 0n,
         relayers: request.selfRelay === undefined ? this.#relayerClients(relayers) : [],
         selfRelay: request.selfRelay,
+        feeCaps: request.networkFeeCaps,
         confirm: request.confirm,
         notBefore: undefined,
         inputs,
@@ -1509,10 +1575,14 @@ export class PrivateWallet {
    * may call it. While the vault cannot pay out, it stops with the queue as it is, and fails with
    * the vault error VaultCannotPay when it could pay nothing.
    */
-  releaseExits(signer: TransactionSigner, max = 10): Promise<{ readonly txHash: string }> {
+  releaseExits(
+    signer: TransactionSigner,
+    max = 10,
+    networkFeeCaps?: Partial<NetworkFeeCaps>,
+  ): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      const { hash } = await invokeVault(invokeContext(this.#core), signer, {
+      const { hash } = await invokeVault(invokeContext(this.#core, networkFeeCaps), signer, {
         fn: "release",
         args: [xdr.ScVal.scvU32(max)],
         transfers: [],
@@ -1529,15 +1599,20 @@ export class PrivateWallet {
   claimExit(
     exitId: number,
     signer: TransactionSigner,
+    networkFeeCaps?: Partial<NetworkFeeCaps>,
   ): Promise<{ readonly txHash: string; readonly requeuedAs: number }> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      const { hash, returnValue } = await invokeVault(invokeContext(this.#core), signer, {
-        fn: "claim",
-        args: [xdr.ScVal.scvU64(new xdr.Uint64(BigInt(exitId)))],
-        transfers: [],
-        extend: claimRoom(this.#core),
-      });
+      const { hash, returnValue } = await invokeVault(
+        invokeContext(this.#core, networkFeeCaps),
+        signer,
+        {
+          fn: "claim",
+          args: [xdr.ScVal.scvU64(new xdr.Uint64(BigInt(exitId)))],
+          transfers: [],
+          extend: claimRoom(this.#core),
+        },
+      );
       if (returnValue?.switch().name !== "scvU64") {
         fail("rpc_error", "the claim returned no exit ID");
       }

@@ -1,5 +1,5 @@
 import { Address, Asset, MuxedAccount, StrKey, scValToBigInt, xdr } from "@stellar/stellar-base";
-import { bytesToHex } from "../bytes.ts";
+import { bytesToHex, hexToBytes } from "../bytes.ts";
 import { fail } from "../errors.ts";
 import { isMuxedAccountId } from "../extdata.ts";
 import { type SorobanRpc, keyId } from "../net/rpc.ts";
@@ -71,6 +71,21 @@ export const pendingKey = (vault: string, id: bigint): xdr.LedgerKey =>
 // The asset contract's entry of a contract's balance.
 export const balanceKey = (token: string, holder: string): xdr.LedgerKey =>
   contractDataKey(token, dataKey("Balance", new Address(holder).toScVal()));
+
+// The entries every call of the vault reads: its code, instance and tree, and its balance in the
+// asset contract.
+export const vaultKeys = (vault: string, wasmHash: string, token: string): xdr.LedgerKey[] => [
+  xdr.LedgerKey.contractCode(
+    new xdr.LedgerKeyContractCode({
+      hash: hexToBytes(wasmHash) as unknown as ReturnType<xdr.LedgerKeyContractCode["hash"]>,
+    }),
+  ),
+  instanceKey(vault),
+  contractDataKey(vault, dataKey("Roots")),
+  contractDataKey(vault, dataKey("Frontier")),
+  contractDataKey(vault, dataKey("NextLeaf")),
+  balanceKey(token, vault),
+];
 
 // The entries a payment of the pool asset to an address writes: for the native asset the account,
 // for an issued one the account's trustline and nothing for its issuer, and for a contract its

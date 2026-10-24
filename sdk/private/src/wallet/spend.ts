@@ -18,7 +18,7 @@ import { addressKeyFor, type AddressKey } from "../keys.ts";
 import type { HeldRequest, Quote, RelayerClient } from "../net/relayer.ts";
 import { proveTransaction } from "../proving.ts";
 import { buildTransaction, type BuiltTransaction, type ExtTerms } from "../transaction.ts";
-import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
+import { type NetworkFeeCaps, type TransactionSigner, invokeVault } from "../vault/invoke.ts";
 import type { VaultInstance } from "../vault/state.ts";
 import {
   type Core,
@@ -81,6 +81,8 @@ export interface SpendIntent {
   readonly maxFee: bigint;
   readonly relayers: readonly RelayerClient[];
   readonly selfRelay: TransactionSigner | undefined;
+  // The caps of a self-relayed unshield's own transaction, over the wallet's.
+  readonly feeCaps: Partial<NetworkFeeCaps> | undefined;
   readonly confirm: ConfirmSpend | undefined;
   readonly notBefore: number | undefined;
   // A retry spends the stalled plan's notes, so at most one of the two can land.
@@ -586,7 +588,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       await core.save();
 
       if (relay === undefined) {
-        return await selfRelay(core, plan, intent.selfRelay as TransactionSigner);
+        return await selfRelay(core, plan, intent.selfRelay as TransactionSigner, intent.feeCaps);
       }
       const result = await relay.client.submit(plan.proof, plan.ext, intent.notBefore);
       if (result.accepted) {
@@ -722,11 +724,16 @@ export async function resendConflicted(
 // The user's own account submits the unshield and pays the network fee. The plan stays
 // submitted until a sync shows its nullifiers and commitments in one transaction, as for a relayed
 // one; the RPC's word that the transaction succeeded does not confirm it.
-async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Promise<Submission> {
+async function selfRelay(
+  core: Core,
+  plan: Plan,
+  signer: TransactionSigner,
+  caps: Partial<NetworkFeeCaps> | undefined,
+): Promise<Submission> {
   const ext: ExtData = extDataFromJson(plan.ext);
   try {
     await invokeVault(
-      invokeContext(core),
+      invokeContext(core, caps),
       signer,
       {
         fn: "transact",
