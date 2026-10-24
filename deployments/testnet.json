@@ -23,5 +23,16 @@
       },
       "relayer_fee_address": "GD2BLMN6PYT32NVBDPVGTYDLNJV3RTMLSK3S3HNLRYBA6RXXOCPXFCNX"
     }
-  ]
+  ],
+  "services": {
+    "tag": "services-v1.0.0",
+    "commit": "3cc2526eef00927d8695908042c66e9f93904e8b",
+    "images": {
+      "indexer": "ghcr.io/cyphras/cyphras-contracts/indexer@sha256:274cff89eea5a1164de8cf3e2fa90e65865597af240e98f6b10c49046d1c9bc5",
+      "relayer": "ghcr.io/cyphras/cyphras-contracts/relayer@sha256:14901e9682cfd724886a9a30539d3e745ed64fb349bcaffa7822864500c045f5",
+      "keeper": "ghcr.io/cyphras/cyphras-contracts/keeper@sha256:0958c82dcfdd5195759053ac387e495ab4d02e75e327c53acfae4f8f2139e028",
+      "screening": "ghcr.io/cyphras/cyphras-contracts/screening@sha256:1064877fecf0c6dd38c46f10c36aa8d241690d9f996c607db498b1d7e211b1ad",
+      "watcher": "ghcr.io/cyphras/cyphras-contracts/watcher@sha256:6657aed58bd482d72732b1531a6329c04613c2d03de6de7127194750409921e0"
+    }
+  }
 }
