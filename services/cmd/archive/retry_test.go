@@ -151,3 +151,65 @@ func TestAStalledAnswerGivesUpAfterTheAttemptTimeoutNotTheClientTimeout(t *testi
 		t.Fatalf("the client has a timeout of %v that spans every try", d)
 	}
 }
+
+func TestAnAnswerThatDropsPartWayThroughItsBodyIsRetried(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) <= 2 {
+			w.Header().Set("Content-Length", "1000")
+			w.WriteHeader(200)
+			_, _ = io.WriteString(w, "start")
+			return
+		}
+		_, _ = io.WriteString(w, "whole answer")
+	}))
+	defer srv.Close()
+	resp, err := clientOf(retrying{}).Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || string(body) != "whole answer" || calls.Load() != 3 {
+		t.Fatalf("%d requests, body %q, %v", calls.Load(), body, err)
+	}
+}
+
+func TestAnAnswerThatAlwaysDropsGivesUpAfterTheAttempts(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "start")
+	}))
+	defer srv.Close()
+	resp, err := clientOf(retrying{}).Get(srv.URL)
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if err == nil || calls.Load() != attempts {
+		t.Fatalf("%d requests, %v", calls.Load(), err)
+	}
+}
+
+func TestAnAnswerLargerThanWhatIsKeptForRetryIsStillReadWhole(t *testing.T) {
+	big := make([]byte, 24<<20)
+	for i := range big {
+		big[i] = byte(i)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(big)
+	}))
+	defer srv.Close()
+	resp, err := clientOf(retrying{}).Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || string(body) != string(big) {
+		t.Fatalf("%d bytes of %d, %v", len(body), len(big), err)
+	}
+}
