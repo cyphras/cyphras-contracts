@@ -11,6 +11,8 @@ import (
 	"io"
 	"slices"
 
+	"github.com/stellar/go-stellar-sdk/xdr"
+
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
@@ -189,7 +191,24 @@ func parseEvent(line []byte, n int, vaultID string) (vault.RawEvent, error) {
 	if err := e.Valid(); err != nil {
 		return vault.RawEvent{}, invalid("line %d: %v", n, err)
 	}
+	for _, s := range append([]string{e.Value}, e.Topics...) {
+		if !canonicalXDR(s) {
+			return vault.RawEvent{}, invalid("line %d is not in canonical form: a topic or value is not the base64 of its own XDR", n)
+		}
+	}
 	return e, nil
+}
+
+// canonicalXDR reports whether s is exactly what encoding its own decoding gives. The base64
+// decoder takes spellings with non-zero spare bits, so the same event could otherwise be
+// written in more than one way.
+func canonicalXDR(s string) bool {
+	var v xdr.ScVal
+	if err := xdr.SafeUnmarshalBase64(s, &v); err != nil {
+		return false
+	}
+	again, err := xdr.MarshalBase64(v)
+	return err == nil && again == s
 }
 
 // gunzip returns the bytes of a gzip file, refusing one that expands past the window limit.
