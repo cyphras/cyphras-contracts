@@ -13,6 +13,8 @@ import (
 type exportHost struct {
 	t                  *testing.T
 	root, log, publish string
+	// cwd is where the script is started from; the root of the host when empty.
+	cwd string
 }
 
 func newExportHost(t *testing.T) *exportHost {
@@ -55,6 +57,7 @@ func (h *exportHost) run(env ...string) (args []string, output string, ok bool) 
 	h.t.Helper()
 	os.Remove(h.log)
 	cmd := exec.Command("bash", filepath.Join(h.root, "services", "deploy", "archive-export.sh"))
+	cmd.Dir = h.cwd
 	cmd.Env = append(os.Environ(),
 		"PATH="+filepath.Join(h.root, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"FAKE_LOG="+h.log, "NETWORK=testnet", "ASSET=xlm", "ARCHIVE_IMAGE="+exportImage, "ARCHIVE_PUBLISH_DIR="+h.publish)
@@ -135,5 +138,35 @@ func TestTheArchiveExportFailsWhenTheExportFailsOrItsSettingsAreWrong(t *testing
 		if ok || len(args) != 0 {
 			t.Errorf("%s: ok %v, docker asked %v\n%s", name, ok, args, out)
 		}
+	}
+}
+
+func TestTheArchiveExportTakesARelativePublishDirectoryFromWhereItWasStarted(t *testing.T) {
+	h := newExportHost(t)
+	h.cwd = h.root
+	args, out, ok := h.run("ARCHIVE_PUBLISH_DIR=publish")
+	if !ok {
+		t.Fatalf("a publish directory relative to the caller's directory was refused:\n%s", out)
+	}
+	if !contains(args, "type=bind,source="+h.publish+",target=/out") {
+		t.Errorf("the publish directory is mounted from the wrong place:\n%s", strings.Join(args, "\n"))
+	}
+	if err := os.Mkdir(filepath.Join(h.root, "services", "deploy", "publish"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h.cwd = t.TempDir()
+	if args, out, ok := h.run("ARCHIVE_PUBLISH_DIR=publish"); ok || len(args) != 0 {
+		t.Errorf("a directory of the script's own folder was taken for the caller's:\n%s", out)
+	}
+}
+
+func TestTheArchiveExportRefusesPathsThatWouldAddMountOptions(t *testing.T) {
+	h := newExportHost(t)
+	odd := filepath.Join(h.root, "pub,readonly")
+	if err := os.Mkdir(odd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if args, out, ok := h.run("ARCHIVE_PUBLISH_DIR=" + odd); ok || len(args) != 0 {
+		t.Errorf("a publish directory with a comma in its name reached docker:\n%s\n%v", out, args)
 	}
 }
