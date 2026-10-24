@@ -313,8 +313,20 @@ export class VaultReader {
   }
 
   // The queued exits among these IDs, in one read.
-  async exits(ids: readonly bigint[]): Promise<Map<bigint, QueuedExitEntry>> {
-    const keys = ids.map((id) => exitKey(this.vault, id));
+  exits(ids: readonly bigint[]): Promise<Map<bigint, QueuedExitEntry>> {
+    return this.#exitEntries(ids, exitKey);
+  }
+
+  // The stranded exits among these IDs, in one read.
+  stranded(ids: readonly bigint[]): Promise<Map<bigint, QueuedExitEntry>> {
+    return this.#exitEntries(ids, strandedKey);
+  }
+
+  async #exitEntries(
+    ids: readonly bigint[],
+    keyOf: (vault: string, id: bigint) => xdr.LedgerKey,
+  ): Promise<Map<bigint, QueuedExitEntry>> {
+    const keys = ids.map((id) => keyOf(this.vault, id));
     const { entries } = await this.#rpc.getLedgerEntries(keys);
     const out = new Map<bigint, QueuedExitEntry>();
     ids.forEach((id, i) => {

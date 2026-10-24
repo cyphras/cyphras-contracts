@@ -52,9 +52,11 @@ import {
   type ChainReads,
   type Core,
   chainReads,
+  claimPayees,
   claimRoom,
   invokeContext,
   newId,
+  releasePayees,
   releaseRoom,
 } from "./core.ts";
 import {
@@ -241,10 +243,10 @@ export interface UnshieldRequest {
   // Caps of a self-relayed unshield's own transactions over the wallet's, as after the user agreed
   // to the fee a fee_above_cap error reported. An unshield that failed so keeps its plan and notes:
   // a single one goes again through retry with these caps. A split one, whose errors name its
-  // operationId, goes on when the same request is made again, which continues that operation, with
-  // the same notes for a part that did not go out, rather than start another; these caps then
-  // apply to the parts that call sends. A new split to the same destination for the same amount
-  // needs that operation abandoned first. Later parts take the caps continueOperations is given.
+  // operationId, stays open: the same split request again, same amount and route, continues it
+  // with these caps for the parts that call sends, and any other unshield to that destination fails
+  // with operation_open until the operation is done, or abandoned with its sent parts settled.
+  // Later parts take the caps continueOperations is given.
   readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   readonly confirm?: ConfirmSpend;
   readonly notBefore?: number;
@@ -1274,28 +1276,33 @@ export class PrivateWallet {
     return this.#run(async () => {
       const caps = feeCapsOf(request.networkFeeCaps);
       await this.#sync(false);
+      // An open operation to this destination may still pay, whatever error stopped it: only the
+      // same split request continues it, and no other unshield there goes beside it.
+      const open = this.#openOperation(request.to);
+      if (open !== undefined) {
+        const continues =
+          request.split === true &&
+          open.total === request.amount &&
+          (open.route.kind === "self"
+            ? open.route.account === request.selfRelay?.publicKey
+            : request.selfRelay === undefined);
+        if (!continues) {
+          fail(
+            "operation_open",
+            "an unshield to this destination is still open; continue it with the same request, or abandon it and wait for its sent parts to settle",
+            { operationId: open.id },
+          );
+        }
+        await this.#advance(open, request.selfRelay, false, caps);
+        await this.#core.save();
+        return this.#operationView(open);
+      }
       const maxFee = request.selfRelay === undefined ? request.maxFee : 0n;
       if (maxFee === undefined) fail("invalid_argument", "a relayed unshield needs maxFee");
       const { limits } = chainReads(this.#core).view.instance;
       const burnToIssuer = request.burnToIssuer === true;
       if (request.split === true && request.amount + maxFee > limits.maxDailyOutflow) {
         checkIssuer(this.#core.deployment.asset.name, request.to, burnToIssuer);
-        // The same request again continues its operation: a part of it may have gone out, and
-        // landed, whatever the error that stopped it said.
-        const same = this.#core.state.operations.find(
-          (op) =>
-            (op.state === "active" || op.state === "blocked") &&
-            op.to === request.to &&
-            op.total === request.amount &&
-            (op.route.kind === "self"
-              ? op.route.account === request.selfRelay?.publicKey
-              : request.selfRelay === undefined),
-        );
-        if (same !== undefined) {
-          await this.#advance(same, request.selfRelay, false, caps);
-          await this.#core.save();
-          return this.#operationView(same);
-        }
         return this.#startSplit(request, maxFee, limits.maxDailyOutflow - maxFee, caps);
       }
       return spend(this.#core, {
@@ -1355,10 +1362,23 @@ export class PrivateWallet {
       state: "active",
       blockedBy: undefined,
     };
-    this.#core.state.operations.push(op);
-    await this.#core.save();
+    // The operation is saved with its first plan, in one write: one whose first part stops before
+    // a plan exists was never started, and nothing of it goes later.
     await this.#nextPart(op, request.selfRelay, undefined, undefined, request.confirm, caps);
     return this.#operationView(op);
+  }
+
+  // The operation of this wallet that is open for a destination: active or blocked, or with a part
+  // that may still land.
+  #openOperation(to: string): Operation | undefined {
+    const { operations, plans } = this.#core.state;
+    return operations.find(
+      (op) =>
+        op.to === to &&
+        (op.state === "active" ||
+          op.state === "blocked" ||
+          plans.some((p) => p.operationId === op.id && isActive(p))),
+    );
   }
 
   #sent(op: Operation): bigint {
@@ -1399,9 +1419,17 @@ export class PrivateWallet {
       // submission, and sends nothing more until its fate is known.
       onPlan: (plan) => {
         op.awaiting = plan.id;
+        const { operations } = this.#core.state;
+        if (!operations.includes(op)) operations.push(op);
       },
     }).catch((err: unknown) => {
-      if (!(err instanceof CyphrasError) || "operationId" in err.details) throw err;
+      if (
+        !(err instanceof CyphrasError) ||
+        "operationId" in err.details ||
+        !this.#core.state.operations.includes(op)
+      ) {
+        throw err;
+      }
       throw new CyphrasError(
         err.code,
         err.message,
@@ -1511,8 +1539,13 @@ export class PrivateWallet {
     return this.#run(async () => {
       const caps = feeCapsOf(networkFeeCaps);
       await this.#sync(false);
-      for (const op of this.#core.state.operations) await this.#advance(op, signer, false, caps);
+      // One operation's error stops none of the others; the first is raised once all went on.
+      const errors: unknown[] = [];
+      for (const op of [...this.#core.state.operations]) {
+        await this.#advance(op, signer, false, caps).catch((err: unknown) => errors.push(err));
+      }
       await this.#core.save();
+      if (errors.length > 0) throw errors[0];
       return this.#core.state.operations.map((op) => this.#operationView(op));
     });
   }
@@ -1540,7 +1573,8 @@ export class PrivateWallet {
 
   /**
    * Stops a split unshield that is not done: nothing more of it is sent. Parts already sent are
-   * followed as before, and count as sent once they land.
+   * followed as before, and count as sent once they land. Another unshield to its destination
+   * fails with operation_open until those parts have settled, landed or dead.
    */
   abandonOperation(operationId: string): Promise<OperationView> {
     return this.#run(async () => {
@@ -1668,6 +1702,7 @@ export class PrivateWallet {
         args: [xdr.ScVal.scvU32(max)],
         transfers: [],
         extend: releaseRoom(this.#core, max),
+        payees: await releasePayees(this.#core, max),
       });
       return { txHash: hash };
     });
@@ -1690,6 +1725,7 @@ export class PrivateWallet {
         args: [xdr.ScVal.scvU64(new xdr.Uint64(BigInt(exitId)))],
         transfers: [],
         extend: claimRoom(this.#core),
+        payees: await claimPayees(this.#core, BigInt(exitId)),
       });
       if (returnValue?.switch().name !== "scvU64") {
         fail("rpc_error", "the claim returned no exit ID");
