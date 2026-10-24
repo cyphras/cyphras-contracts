@@ -79,11 +79,38 @@ func TestTheArchiveRoutesKeepTheServersSecurityHeadersAndNothingThatRewritesAPat
 	}
 }
 
-func TestTheArchiveRoutesNeverFollowALink(t *testing.T) {
+func TestTheArchiveRoutesNeverFollowALinkAndAreRateLimited(t *testing.T) {
 	_, served := archiveLocations(t)
+	zones, err := os.ReadFile("nginx/conf.d/cyphras-v2-zones.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defined := func(directive, zone string) bool {
+		return regexp.MustCompile(`(?m)^` + directive + ` \$cy_(client|site) zone=` + zone + `[:\s]`).Match(zones)
+	}
 	for _, l := range served {
 		if !strings.Contains(l.body, "disable_symlinks on;\n") {
 			t.Errorf("%s follows symbolic links", l.spec)
+		}
+		for _, line := range []string{"limit_req_status 429;", "limit_conn_status 429;", "limit_req_log_level notice;", "limit_conn_log_level notice;"} {
+			if !strings.Contains(l.body, line+"\n") {
+				t.Errorf("%s lacks %q", l.spec, line)
+			}
+		}
+		requests := regexp.MustCompile(`(?m)^limit_req zone=(\w+) `).FindAllStringSubmatch(l.body, -1)
+		conns := regexp.MustCompile(`(?m)^limit_conn (\w+) `).FindAllStringSubmatch(l.body, -1)
+		if len(requests) != 2 || len(conns) != 2 {
+			t.Errorf("%s limits requests by %d zones and connections by %d, want a per-client and a per-site zone of each", l.spec, len(requests), len(conns))
+		}
+		for _, r := range requests {
+			if !defined("limit_req_zone", r[1]) {
+				t.Errorf("%s uses the zone %s, which conf.d does not define", l.spec, r[1])
+			}
+		}
+		for _, c := range conns {
+			if !defined("limit_conn_zone", c[1]) {
+				t.Errorf("%s uses the zone %s, which conf.d does not define", l.spec, c[1])
+			}
 		}
 	}
 }
