@@ -321,6 +321,9 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	fmt.Fprintln(out, "format checks passed")
 	fmt.Fprintf(out, "chain checks passed for vault %s at ledger %d: %d of its %d leaves, %d nullifiers present\n",
 		want.Vault, report.Ledger, report.Leaves, report.ChainLeaves, report.Nullifiers)
+	if report.TailLeaves > 0 {
+		fmt.Fprintf(out, "the vault is further ahead than its root ring reaches: its %d leaves after the archive were read from the RPC's events\n", report.TailLeaves)
+	}
 	return nil
 }
 
