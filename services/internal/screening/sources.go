@@ -355,12 +355,16 @@ type DirectorySource struct {
 	HTTP    *http.Client
 	// Pause spaces the pages out: the API answers a burst of them with 429.
 	Pause time.Duration
+	// Every is how long a downloaded directory is kept before the next download. A download takes
+	// minutes, and refreshes run one source after another, so redoing it each round would delay
+	// the sources that age in minutes.
+	Every time.Duration
 	now   func() time.Time
 }
 
 // NewDirectorySource reads the directory API at baseURL, such as https://api.stellar.expert.
 func NewDirectorySource(baseURL string, maxAge time.Duration) *DirectorySource {
-	return &DirectorySource{list: list{name: "stellar_expert", maxAge: maxAge}, BaseURL: strings.TrimSuffix(baseURL, "/"), HTTP: &http.Client{Timeout: time.Minute}, Pause: 2 * time.Second, now: time.Now}
+	return &DirectorySource{list: list{name: "stellar_expert", maxAge: maxAge}, BaseURL: strings.TrimSuffix(baseURL, "/"), HTTP: &http.Client{Timeout: time.Minute}, Pause: 2 * time.Second, Every: time.Hour, now: time.Now}
 }
 
 // directoryRetries is how often a page the API refused with 429 is asked for again.
@@ -411,6 +415,9 @@ const directoryPageSize = 200
 // Refresh implements Source. The whole tagged list is downloaded, so no address being screened is
 // ever sent to the directory.
 func (s *DirectorySource) Refresh(ctx context.Context) error {
+	if fetched := s.Status().FetchedAt; !fetched.IsZero() && s.now().Sub(fetched) < s.Every {
+		return nil
+	}
 	entries := map[string]Hit{}
 	for _, tag := range []string{"malicious", "unsafe"} {
 		next := fmt.Sprintf("/explorer/directory?tag[]=%s&limit=%d", url.QueryEscape(tag), directoryPageSize)

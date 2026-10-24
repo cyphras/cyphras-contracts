@@ -393,6 +393,33 @@ func TestADirectoryPageRefusedForRateIsAskedForAgain(t *testing.T) {
 	}
 }
 
+func TestTheDirectoryIsDownloadedAgainOnlyAfterEvery(t *testing.T) {
+	asked := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked++
+		records := []directoryRecord{{Address: thief, Name: "Scam"}}
+		_ = json.NewEncoder(w).Encode(directoryPage{Embedded: &struct {
+			Records *[]directoryRecord `json:"records"`
+		}{Records: &records}})
+	}))
+	defer srv.Close()
+	now := time.Unix(1_728_000_000, 0)
+	s := NewDirectorySource(srv.URL, 24*time.Hour)
+	s.Pause, s.now = 0, func() time.Time { return now }
+	for _, step := range []struct {
+		after time.Duration
+		asked int
+	}{{0, 2}, {5 * time.Minute, 2}, {time.Hour, 4}} {
+		now = now.Add(step.after)
+		if err := s.Refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if asked != step.asked {
+			t.Fatalf("after %v: %d requests", step.after, asked)
+		}
+	}
+}
+
 func TestADirectoryThatKeepsRefusingFailsTheRefresh(t *testing.T) {
 	asked := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
