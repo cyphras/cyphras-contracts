@@ -86,7 +86,7 @@ func TestTheServerNeverFollowsASymbolicLink(t *testing.T) {
 }
 
 func TestVerifyFetchesNoWindowForAManifestTheVaultCannotHold(t *testing.T) {
-	dir, _ := exportSample(t)
+	dir, deployment := exportSample(t)
 	var windows atomic.Int32
 	files := http.FileServer(http.Dir(dir))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -100,14 +100,14 @@ func TestVerifyFetchesNoWindowForAManifestTheVaultCannotHold(t *testing.T) {
 	fake.SetLatest(window)
 	t.Cleanup(func(old func(string) rpc.Client) func() { return func() { dialRPC = old } }(dialRPC))
 	dialRPC = func(string) rpc.Client { return fake }
-	_, err := do(t, "verify", "--url", srv.URL, "--rpc", "http://rpc.invalid")
+	_, err := do(t, "verify", "--url", srv.URL, "--rpc", "http://rpc.invalid", "--deployment", deployment)
 	if err == nil || windows.Load() != 0 {
 		t.Fatalf("a manifest that covers ledgers the RPC has not closed: %v, %d windows fetched", err, windows.Load())
 	}
 }
 
 func TestVerifyAsksEveryRPCItIsGiven(t *testing.T) {
-	dir, _ := exportSample(t)
+	dir, deployment := exportSample(t)
 	honest, other := chainFake(t, dir), chainFake(t, dir)
 	c, err := vaultarchive.Load(context.Background(), vaultarchive.DirFetcher(dir), vaultarchive.Expect{})
 	if err != nil {
@@ -125,10 +125,49 @@ func TestVerifyAsksEveryRPCItIsGiven(t *testing.T) {
 		}
 		return honest
 	}
-	if _, err := do(t, "verify", "--dir", dir, "--rpc", "http://first.invalid"); err != nil {
+	if _, err := do(t, "verify", "--dir", dir, "--rpc", "http://first.invalid", "--deployment", deployment); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := do(t, "verify", "--dir", dir, "--rpc", "http://second.invalid", "--rpc", "http://first.invalid"); err == nil || !strings.Contains(err.Error(), "has no entry in the vault") {
+	if _, err := do(t, "verify", "--dir", dir, "--rpc", "http://second.invalid", "--rpc", "http://first.invalid", "--deployment", deployment); err == nil || !strings.Contains(err.Error(), "has no entry in the vault") {
 		t.Fatalf("a second RPC that does not know a nullifier: %v", err)
+	}
+}
+
+func TestTheChainChecksNeedToKnowWhichVaultTheArchiveIsOf(t *testing.T) {
+	dir, deployment := exportSample(t)
+	fake := chainFake(t, dir)
+	t.Cleanup(func(old func(string) rpc.Client) func() { return func() { dialRPC = old } }(dialRPC))
+	dialRPC = func(string) rpc.Client { return fake }
+	rpcFlag := []string{"--dir", dir, "--rpc", "http://rpc.invalid"}
+	with := func(more ...string) []string { return append(append([]string{"verify"}, rpcFlag...), more...) }
+
+	if _, err := do(t, with()...); err == nil {
+		t.Fatal("an archive was confirmed against whatever vault its manifest names")
+	}
+	if _, err := do(t, with("--vault", vaulttest.Vault)...); err == nil {
+		t.Fatal("a vault without the network it is on pinned nothing")
+	}
+	if _, err := do(t, with("--passphrase", passphrase)...); err == nil {
+		t.Fatal("a network without a vault pinned nothing")
+	}
+	out, err := do(t, with("--deployment", deployment)...)
+	if err != nil || !strings.Contains(out, "chain checks passed for vault "+vaulttest.Vault) {
+		t.Fatalf("pinned by the deployment file: %q, %v", out, err)
+	}
+	out, err = do(t, with("--vault", vaulttest.Vault, "--passphrase", passphrase)...)
+	if err != nil || !strings.Contains(out, "chain checks passed for vault "+vaulttest.Vault) {
+		t.Fatalf("pinned by vault and passphrase: %q, %v", out, err)
+	}
+	if _, err := do(t, with("--vault", vaulttest.Token, "--passphrase", passphrase)...); err == nil {
+		t.Fatal("an archive of another vault than the pinned one was confirmed")
+	}
+	if _, err := do(t, with("--vault", vaulttest.Vault, "--passphrase", "Public Global Stellar Network ; September 2015")...); err == nil {
+		t.Fatal("an archive of another network than the pinned one was confirmed")
+	}
+	if _, err := do(t, with("--deployment", deployment, "--passphrase", passphrase)...); err == nil {
+		t.Fatal("a passphrase next to a deployment file was taken")
+	}
+	if _, err := do(t, "verify", "--dir", dir, "--format-only"); err != nil {
+		t.Fatalf("the format checks need no pin: %v", err)
 	}
 }

@@ -398,7 +398,7 @@ func TestVerifyAcceptsAGoodArchiveAndRefusesATamperedLeafAndAMissingNullifier(t 
 	t.Cleanup(func(old func(string) rpc.Client) func() { return func() { dialRPC = old } }(dialRPC))
 	dialRPC = func(string) rpc.Client { return fake }
 	out, err := do(t, "verify", "--dir", dir, "--rpc", "http://rpc.invalid", "--deployment", deployment)
-	if err != nil || !strings.Contains(out, "chain checks passed") || !strings.Contains(out, "8 of the vault's 8 leaves, 8 nullifiers present") {
+	if err != nil || !strings.Contains(out, "chain checks passed") || !strings.Contains(out, "8 of its 8 leaves, 8 nullifiers present") {
 		t.Fatalf("a good archive: %q, %v", out, err)
 	}
 	if _, err := do(t, "verify", "--dir", dir, "--format-only", "--deployment", writeDeployment(t, vaulttest.Token)); err == nil || !strings.Contains(err.Error(), "archive of vault") {
@@ -419,7 +419,7 @@ func TestVerifyAcceptsAGoodArchiveAndRefusesATamperedLeafAndAMissingNullifier(t 
 	}
 	missing.DeleteEntry(k)
 	dialRPC = func(string) rpc.Client { return missing }
-	if _, err := do(t, "verify", "--dir", dir, "--rpc", "http://rpc.invalid"); err == nil || !strings.Contains(err.Error(), "has no entry in the vault") {
+	if _, err := do(t, "verify", "--dir", dir, "--rpc", "http://rpc.invalid", "--deployment", deployment); err == nil || !strings.Contains(err.Error(), "has no entry in the vault") {
 		t.Fatalf("a nullifier the vault never spent: %v", err)
 	}
 
@@ -432,7 +432,7 @@ func TestVerifyAcceptsAGoodArchiveAndRefusesATamperedLeafAndAMissingNullifier(t 
 	if out, err := do(t, "verify", "--dir", tampered, "--format-only"); err != nil {
 		t.Fatalf("the tampered archive is well formed: %q, %v", out, err)
 	}
-	if _, err := do(t, "verify", "--dir", tampered, "--rpc", "http://rpc.invalid"); err == nil || !strings.Contains(err.Error(), "never held") {
+	if _, err := do(t, "verify", "--dir", tampered, "--rpc", "http://rpc.invalid", "--deployment", deployment); err == nil || !strings.Contains(err.Error(), "never held") {
 		t.Fatalf("a tampered leaf: %v", err)
 	}
 }

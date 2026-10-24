@@ -31,7 +31,7 @@ import (
 const usage = `usage:
   archive export  --dir <indexer archive> --deployment <file> --out <dir> [--vault <id>] [--network <name>]
   archive rebuild --ledger-meta <url> --deployment <file> --out <dir> [--vault <id>] [--network <name>] [--from <ledger>] [--to <ledger> | --rpc <url>] [--workers <n>]
-  archive verify  (--dir <dir> | --url <base>) (--rpc <url>... | --format-only) [--deployment <file> [--vault <id>]]
+  archive verify  (--dir <dir> | --url <base>) (--rpc <url>... | --format-only) [--deployment <file> [--vault <id>] | --vault <id> --passphrase <text>]
   archive serve   --dir <dir> [--addr 127.0.0.1:8737]`
 
 // dialRPC is replaced by tests.
@@ -275,6 +275,7 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	formatOnly := fs.Bool("format-only", false, "check the format only, without asking the chain")
 	deployment := fs.String("deployment", "", "a deployment file that pins the vault, network and deploy ledger")
 	vaultID := fs.String("vault", "", "the vault, when the deployment file lists several")
+	passphrase := fs.String("passphrase", "", "the network passphrase, to pin the vault without a deployment file")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -284,8 +285,14 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	if (len(rpcURLs) == 0) == !*formatOnly {
 		return errors.New("give --rpc, or --format-only to skip the chain checks")
 	}
-	if *vaultID != "" && *deployment == "" {
-		return errors.New("--vault needs --deployment, which is what pins it")
+	pinned := *deployment != "" || (*vaultID != "" && *passphrase != "")
+	switch {
+	case *deployment != "" && *passphrase != "":
+		return errors.New("--passphrase is for use without --deployment, which carries it")
+	case !pinned && (*vaultID != "" || *passphrase != ""):
+		return errors.New("--vault needs --deployment, or --passphrase with it, to pin anything")
+	case !pinned && !*formatOnly:
+		return errors.New("the chain checks need to know which vault the archive is of: give --deployment, or --vault and --passphrase")
 	}
 	var want vaultarchive.Expect
 	if *deployment != "" {
@@ -294,6 +301,8 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 			return err
 		}
 		want = vaultarchive.Expect{Vault: v.Vault, NetworkPassphrase: d.NetworkPassphrase, DeployLedger: v.DeployLedger}
+	} else if pinned {
+		want = vaultarchive.Expect{Vault: *vaultID, NetworkPassphrase: *passphrase}
 	}
 	var fetch vaultarchive.Fetcher = vaultarchive.DirFetcher(*dir)
 	if *url != "" {
@@ -318,8 +327,8 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	}
 	summary(out, contents.Manifest)
 	fmt.Fprintln(out, "format checks passed")
-	fmt.Fprintf(out, "chain checks passed at ledger %d: %d of the vault's %d leaves, %d nullifiers present\n",
-		report.Ledger, report.Leaves, report.ChainLeaves, report.Nullifiers)
+	fmt.Fprintf(out, "chain checks passed for vault %s at ledger %d: %d of its %d leaves, %d nullifiers present\n",
+		want.Vault, report.Ledger, report.Leaves, report.ChainLeaves, report.Nullifiers)
 	return nil
 }
 
