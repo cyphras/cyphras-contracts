@@ -12,8 +12,13 @@
 # a window it already published, the export fails and leaves the directory as it was. Set
 # ARCHIVE_VAULT when the deployment file lists several vaults.
 set -euo pipefail
-cd "$(dirname "$0")"
 : "${NETWORK:?}" "${ASSET:?}" "${ARCHIVE_IMAGE:?}" "${ARCHIVE_PUBLISH_DIR:?}"
+if ! [ -d "$ARCHIVE_PUBLISH_DIR" ]; then
+  echo "$ARCHIVE_PUBLISH_DIR is not a directory" >&2
+  exit 1
+fi
+publish=$(cd "$ARCHIVE_PUBLISH_DIR" && pwd)
+cd "$(dirname "$0")"
 if ! [[ "$NETWORK" =~ ^[a-z]+$ ]] || ! [[ "$ASSET" =~ ^[a-z0-9]+$ ]]; then
   echo "NETWORK and ASSET must be lowercase names" >&2
   exit 1
@@ -29,14 +34,17 @@ if ! [[ "$uid" =~ ^[0-9]+$ ]] || [ "$uid" -eq 0 ]; then
 fi
 events="$PWD/data/$NETWORK/$ASSET/archive"
 deployment="$(cd ../.. && pwd)/deployments/$NETWORK.json"
-for path in "$events" "$ARCHIVE_PUBLISH_DIR"; do
-  if ! [ -d "$path" ]; then
-    echo "$path is not a directory" >&2
-    exit 1
-  fi
-done
+if ! [ -d "$events" ]; then
+  echo "$events is not a directory" >&2
+  exit 1
+fi
 if ! [ -f "$deployment" ]; then
   echo "$deployment is not a file" >&2
+  exit 1
+fi
+# A comma would start another option of the mount.
+if [[ "$events$publish$deployment" == *,* ]]; then
+  echo "the paths of the mounts must not contain a comma" >&2
   exit 1
 fi
 vault=()
@@ -47,6 +55,6 @@ exec docker run --rm --pull never --network none --read-only --cap-drop ALL \
   --security-opt no-new-privileges:true --user "$uid:$uid" \
   --mount "type=bind,source=$events,target=/in,readonly" \
   --mount "type=bind,source=$deployment,target=/etc/cyphras/deployment.json,readonly" \
-  --mount "type=bind,source=$(cd "$ARCHIVE_PUBLISH_DIR" && pwd),target=/out" \
+  --mount "type=bind,source=$publish,target=/out" \
   "$ARCHIVE_IMAGE" export --dir /in --deployment /etc/cyphras/deployment.json --out /out \
   --network "$NETWORK" ${vault[@]+"${vault[@]}"}

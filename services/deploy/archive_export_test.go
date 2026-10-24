@@ -148,7 +148,11 @@ func TestTheArchiveExportTakesARelativePublishDirectoryFromWhereItWasStarted(t *
 	if !ok {
 		t.Fatalf("a publish directory relative to the caller's directory was refused:\n%s", out)
 	}
-	if !contains(args, "type=bind,source="+h.publish+",target=/out") {
+	physical, err := filepath.EvalSymlinks(h.publish)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(args, "type=bind,source="+h.publish+",target=/out") && !contains(args, "type=bind,source="+physical+",target=/out") {
 		t.Errorf("the publish directory is mounted from the wrong place:\n%s", strings.Join(args, "\n"))
 	}
 	if err := os.Mkdir(filepath.Join(h.root, "services", "deploy", "publish"), 0o755); err != nil {
