@@ -103,9 +103,9 @@ func (v *View) Admits(m Manifest) error {
 // the tree, must give the vault's current root, or the root it held at that many leaves if it
 // has moved on by up to 255 pairs. Past that the root ring no longer holds it, and the tree is
 // carried on with the vault's own events after the archive's last ledger, read from the RPC,
-// until it must give the current root; that needs the RPC to still keep those ledgers. Every nullifier the archive lists must have an entry, live or
-// archived, so a nullifier made up cannot pass. A nullifier the archive leaves out cannot be
-// seen from here.
+// until it must give the current root; that needs the RPC to still keep those ledgers. Every
+// nullifier the archive lists must have an entry, live or archived, so a nullifier made up cannot
+// pass. A nullifier the archive leaves out cannot be seen from here.
 func (v *View) Verify(ctx context.Context, contents *Contents) (Report, error) {
 	report := Report{Leaves: uint64(len(contents.Commitments)), ChainLeaves: v.Next, Nullifiers: len(contents.Nullifiers), Ledger: v.Latest}
 	if err := v.checkRoot(ctx, contents, &report); err != nil {
