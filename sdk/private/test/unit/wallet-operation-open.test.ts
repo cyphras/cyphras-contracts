@@ -115,3 +115,84 @@ describe("another unshield to a destination with an open operation", () => {
     assert.equal(signer.signed(), 1);
   });
 });
+
+describe("a new unshield beside a single one that may still land", () => {
+  // A wallet with notes of 100 and 50 XLM, and an unshield of 10 XLM whose wallet rejected its
+  // transaction, so its plan may still land.
+  async function stalled() {
+    const world = await createWorld();
+    const alice = await openWallet(world, 0);
+    for (const amount of [100n * XLM, 50n * XLM]) {
+      await alice.shield({ amount, signer: world.signer("alice depositor") });
+    }
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    world.rpc.sent = [];
+    const destination = world.signer("exchange").publicKey;
+    const signer = counting(world);
+    const rejecting: TransactionSigner = {
+      publicKey: signer.publicKey,
+      signTransaction: async () => ({ signedTxXdr: "", error: "User declined access" }),
+    };
+    const err = await alice
+      .unshield({ to: destination, amount: 10n * XLM, selfRelay: rejecting, confirm: confirmAll })
+      .catch((e: unknown) => e);
+    assert.ok(isError("signer_rejected")(err));
+    const planId = (err as CyphrasError).details["planId"] as string;
+    return { world, alice, destination, signer, planId };
+  }
+
+  it("is refused before anything is proved or sent, and the plan goes on through retry", async () => {
+    const { world, alice, destination, signer, planId } = await stalled();
+    const refused = (e: unknown): boolean =>
+      e instanceof CyphrasError && e.code === "operation_open" && e.details["planId"] === planId;
+    await assert.rejects(
+      alice.unshield({ to: destination, amount: 5n * XLM, selfRelay: signer, confirm: confirmAll }),
+      refused,
+    );
+    await assert.rejects(
+      alice.unshield({ to: destination, amount: 10n * XLM, maxFee: 2n * XLM, confirm: confirmAll }),
+      refused,
+    );
+    assert.equal((await alice.plans()).length, 1);
+    assert.equal(signer.signed(), 0);
+    assert.deepEqual(world.rpc.sent, []);
+    // Another destination is not held back.
+    await alice.unshield({
+      to: world.signer("merchant").publicKey,
+      amount: 5n * XLM,
+      selfRelay: signer,
+      confirm: confirmAll,
+    });
+    assert.equal(signer.signed(), 1);
+    await alice.retry(planId, { selfRelay: signer, confirm: confirmAll });
+    assert.equal(signer.signed(), 2);
+    assert.equal(world.rpc.sent.length, 2);
+    // Once it landed, the destination is free again.
+    await alice.unshield({
+      to: destination,
+      amount: 5n * XLM,
+      selfRelay: signer,
+      confirm: confirmAll,
+    });
+    assert.equal(signer.signed(), 3);
+    const paid = world.vault.transfers.filter((t) => t.to === destination).map((t) => t.amount);
+    assert.deepEqual(paid, [10n * XLM, 5n * XLM]);
+  });
+
+  it("goes once the single plan is dead past its deadline", async () => {
+    const { world, alice, destination, signer } = await stalled();
+    world.advance(121 * 5);
+    world.fill(1);
+    await alice.sync();
+    assert.equal((await alice.plans())[0]?.state, "dead");
+    await alice.unshield({
+      to: destination,
+      amount: 5n * XLM,
+      selfRelay: signer,
+      confirm: confirmAll,
+    });
+    assert.equal(signer.signed(), 1);
+  });
+});
