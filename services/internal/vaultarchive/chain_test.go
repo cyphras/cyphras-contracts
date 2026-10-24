@@ -9,6 +9,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
+	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc/rpctest"
 	"github.com/cyphras/cyphras-contracts/services/internal/tree"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
@@ -163,6 +164,10 @@ func TestTheChainChecksRefuseAnotherNetworkAndMissingEntries(t *testing.T) {
 
 // ringOf lays the roots out as the vault does: the root after pair j in slot j modulo the ring.
 func ringOf(roots []fr.Element) xdr.ScVal {
+	return ringEndingAt(roots, uint32((len(roots)-1)%vault.RootHistory))
+}
+
+func ringEndingAt(roots []fr.Element, newest uint32) xdr.ScVal {
 	ring := make([]xdr.ScVal, vault.RootHistory)
 	for i := range ring {
 		ring[i] = vaulttest.Field(fr.Element{})
@@ -170,7 +175,6 @@ func ringOf(roots []fr.Element) xdr.ScVal {
 	for j, r := range roots {
 		ring[j%vault.RootHistory] = vaulttest.Field(r)
 	}
-	newest := uint32((len(roots) - 1) % vault.RootHistory)
 	return vault.Struct(vault.Field{Name: "roots", Value: vault.Vec(ring...)}, vault.Field{Name: "newest", Value: vault.U32(newest)})
 }
 
@@ -213,5 +217,71 @@ func TestAManifestThatClaimsMoreThanTheVaultHasIsRefusedBeforeAnyWindowIsFetched
 	contents, report, err := VerifyArchive(ctx, fetch, Expect{}, good)
 	if err != nil || fetch.windows != 2 || report.Leaves != 8 || len(contents.Commitments) != 8 {
 		t.Fatalf("a good archive: %d windows, %+v, %v", fetch.windows, report, err)
+	}
+}
+
+func TestAnRPCThatAnswersWithAnotherEntryThanAskedForIsNotBelieved(t *testing.T) {
+	ctx := context.Background()
+	c := loaded(t)
+	v := vaulttest.Vault
+
+	f := chainOf(t, c)
+	asked := mustKey(vault.NullifierKey(v, c.Nullifiers[2].Bytes()))
+	other, _, err := rpc.One(ctx, f, mustKey(vault.NullifierKey(v, c.Nullifiers[3].Bytes())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetEntry(asked, other.Data, 100, nil)
+	if _, err := VerifyChain(ctx, f, c); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), c.Nullifiers[2].Hex()) {
+		t.Fatalf("a nullifier answered with the entry of another: %v", err)
+	}
+
+	f = chainOf(t, c)
+	next, _, err := rpc.One(ctx, f, mustKey(vault.NextLeafKey(v)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetEntry(mustKey(vault.RootsKey(v)), next.Data, 100, nil)
+	if _, err := VerifyChain(ctx, f, c); !errors.Is(err, ErrChain) {
+		t.Fatalf("the root ring answered with the leaf count: %v", err)
+	}
+}
+
+func TestARootRingThatEndsWhereTheLeafCountCannotPutItIsNotBelieved(t *testing.T) {
+	c := loaded(t)
+	f := chainOf(t, c)
+	roots := []fr.Element{tree.Zero(tree.Depth)}
+	var tr tree.Tree
+	for i := 0; i < len(c.Commitments); i += 2 {
+		if _, err := tr.AppendPair(c.Commitments[i], c.Commitments[i+1]); err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, tr.Root())
+	}
+	// The ring holds the right roots but points at an older one as the newest.
+	f.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), ringEndingAt(roots, 3), 100, nil)
+	if _, err := VerifyChain(context.Background(), f, c); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), "root ring ends at slot 3") {
+		t.Fatalf("a ring that ends in the wrong slot: %v", err)
+	}
+}
+
+func TestEveryRPCMustConfirmTheArchive(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := good(t)
+	c := loaded(t)
+	fetch := DirFetcher(dir)
+	honest, alsoHonest := chainOf(t, c), chainOf(t, c)
+	if _, _, err := VerifyArchive(ctx, fetch, Expect{}, honest, alsoHonest); err != nil {
+		t.Fatal(err)
+	}
+	forged := &Contents{Manifest: c.Manifest, Commitments: append([]fr.Element(nil), c.Commitments...), Nullifiers: c.Nullifiers}
+	forged.Commitments[5] = fr.SetUint64(99)
+	for name, views := range map[string][]rpc.Client{
+		"the first lies":  {chainOf(t, forged), honest},
+		"the second lies": {honest, chainOf(t, forged)},
+	} {
+		if _, _, err := VerifyArchive(ctx, fetch, Expect{}, views...); !errors.Is(err, ErrChain) {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 }

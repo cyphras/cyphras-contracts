@@ -31,7 +31,7 @@ import (
 const usage = `usage:
   archive export  --dir <indexer archive> --deployment <file> --out <dir> [--vault <id>] [--network <name>]
   archive rebuild --ledger-meta <url> --deployment <file> --out <dir> [--vault <id>] [--network <name>] [--from <ledger>] [--to <ledger> | --rpc <url>] [--workers <n>]
-  archive verify  (--dir <dir> | --url <base>) (--rpc <url> | --format-only) [--deployment <file> [--vault <id>]]
+  archive verify  (--dir <dir> | --url <base>) (--rpc <url>... | --format-only) [--deployment <file> [--vault <id>]]
   archive serve   --dir <dir> [--addr 127.0.0.1:8737]`
 
 // dialRPC is replaced by tests.
@@ -270,7 +270,8 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	fs := flags("verify", out)
 	dir := fs.String("dir", "", "an archive in a directory")
 	url := fs.String("url", "", "an archive at a base URL")
-	rpcURL := fs.String("rpc", "", "the RPC the chain checks read")
+	var rpcURLs stringList
+	fs.Var(&rpcURLs, "rpc", "an RPC the chain checks read; give several and each must confirm the archive")
 	formatOnly := fs.Bool("format-only", false, "check the format only, without asking the chain")
 	deployment := fs.String("deployment", "", "a deployment file that pins the vault, network and deploy ledger")
 	vaultID := fs.String("vault", "", "the vault, when the deployment file lists several")
@@ -280,7 +281,7 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	if (*dir == "") == (*url == "") {
 		return errors.New("give --dir or --url")
 	}
-	if (*rpcURL == "") == !*formatOnly {
+	if (len(rpcURLs) == 0) == !*formatOnly {
 		return errors.New("give --rpc, or --format-only to skip the chain checks")
 	}
 	if *vaultID != "" && *deployment == "" {
@@ -307,7 +308,11 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 		fmt.Fprintln(out, "format checks passed")
 		return nil
 	}
-	contents, report, err := vaultarchive.VerifyArchive(ctx, fetch, want, dialRPC(*rpcURL))
+	clients := make([]rpc.Client, len(rpcURLs))
+	for i, u := range rpcURLs {
+		clients[i] = dialRPC(u)
+	}
+	contents, report, err := vaultarchive.VerifyArchive(ctx, fetch, want, clients...)
 	if err != nil {
 		return err
 	}
@@ -315,6 +320,16 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	fmt.Fprintln(out, "format checks passed")
 	fmt.Fprintf(out, "chain checks passed at ledger %d: %d of the vault's %d leaves, %d nullifiers present\n",
 		report.Ledger, report.Leaves, report.ChainLeaves, report.Nullifiers)
+	return nil
+}
+
+// stringList is a flag that may be given more than once.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	*l = append(*l, v)
 	return nil
 }
 

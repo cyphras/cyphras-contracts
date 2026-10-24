@@ -55,8 +55,8 @@ func ReadView(ctx context.Context, c rpc.Client, vaultID, passphrase string) (*V
 	if err != nil {
 		return nil, err
 	}
-	rootsEntry, ok0 := entries[mustKeyString(rootsKey)]
-	nextEntry, ok1 := entries[mustKeyString(nextKey)]
+	rootsEntry, ok0 := entryOf(entries, rootsKey)
+	nextEntry, ok1 := entryOf(entries, nextKey)
 	if !ok0 || !ok1 {
 		return nil, fmt.Errorf("%w: the vault's tree entries are missing", ErrChain)
 	}
@@ -75,6 +75,9 @@ func ReadView(ctx context.Context, c rpc.Client, vaultID, passphrase string) (*V
 	next, ok := nextVal.GetU64()
 	if !ok || next%2 != 0 {
 		return nil, fmt.Errorf("%w: the vault's next leaf is not an even u64", ErrChain)
+	}
+	if want := uint32((uint64(next) / 2) % vault.RootHistory); ring.Newest != want {
+		return nil, fmt.Errorf("%w: the root ring ends at slot %d, but %d leaves put it at %d", ErrChain, ring.Newest, next, want)
 	}
 	return &View{client: c, vault: vaultID, ring: ring, Next: uint64(next), Latest: latest}, nil
 }
@@ -116,7 +119,7 @@ func (v *View) Verify(ctx context.Context, contents *Contents) (Report, error) {
 		}
 		report.Ledger = max(report.Ledger, seen)
 		for i, k := range keys {
-			if _, ok := found[mustKeyString(k)]; !ok {
+			if _, ok := entryOf(found, k); !ok {
 				return report, fmt.Errorf("%w: nullifier %s has no entry in the vault", ErrChain, batch[i].Hex())
 			}
 		}
@@ -186,6 +189,22 @@ func (v *View) checkRoot(contents *Contents, report Report) error {
 		return fmt.Errorf("%w: the archive's %d leaves give root %s, which the vault never held at that count", ErrChain, report.Leaves, t.Root().Hex())
 	}
 	return nil
+}
+
+// entryOf returns the entry the RPC gave for key if the entry is that one: the RPC names the key
+// it answers for, so its own data must name it too.
+func entryOf(found map[string]rpc.Entry, key xdr.LedgerKey) (rpc.Entry, bool) {
+	name := mustKeyString(key)
+	e, ok := found[name]
+	if !ok {
+		return rpc.Entry{}, false
+	}
+	own, err := e.Data.LedgerKey()
+	if err != nil {
+		return rpc.Entry{}, false
+	}
+	got, err := rpc.KeyString(own)
+	return e, err == nil && got == name
 }
 
 func mustKeyString(k xdr.LedgerKey) string {

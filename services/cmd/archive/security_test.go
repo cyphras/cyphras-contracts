@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,9 @@ import (
 	"testing"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
+	"github.com/cyphras/cyphras-contracts/services/internal/vaultarchive"
 )
 
 const (
@@ -99,5 +103,32 @@ func TestVerifyFetchesNoWindowForAManifestTheVaultCannotHold(t *testing.T) {
 	_, err := do(t, "verify", "--url", srv.URL, "--rpc", "http://rpc.invalid")
 	if err == nil || windows.Load() != 0 {
 		t.Fatalf("a manifest that covers ledgers the RPC has not closed: %v, %d windows fetched", err, windows.Load())
+	}
+}
+
+func TestVerifyAsksEveryRPCItIsGiven(t *testing.T) {
+	dir, _ := exportSample(t)
+	honest, other := chainFake(t, dir), chainFake(t, dir)
+	c, err := vaultarchive.Load(context.Background(), vaultarchive.DirFetcher(dir), vaultarchive.Expect{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := vault.NullifierKey(vaulttest.Vault, c.Nullifiers[1].Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.DeleteEntry(k)
+	t.Cleanup(func(old func(string) rpc.Client) func() { return func() { dialRPC = old } }(dialRPC))
+	dialRPC = func(u string) rpc.Client {
+		if u == "http://second.invalid" {
+			return other
+		}
+		return honest
+	}
+	if _, err := do(t, "verify", "--dir", dir, "--rpc", "http://first.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := do(t, "verify", "--dir", dir, "--rpc", "http://second.invalid", "--rpc", "http://first.invalid"); err == nil || !strings.Contains(err.Error(), "has no entry in the vault") {
+		t.Fatalf("a second RPC that does not know a nullifier: %v", err)
 	}
 }
