@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
@@ -67,6 +68,7 @@ func Build(ctx context.Context, src Source, dir string, h Header, from, to uint3
 		next = start
 	}
 	var failure error
+	built := 0
 	for ; next+WindowLedgers-1 <= uint64(to); next += WindowLedgers {
 		w, err := buildWindow(ctx, src, dir, h, m.Windows, uint32(next))
 		if err != nil {
@@ -74,19 +76,52 @@ func Build(ctx context.Context, src Source, dir string, h Header, from, to uint3
 			break
 		}
 		m.Windows = append(m.Windows, w)
+		built++
+	}
+	if failure != nil && built == 0 {
+		// Nothing changed on disk, so the manifest there stays as it is.
+		return m, failure
+	}
+	if len(m.Windows) < kept {
+		// Windows after the ones rebuilt stay listed, so a shorter run never shortens the archive.
+		m.Windows = append(m.Windows, existing.Windows[len(m.Windows):]...)
 	}
 	if n := len(m.Windows); n > 0 {
 		m.CoveredTo = m.Windows[n-1].End
 	}
-	if failure != nil && len(m.Windows) <= kept {
-		// A build that got no further than the manifest on disk must not replace it with less.
-		return m, failure
+	if err := m.Validate(Expect{}); err != nil {
+		return m, errors.Join(failure, fmt.Errorf("the windows built do not lead into the ones after them: %w", err))
 	}
 	if err := writeManifest(dir, m); err != nil {
 		return Manifest{}, errors.Join(failure, err)
 	}
-	return m, failure
+	return m, errors.Join(failure, removeUnlisted(dir, m))
 }
+
+// removeUnlisted deletes the window files the manifest does not list, which a shorter or
+// emptier rebuild leaves behind.
+func removeUnlisted(dir string, m Manifest) error {
+	listed := map[string]bool{}
+	for _, w := range m.Windows {
+		if w.Events > 0 {
+			listed[filepath.Base(w.File())] = true
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "windows"))
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if windowFile.MatchString(e.Name()) && !listed[e.Name()] {
+			if err := os.Remove(filepath.Join(dir, "windows", e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+var windowFile = regexp.MustCompile(`^[0-9]{10}\.jsonl\.gz$`)
 
 func buildWindow(ctx context.Context, src Source, dir string, h Header, done []Window, start uint32) (Window, error) {
 	end := start + WindowLedgers - 1

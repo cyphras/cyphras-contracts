@@ -1,6 +1,7 @@
 package vaultarchive
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
 // linkOutside moves a file, or the windows directory, of the archive in dir to outside and leaves
@@ -109,4 +112,68 @@ func TestATimeBeyondWhatAJavaScriptNumberHoldsIsRefusedByReaderAndWriter(t *test
 	late.ClosedAt = 1 << 53
 	_, err = Build(context.Background(), fixedSource{late}, t.TempDir(), head(), 0, WindowLedgers-1)
 	mustInvalid(t, "the writer", err, "closed_at")
+}
+
+func TestABuildThatEndsBeforeTheArchiveDoesNotShortenIt(t *testing.T) {
+	ctx := context.Background()
+	dir, whole := good(t)
+	m, err := Build(ctx, memSource{sample(), 4 * WindowLedgers}, dir, head(), WindowLedgers, 2*WindowLedgers-1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readManifestFile(t, dir); len(got.Windows) != 3 || got.CoveredTo != whole.CoveredTo || len(m.Windows) != 3 {
+		t.Fatalf("manifest after a shorter run %+v", got)
+	}
+	// A run that fails after one window keeps the windows after it listed as well.
+	if _, err := Build(ctx, memSource{sample(), WindowLedgers + 100}, dir, head(), 1, 3*WindowLedgers-1); err == nil {
+		t.Fatal("a build over an uncovered window passed")
+	}
+	if got := readManifestFile(t, dir); len(got.Windows) != 3 || got.CoveredTo != whole.CoveredTo {
+		t.Fatalf("manifest after a failed run %+v", got)
+	}
+	if _, err := Load(ctx, DirFetcher(dir), Expect{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRebuiltWindowsThatNoLongerLeadIntoTheOnesAfterThemAreNotPublished(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := good(t)
+	before, err := os.ReadFile(filepath.Join(dir, ManifestName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fewer []vault.RawEvent
+	for _, e := range sample() {
+		if e.Ledger != 13 {
+			fewer = append(fewer, e)
+		}
+	}
+	if _, err := Build(ctx, memSource{fewer, 4 * WindowLedgers}, dir, head(), 1, WindowLedgers-1); err == nil {
+		t.Fatal("a first window with fewer leaves was accepted in front of a second that expects them")
+	}
+	after, err := os.ReadFile(filepath.Join(dir, ManifestName))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("the manifest changed: %v", err)
+	}
+}
+
+func TestWindowFilesTheManifestDoesNotListAreRemoved(t *testing.T) {
+	dir, _ := good(t)
+	stale := filepath.Join(dir, Window{Start: 7 * WindowLedgers}.File())
+	other := filepath.Join(dir, "windows", "notes.txt")
+	for _, name := range []string{stale, other} {
+		if err := os.WriteFile(name, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := Build(context.Background(), memSource{sample(), 4 * WindowLedgers}, dir, head(), 0, 3*WindowLedgers-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a window the manifest does not list stays: %v", err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatalf("a file that is not a window was removed: %v", err)
+	}
 }
