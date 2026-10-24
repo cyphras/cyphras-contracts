@@ -5,6 +5,7 @@
 package vaultarchive
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -62,6 +63,24 @@ type Window struct {
 	Nullifiers int       `json:"nullifiers"`
 	Bytes      int64     `json:"bytes"`
 	SHA256     string    `json:"sha256,omitempty"`
+}
+
+// UnmarshalJSON refuses a leaves range of any length but two, which a fixed array would cut short
+// without a word.
+func (w *Window) UnmarshalJSON(raw []byte) error {
+	type plain Window
+	shadow := struct {
+		*plain
+		Leaves []uint64 `json:"leaves"`
+	}{plain: (*plain)(w)}
+	if err := json.Unmarshal(raw, &shadow); err != nil {
+		return err
+	}
+	if len(shadow.Leaves) != 2 {
+		return fmt.Errorf("leaves range of %d numbers", len(shadow.Leaves))
+	}
+	w.Leaves = [2]uint64{shadow.Leaves[0], shadow.Leaves[1]}
+	return nil
 }
 
 // File is the window's path under the base.

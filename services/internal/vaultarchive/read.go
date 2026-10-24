@@ -110,6 +110,7 @@ func Load(ctx context.Context, f Fetcher, want Expect) (*Contents, error) {
 		return nil, err
 	}
 	out := &Contents{Manifest: m}
+	spent := map[fr.Element]bool{}
 	for _, w := range m.Windows {
 		if w.Events == 0 {
 			continue
@@ -121,9 +122,15 @@ func Load(ctx context.Context, f Fetcher, want Expect) (*Contents, error) {
 		if err != nil {
 			return nil, fmt.Errorf("window %d: %w", w.Start, err)
 		}
-		c, err := check(w, compressed, m.Vault)
+		c, err := check(w, compressed, m.DeployLedger, m.Vault)
 		if err != nil {
 			return nil, err
+		}
+		for _, n := range c.nullifiers {
+			if spent[n] {
+				return nil, invalid("window %d: nullifier %s is spent twice", w.Start, n.Hex())
+			}
+			spent[n] = true
 		}
 		out.Commitments = append(out.Commitments, c.commitments...)
 		out.Nullifiers = append(out.Nullifiers, c.nullifiers...)

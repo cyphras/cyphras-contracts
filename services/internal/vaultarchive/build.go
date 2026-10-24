@@ -42,6 +42,7 @@ func Build(ctx context.Context, src Source, dir string, h Header, from, to uint3
 		return Manifest{}, err
 	}
 	existing, err := ReadManifest(ctx, DirFetcher(dir), Expect{})
+	var kept int
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 	case err != nil:
@@ -50,6 +51,7 @@ func Build(ctx context.Context, src Source, dir string, h Header, from, to uint3
 		return Manifest{}, errors.New("the directory holds the archive of another vault")
 	default:
 		m.Windows = existing.Windows
+		kept = len(existing.Windows)
 	}
 	first := uint64(windowStart(h.DeployLedger))
 	next := first + uint64(len(m.Windows))*WindowLedgers
@@ -76,6 +78,10 @@ func Build(ctx context.Context, src Source, dir string, h Header, from, to uint3
 	if n := len(m.Windows); n > 0 {
 		m.CoveredTo = m.Windows[n-1].End
 	}
+	if failure != nil && len(m.Windows) <= kept {
+		// A build that got no further than the manifest on disk must not replace it with less.
+		return m, failure
+	}
 	if err := writeManifest(dir, m); err != nil {
 		return Manifest{}, errors.Join(failure, err)
 	}
@@ -93,7 +99,7 @@ func buildWindow(ctx context.Context, src Source, dir string, h Header, done []W
 	if n := len(done); n > 0 {
 		firstLeaf = done[n-1].Leaves[1]
 	}
-	data, entry, err := encode(events, start, end, h.Vault, firstLeaf)
+	data, entry, err := encode(events, start, end, h.DeployLedger, h.Vault, firstLeaf)
 	if err != nil {
 		return Window{}, err
 	}

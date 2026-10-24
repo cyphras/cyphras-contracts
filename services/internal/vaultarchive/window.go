@@ -33,7 +33,7 @@ type content struct {
 // encode returns the canonical bytes of the vault's events of ledgers [start, end] and the
 // manifest entry for them, whose leaves start at firstLeaf. A window with no events has no bytes.
 // It refuses what a reader would refuse, so a writer cannot publish a window nobody takes.
-func encode(events []vault.RawEvent, start, end uint32, vaultID string, firstLeaf uint64) ([]byte, Window, error) {
+func encode(events []vault.RawEvent, start, end, deployLedger uint32, vaultID string, firstLeaf uint64) ([]byte, Window, error) {
 	sorted := slices.Clone(events)
 	slices.SortStableFunc(sorted, func(a, b vault.RawEvent) int {
 		switch {
@@ -64,7 +64,7 @@ func encode(events []vault.RawEvent, start, end uint32, vaultID string, firstLea
 	out.Write(tail)
 	out.WriteByte('\n')
 	data := out.Bytes()
-	c, err := parse(data, start, end, vaultID, firstLeaf)
+	c, err := parse(data, start, end, deployLedger, vaultID, firstLeaf)
 	if err != nil {
 		return nil, Window{}, err
 	}
@@ -88,7 +88,7 @@ func marshalLine(e vault.RawEvent) ([]byte, error) {
 
 // parse checks a window's decompressed bytes against every rule of the format and returns what
 // they hold. firstLeaf is where the window's leaf indices must begin.
-func parse(data []byte, start, end uint32, vaultID string, firstLeaf uint64) (content, error) {
+func parse(data []byte, start, end, deployLedger uint32, vaultID string, firstLeaf uint64) (content, error) {
 	if len(data) > MaxWindowBytes {
 		return content{}, invalid("window of %d bytes", len(data))
 	}
@@ -97,6 +97,7 @@ func parse(data []byte, start, end uint32, vaultID string, firstLeaf uint64) (co
 	var left *vault.NewCommitment
 	var leftAt vault.Position
 	var tail []byte
+	spent := map[fr.Element]bool{}
 	for n := 1; len(data) > 0; n++ {
 		i := bytes.IndexByte(data, '\n')
 		if i < 0 {
@@ -118,6 +119,9 @@ func parse(data []byte, start, end uint32, vaultID string, firstLeaf uint64) (co
 		if e.Ledger < start || e.Ledger > end {
 			return content{}, invalid("line %d: ledger %d outside the window %d to %d", n, e.Ledger, start, end)
 		}
+		if e.Ledger < deployLedger {
+			return content{}, invalid("line %d: ledger %d is before the deploy ledger %d", n, e.Ledger, deployLedger)
+		}
 		if last != nil && !last.Pos().Less(e.Pos()) {
 			return content{}, invalid("line %d: position %v does not follow %v", n, e.Pos(), last.Pos())
 		}
@@ -129,6 +133,10 @@ func parse(data []byte, start, end uint32, vaultID string, firstLeaf uint64) (co
 		c.events++
 		switch body := decoded.Body.(type) {
 		case vault.NewNullifier:
+			if spent[body.Nullifier] {
+				return content{}, invalid("line %d: nullifier %s is spent twice", n, body.Nullifier.Hex())
+			}
+			spent[body.Nullifier] = true
 			c.nullifiers = append(c.nullifiers, body.Nullifier)
 		case vault.NewCommitment:
 			if body.Index != c.leaves[1] {
@@ -217,7 +225,7 @@ func gzipBytes(data []byte) ([]byte, error) {
 
 // check reads a window's file against its manifest entry: size, hash, then every rule of
 // parse, then the counts the entry states.
-func check(w Window, compressed []byte, vaultID string) (content, error) {
+func check(w Window, compressed []byte, deployLedger uint32, vaultID string) (content, error) {
 	data, err := gunzip(compressed)
 	if err != nil {
 		return content{}, fmt.Errorf("window %d: %w", w.Start, err)
@@ -229,7 +237,7 @@ func check(w Window, compressed []byte, vaultID string) (content, error) {
 	if hex.EncodeToString(sum[:]) != w.SHA256 {
 		return content{}, invalid("window %d has another sha256 than the manifest", w.Start)
 	}
-	c, err := parse(data, w.Start, w.End, vaultID, w.Leaves[0])
+	c, err := parse(data, w.Start, w.End, deployLedger, vaultID, w.Leaves[0])
 	if err != nil {
 		return content{}, fmt.Errorf("window %d: %w", w.Start, err)
 	}
