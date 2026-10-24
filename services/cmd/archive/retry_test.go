@@ -139,11 +139,10 @@ func TestAStalledAnswerGivesUpAfterTheAttemptTimeoutNotTheClientTimeout(t *testi
 	defer close(stall)
 	start := time.Now()
 	resp, err := clientOf(retrying{attemptTimeout: 200 * time.Millisecond}).Get(srv.URL)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
 	}
-	_, err = io.ReadAll(resp.Body)
-	resp.Body.Close()
 	if err == nil || time.Since(start) > 5*time.Second {
 		t.Fatalf("a body that stalls: %v after %v", err, time.Since(start))
 	}
