@@ -1,0 +1,203 @@
+package vaultarchive
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/cyphras/cyphras-contracts/services/internal/fr"
+)
+
+// Fetcher reads the files of an archive by their path under its base, refusing one longer than
+// limit instead of cutting it short.
+type Fetcher interface {
+	Get(ctx context.Context, name string, limit int64) ([]byte, error)
+}
+
+// DirFetcher reads an archive from a directory.
+type DirFetcher string
+
+// Get implements Fetcher.
+func (d DirFetcher) Get(ctx context.Context, name string, limit int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(string(d))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	f, err := OpenRegular(root, name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return readLimited(f, limit)
+}
+
+// OpenRegular opens the slash-separated name under root. It refuses a name with a symbolic link
+// in any part of it, even one that points inside root, and anything but a regular file at the
+// end, with the error of a file that does not exist: an archive is plain files, and a mirror
+// someone else made must not be able to point a reader at the rest of the disk.
+func OpenRegular(root *os.Root, name string) (*os.File, error) {
+	missing := &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	parts := strings.Split(name, "/")
+	for i := range parts {
+		info, err := root.Lstat(strings.Join(parts[:i+1], "/"))
+		if err != nil {
+			return nil, err
+		}
+		last := i == len(parts)-1
+		if info.Mode()&fs.ModeSymlink != 0 || (last && !info.Mode().IsRegular()) || (!last && !info.IsDir()) {
+			return nil, missing
+		}
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		return nil, missing
+	}
+	return f, nil
+}
+
+// HTTPFetcher reads an archive from a base URL.
+type HTTPFetcher struct {
+	Base string
+	// Client is used for every request; without one, a request that stalls for two minutes fails.
+	Client *http.Client
+}
+
+var defaultClient = &http.Client{Timeout: 2 * time.Minute}
+
+// followsOnlyOnTheBase refuses a redirect that leaves the host of the base URL or drops from
+// https to http, since the URL is given by whoever publishes the archive and a redirect must not
+// turn the tool into a request to somewhere else.
+func followsOnlyOnTheBase(req *http.Request, via []*http.Request) error {
+	first := via[0].URL
+	switch {
+	case len(via) >= 10:
+		return errors.New("too many redirects")
+	case req.URL.Host != first.Host:
+		return errors.New("redirected to another host")
+	case first.Scheme == "https" && req.URL.Scheme != "https":
+		return fmt.Errorf("redirected from https to %s", req.URL.Scheme)
+	}
+	return nil
+}
+
+// Get implements Fetcher.
+func (h HTTPFetcher) Get(ctx context.Context, name string, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(h.Base, "/")+"/"+name, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%s: the base URL is not usable", name)
+	}
+	client := defaultClient
+	if h.Client != nil {
+		client = h.Client
+	}
+	if client.CheckRedirect == nil {
+		own := *client
+		own.CheckRedirect = followsOnlyOnTheBase
+		client = &own
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		// The URL may carry a credential, so only the name of the file is reported.
+		var failed *url.Error
+		if errors.As(err, &failed) {
+			err = failed.Err
+		}
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%s: %w", name, os.ErrNotExist)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: the server answered %d", name, resp.StatusCode)
+	}
+	return readLimited(resp.Body, limit)
+}
+
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, invalid("a file longer than %d bytes", limit)
+	}
+	return data, nil
+}
+
+// ReadManifest reads and validates the manifest.
+func ReadManifest(ctx context.Context, f Fetcher, want Expect) (Manifest, error) {
+	raw, err := f.Get(ctx, ManifestName, MaxManifestBytes)
+	if err != nil {
+		return Manifest{}, err
+	}
+	var m Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return Manifest{}, invalid("manifest: %v", err)
+	}
+	return m, m.Validate(want)
+}
+
+// Contents is everything a verified archive holds that the chain can be asked about: the
+// commitments in leaf order and the spent nullifiers.
+type Contents struct {
+	Manifest    Manifest
+	Commitments []fr.Element
+	Nullifiers  []fr.Element
+}
+
+// Load reads every window, checking each against the manifest and the format, and returns what
+// they hold. It does not look at the chain, so it proves the archive is well formed, not true.
+func Load(ctx context.Context, f Fetcher, want Expect) (*Contents, error) {
+	m, err := ReadManifest(ctx, f, want)
+	if err != nil {
+		return nil, err
+	}
+	return loadWindows(ctx, f, m)
+}
+
+func loadWindows(ctx context.Context, f Fetcher, m Manifest) (*Contents, error) {
+	out := &Contents{Manifest: m}
+	spent := map[fr.Element]bool{}
+	for _, w := range m.Windows {
+		if w.Events == 0 {
+			continue
+		}
+		compressed, err := f.Get(ctx, w.File(), MaxWindowBytes)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, invalid("window %d is in the manifest but has no file", w.Start)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("window %d: %w", w.Start, err)
+		}
+		c, err := check(w, compressed, m.DeployLedger, m.Vault)
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range c.nullifiers {
+			if spent[n] {
+				return nil, invalid("window %d: nullifier %s is spent twice", w.Start, n.Hex())
+			}
+			spent[n] = true
+		}
+		out.Commitments = append(out.Commitments, c.commitments...)
+		out.Nullifiers = append(out.Nullifiers, c.nullifiers...)
+	}
+	return out, nil
+}

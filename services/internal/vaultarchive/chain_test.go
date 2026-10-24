@@ -1,0 +1,320 @@
+package vaultarchive
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/cyphras/cyphras-contracts/services/internal/fr"
+	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
+	"github.com/cyphras/cyphras-contracts/services/internal/rpc/rpctest"
+	"github.com/cyphras/cyphras-contracts/services/internal/tree"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
+)
+
+func mustKey(k xdr.LedgerKey, err error) xdr.LedgerKey {
+	if err != nil {
+		panic(err)
+	}
+	return k
+}
+
+// chainOf is a vault that holds every leaf and nullifier of the contents, with the ring of roots
+// after each pair. Nullifiers are stored as archived entries, which the RPC still returns.
+func chainOf(t *testing.T, c *Contents) *rpctest.Fake {
+	t.Helper()
+	var tr tree.Tree
+	roots := []fr.Element{tree.Zero(tree.Depth)}
+	for i := 0; i < len(c.Commitments); i += 2 {
+		if _, err := tr.AppendPair(c.Commitments[i], c.Commitments[i+1]); err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, tr.Root())
+	}
+	f := rpctest.New(passphrase, 5*WindowLedgers)
+	v := vaulttest.Vault
+	f.SetContractData(mustKey(vault.RootsKey(v)), ringOf(roots), 100, nil)
+	f.SetContractData(mustKey(vault.NextLeafKey(v)), vault.U64(uint64(len(c.Commitments))), 100, nil)
+	archived := uint32(1)
+	for _, n := range c.Nullifiers {
+		f.SetContractData(mustKey(vault.NullifierKey(v, n.Bytes())), vault.Bool(true), 100, &archived)
+	}
+	return f
+}
+
+func loaded(t *testing.T) *Contents {
+	t.Helper()
+	dir, _ := good(t)
+	c, err := Load(context.Background(), DirFetcher(dir), Expect{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestAnArchiveOfTheVaultsOwnHistoryPassesTheChainChecks(t *testing.T) {
+	c := loaded(t)
+	f := chainOf(t, c)
+	report, err := VerifyChain(context.Background(), f, pinOf(c), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Leaves != 8 || report.ChainLeaves != 8 || report.Nullifiers != 8 || report.Ledger != 5*WindowLedgers {
+		t.Fatalf("report %+v", report)
+	}
+}
+
+func TestAnArchiveBehindTheVaultPassesWhileItsRootIsInTheRing(t *testing.T) {
+	c := loaded(t)
+	// The vault took one more pair after the archive's last window.
+	more := &Contents{Manifest: c.Manifest, Commitments: append(append([]fr.Element(nil), c.Commitments...), fr.SetUint64(7), fr.SetUint64(8)), Nullifiers: c.Nullifiers}
+	f := chainOf(t, more)
+	report, err := VerifyChain(context.Background(), f, pinOf(c), c)
+	if err != nil || report.ChainLeaves != 10 || report.Leaves != 8 {
+		t.Fatalf("report %+v, %v", report, err)
+	}
+	// Far enough ahead that the archive's root has left the ring.
+	var far []fr.Element
+	far = append(far, c.Commitments...)
+	for i := range 2 * vault.RootHistory {
+		far = append(far, fr.SetUint64(uint64(1000+i)))
+	}
+	f = chainOf(t, &Contents{Manifest: c.Manifest, Commitments: far, Nullifiers: c.Nullifiers})
+	if _, err := VerifyChain(context.Background(), f, pinOf(c), c); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), "ahead of the archive") {
+		t.Fatalf("an archive 256 pairs behind: %v", err)
+	}
+}
+
+func TestATamperedLeafIsNotAnyRootTheVaultHeld(t *testing.T) {
+	c := loaded(t)
+	f := chainOf(t, c)
+	for _, i := range []int{0, 3, len(c.Commitments) - 1} {
+		tampered := &Contents{Manifest: c.Manifest, Commitments: append([]fr.Element(nil), c.Commitments...), Nullifiers: c.Nullifiers}
+		tampered.Commitments[i] = fr.SetUint64(424242)
+		if _, err := VerifyChain(context.Background(), f, pinOf(tampered), tampered); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), "never held") {
+			t.Fatalf("leaf %d changed: %v", i, err)
+		}
+	}
+	reordered := &Contents{Manifest: c.Manifest, Commitments: append([]fr.Element(nil), c.Commitments...), Nullifiers: c.Nullifiers}
+	reordered.Commitments[0], reordered.Commitments[1] = reordered.Commitments[1], reordered.Commitments[0]
+	if _, err := VerifyChain(context.Background(), f, pinOf(reordered), reordered); !errors.Is(err, ErrChain) {
+		t.Fatalf("leaves swapped: %v", err)
+	}
+	omitted := &Contents{Manifest: c.Manifest, Commitments: append(append([]fr.Element(nil), c.Commitments[:2]...), c.Commitments[4:]...), Nullifiers: c.Nullifiers}
+	if _, err := VerifyChain(context.Background(), f, pinOf(omitted), omitted); !errors.Is(err, ErrChain) {
+		t.Fatalf("a pair left out: %v", err)
+	}
+	ahead := &Contents{Manifest: c.Manifest, Commitments: append(append([]fr.Element(nil), c.Commitments...), fr.SetUint64(1), fr.SetUint64(2)), Nullifiers: c.Nullifiers}
+	if _, err := VerifyChain(context.Background(), f, pinOf(ahead), ahead); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), "holds 10 leaves") {
+		t.Fatalf("a pair the vault never took: %v", err)
+	}
+}
+
+func TestANullifierTheVaultNeverSpentFailsTheChainChecks(t *testing.T) {
+	c := loaded(t)
+	f := chainOf(t, c)
+	v := vaulttest.Vault
+	f.DeleteEntry(mustKey(vault.NullifierKey(v, c.Nullifiers[5].Bytes())))
+	if _, err := VerifyChain(context.Background(), f, pinOf(c), c); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), c.Nullifiers[5].Hex()) {
+		t.Fatalf("a nullifier with no entry: %v", err)
+	}
+	made := &Contents{Manifest: c.Manifest, Commitments: c.Commitments, Nullifiers: append(append([]fr.Element(nil), c.Nullifiers...), fr.SetUint64(31337))}
+	if _, err := VerifyChain(context.Background(), chainOf(t, c), pinOf(c), made); !errors.Is(err, ErrChain) {
+		t.Fatalf("a nullifier made up: %v", err)
+	}
+}
+
+func TestNullifiersAreReadInBatchesOfAtMostTwoHundredKeys(t *testing.T) {
+	c := loaded(t)
+	for i := range 450 {
+		c.Nullifiers = append(c.Nullifiers, fr.SetUint64(uint64(9000+i)))
+	}
+	f := chainOf(t, c)
+	if _, err := VerifyChain(context.Background(), f, pinOf(c), c); err != nil {
+		t.Fatal(err)
+	}
+	// One call for the tree entries, then 458 nullifiers in batches of 200.
+	if calls := f.CallCount("getLedgerEntries"); calls != 1+3 {
+		t.Fatalf("%d calls", calls)
+	}
+}
+
+func TestTheChainChecksRefuseAnotherNetworkAndMissingEntries(t *testing.T) {
+	c := loaded(t)
+	f := chainOf(t, c)
+	f.Passphrase = "Public Global Stellar Network ; September 2015"
+	if _, err := VerifyChain(context.Background(), f, pinOf(c), c); err == nil {
+		t.Fatal("an RPC of another network was read")
+	}
+	f = chainOf(t, c)
+	f.DeleteEntry(mustKey(vault.NextLeafKey(vaulttest.Vault)))
+	if _, err := VerifyChain(context.Background(), f, pinOf(c), c); !errors.Is(err, ErrChain) {
+		t.Fatalf("a vault with no tree: %v", err)
+	}
+	f = chainOf(t, c)
+	f.Fail["getLedgerEntries"] = errors.New("down")
+	if _, err := VerifyChain(context.Background(), f, pinOf(c), c); err == nil {
+		t.Fatal("a failing RPC passed")
+	}
+}
+
+// ringOf lays the roots out as the vault does: the root after pair j in slot j modulo the ring.
+func ringOf(roots []fr.Element) xdr.ScVal {
+	return ringEndingAt(roots, uint32((len(roots)-1)%vault.RootHistory))
+}
+
+func ringEndingAt(roots []fr.Element, newest uint32) xdr.ScVal {
+	ring := make([]xdr.ScVal, vault.RootHistory)
+	for i := range ring {
+		ring[i] = vaulttest.Field(fr.Element{})
+	}
+	for j, r := range roots {
+		ring[j%vault.RootHistory] = vaulttest.Field(r)
+	}
+	return vault.Struct(vault.Field{Name: "roots", Value: vault.Vec(ring...)}, vault.Field{Name: "newest", Value: vault.U32(newest)})
+}
+
+// windowFetches counts the windows a Fetcher is asked for, which cost a download each.
+type windowFetches struct {
+	Fetcher
+	windows int
+}
+
+func (w *windowFetches) Get(ctx context.Context, name string, limit int64) ([]byte, error) {
+	if name != ManifestName {
+		w.windows++
+	}
+	return w.Fetcher.Get(ctx, name, limit)
+}
+
+func TestAManifestThatClaimsMoreThanTheVaultHasIsRefusedBeforeAnyWindowIsFetched(t *testing.T) {
+	dir, _ := good(t)
+	c := loaded(t)
+	ctx := context.Background()
+	fetch := &windowFetches{Fetcher: DirFetcher(dir)}
+
+	// The vault holds fewer leaves than the manifest lists.
+	short := chainOf(t, &Contents{Manifest: c.Manifest, Commitments: c.Commitments[:4], Nullifiers: c.Nullifiers})
+	if _, _, err := VerifyArchive(ctx, fetch, pinOf(c), short); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), "lists 8 leaves") {
+		t.Fatalf("more leaves than the vault holds: %v", err)
+	}
+
+	// The RPC has not closed the ledger the manifest says it covers.
+	young := chainOf(t, c)
+	young.SetLatest(2 * WindowLedgers)
+	if _, _, err := VerifyArchive(ctx, fetch, pinOf(c), young); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), "latest is") {
+		t.Fatalf("a ledger past the RPC's latest: %v", err)
+	}
+	if fetch.windows != 0 {
+		t.Fatalf("%d windows were fetched for a manifest the chain refuses", fetch.windows)
+	}
+
+	good := chainOf(t, c)
+	contents, report, err := VerifyArchive(ctx, fetch, pinOf(c), good)
+	if err != nil || fetch.windows != 2 || report.Leaves != 8 || len(contents.Commitments) != 8 {
+		t.Fatalf("a good archive: %d windows, %+v, %v", fetch.windows, report, err)
+	}
+}
+
+func TestAnRPCThatAnswersWithAnotherEntryThanAskedForIsNotBelieved(t *testing.T) {
+	ctx := context.Background()
+	c := loaded(t)
+	v := vaulttest.Vault
+
+	f := chainOf(t, c)
+	asked := mustKey(vault.NullifierKey(v, c.Nullifiers[2].Bytes()))
+	other, _, err := rpc.One(ctx, f, mustKey(vault.NullifierKey(v, c.Nullifiers[3].Bytes())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetEntry(asked, other.Data, 100, nil)
+	if _, err := VerifyChain(ctx, f, pinOf(c), c); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), c.Nullifiers[2].Hex()) {
+		t.Fatalf("a nullifier answered with the entry of another: %v", err)
+	}
+
+	f = chainOf(t, c)
+	next, _, err := rpc.One(ctx, f, mustKey(vault.NextLeafKey(v)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.SetEntry(mustKey(vault.RootsKey(v)), next.Data, 100, nil)
+	if _, err := VerifyChain(ctx, f, pinOf(c), c); !errors.Is(err, ErrChain) {
+		t.Fatalf("the root ring answered with the leaf count: %v", err)
+	}
+}
+
+func TestARootRingThatEndsWhereTheLeafCountCannotPutItIsNotBelieved(t *testing.T) {
+	c := loaded(t)
+	f := chainOf(t, c)
+	roots := []fr.Element{tree.Zero(tree.Depth)}
+	var tr tree.Tree
+	for i := 0; i < len(c.Commitments); i += 2 {
+		if _, err := tr.AppendPair(c.Commitments[i], c.Commitments[i+1]); err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, tr.Root())
+	}
+	// The ring holds the right roots but points at an older one as the newest.
+	f.SetContractData(mustKey(vault.RootsKey(vaulttest.Vault)), ringEndingAt(roots, 3), 100, nil)
+	if _, err := VerifyChain(context.Background(), f, pinOf(c), c); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), "root ring ends at slot 3") {
+		t.Fatalf("a ring that ends in the wrong slot: %v", err)
+	}
+}
+
+func TestEveryRPCMustConfirmTheArchive(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := good(t)
+	c := loaded(t)
+	fetch := DirFetcher(dir)
+	honest, alsoHonest := chainOf(t, c), chainOf(t, c)
+	if _, _, err := VerifyArchive(ctx, fetch, pinOf(c), honest, alsoHonest); err != nil {
+		t.Fatal(err)
+	}
+	forged := &Contents{Manifest: c.Manifest, Commitments: append([]fr.Element(nil), c.Commitments...), Nullifiers: c.Nullifiers}
+	forged.Commitments[5] = fr.SetUint64(99)
+	for name, views := range map[string][]rpc.Client{
+		"the first lies":  {chainOf(t, forged), honest},
+		"the second lies": {honest, chainOf(t, forged)},
+	} {
+		if _, _, err := VerifyArchive(ctx, fetch, pinOf(c), views...); !errors.Is(err, ErrChain) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+// pinOf is the pin of a test that checks an archive against the vault it says it is of.
+func pinOf(c *Contents) Expect {
+	return Expect{Vault: c.Manifest.Vault, NetworkPassphrase: c.Manifest.NetworkPassphrase}
+}
+
+func TestAChainCheckNeedsAnRPCAndAPinAndTheArchiveMustBeOfThePinnedVault(t *testing.T) {
+	ctx := context.Background()
+	dir, _ := good(t)
+	c := loaded(t)
+	fetch := DirFetcher(dir)
+	f := chainOf(t, c)
+	if _, _, err := VerifyArchive(ctx, fetch, pinOf(c)); err == nil {
+		t.Fatal("an archive was confirmed by no RPC at all")
+	}
+	for name, pin := range map[string]Expect{
+		"no pin":        {},
+		"no vault":      {NetworkPassphrase: passphrase},
+		"no network":    {Vault: vaulttest.Vault},
+		"another vault": {Vault: vaulttest.Token, NetworkPassphrase: passphrase},
+		"another chain": {Vault: vaulttest.Vault, NetworkPassphrase: "Public Global Stellar Network ; September 2015"},
+	} {
+		if _, _, err := VerifyArchive(ctx, fetch, pin, f); err == nil {
+			t.Fatalf("VerifyArchive with %s", name)
+		}
+		if _, err := VerifyChain(ctx, f, pin, c); err == nil {
+			t.Fatalf("VerifyChain with %s", name)
+		}
+	}
+	if _, _, err := VerifyArchive(ctx, fetch, pinOf(c), f); err != nil {
+		t.Fatal(err)
+	}
+}

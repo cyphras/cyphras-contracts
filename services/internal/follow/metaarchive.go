@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -42,8 +43,14 @@ var archiveClient = &http.Client{Timeout: 2 * time.Minute}
 
 const (
 	maxCompressed = 256 << 20
-	// maxLedgerMeta bounds the decompressed metadata of one ledger, far above what a ledger holds.
-	maxLedgerMeta = 64 << 20
+	// maxBatchMeta bounds the decompressed metadata of one file, far above what the ledgers of a
+	// file hold, whatever the archive's configuration says.
+	maxBatchMeta = 256 << 20
+
+	// The most ledgers per file and files per partition a layout may claim; the public archive
+	// uses one and 64,000.
+	maxLedgersPerBatch     = 64
+	maxBatchesPerPartition = 64_000
 )
 
 type archiveSchema struct {
@@ -58,10 +65,10 @@ type archiveSchema struct {
 func (s archiveSchema) objectKey(ledger uint32) string {
 	var key string
 	if s.BatchesPerPartition > 1 {
-		size := s.LedgersPerBatch * s.BatchesPerPartition
-		start := ledger / size * size
-		end := uint32(min(uint64(start)+uint64(size)-1, math.MaxUint32))
-		key = fmt.Sprintf("%08X--%d-%d/", math.MaxUint32-start, start, end)
+		size := uint64(s.LedgersPerBatch) * uint64(s.BatchesPerPartition)
+		start := uint64(ledger) / size * size
+		end := min(start+size-1, math.MaxUint32)
+		key = fmt.Sprintf("%08X--%d-%d/", math.MaxUint32-uint32(start), start, end)
 	}
 	start := ledger / s.LedgersPerBatch * s.LedgersPerBatch
 	end := start + s.LedgersPerBatch - 1
@@ -98,7 +105,12 @@ func (a *LedgerArchive) get(ctx context.Context, path string) ([]byte, error) {
 	}
 	resp, err := a.client().Do(req)
 	if err != nil {
-		return nil, err
+		// The URL may carry a credential, so only the object's path is reported.
+		var failed *url.Error
+		if errors.As(err, &failed) {
+			err = failed.Err
+		}
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
@@ -134,8 +146,10 @@ func (a *LedgerArchive) load(ctx context.Context) (archiveSchema, error) {
 		return archiveSchema{}, fmt.Errorf("archive holds %q", schema.NetworkPassphrase)
 	case schema.Compression != "zstd":
 		return archiveSchema{}, fmt.Errorf("archive compression %q", schema.Compression)
-	case schema.LedgersPerBatch == 0:
-		return archiveSchema{}, errors.New("archive has no batch size")
+	case schema.LedgersPerBatch < 1 || schema.LedgersPerBatch > maxLedgersPerBatch:
+		return archiveSchema{}, fmt.Errorf("archive has %d ledgers per file", schema.LedgersPerBatch)
+	case schema.BatchesPerPartition < 1 || schema.BatchesPerPartition > maxBatchesPerPartition:
+		return archiveSchema{}, fmt.Errorf("archive has %d files per partition", schema.BatchesPerPartition)
 	}
 	a.schema, a.loaded = schema, true
 	return schema, nil
@@ -159,26 +173,44 @@ func (a *LedgerArchive) Events(ctx context.Context, from, to uint32) ([]vault.Ra
 		files = append(files, uint32(l))
 	}
 	results := make([][]vault.RawEvent, len(files))
-	errs := make([]error, len(files))
+	// The first failure stops the other fetches: the window fails whole anyway, and a store that is
+	// refusing requests should not be asked for the rest of its files.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var failure error
+	var failed sync.Once
 	jobs := make(chan int)
 	var wg sync.WaitGroup
 	for range max(a.Workers, 1) {
 		wg.Go(func() {
 			for i := range jobs {
-				results[i], errs[i] = a.file(ctx, schema, files[i], from, to, xdr.ContractId(contract))
+				var err error
+				results[i], err = a.file(ctx, schema, files[i], from, to, xdr.ContractId(contract))
+				if err != nil {
+					failed.Do(func() { failure = err })
+					cancel()
+				}
 			}
 		})
 	}
+feed:
 	for i := range files {
-		jobs <- i
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			break feed
+		}
 	}
 	close(jobs)
 	wg.Wait()
+	if failure != nil {
+		return nil, failure
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var out []vault.RawEvent
 	for i := range files {
-		if errs[i] != nil {
-			return nil, errs[i]
-		}
 		out = append(out, results[i]...)
 	}
 	return out, nil
@@ -194,7 +226,7 @@ func (a *LedgerArchive) file(ctx context.Context, schema archiveSchema, first, f
 		return nil, err
 	}
 	defer dec.Close()
-	raw, err := readAll(dec, int64(schema.LedgersPerBatch)*maxLedgerMeta)
+	raw, err := readAll(dec, maxBatchMeta)
 	if err != nil {
 		return nil, fmt.Errorf("ledger batch %d: %w", first, err)
 	}
