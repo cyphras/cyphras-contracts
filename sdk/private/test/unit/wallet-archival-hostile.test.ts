@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Address, type Transaction, xdr } from "@stellar/stellar-base";
+import {
+  Account,
+  Address,
+  Operation,
+  type Transaction,
+  TransactionBuilder,
+  xdr,
+} from "@stellar/stellar-base";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
+import { MemoryStore } from "../../src/storage.ts";
 import type { NetworkFee, NetworkFeeCaps, TransactionSigner } from "../../src/vault/invoke.ts";
-import { PrivateWallet } from "../../src/wallet/wallet.ts";
+import { type OperationView, PrivateWallet } from "../../src/wallet/wallet.ts";
 import { RPC, XLM, type World, createWorld } from "../support/network.ts";
 import { confirmAll, isError, openWallet } from "../support/wallets.ts";
 
@@ -315,5 +323,121 @@ describe("archival retries with a second provider", () => {
     assert.ok(isError("transaction_failed")(err), String(err));
     assert.equal(details(err)["secondProvider"], "other_outcome");
     assert.deepEqual(ops(world), ["invokeHostFunction"]);
+  });
+});
+
+describe("a split part whose proof an RPC lands itself", () => {
+  // An RPC that, on the first simulation of a transact, lands the proof it was given from an
+  // account of its own, then answers the user's simulation honestly, which the vault now refuses.
+  function lander(world: World, armed: { on: boolean; landed: number }): FetchLike {
+    return async (input, init) => {
+      const url = new URL(input);
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        method?: string;
+        params?: Record<string, unknown>;
+      };
+      if (url.origin === RPC && armed.on && body.method === "simulateTransaction") {
+        const parsed = TransactionBuilder.fromXDR(
+          body.params?.["transaction"] as string,
+          world.deployment.networkPassphrase,
+        ) as Transaction;
+        const op = parsed.operations[0];
+        if (
+          op?.type === "invokeHostFunction" &&
+          op.func.invokeContract().functionName().toString() === "transact"
+        ) {
+          armed.on = false;
+          const args = op.func.invokeContract().args();
+          const attacker = world.signer("attacker");
+          const sequence = (world.rpc.accounts.get(attacker.publicKey)?.sequence ?? 0n).toString();
+          const build = (
+            data?: xdr.SorobanTransactionData,
+            auth?: xdr.SorobanAuthorizationEntry[],
+          ): Transaction =>
+            new TransactionBuilder(new Account(attacker.publicKey, sequence), {
+              fee: "100000",
+              networkPassphrase: world.deployment.networkPassphrase,
+              ...(data === undefined ? {} : { sorobanData: data }),
+            })
+              .addOperation(
+                Operation.invokeContractFunction({
+                  contract: world.vault.address,
+                  function: "transact",
+                  args: [
+                    args[0] as xdr.ScVal,
+                    args[1] as xdr.ScVal,
+                    new Address(attacker.publicKey).toScVal(),
+                  ],
+                  ...(auth === undefined ? {} : { auth }),
+                }),
+              )
+              .setTimeout(300)
+              .build();
+          const sim = world.rpc.handle("simulateTransaction", {
+            transaction: build().toEnvelope().toXDR("base64"),
+          }) as { transactionData: string; results: { auth: string[] }[] };
+          const tx = build(
+            xdr.SorobanTransactionData.fromXDR(sim.transactionData, "base64"),
+            (sim.results[0]?.auth ?? []).map((a) =>
+              xdr.SorobanAuthorizationEntry.fromXDR(a, "base64"),
+            ),
+          );
+          tx.sign(attacker.keypair);
+          const sent = world.rpc.handle("sendTransaction", { transaction: tx.toXDR() }) as {
+            hash: string;
+          };
+          if (world.rpc.records.get(sent.hash)?.status === "SUCCESS") armed.landed++;
+        }
+      }
+      return world.fetch(input, init);
+    };
+  }
+
+  it("keeps the part and its operation, so the same request again pays no more than asked", async () => {
+    const world = await createWorld({
+      limits: { maxDailyOutflow: 50n * XLM, maxDeposit: 500n * XLM, tvlCap: 500n * XLM },
+    });
+    const armed = { on: false, landed: 0 };
+    const alice = await openWallet({ ...world, fetch: lander(world, armed) }, 0, new MemoryStore());
+    for (const amount of [60n * XLM, 70n * XLM, 100n * XLM]) {
+      await alice.shield({ amount, signer: world.signer("alice depositor") });
+    }
+    world.advance(3_601);
+    world.admitAll();
+    await alice.sync();
+    const destination = world.signer("exchange").publicKey;
+    const account = world.signer("my account");
+    const request = {
+      to: destination,
+      amount: 90n * XLM,
+      selfRelay: account,
+      split: true,
+      confirm: confirmAll,
+    } as const;
+    armed.on = true;
+    const err = await alice.unshield(request).catch((e: unknown) => e);
+    assert.equal(armed.landed, 1);
+    assert.ok(err instanceof CyphrasError, String(err));
+    const operationId = details(err)["operationId"];
+    assert.equal(typeof operationId, "string");
+    // The same request again continues that operation, whose first part the sync finds landed.
+    const view = (await alice.unshield(request)) as OperationView;
+    assert.equal(view.operationId, operationId);
+    for (let round = 0; round < 4; round++) {
+      world.advance(7 * 3600);
+      world.fill(1);
+      await alice.continueOperations(account).catch(() => undefined);
+    }
+    const owed =
+      world.vault.transfers.filter((t) => t.to === destination).reduce((s, t) => s + t.amount, 0n) +
+      [...world.vault.exits.values()]
+        .filter((e) => e.recipient === destination)
+        .reduce((s, e) => s + e.payout, 0n);
+    assert.equal(owed, 90n * XLM);
+    const views = await alice.continueOperations(account);
+    assert.deepEqual(
+      views.map((v) => [v.operationId, v.state]),
+      [[operationId, "done"]],
+    );
   });
 });
