@@ -18,7 +18,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
 	"github.com/cyphras/cyphras-contracts/services/internal/config"
@@ -37,43 +36,6 @@ const usage = `usage:
 
 // dialRPC is replaced by tests.
 var dialRPC = rpc.Dial
-
-// patientClient retries what an object store answers when it is busy, since one failed request
-// would otherwise cost a whole window of ledger files that a rebuild fetches again.
-var patientClient = &http.Client{Timeout: 10 * time.Minute, Transport: retrying{next: http.DefaultTransport, delay: 500 * time.Millisecond}}
-
-// attempts is the number of tries a request gets.
-const attempts = 5
-
-type retrying struct {
-	next  http.RoundTripper
-	delay time.Duration
-}
-
-func (r retrying) RoundTrip(req *http.Request) (*http.Response, error) {
-	var resp *http.Response
-	var err error
-	for try := range attempts {
-		if try > 0 {
-			select {
-			case <-req.Context().Done():
-				return nil, req.Context().Err()
-			case <-time.After(r.delay << (try - 1)):
-			}
-		}
-		resp, err = r.next.RoundTrip(req)
-		if err == nil && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
-			return resp, nil
-		}
-		if err != nil && req.Context().Err() != nil {
-			return nil, err
-		}
-		if err == nil && try < attempts-1 {
-			resp.Body.Close()
-		}
-	}
-	return resp, err
-}
 
 // defaultAddr keeps the server on this machine unless --addr says otherwise.
 const defaultAddr = "127.0.0.1:8737"
