@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -111,7 +110,7 @@ func readWindow(t *testing.T, dir string, start uint32) []byte {
 
 func writeManifestFile(t *testing.T, dir string, m Manifest) {
 	t.Helper()
-	raw, err := json.Marshal(m)
+	raw, err := m.Canonical()
 	if err != nil {
 		t.Fatal(err)
 	}

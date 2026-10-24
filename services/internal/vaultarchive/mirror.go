@@ -82,7 +82,11 @@ func Mirror(ctx context.Context, remote Fetcher, dir string, want Expect) (Mirro
 	if err := publish(dir, stage, fetched); err != nil {
 		return Mirrored{}, err
 	}
-	if err := writeFile(filepath.Join(dir, ManifestName), raw); err != nil {
+	canonical, err := published.Canonical()
+	if err != nil {
+		return Mirrored{}, err
+	}
+	if err := writeFile(filepath.Join(dir, ManifestName), canonical); err != nil {
 		return Mirrored{}, err
 	}
 	done = true

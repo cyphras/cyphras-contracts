@@ -373,7 +373,7 @@ func tamperLeaf(t *testing.T, dir string) {
 	}
 	sum := sha256.Sum256(data)
 	m.Windows[0].Bytes, m.Windows[0].SHA256 = int64(len(data)), hex.EncodeToString(sum[:])
-	raw, err = json.Marshal(m)
+	raw, err = m.Canonical()
 	if err != nil {
 		t.Fatal(err)
 	}

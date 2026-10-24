@@ -3,7 +3,6 @@ package vaultarchive
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"maps"
 	"net/http"
@@ -275,14 +274,8 @@ func TestNumbersPastTheTreeOrWhatJavaScriptHoldsAreRefused(t *testing.T) {
 		dir, _ := good(t)
 		m := readManifestFile(t, dir)
 		c.change(&m.Windows[0])
-		raw, err := json.Marshal(m)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, ManifestName), raw, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		_, err = ReadManifest(context.Background(), DirFetcher(dir), Expect{})
+		writeManifestFile(t, dir, m)
+		_, err := ReadManifest(context.Background(), DirFetcher(dir), Expect{})
 		mustInvalid(t, name, err, c.reason)
 	}
 

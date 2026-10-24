@@ -2,7 +2,6 @@ package vaultarchive
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -188,11 +187,11 @@ func buildWindow(ctx context.Context, src Source, stage string, h Header, done [
 }
 
 func writeManifest(dir string, m Manifest) error {
-	raw, err := json.MarshalIndent(m, "", "  ")
+	raw, err := m.Canonical()
 	if err != nil {
 		return err
 	}
-	return writeFile(filepath.Join(dir, ManifestName), append(raw, '\n'))
+	return writeFile(filepath.Join(dir, ManifestName), raw)
 }
 
 // writeFile replaces name in one step, so a reader never sees half a file.
