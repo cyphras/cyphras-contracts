@@ -70,7 +70,8 @@ server {
 
   # The published archive of the testnet vault: plain files from disk, read-only, nothing proxied.
   # add_header here replaces the server's, so the HSTS line is repeated. The cache lifetime is
-  # given without always, so an answer that is an error is not kept.
+  # given without always, so an answer that is an error is not kept. A link under the directory
+  # is never followed, so the directory may not be reached through one.
   location /testnet/xlm/archive/ {
     return 404;
   }
@@ -78,6 +79,7 @@ server {
     limit_except GET { deny all; }
     alias /var/www/cyphras-vault-archive/testnet/xlm/manifest.json;
     autoindex off;
+    disable_symlinks on;
     gzip off;
     default_type application/json;
     add_header Strict-Transport-Security "max-age=63072000" always;
@@ -89,6 +91,7 @@ server {
     limit_except GET { deny all; }
     alias /var/www/cyphras-vault-archive/testnet/xlm/windows/$window.jsonl.gz;
     autoindex off;
+    disable_symlinks on;
     gzip off;
     default_type application/gzip;
     add_header Strict-Transport-Security "max-age=63072000" always;
@@ -156,7 +159,8 @@ server {
 
   # The published archive of the mainnet vault: plain files from disk, read-only, nothing proxied.
   # add_header here replaces the server's, so the HSTS line is repeated. The cache lifetime is
-  # given without always, so an answer that is an error is not kept.
+  # given without always, so an answer that is an error is not kept. A link under the directory
+  # is never followed, so the directory may not be reached through one.
   location /mainnet/xlm/archive/ {
     return 404;
   }
@@ -164,6 +168,7 @@ server {
     limit_except GET { deny all; }
     alias /var/www/cyphras-vault-archive/mainnet/xlm/manifest.json;
     autoindex off;
+    disable_symlinks on;
     gzip off;
     default_type application/json;
     add_header Strict-Transport-Security "max-age=63072000" always;
@@ -175,6 +180,7 @@ server {
     limit_except GET { deny all; }
     alias /var/www/cyphras-vault-archive/mainnet/xlm/windows/$window.jsonl.gz;
     autoindex off;
+    disable_symlinks on;
     gzip off;
     default_type application/gzip;
     add_header Strict-Transport-Security "max-age=63072000" always;

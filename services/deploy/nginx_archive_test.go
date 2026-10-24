@@ -78,3 +78,12 @@ func TestTheArchiveRoutesKeepTheServersSecurityHeadersAndNothingThatRewritesAPat
 		}
 	}
 }
+
+func TestTheArchiveRoutesNeverFollowALink(t *testing.T) {
+	_, served := archiveLocations(t)
+	for _, l := range served {
+		if !strings.Contains(l.body, "disable_symlinks on;\n") {
+			t.Errorf("%s follows symbolic links", l.spec)
+		}
+	}
+}
