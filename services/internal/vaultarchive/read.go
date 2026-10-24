@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,12 +29,45 @@ func (d DirFetcher) Get(ctx context.Context, name string, limit int64) ([]byte, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	f, err := os.Open(filepath.Join(string(d), filepath.FromSlash(name)))
+	root, err := os.OpenRoot(string(d))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	f, err := OpenRegular(root, name)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 	return readLimited(f, limit)
+}
+
+// OpenRegular opens the slash-separated name under root. It refuses a name with a symbolic link
+// in any part of it, even one that points inside root, and anything but a regular file at the
+// end, with the error of a file that does not exist: an archive is plain files, and a mirror
+// someone else made must not be able to point a reader at the rest of the disk.
+func OpenRegular(root *os.Root, name string) (*os.File, error) {
+	missing := &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+	parts := strings.Split(name, "/")
+	for i := range parts {
+		info, err := root.Lstat(strings.Join(parts[:i+1], "/"))
+		if err != nil {
+			return nil, err
+		}
+		last := i == len(parts)-1
+		if info.Mode()&fs.ModeSymlink != 0 || (last && !info.Mode().IsRegular()) || (!last && !info.IsDir()) {
+			return nil, missing
+		}
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		return nil, missing
+	}
+	return f, nil
 }
 
 // HTTPFetcher reads an archive from a base URL.

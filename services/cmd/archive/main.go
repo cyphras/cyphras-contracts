@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
@@ -331,9 +332,9 @@ func serve(ctx context.Context, args []string, out io.Writer) error {
 
 var served = regexp.MustCompile(`^/(manifest\.json|windows/[0-9]{10}\.jsonl\.gz)$`)
 
-// handler serves the archive's own files and nothing else in dir, to any page that asks.
+// handler serves the archive's own files and nothing else in dir, to any page that asks. A
+// symbolic link is never followed, so a directory someone else made cannot leak a file.
 func handler(dir string) http.Handler {
-	files := http.FileServer(http.Dir(dir))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		switch {
@@ -345,10 +346,32 @@ func handler(dir string) http.Handler {
 		case !served.MatchString(r.URL.Path):
 			http.NotFound(w, r)
 		default:
-			if r.URL.Path == "/manifest.json" {
-				w.Header().Set("Cache-Control", "no-cache")
-			}
-			files.ServeHTTP(w, r)
+			sendFile(w, r, dir)
 		}
 	})
+}
+
+func sendFile(w http.ResponseWriter, r *http.Request, dir string) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer root.Close()
+	name := strings.TrimPrefix(r.URL.Path, "/")
+	f, err := vaultarchive.OpenRegular(root, name)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if name == vaultarchive.ManifestName {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
+	http.ServeContent(w, r, name, info.ModTime(), f)
 }
