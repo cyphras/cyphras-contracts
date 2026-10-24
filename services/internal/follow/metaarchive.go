@@ -159,26 +159,44 @@ func (a *LedgerArchive) Events(ctx context.Context, from, to uint32) ([]vault.Ra
 		files = append(files, uint32(l))
 	}
 	results := make([][]vault.RawEvent, len(files))
-	errs := make([]error, len(files))
+	// The first failure stops the other fetches: the window fails whole anyway, and a store that is
+	// refusing requests should not be asked for the rest of its files.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var failure error
+	var failed sync.Once
 	jobs := make(chan int)
 	var wg sync.WaitGroup
 	for range max(a.Workers, 1) {
 		wg.Go(func() {
 			for i := range jobs {
-				results[i], errs[i] = a.file(ctx, schema, files[i], from, to, xdr.ContractId(contract))
+				var err error
+				results[i], err = a.file(ctx, schema, files[i], from, to, xdr.ContractId(contract))
+				if err != nil {
+					failed.Do(func() { failure = err })
+					cancel()
+				}
 			}
 		})
 	}
+feed:
 	for i := range files {
-		jobs <- i
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			break feed
+		}
 	}
 	close(jobs)
 	wg.Wait()
+	if failure != nil {
+		return nil, failure
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var out []vault.RawEvent
 	for i := range files {
-		if errs[i] != nil {
-			return nil, errs[i]
-		}
 		out = append(out, results[i]...)
 	}
 	return out, nil
