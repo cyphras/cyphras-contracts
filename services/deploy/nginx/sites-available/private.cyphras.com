@@ -69,7 +69,8 @@ server {
   }
 
   # The published archive of the testnet vault: plain files from disk, read-only, nothing proxied.
-  # add_header here replaces the server's, so the HSTS line is repeated.
+  # add_header here replaces the server's, so the HSTS line is repeated. The cache lifetime is
+  # given without always, so an answer that is an error is not kept.
   location /testnet/xlm/archive/ {
     return 404;
   }
@@ -82,7 +83,7 @@ server {
     add_header Strict-Transport-Security "max-age=63072000" always;
     add_header Access-Control-Allow-Origin "*" always;
     add_header X-Content-Type-Options "nosniff" always;
-    add_header Cache-Control "public, max-age=60" always;
+    add_header Cache-Control "public, max-age=60";
   }
   location ~ "^/testnet/xlm/archive/windows/(?<window>[0-9]{10})\.jsonl\.gz$" {
     limit_except GET { deny all; }
@@ -93,7 +94,7 @@ server {
     add_header Strict-Transport-Security "max-age=63072000" always;
     add_header Access-Control-Allow-Origin "*" always;
     add_header X-Content-Type-Options "nosniff" always;
-    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    add_header Cache-Control "public, max-age=31536000, immutable";
   }
 
   # Cyphras private payments v2, mainnet XLM vault (compose project cyphras-mainnet-xlm).
@@ -154,7 +155,8 @@ server {
   }
 
   # The published archive of the mainnet vault: plain files from disk, read-only, nothing proxied.
-  # add_header here replaces the server's, so the HSTS line is repeated.
+  # add_header here replaces the server's, so the HSTS line is repeated. The cache lifetime is
+  # given without always, so an answer that is an error is not kept.
   location /mainnet/xlm/archive/ {
     return 404;
   }
@@ -167,7 +169,7 @@ server {
     add_header Strict-Transport-Security "max-age=63072000" always;
     add_header Access-Control-Allow-Origin "*" always;
     add_header X-Content-Type-Options "nosniff" always;
-    add_header Cache-Control "public, max-age=60" always;
+    add_header Cache-Control "public, max-age=60";
   }
   location ~ "^/mainnet/xlm/archive/windows/(?<window>[0-9]{10})\.jsonl\.gz$" {
     limit_except GET { deny all; }
@@ -178,7 +180,7 @@ server {
     add_header Strict-Transport-Security "max-age=63072000" always;
     add_header Access-Control-Allow-Origin "*" always;
     add_header X-Content-Type-Options "nosniff" always;
-    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    add_header Cache-Control "public, max-age=31536000, immutable";
   }
 
   location / {

@@ -288,9 +288,9 @@ func TestPrivateVhostServesThePublishedArchiveReadOnly(t *testing.T) {
 					t.Errorf("%s uses %q", uri, line)
 				}
 			}
-			cache := `add_header Cache-Control "public, max-age=60" always;`
+			cache := `add_header Cache-Control "public, max-age=60";`
 			if strings.HasSuffix(uri, ".gz") {
-				cache = `add_header Cache-Control "public, max-age=31536000, immutable" always;`
+				cache = `add_header Cache-Control "public, max-age=31536000, immutable";`
 			}
 			if !strings.Contains(l.body, cache+"\n") {
 				t.Errorf("%s lacks %q", uri, cache)
