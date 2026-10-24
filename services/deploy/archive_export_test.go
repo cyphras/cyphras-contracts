@@ -40,6 +40,9 @@ func newExportHost(t *testing.T) *exportHost {
 		filepath.Join(root, "services", "deploy", "archive-export.sh"): script,
 		filepath.Join(root, "deployments", "testnet.json"):             []byte("{}"),
 		filepath.Join(root, "bin", "docker"):                           []byte("#!/bin/sh\nfor a in \"$@\"; do echo \"$a\"; done > \"$FAKE_LOG\"\nexit \"${FAKE_STATUS:-0}\"\n"),
+		// flock -n FD, for a host that has no flock(1): perl takes the lock on the descriptor the
+		// script opened, which stays locked for as long as the script holds it.
+		filepath.Join(root, "bin", "flock"): []byte("#!/bin/sh\nexec perl -e 'open(my $f, \">&=\", $ARGV[1]) or exit 2; flock($f, 6) or exit 1' -- \"$@\"\n"),
 	}
 	for name, content := range files {
 		if err := os.WriteFile(name, content, 0o755); err != nil {
@@ -60,7 +63,7 @@ func (h *exportHost) run(env ...string) (args []string, output string, ok bool) 
 	cmd.Dir = h.cwd
 	cmd.Env = append(os.Environ(),
 		"PATH="+filepath.Join(h.root, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"FAKE_LOG="+h.log, "NETWORK=testnet", "ASSET=xlm", "ARCHIVE_IMAGE="+exportImage, "ARCHIVE_PUBLISH_DIR="+h.publish)
+		"FAKE_LOG="+h.log, "NETWORK=testnet", "ASSET=xlm", "ARCHIVE_IMAGE="+exportImage, "ARCHIVE_PUBLISH_DIR="+h.publish, "ARCHIVE_UID=10100")
 	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.CombinedOutput()
 	raw, _ := os.ReadFile(h.log)
@@ -88,7 +91,7 @@ func TestTheArchiveExportRunsTheImageAsAnUnprivilegedUserOverAReadOnlyEventArchi
 	events := filepath.Join(h.root, "services", "deploy", "data", "testnet", "xlm", "archive")
 	published := h.publish
 	for _, want := range []string{
-		"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "no-new-privileges:true", "65532:65532",
+		"run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "no-new-privileges:true", "10100:10100",
 		"type=bind,source=" + events + ",target=/in,readonly",
 		"type=bind,source=" + published + ",target=/out",
 		exportImage, "export", "--out", "/out", "--dir", "/in", "--network", "testnet",
@@ -123,16 +126,20 @@ func TestTheArchiveExportFailsWhenTheExportFailsOrItsSettingsAreWrong(t *testing
 	}
 	missing := filepath.Join(h.root, "nothing")
 	for name, env := range map[string][]string{
-		"no network":                         {"NETWORK="},
-		"a network that climbs out":          {"NETWORK=../x"},
-		"an asset with a slash":              {"ASSET=x/y"},
-		"an image by tag":                    {"ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/archive:latest"},
-		"no image":                           {"ARCHIVE_IMAGE="},
-		"no publish directory":               {"ARCHIVE_PUBLISH_DIR="},
-		"a publish directory that is absent": {"ARCHIVE_PUBLISH_DIR=" + missing},
-		"root":                               {"ARCHIVE_UID=0"},
-		"a user that is not a number":        {"ARCHIVE_UID=nobody"},
-		"a network with no event archive":    {"NETWORK=mainnet"},
+		"no network":                           {"NETWORK="},
+		"a network that climbs out":            {"NETWORK=../x"},
+		"an asset with a slash":                {"ASSET=x/y"},
+		"an image by tag":                      {"ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/archive:latest"},
+		"no image":                             {"ARCHIVE_IMAGE="},
+		"no publish directory":                 {"ARCHIVE_PUBLISH_DIR="},
+		"a publish directory that is absent":   {"ARCHIVE_PUBLISH_DIR=" + missing},
+		"root":                                 {"ARCHIVE_UID=0"},
+		"the user every service image runs as": {"ARCHIVE_UID=65532"},
+		"no user":                              {"ARCHIVE_UID="},
+		"an image of another repository":       {"ARCHIVE_IMAGE=ghcr.io/someone/else/archive@sha256:" + strings.Repeat("ab", 32)},
+		"another image of this repository":     {"ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/indexer@sha256:" + strings.Repeat("ab", 32)},
+		"a user that is not a number":          {"ARCHIVE_UID=nobody"},
+		"a network with no event archive":      {"NETWORK=mainnet"},
 	} {
 		args, out, ok := h.run(env...)
 		if ok || len(args) != 0 {
@@ -172,5 +179,46 @@ func TestTheArchiveExportRefusesPathsThatWouldAddMountOptions(t *testing.T) {
 	}
 	if args, out, ok := h.run("ARCHIVE_PUBLISH_DIR=" + odd); ok || len(args) != 0 {
 		t.Errorf("a publish directory with a comma in its name reached docker:\n%s\n%v", out, args)
+	}
+}
+
+func TestTheArchiveExportStopsWhenAnotherExportHoldsTheLock(t *testing.T) {
+	if _, err := exec.LookPath("perl"); err != nil {
+		t.Skip("perl is not installed")
+	}
+	h := newExportHost(t)
+	lock := filepath.Join(h.root, "services", "deploy", "data", "testnet", "xlm", ".archive-export.lock")
+	// Another process holds the lock until its input closes.
+	holder := exec.Command("perl", "-e", `$| = 1; open(my $f, ">", $ARGV[0]) or die; flock($f, 2) or die; print "locked\n"; <STDIN>`, lock)
+	stdin, err := holder.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := holder.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			stdin.Close()
+			holder.Wait()
+		}
+	}
+	defer release()
+	if n, err := stdout.Read(make([]byte, 7)); err != nil || n != 7 {
+		t.Fatalf("the lock was not taken: %d, %v", n, err)
+	}
+	args, out, ok := h.run()
+	if ok || len(args) != 0 || !strings.Contains(out, "another export is running") {
+		t.Fatalf("an export beside another: ok %v, docker asked %v\n%s", ok, args, out)
+	}
+	release()
+	if args, out, ok := h.run(); !ok || len(args) == 0 {
+		t.Fatalf("the export after the lock was let go: %v\n%s", args, out)
 	}
 }

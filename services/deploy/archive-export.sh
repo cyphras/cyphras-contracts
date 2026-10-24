@@ -4,15 +4,17 @@
 # windows that have closed since the last run. Run verify-images.sh with ARCHIVE_IMAGE first.
 #
 #   NETWORK=testnet ASSET=xlm ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/archive@sha256:... \
-#   ARCHIVE_PUBLISH_DIR=/srv/archive/testnet/xlm ./archive-export.sh
+#   ARCHIVE_UID=<id> ARCHIVE_PUBLISH_DIR=/var/www/cyphras-vault-archive/testnet/xlm ./archive-export.sh
 #
 # The event archive is mounted read only and the container has no network and no capabilities. It
-# runs as ARCHIVE_UID (65532 unless set), which must own ARCHIVE_PUBLISH_DIR or be able to write to
-# it. A published window is never rewritten with other bytes: if the event archive no longer gives
-# a window it already published, the export fails and leaves the directory as it was. Set
-# ARCHIVE_VAULT when the deployment file lists several vaults.
+# runs as ARCHIVE_UID, a user id that nothing else on the host uses (not root and not the 65532 the
+# service images share), which must own ARCHIVE_PUBLISH_DIR or be able to write to it. Only one
+# export runs at a time: a second one stops at once. A published window is never rewritten with
+# other bytes: if the event archive no longer gives a window it already published, the export fails
+# and leaves the directory as it was. Set ARCHIVE_VAULT when the deployment file lists several
+# vaults.
 set -euo pipefail
-: "${NETWORK:?}" "${ASSET:?}" "${ARCHIVE_IMAGE:?}" "${ARCHIVE_PUBLISH_DIR:?}"
+: "${NETWORK:?}" "${ASSET:?}" "${ARCHIVE_IMAGE:?}" "${ARCHIVE_PUBLISH_DIR:?}" "${ARCHIVE_UID:?}"
 if ! [ -d "$ARCHIVE_PUBLISH_DIR" ]; then
   echo "$ARCHIVE_PUBLISH_DIR is not a directory" >&2
   exit 1
@@ -23,13 +25,13 @@ if ! [[ "$NETWORK" =~ ^[a-z]+$ ]] || ! [[ "$ASSET" =~ ^[a-z0-9]+$ ]]; then
   echo "NETWORK and ASSET must be lowercase names" >&2
   exit 1
 fi
-if ! [[ "$ARCHIVE_IMAGE" =~ ^[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
-  echo "ARCHIVE_IMAGE must name an image by its digest" >&2
+if ! [[ "$ARCHIVE_IMAGE" =~ ^ghcr\.io/cyphras/cyphras-contracts/archive@sha256:[0-9a-f]{64}$ ]]; then
+  echo "ARCHIVE_IMAGE must be the archive image of cyphras-contracts, by its digest" >&2
   exit 1
 fi
-uid=${ARCHIVE_UID:-65532}
-if ! [[ "$uid" =~ ^[0-9]+$ ]] || [ "$uid" -eq 0 ]; then
-  echo "ARCHIVE_UID must be a user id other than root" >&2
+uid=$ARCHIVE_UID
+if ! [[ "$uid" =~ ^[0-9]+$ ]] || [ "$uid" -eq 0 ] || [ "$uid" -eq 65532 ]; then
+  echo "ARCHIVE_UID must be a user id of its own, not root and not 65532" >&2
   exit 1
 fi
 events="$PWD/data/$NETWORK/$ASSET/archive"
@@ -45,6 +47,16 @@ fi
 # A comma would start another option of the mount.
 if [[ "$events$publish$deployment" == *,* ]]; then
   echo "the paths of the mounts must not contain a comma" >&2
+  exit 1
+fi
+# The lock is outside the published directory, in the stack's data folder.
+if ! command -v flock > /dev/null; then
+  echo "flock is required" >&2
+  exit 1
+fi
+exec 9> "$PWD/data/$NETWORK/$ASSET/.archive-export.lock"
+if ! flock -n 9; then
+  echo "another export is running" >&2
   exit 1
 fi
 vault=()
