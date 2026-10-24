@@ -12,7 +12,8 @@ export interface LedgerEntry {
 export interface LedgerEntries {
   readonly latestLedger: number;
   // Keyed by the base64 XDR of each requested key; keys with no entry are absent. An archived
-  // entry is present, with a liveUntilLedger before latestLedger, 0 once the network evicted it.
+  // entry is present, with a liveUntilLedger at or before latestLedger, 0 once the network evicted
+  // it.
   readonly entries: ReadonlyMap<string, LedgerEntry>;
 }
 
@@ -98,12 +99,21 @@ export const isPersistent = (key: xdr.LedgerKey): boolean =>
   (key.switch().name === "contractData" && key.contractData().durability().name === "persistent");
 
 function sorobanData(f: Fields, key: string): xdr.SorobanTransactionData {
+  let data: xdr.SorobanTransactionData;
   try {
-    return xdr.SorobanTransactionData.fromXDR(f.string(key), "base64");
+    data = xdr.SorobanTransactionData.fromXDR(f.string(key), "base64");
   } catch (err) {
     if (err instanceof CyphrasError) throw err;
     return f.fault(`${key} is not SorobanTransactionData XDR`);
   }
+  if (BigInt(data.resourceFee().toString()) < 0n) f.fault(`${key} has a negative resource fee`);
+  return data;
+}
+
+function fee(f: Fields, key: string): bigint {
+  const value = f.amount(key);
+  if (value < 0n) f.fault(`${key} is negative`);
+  return value;
 }
 
 // The read-write entries the data marks as archived. The network refuses data whose marks are not
@@ -235,7 +245,7 @@ export class SorobanRpc {
     const preamble = r.has("restorePreamble") ? r.object("restorePreamble") : undefined;
     return {
       transactionData: r.string("transactionData"),
-      minResourceFee: r.amount("minResourceFee"),
+      minResourceFee: fee(r, "minResourceFee"),
       auth: first?.has("auth") ? first.array("auth").map(String) : [],
       result: first?.has("xdr") ? xdr.ScVal.fromXDR(first.string("xdr"), "base64") : undefined,
       latestLedger,
@@ -245,7 +255,7 @@ export class SorobanRpc {
           ? undefined
           : {
               transactionData: sorobanData(preamble, "transactionData"),
-              minResourceFee: preamble.amount("minResourceFee"),
+              minResourceFee: fee(preamble, "minResourceFee"),
             },
       contractError: undefined,
       failed: false,

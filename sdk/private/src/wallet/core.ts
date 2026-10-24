@@ -53,13 +53,16 @@ export interface Core {
 
 export const newId = (): string => bytesToHex(randomBytes(16));
 
-// With `caps`, a call's own caps over the wallet's, as after its user agreed to a restore's fee.
+// With `caps`, checked by feeCapsOf, a call's own caps over the wallet's, as after its user agreed
+// to a restore's fee.
 export function invokeContext(core: Core, caps?: Partial<NetworkFeeCaps>): InvokeContext {
   return {
     rpc: core.services.rpc,
     second: core.services.second?.rpc,
     networkPassphrase: core.deployment.networkPassphrase,
     vault: core.deployment.vault,
+    vaultWasmHash: core.deployment.vaultWasmHash,
+    asset: core.deployment.asset.contract,
     feeCaps: { ...core.feeCaps, ...caps },
     now: () => core.now(),
     sleep: (ms: number) => core.sleep(ms),

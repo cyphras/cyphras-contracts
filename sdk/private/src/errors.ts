@@ -29,6 +29,7 @@ export type ErrorCode =
   | "insufficient_funds"
   | "needs_consolidation"
   | "fee_above_cap"
+  | "fee_above_limit"
   | "quote_invalid"
   | "not_confirmed"
   | "destination_invalid"

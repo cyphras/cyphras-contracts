@@ -44,6 +44,7 @@ import {
   type NetworkFeeCaps,
   type TransactionSigner,
   type VaultRestore,
+  feeCapsOf,
   invokeVault,
   restoreEntries,
 } from "../vault/invoke.ts";
@@ -144,8 +145,8 @@ export interface ConnectionOptions {
   // Service URLs other than the pinned ones; each must report the pinned vault and network.
   readonly indexers?: readonly string[];
   readonly relayers?: readonly string[];
-  // The most a transaction the SDK builds may pay the network; defaults to 0.01 XLM for inclusion
-  // and 1 XLM for resources.
+  // The most a transaction the SDK builds may pay the network; defaults to 0.01 XLM for inclusion,
+  // 1 XLM for resources and nothing more for a restore or a renewal of entries.
   readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   // How much one sync downloads at most; the defaults suit an extension's service worker.
   readonly syncLimits?: Partial<SyncLimits>;
@@ -237,8 +238,11 @@ export interface UnshieldRequest {
   readonly maxFee?: bigint;
   readonly relayer?: string | readonly string[];
   readonly selfRelay?: TransactionSigner;
-  // Caps of a self-relayed unshield's own transaction over the wallet's, as after the user agreed
-  // to the fee a fee_above_cap error reported.
+  // Caps of a self-relayed unshield's own transactions over the wallet's, as after the user agreed
+  // to the fee a fee_above_cap error reported. An unshield that failed so keeps its plan and notes
+  // and goes again only through retry with these caps; a split whose first part never reached the
+  // signer leaves nothing behind, and goes again as a new unshield. Later parts of a split take
+  // the caps continueOperations is given.
   readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   readonly confirm?: ConfirmSpend;
   readonly notBefore?: number;
@@ -659,7 +663,7 @@ export class PrivateWallet {
       artifacts,
       state,
       chain: undefined,
-      feeCaps: { ...DEFAULT_NETWORK_FEE_CAPS, ...options.networkFeeCaps },
+      feeCaps: { ...DEFAULT_NETWORK_FEE_CAPS, ...feeCapsOf(options.networkFeeCaps) },
       save: () => states.save(state),
       now,
       sleep,
@@ -707,7 +711,8 @@ export class PrivateWallet {
    * Restores the vault's code, instance, tree and balance in the asset contract where they are
    * archived, with one RestoreFootprint transaction that `signer` sends and pays for. No wallet or
    * proof is needed, so anyone can pay the restore once for every user. Its fee counts against
-   * `networkFeeCaps.resource` plus `networkFeeCaps.restore`, which is 0 unless set.
+   * `networkFeeCaps.resource` plus `networkFeeCaps.restore`, which is 0 unless set. The RPC must
+   * serve the deployment's network.
    */
   static async restoreVault(
     signer: TransactionSigner,
@@ -726,12 +731,19 @@ export class PrivateWallet {
       options.deployment,
       options.allowUnpinnedDeployment ?? false,
     );
+    const caps = feeCapsOf(options.networkFeeCaps);
+    const rpc = new SorobanRpc(options.rpcUrl, options.fetch ?? defaultFetch);
+    if ((await rpc.getNetworkPassphrase()) !== deployment.networkPassphrase) {
+      fail("deployment_mismatch", "the RPC serves another network");
+    }
     return restoreEntries(
       {
-        rpc: new SorobanRpc(options.rpcUrl, options.fetch ?? defaultFetch),
+        rpc,
         networkPassphrase: deployment.networkPassphrase,
         vault: deployment.vault,
-        feeCaps: { ...DEFAULT_NETWORK_FEE_CAPS, ...options.networkFeeCaps },
+        vaultWasmHash: deployment.vaultWasmHash,
+        asset: deployment.asset.contract,
+        feeCaps: { ...DEFAULT_NETWORK_FEE_CAPS, ...caps },
         now: options.clock ?? (() => Date.now()),
         sleep:
           options.sleep ??
@@ -1158,13 +1170,14 @@ export class PrivateWallet {
     readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   }): Promise<ShieldReceipt> {
     return this.#run(async () => {
+      const caps = feeCapsOf(request.networkFeeCaps);
       await this.#ensureVerified();
       return shield(
         this.#core,
         request.amount,
         request.signer,
         request.whileSubmitting === true,
-        request.networkFeeCaps,
+        caps,
       );
     });
   }
@@ -1177,7 +1190,8 @@ export class PrivateWallet {
   ): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      return { txHash: await cancelDeposit(this.#core, id, signer, networkFeeCaps) };
+      const caps = feeCapsOf(networkFeeCaps);
+      return { txHash: await cancelDeposit(this.#core, id, signer, caps) };
     });
   }
 
@@ -1189,7 +1203,8 @@ export class PrivateWallet {
   ): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
       await this.#ensureVerified();
-      return { txHash: await refundDeposit(this.#core, id, signer, networkFeeCaps) };
+      const caps = feeCapsOf(networkFeeCaps);
+      return { txHash: await refundDeposit(this.#core, id, signer, caps) };
     });
   }
 
@@ -1255,6 +1270,7 @@ export class PrivateWallet {
   unshield(request: UnshieldRequest): Promise<Submission | OperationView>;
   unshield(request: UnshieldRequest): Promise<Submission | OperationView> {
     return this.#run(async () => {
+      const caps = feeCapsOf(request.networkFeeCaps);
       await this.#sync(false);
       const maxFee = request.selfRelay === undefined ? request.maxFee : 0n;
       if (maxFee === undefined) fail("invalid_argument", "a relayed unshield needs maxFee");
@@ -1262,7 +1278,7 @@ export class PrivateWallet {
       const burnToIssuer = request.burnToIssuer === true;
       if (request.split === true && request.amount + maxFee > limits.maxDailyOutflow) {
         checkIssuer(this.#core.deployment.asset.name, request.to, burnToIssuer);
-        return this.#startSplit(request, maxFee, limits.maxDailyOutflow - maxFee);
+        return this.#startSplit(request, maxFee, limits.maxDailyOutflow - maxFee, caps);
       }
       return spend(this.#core, {
         kind: "unshield",
@@ -1271,7 +1287,7 @@ export class PrivateWallet {
         maxFee,
         relayers: request.selfRelay === undefined ? this.#relayerClients(request.relayer) : [],
         selfRelay: request.selfRelay,
-        feeCaps: request.networkFeeCaps,
+        feeCaps: caps,
         confirm: request.confirm,
         notBefore: request.notBefore,
         inputs: undefined,
@@ -1288,6 +1304,7 @@ export class PrivateWallet {
     request: UnshieldRequest,
     maxFee: bigint,
     partSize: bigint,
+    caps: Partial<NetworkFeeCaps>,
   ): Promise<OperationView> {
     if (partSize <= 0n) fail("limit_exceeded", "the fee cap leaves no room for a payout");
     const parts = Number((request.amount + partSize - 1n) / partSize);
@@ -1320,9 +1337,30 @@ export class PrivateWallet {
       state: "active",
       blockedBy: undefined,
     };
-    this.#core.state.operations.push(op);
+    const { state } = this.#core;
+    state.operations.push(op);
     await this.#core.save();
-    await this.#nextPart(op, request.selfRelay, undefined, undefined, request.confirm);
+    try {
+      await this.#nextPart(op, request.selfRelay, undefined, undefined, request.confirm, caps);
+    } catch (err) {
+      // A first part that made no plan, or whose transaction never reached the signer, can never
+      // land: the operation goes as if never made, so that the unshield itself goes again rather
+      // than a second operation beside this one.
+      const part = state.plans.find((p) => p.operationId === op.id);
+      const unsigned = err instanceof CyphrasError && err.details["signed"] === false;
+      if (part === undefined || unsigned) {
+        if (part !== undefined) state.plans.splice(state.plans.indexOf(part), 1);
+        state.operations.splice(state.operations.indexOf(op), 1);
+        await this.#core.save();
+        if (err instanceof CyphrasError) {
+          const details = Object.fromEntries(
+            Object.entries(err.details).filter(([k]) => k !== "planId" && k !== "signed"),
+          );
+          throw new CyphrasError(err.code, err.message, details, { cause: err.cause });
+        }
+      }
+      throw err;
+    }
     return this.#operationView(op);
   }
 
@@ -1339,6 +1377,7 @@ export class PrivateWallet {
     inputs: OwnedNote[] | undefined,
     again: Plan | undefined,
     confirm?: ConfirmSpend,
+    caps?: Partial<NetworkFeeCaps>,
   ): Promise<void> {
     const remaining = op.total - this.#sent(op);
     await spend(this.#core, {
@@ -1348,7 +1387,7 @@ export class PrivateWallet {
       maxFee: op.maxFee,
       relayers: op.route.kind === "relayers" ? this.#relayerClients(op.route.urls) : [],
       selfRelay: signer,
-      feeCaps: undefined,
+      feeCaps: caps,
       // Later parts were confirmed with the whole operation; their warnings cannot stop them.
       confirm: confirm ?? (() => true),
       notBefore: undefined,
@@ -1379,21 +1418,40 @@ export class PrivateWallet {
     };
   }
 
-  // One step of an operation: follows the part it awaits, then sends the next one once it is due.
-  // With `resume`, a part that blocks the operation is taken, on the caller's word, for one that
-  // never paid.
+  // One step of an operation: follows the part it awaits, then sends the next one once it is due,
+  // within `caps` when self-relayed. With `resume`, a part that blocks the operation is taken, on
+  // the caller's word, for one that never paid.
   async #advance(
     op: Operation,
     signer: TransactionSigner | undefined,
     resume: boolean,
+    caps: Partial<NetworkFeeCaps>,
   ): Promise<void> {
     if (op.state === "done" || op.state === "abandoned") return;
     const { state } = this.#core;
     const parts = state.plans.filter((p) => p.operationId === op.id);
-    if (parts.some(isActive)) return;
     // A self-relayed part goes only with its signer; the operation's state moves without it.
     const sends = op.route.kind !== "self" || signer?.publicKey === op.route.account;
     const relay = op.route.kind === "self" ? signer : undefined;
+    // A self-relayed part that stopped on an error before the network took it goes again with its
+    // own notes, as retry sends it, so at most one of the two can land.
+    const stalled = parts.find(
+      (p) =>
+        p.id === op.awaiting &&
+        p.state === "prepared" &&
+        p.txHash === undefined &&
+        p.error !== undefined,
+    );
+    if (stalled !== undefined && op.route.kind === "self") {
+      const notes = stalled.inputs.map((i) =>
+        state.notes.find((n) => n.pos === i.pos && n.spent === undefined),
+      );
+      if (sends && notes.every((n) => n !== undefined)) {
+        await this.#nextPart(op, relay, notes, stalled, undefined, caps);
+      }
+      return;
+    }
+    if (parts.some(isActive)) return;
     const awaiting = parts.find((p) => p.id === op.awaiting);
     if (awaiting !== undefined) {
       const providers = this.#core.services.second === undefined ? 1 : 2;
@@ -1409,7 +1467,7 @@ export class PrivateWallet {
         const notes = awaiting.inputs.map(
           (i) => state.notes.find((n) => n.pos === i.pos) as OwnedNote,
         );
-        if (sends) await this.#nextPart(op, relay, notes, awaiting);
+        if (sends) await this.#nextPart(op, relay, notes, awaiting, undefined, caps);
         return;
       }
       op.awaiting = undefined;
@@ -1421,7 +1479,7 @@ export class PrivateWallet {
       return;
     }
     if (this.#core.now() < op.nextAt || !sends) return;
-    await this.#nextPart(op, relay, undefined, undefined);
+    await this.#nextPart(op, relay, undefined, undefined, undefined, caps);
   }
 
   #operation(operationId: string): Operation {
@@ -1436,12 +1494,18 @@ export class PrivateWallet {
    * whose notes a landed payment of this wallet spent never paid, and the next part takes its
    * place. One that did not land and whose notes were spent elsewhere blocks the operation until
    * it lands after all, or the caller resumes or abandons the operation. A self-relayed operation
-   * needs its signer again.
+   * needs its signer again; a part of it that stopped before the network took it, as on a fee
+   * above the caps, goes again with its own notes. `networkFeeCaps` apply, over the wallet's, to
+   * the transactions of the parts `signer` sends in this call alone.
    */
-  continueOperations(signer?: TransactionSigner): Promise<OperationView[]> {
+  continueOperations(
+    signer?: TransactionSigner,
+    networkFeeCaps?: Partial<NetworkFeeCaps>,
+  ): Promise<OperationView[]> {
     return this.#run(async () => {
+      const caps = feeCapsOf(networkFeeCaps);
       await this.#sync(false);
-      for (const op of this.#core.state.operations) await this.#advance(op, signer, false);
+      for (const op of this.#core.state.operations) await this.#advance(op, signer, false, caps);
       await this.#core.save();
       return this.#core.state.operations.map((op) => this.#operationView(op));
     });
@@ -1452,12 +1516,17 @@ export class PrivateWallet {
    * paid, as when its notes were spent elsewhere: the next part goes in its place, with other
    * notes. Should the part have landed after all, the operation simply goes on from it.
    */
-  resumeOperation(operationId: string, signer?: TransactionSigner): Promise<OperationView> {
+  resumeOperation(
+    operationId: string,
+    signer?: TransactionSigner,
+    networkFeeCaps?: Partial<NetworkFeeCaps>,
+  ): Promise<OperationView> {
     return this.#run(async () => {
+      const caps = feeCapsOf(networkFeeCaps);
       await this.#sync(false);
       const op = this.#operation(operationId);
       if (op.state !== "blocked") fail("invalid_argument", "only a blocked operation resumes");
-      await this.#advance(op, signer, true);
+      await this.#advance(op, signer, true, caps);
       await this.#core.save();
       return this.#operationView(op);
     });
@@ -1485,6 +1554,7 @@ export class PrivateWallet {
    */
   retry(planId: string, request: RetryRequest = {}): Promise<Submission> {
     return this.#run(async () => {
+      const caps = feeCapsOf(request.networkFeeCaps);
       await this.#sync(false);
       const { state } = this.#core;
       const plan = state.plans.find((p) => p.id === planId);
@@ -1520,7 +1590,7 @@ export class PrivateWallet {
         maxFee: request.selfRelay === undefined ? (request.maxFee ?? plan.fee) : 0n,
         relayers: request.selfRelay === undefined ? this.#relayerClients(relayers) : [],
         selfRelay: request.selfRelay,
-        feeCaps: request.networkFeeCaps,
+        feeCaps: caps,
         confirm: request.confirm,
         notBefore: undefined,
         inputs,
@@ -1581,8 +1651,9 @@ export class PrivateWallet {
     networkFeeCaps?: Partial<NetworkFeeCaps>,
   ): Promise<{ readonly txHash: string }> {
     return this.#run(async () => {
+      const caps = feeCapsOf(networkFeeCaps);
       await this.#ensureVerified();
-      const { hash } = await invokeVault(invokeContext(this.#core, networkFeeCaps), signer, {
+      const { hash } = await invokeVault(invokeContext(this.#core, caps), signer, {
         fn: "release",
         args: [xdr.ScVal.scvU32(max)],
         transfers: [],
@@ -1602,17 +1673,14 @@ export class PrivateWallet {
     networkFeeCaps?: Partial<NetworkFeeCaps>,
   ): Promise<{ readonly txHash: string; readonly requeuedAs: number }> {
     return this.#run(async () => {
+      const caps = feeCapsOf(networkFeeCaps);
       await this.#ensureVerified();
-      const { hash, returnValue } = await invokeVault(
-        invokeContext(this.#core, networkFeeCaps),
-        signer,
-        {
-          fn: "claim",
-          args: [xdr.ScVal.scvU64(new xdr.Uint64(BigInt(exitId)))],
-          transfers: [],
-          extend: claimRoom(this.#core),
-        },
-      );
+      const { hash, returnValue } = await invokeVault(invokeContext(this.#core, caps), signer, {
+        fn: "claim",
+        args: [xdr.ScVal.scvU64(new xdr.Uint64(BigInt(exitId)))],
+        transfers: [],
+        extend: claimRoom(this.#core),
+      });
       if (returnValue?.switch().name !== "scvU64") {
         fail("rpc_error", "the claim returned no exit ID");
       }

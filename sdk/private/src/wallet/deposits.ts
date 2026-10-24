@@ -254,6 +254,11 @@ export async function shield(
           deposit.txHash = hash;
           await core.save();
         },
+        // A transaction past its ledger bound can never land, so it holds the deposit no longer.
+        onDropped: async (hash) => {
+          if (deposit.txHash === hash) deposit.txHash = undefined;
+          await core.save();
+        },
       },
     );
     // The deposit's ID counts once every RPC provider reports its transaction alike; until then the

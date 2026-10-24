@@ -723,7 +723,9 @@ export async function resendConflicted(
 
 // The user's own account submits the unshield and pays the network fee. The plan stays
 // submitted until a sync shows its nullifiers and commitments in one transaction, as for a relayed
-// one; the RPC's word that the transaction succeeded does not confirm it.
+// one; the RPC's word that the transaction succeeded does not confirm it. An error that came before
+// the signer was asked to sign the call says so with details.signed false: nothing of the plan can
+// land then.
 async function selfRelay(
   core: Core,
   plan: Plan,
@@ -731,6 +733,7 @@ async function selfRelay(
   caps: Partial<NetworkFeeCaps> | undefined,
 ): Promise<Submission> {
   const ext: ExtData = extDataFromJson(plan.ext);
+  let signing = false;
   try {
     await invokeVault(
       invokeContext(core, caps),
@@ -746,6 +749,9 @@ async function selfRelay(
         extend: transactRoom(core, ext),
       },
       {
+        onSigning: () => {
+          signing = true;
+        },
         onSubmitted: async (hash) => {
           plan.state = "submitted";
           plan.txHash = hash;
@@ -757,6 +763,14 @@ async function selfRelay(
     if (err instanceof CyphrasError) {
       plan.error = err.code;
       await core.save();
+      if (!signing) {
+        throw new CyphrasError(
+          err.code,
+          err.message,
+          { ...err.details, signed: false },
+          { cause: err.cause },
+        );
+      }
     }
     throw err;
   }

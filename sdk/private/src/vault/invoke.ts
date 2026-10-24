@@ -53,6 +53,33 @@ export const DEFAULT_NETWORK_FEE_CAPS: NetworkFeeCaps = {
   restore: 0n,
 };
 
+// The most a transaction envelope's fee field holds, in stroops.
+const MAX_ENVELOPE_FEE = 4_294_967_295n;
+
+// Caps a caller gives, checked: each present one a bigint of at least 0, the inclusion cap within
+// what an envelope holds. Caps left undefined are dropped, so they keep the caps they would replace.
+export function feeCapsOf(caps: unknown): Partial<NetworkFeeCaps> {
+  if (caps === undefined) return {};
+  if (typeof caps !== "object" || caps === null) {
+    fail("invalid_argument", "network fee caps are an object of bigints");
+  }
+  const out: { -readonly [K in keyof NetworkFeeCaps]?: bigint } = {};
+  for (const [name, value] of Object.entries(caps)) {
+    if (name !== "inclusion" && name !== "resource" && name !== "restore") {
+      fail("invalid_argument", `there is no network fee cap ${name}`);
+    }
+    if (value === undefined) continue;
+    if (typeof value !== "bigint" || value < 0n) {
+      fail("invalid_argument", `the network fee cap ${name} is not a bigint of at least 0`);
+    }
+    if (name === "inclusion" && value > MAX_ENVELOPE_FEE) {
+      fail("invalid_argument", "the inclusion fee cap is above what a transaction carries");
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
 /** What a restore of the vault's entries did: its transaction, when one was needed, and the entries it restored, by name. */
 export interface VaultRestore {
   readonly txHash: string | undefined;
@@ -108,6 +135,10 @@ export interface InvokeContext {
   readonly second: SorobanRpc | undefined;
   readonly networkPassphrase: string;
   readonly vault: string;
+  // The pinned vault wasm and pool asset contract: the only code and the only other contract
+  // whose archived entries a call restores.
+  readonly vaultWasmHash: string;
+  readonly asset: string;
   readonly feeCaps: NetworkFeeCaps;
   // Milliseconds since the epoch.
   readonly now: () => number;
@@ -443,33 +474,53 @@ function checkAuth(
   }
 }
 
-// A ledger entry by the name the vault or the asset contract keys it with, as a fee shows it.
-function entryName(key: xdr.LedgerKey, vault: string): string {
+type Owners = Pick<InvokeContext, "vault" | "vaultWasmHash" | "asset">;
+
+// A ledger entry by its owner and the name it is keyed with, as a fee shows it: the vault's code
+// and entries by name alone, the pool asset contract's after "asset", any other by its contract
+// address or code hash.
+function entryName(key: xdr.LedgerKey, o: Owners): string {
   const kind = key.switch().name;
-  if (kind === "contractCode") return "code";
+  if (kind === "contractCode") {
+    const hash = bytesToHex(Uint8Array.from(key.contractCode().hash()));
+    return hash === o.vaultWasmHash ? "code" : `code ${hash}`;
+  }
   if (kind !== "contractData") return kind;
   const data = key.contractData();
-  const owner = Address.fromScAddress(data.contract()).toString() === vault ? "" : "asset ";
+  const contract = Address.fromScAddress(data.contract()).toString();
+  const owner = contract === o.vault ? "" : contract === o.asset ? "asset " : `${contract} `;
   const k = data.key();
   if (k.switch().name === "scvLedgerKeyContractInstance") return `${owner}instance`;
   const first = k.switch().name === "scvVec" ? k.vec()?.[0] : undefined;
   return owner + (first?.switch().name === "scvSymbol" ? first.sym().toString() : "data");
 }
 
-const entryNames = (keys: readonly xdr.LedgerKey[], vault: string): string[] => [
-  ...new Set(keys.map((k) => entryName(k, vault))),
+const entryNames = (keys: readonly xdr.LedgerKey[], o: Owners): string[] => [
+  ...new Set(keys.map((k) => entryName(k, o))),
 ];
+
+// An entry a vault call may restore: the pinned vault code, a persistent entry of the vault, or
+// the pool asset contract's instance or a balance in it.
+function restorable(key: xdr.LedgerKey, o: Owners): boolean {
+  if (!isPersistent(key)) return false;
+  const name = entryName(key, o);
+  if (key.switch().name === "contractCode") return name === "code";
+  const contract = Address.fromScAddress(key.contractData().contract()).toString();
+  return contract === o.vault || name === "asset instance" || name === "asset Balance";
+}
 
 // The vault's entries of one nullifier, deposit or exit. A call's simulation restores those it
 // needs; one that archives while the call is on its way fails the call, which goes once more.
 const PER_ITEM = new Set(["Nullifier", "Pending", "Exit", "Stranded"]);
 
-// A persistent entry every user's calls share: the vault's code, instance and tree, or an entry of
-// the asset contract. A call reads their TTLs, so that their archival edge drops it unpaid.
-const shared = (key: xdr.LedgerKey, vault: string): boolean =>
-  isPersistent(key) && !PER_ITEM.has(entryName(key, vault));
+// A persistent entry other than the vault's per-item ones, such as its code, instance and tree, or
+// a balance in the asset contract. A call reads their TTLs, so that their archival edge drops it
+// unpaid.
+const bounded = (key: xdr.LedgerKey, o: Owners): boolean =>
+  isPersistent(key) && !PER_ITEM.has(entryName(key, o));
 
-// An entry the network holds archived as of `latest`: it can come back only by a restore.
+// An entry the network holds archived as of `latest`, its TTL at or before that ledger: it can come
+// back only by a restore.
 const archivedBy = (entry: LedgerEntry, latest: number): boolean =>
   entry.liveUntilLedger !== undefined && entry.liveUntilLedger <= latest;
 
@@ -498,8 +549,9 @@ async function readEntries(
   return { latestLedger, entries };
 }
 
-// The fee shown for a transaction, refused above the caps: a restore or a renewal may take the
-// caps' room for a restore beyond the resource cap.
+// The fee shown for a transaction, refused above what an envelope carries, whatever the caps, and
+// above the caps: a restore or a renewal may take the caps' room for a restore beyond the resource
+// cap.
 function checkFee(
   caps: NetworkFeeCaps,
   inclusion: bigint,
@@ -507,14 +559,21 @@ function checkFee(
   reason: FeeReason,
   entries: readonly string[],
 ): NetworkFee {
+  const details = {
+    inclusion: inclusion.toString(),
+    resource: resource.toString(),
+    reason,
+    ...(entries.length === 0 ? {} : { entries: entries.join(",") }),
+  };
+  if (inclusion + resource > MAX_ENVELOPE_FEE) {
+    fail("fee_above_limit", "the network fee is above what one transaction carries", {
+      ...details,
+      limit: MAX_ENVELOPE_FEE.toString(),
+    });
+  }
   const room = reason === "network" ? caps.resource : caps.resource + caps.restore;
   if (inclusion > caps.inclusion || resource > room) {
-    fail("fee_above_cap", "the network fee is above the cap", {
-      inclusion: inclusion.toString(),
-      resource: resource.toString(),
-      reason,
-      ...(entries.length === 0 ? {} : { entries: entries.join(",") }),
-    });
+    fail("fee_above_cap", "the network fee is above the cap", details);
   }
   return { inclusion, resource, total: inclusion + resource, reason, entries };
 }
@@ -553,11 +612,14 @@ function simulationFailure(code: number | undefined): CyphrasError {
   });
 }
 
-// What a caller learns of each attempt of a call: its hash just before the signed envelope goes
-// out, and again once the network has the transaction, before the wait for it.
+// What a caller learns of each attempt of a call: that the signer is asked to sign it; its hash
+// just before the signed envelope goes out, and again once the network has the transaction, before
+// the wait for it; and the hash of one the network can no longer take, past its ledger bound.
 export interface SubmitHooks {
+  readonly onSigning?: () => void;
   readonly onSending?: (hash: string) => Promise<void>;
   readonly onSubmitted?: (hash: string) => Promise<void>;
+  readonly onDropped?: (hash: string) => Promise<void>;
 }
 
 // Builds, simulates, signs and submits one vault call with the signer's account as source, then
@@ -575,18 +637,39 @@ export async function invokeVault(
   let conflicts = 0;
   let edges = 0;
   let restored = false;
+  // A restore the call needed first takes its fee from the call's room for a restore.
+  let caps = ctx.feeCaps;
   for (;;) {
-    const outcome = await attemptCall(ctx, signer, call, hooks);
+    const outcome = await attemptCall({ ...ctx, feeCaps: caps }, signer, call, hooks);
     if (outcome.kind === "landed") return outcome.result;
     if (outcome.kind === "restore") {
       if (restored) fail("rpc_error", "the call still needs a restore after one landed");
       restored = true;
-      await restoreFootprint(ctx, signer, outcome.data);
+      const spent = await restoreFootprint({ ...ctx, feeCaps: caps }, signer, outcome.data);
+      caps = { ...caps, restore: caps.restore > spent ? caps.restore - spent : 0n };
       continue;
     }
     // An entry of the call archived after its simulation saw it live: the transaction was dropped
-    // at its ledger bound, or failed on the entry, and a fresh simulation restores it.
+    // at its ledger bound, or failed on the entry, and a fresh simulation restores it. With a
+    // second provider, the first one's word alone does not send it again.
     if (outcome.kind === "dropped" || outcome.archived) {
+      if (outcome.hash !== undefined && ctx.second !== undefined) {
+        const [status] = await askTransaction(ctx, [ctx.second], outcome.hash);
+        const confirmed =
+          outcome.kind === "dropped"
+            ? status?.status === "NOT_FOUND" && status.latestLedger + 1 >= outcome.maxLedger
+            : status?.status === "FAILED" && status.archived;
+        if (!confirmed) {
+          fail(
+            "transaction_failed",
+            "the transaction met an archived entry, and the second RPC provider reports it otherwise",
+            { hash: outcome.hash, archived: true, secondProvider: "other_outcome" },
+          );
+        }
+      }
+      if (outcome.kind === "dropped" && outcome.hash !== undefined) {
+        await hooks.onDropped?.(outcome.hash);
+      }
       if (edges === ARCHIVAL_RETRIES) {
         if (outcome.hash === undefined) {
           fail(
@@ -684,7 +767,8 @@ type Attempt =
       readonly conflict: boolean;
       readonly archived: boolean;
     }
-  | { readonly kind: "dropped"; readonly hash: string | undefined }
+  | { readonly kind: "dropped"; readonly hash: undefined }
+  | { readonly kind: "dropped"; readonly hash: string; readonly maxLedger: number }
   | { readonly kind: "restore"; readonly data: xdr.SorobanTransactionData };
 
 async function attemptCall(
@@ -721,28 +805,43 @@ async function attemptCall(
   const draft = build(MIN_INCLUSION_FEE);
   const simulation = await ctx.rpc.simulateTransaction(draft.toEnvelope().toXDR("base64"));
   if (simulation.failed) throw simulationFailure(simulation.contractError);
+  let data = xdr.SorobanTransactionData.fromXDR(simulation.transactionData, "base64");
+  const simulated = data.resources().footprint();
+  const inFootprint = [...simulated.readOnly(), ...simulated.readWrite()];
+  // An RPC chooses what a restore covers, so the SDK takes only the call's own entries of the
+  // vault and the pool asset, never another contract's at the signer's cost.
+  const known = new Set(inFootprint.map(keyId));
+  const own = (k: xdr.LedgerKey): boolean => known.has(keyId(k)) && restorable(k, ctx);
+  if (!simulation.archived.every(own)) {
+    fail("rpc_error", "the simulation restores entries that are not the call's own");
+  }
   if (simulation.restorePreamble !== undefined) {
-    return { kind: "restore", data: simulation.restorePreamble.transactionData };
+    const preamble = simulation.restorePreamble.transactionData;
+    if (!preamble.resources().footprint().readWrite().every(own)) {
+      fail("rpc_error", "the restore the RPC asks for names entries that are not the call's own");
+    }
+    return { kind: "restore", data: preamble };
   }
   const auth = simulation.auth.map((a) => xdr.SorobanAuthorizationEntry.fromXDR(a, "base64"));
   checkAuth(auth, ctx.vault, call);
   const inclusion = await inclusionFee(ctx.rpc);
-  let data = xdr.SorobanTransactionData.fromXDR(simulation.transactionData, "base64");
-  const simulated = data.resources().footprint();
-  const inFootprint = [...simulated.readOnly(), ...simulated.readWrite()];
   const extra = call.extend === undefined ? undefined : await call.extend(simulated);
   const lives = await readEntries(
     ctx.rpc,
-    [...inFootprint, ...(extra?.readWrite ?? [])].filter((k) => shared(k, ctx.vault)),
+    [...inFootprint, ...(extra?.readWrite ?? [])].filter((k) => bounded(k, ctx)),
   );
   // An entry the other path adds that is archived lies outside what the simulation restores, so
   // the call marks it itself.
   const restoring = new Map<string, number>();
   if (extra !== undefined) {
-    const known = new Set(inFootprint.map(keyId));
     for (const key of extra.readWrite) {
       const entry = lives.entries.get(keyId(key));
-      if (entry !== undefined && !known.has(keyId(key)) && archivedBy(entry, lives.latestLedger)) {
+      if (
+        entry !== undefined &&
+        !known.has(keyId(key)) &&
+        restorable(key, ctx) &&
+        archivedBy(entry, lives.latestLedger)
+      ) {
         restoring.set(keyId(key), entryBytes(entry));
       }
     }
@@ -772,7 +871,7 @@ async function attemptCall(
   const renewed = live
     .filter((l) => l.until - lives.latestLedger < VAULT_TTL_THRESHOLD)
     .map((l) => l.key)
-    .filter((k) => RENEWED.has(entryName(k, ctx.vault)));
+    .filter((k) => RENEWED.has(entryName(k, ctx)));
   const reason: FeeReason =
     restored.length > 0 ? "restore" : renewed.length > 0 ? "rent" : "network";
   // The padding's fees come from the network's settings as the RPC reports them, so the cap bounds
@@ -782,7 +881,7 @@ async function attemptCall(
     inclusion,
     BigInt(data.resourceFee().toString()),
     reason,
-    entryNames(reason === "restore" ? restored : reason === "rent" ? renewed : [], ctx.vault),
+    entryNames(reason === "restore" ? restored : reason === "rent" ? renewed : [], ctx),
   );
   const sent = await submit(
     ctx,
@@ -792,7 +891,8 @@ async function attemptCall(
     hooks,
     maxLedger,
   );
-  if (sent.kind === "dropped") return sent;
+  if (sent.kind === "dropped")
+    return { kind: "dropped", hash: sent.hash, maxLedger: maxLedger ?? 0 };
   const { hash, status } = sent;
   if (sent.kind === "failed") {
     return { kind: "failed", hash, conflict: status.conflict, archived: status.archived };
@@ -831,6 +931,7 @@ async function submit(
   if (BigInt(tx.fee) !== fee.total) fail("rpc_error", "the transaction's fee is not the one shown");
   const hash = bytesToHex(Uint8Array.from(tx.hash()));
 
+  hooks.onSigning?.();
   const signedXdr = signedEnvelope(await signer.signTransaction(tx.toXDR(), ctx.networkPassphrase));
   let signed: Transaction | FeeBumpTransaction;
   try {
@@ -884,12 +985,20 @@ async function submit(
 type RestoreContext = Omit<InvokeContext, "second">;
 
 // Restores the read-write entries of `data` with a RestoreFootprint transaction the signer sends
-// and pays for, within the caps' room for a restore, and returns its hash once it landed.
+// and pays for, within the caps' room for a restore, and returns its resource fee once it landed.
 async function restoreFootprint(
   ctx: RestoreContext,
   signer: TransactionSigner,
   data: xdr.SorobanTransactionData,
-): Promise<string> {
+): Promise<bigint> {
+  return (await restoreSent(ctx, signer, data)).resource;
+}
+
+async function restoreSent(
+  ctx: RestoreContext,
+  signer: TransactionSigner,
+  data: xdr.SorobanTransactionData,
+): Promise<{ readonly hash: string; readonly resource: bigint }> {
   const footprint = data.resources().footprint();
   const keys = footprint.readWrite();
   if (footprint.readOnly().length > 0 || keys.length === 0 || !keys.every(isPersistent)) {
@@ -898,7 +1007,7 @@ async function restoreFootprint(
   const sequence = await sequenceOf(ctx.rpc, signer.publicKey);
   const inclusion = await inclusionFee(ctx.rpc);
   const resource = BigInt(data.resourceFee().toString());
-  const fee = checkFee(ctx.feeCaps, inclusion, resource, "restore", entryNames(keys, ctx.vault));
+  const fee = checkFee(ctx.feeCaps, inclusion, resource, "restore", entryNames(keys, ctx));
   const tx = new TransactionBuilder(new Account(signer.publicKey, sequence), {
     fee: inclusion.toString(),
     networkPassphrase: ctx.networkPassphrase,
@@ -919,7 +1028,7 @@ async function restoreFootprint(
   if (sent.kind !== "landed") {
     fail("restore_failed", "the restore failed on chain", { hash: sent.hash });
   }
-  return sent.hash;
+  return { hash: sent.hash, resource };
 }
 
 // Restores those of `keys` that are archived with one RestoreFootprint transaction the signer sends
@@ -965,7 +1074,7 @@ export async function restoreEntries(
   // Entries restored since the read leave nothing to restore.
   if (restoring.length === 0) return { txHash: undefined, restored: [] };
   return {
-    txHash: await restoreFootprint(ctx, signer, data),
-    restored: entryNames(restoring, ctx.vault),
+    txHash: (await restoreSent(ctx, signer, data)).hash,
+    restored: entryNames(restoring, ctx),
   };
 }
