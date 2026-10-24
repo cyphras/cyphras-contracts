@@ -1,8 +1,8 @@
 // Command archive builds, checks and serves the canonical archive of a vault's events, format
 // cyphras-vault-archive/1, so a wallet can sync from it when the indexer and the RPC no longer
 // have the history. It needs no Cyphras service: export turns an indexer's raw event archive into
-// the format, rebuild makes the same bytes from the public ledger metadata archive, and verify
-// checks an archive against the vault on chain.
+// the format, rebuild makes the same bytes from the public ledger metadata archive, fetch keeps a
+// directory in step with a published copy, and verify checks an archive against the vault on chain.
 package main
 
 import (
@@ -31,6 +31,7 @@ import (
 const usage = `usage:
   archive export  --dir <indexer archive> --deployment <file> --out <dir> [--vault <id>] [--network <name>]
   archive rebuild --ledger-meta <url> --deployment <file> --out <dir> [--vault <id>] [--network <name>] [--from <ledger>] [--to <ledger> | --rpc <url>] [--workers <n>]
+  archive fetch   --url <base> --out <dir> --deployment <file> [--vault <id>]
   archive verify  (--dir <dir> | --url <base>) (--rpc <url>... | --format-only) [--deployment <file> [--vault <id>] | --vault <id> --passphrase <text>]
   archive serve   --dir <dir> [--addr 127.0.0.1:8737]`
 
@@ -54,7 +55,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		return errors.New(usage)
 	}
 	commands := map[string]func(context.Context, []string, io.Writer) error{
-		"export": export, "rebuild": rebuild, "verify": verify, "serve": serve,
+		"export": export, "rebuild": rebuild, "fetch": fetch, "verify": verify, "serve": serve,
 	}
 	cmd, ok := commands[args[0]]
 	if !ok {
@@ -176,7 +177,9 @@ func export(ctx context.Context, args []string, out io.Writer) error {
 	if covered == 0 {
 		return errors.New("the event archive covers no ledger")
 	}
-	m, err := vaultarchive.Build(ctx, archive.Reader{Dir: *dir, Vault: v.Vault}, *outDir, header(d, v), 0, covered)
+	// Building from the vault's first window makes every published window come out of the event
+	// archive again, and Build refuses one that would differ from the one in --out.
+	m, err := vaultarchive.Build(ctx, archive.Reader{Dir: *dir, Vault: v.Vault}, *outDir, header(d, v), v.DeployLedger, covered)
 	summary(out, m)
 	return err
 }
@@ -227,6 +230,32 @@ func rebuild(ctx context.Context, args []string, out io.Writer) error {
 	m, err := vaultarchive.Build(ctx, src, *outDir, header(d, v), first, last)
 	summary(out, m)
 	return err
+}
+
+func fetch(ctx context.Context, args []string, out io.Writer) error {
+	fs := flags("fetch", out)
+	url := fs.String("url", "", "the base URL the archive is published at")
+	outDir := fs.String("out", "", "the directory that holds the copy")
+	deployment := fs.String("deployment", "", "the deployment file that pins the vault, network and deploy ledger")
+	vaultID := fs.String("vault", "", "the vault, when the deployment file lists several")
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+	if err := require(map[string]string{"url": *url, "out": *outDir, "deployment": *deployment}); err != nil {
+		return err
+	}
+	d, v, err := target(*deployment, *vaultID, "")
+	if err != nil {
+		return err
+	}
+	want := vaultarchive.Expect{Vault: v.Vault, NetworkPassphrase: d.NetworkPassphrase, DeployLedger: v.DeployLedger}
+	got, err := vaultarchive.Mirror(ctx, vaultarchive.HTTPFetcher{Base: *url, Client: patientClient}, *outDir, want)
+	if err != nil {
+		return err
+	}
+	summary(out, got.Manifest)
+	fmt.Fprintf(out, "fetched %d windows, %d already present\n", got.Fetched, got.Kept)
+	return nil
 }
 
 func verify(ctx context.Context, args []string, out io.Writer) error {

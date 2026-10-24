@@ -147,6 +147,11 @@ func ReadManifest(ctx context.Context, f Fetcher, want Expect) (Manifest, error)
 	if err != nil {
 		return Manifest{}, err
 	}
+	return ParseManifest(raw, want)
+}
+
+// ParseManifest reads and validates the bytes of a manifest.
+func ParseManifest(raw []byte, want Expect) (Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return Manifest{}, invalid("manifest: %v", err)

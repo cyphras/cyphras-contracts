@@ -490,7 +490,7 @@ func TestTheCommandsRefuseWhatTheyCannotDo(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "out")
 	for name, args := range map[string][]string{
 		"no command":                   nil,
-		"an unknown command":           {"fetch"},
+		"an unknown command":           {"publish"},
 		"a missing flag":               {"export", "--dir", raw, "--out", out},
 		"an extra argument":            {"export", "--dir", raw, "--deployment", deployment, "--out", out, "more"},
 		"another network":              {"export", "--dir", raw, "--deployment", deployment, "--out", out, "--network", "mainnet"},
