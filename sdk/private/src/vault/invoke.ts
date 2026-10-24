@@ -828,7 +828,7 @@ async function attemptCall(
   const extra = call.extend === undefined ? undefined : await call.extend(simulated);
   // An RPC chooses what a restore covers, so the SDK takes only entries of the simulated footprint
   // that are the vault's own, the pool asset's instance, or balances there of the vault, of the
-  // call's payees and of the holders the call's room names; never another's at the signer's cost.
+  // call's payees and of the holders the call's room names, as the SDK reads them.
   const known = new Set(inFootprint.map(keyId));
   const holders = new Set([
     ctx.vault,

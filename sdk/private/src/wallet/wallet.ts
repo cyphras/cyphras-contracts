@@ -316,7 +316,8 @@ export interface PlanView extends Submission {
   // failed, or unknown when the relayer could not say. The chain's evidence alone confirms it.
   readonly relayerStatus: string | undefined;
   // The payment may still land, or failed by the wallet's last reading of the chain only: paying
-  // it again must go through retry, which spends the same notes, never through a new send.
+  // it again goes through retry, which spends the same notes. A new unshield to its destination is
+  // refused while it is prepared or submitted.
   readonly mustRetry: boolean;
   // Its deadline has passed, and the wallet cannot tell yet whether it landed, as it lacks part of
   // the vault's tree. The safe choice is retry: both spend the same notes, so at most one pays.
@@ -1386,17 +1387,25 @@ export class PrivateWallet {
     return this.#operationView(op);
   }
 
-  // The operation of this wallet that is open for a destination: active or blocked, or with a part
-  // that may still land.
+  // The operation of this wallet that is open for a destination: started, and active or blocked,
+  // or with a part that may still land.
   #openOperation(to: string): Operation | undefined {
     const { operations, plans } = this.#core.state;
     return operations.find(
       (op) =>
         op.to === to &&
+        this.#started(op) &&
         (op.state === "active" ||
           op.state === "blocked" ||
           plans.some((p) => p.operationId === op.id && isActive(p))),
     );
+  }
+
+  // Whether an operation has a plan. A plan is saved before its proof first leaves the device, and
+  // none is ever removed, so an operation without one, as earlier releases stored it when its
+  // first part stopped before a plan, was never started: nothing of it can land.
+  #started(op: Operation): boolean {
+    return this.#core.state.plans.some((p) => p.operationId === op.id);
   }
 
   #sent(op: Operation): bigint {
@@ -1481,6 +1490,12 @@ export class PrivateWallet {
   ): Promise<void> {
     if (op.state === "done" || op.state === "abandoned") return;
     const { state } = this.#core;
+    // An operation that was never started goes no further: its first part needs its own review,
+    // which a new request asks.
+    if (!this.#started(op)) {
+      state.operations.splice(state.operations.indexOf(op), 1);
+      return;
+    }
     const parts = state.plans.filter((p) => p.operationId === op.id);
     // A self-relayed part goes only with its signer; the operation's state moves without it.
     const sends = op.route.kind !== "self" || signer?.publicKey === op.route.account;
