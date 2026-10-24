@@ -659,3 +659,48 @@ func TestPublicHealthLeavesTheReviewQueueToTheHost(t *testing.T) {
 		t.Fatalf("internal health lacks the review queue: %v", internal)
 	}
 }
+
+func TestASourceNearItsMaximumAgeWarnsOnceADay(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	count := func(code string) int {
+		n := 0
+		for _, p := range h.pages {
+			if p.Code == code {
+				n++
+			}
+		}
+		return n
+	}
+	aging := func() int { return count("source_aging_exploits") }
+	// The source's maximum age is an hour, so it warns past 45 minutes.
+	h.now = h.now.Add(40 * time.Minute)
+	h.s.RefreshSources(ctx)
+	if aging() != 0 {
+		t.Fatal("warned with a quarter of the age left")
+	}
+	h.now = h.now.Add(10 * time.Minute)
+	h.s.RefreshSources(ctx)
+	if aging() != 1 || !strings.Contains(h.pages[len(h.pages)-1].Message, "turns stale at") {
+		t.Fatalf("pages %+v", h.pages)
+	}
+	h.now = h.now.Add(5 * time.Minute)
+	h.s.RefreshSources(ctx)
+	if aging() != 1 {
+		t.Fatal("warned twice within a day")
+	}
+	// Refreshed, the source stops warning, and warns again when it ages once more.
+	h.sources.set(map[string]Hit{thief: {Source: "exploits", Reason: ReasonExploit}}, "2", h.now)
+	h.s.RefreshSources(ctx)
+	h.now = h.now.Add(50 * time.Minute)
+	h.s.RefreshSources(ctx)
+	if aging() != 2 {
+		t.Fatalf("a refreshed source that aged again warned %d times", aging())
+	}
+	// Once stale, source_unavailable pages instead.
+	h.now = h.now.Add(11 * time.Minute)
+	h.s.RefreshSources(ctx)
+	if aging() != 2 || count("source_unavailable") != 1 {
+		t.Fatalf("pages %+v", h.pages)
+	}
+}

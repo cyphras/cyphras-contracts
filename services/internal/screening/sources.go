@@ -353,12 +353,40 @@ type DirectorySource struct {
 	list
 	BaseURL string
 	HTTP    *http.Client
-	now     func() time.Time
+	// Pause spaces the pages out: the API answers a burst of them with 429.
+	Pause time.Duration
+	now   func() time.Time
 }
 
 // NewDirectorySource reads the directory API at baseURL, such as https://api.stellar.expert.
 func NewDirectorySource(baseURL string, maxAge time.Duration) *DirectorySource {
-	return &DirectorySource{list: list{name: "stellar_expert", maxAge: maxAge}, BaseURL: strings.TrimSuffix(baseURL, "/"), HTTP: &http.Client{Timeout: time.Minute}, now: time.Now}
+	return &DirectorySource{list: list{name: "stellar_expert", maxAge: maxAge}, BaseURL: strings.TrimSuffix(baseURL, "/"), HTTP: &http.Client{Timeout: time.Minute}, Pause: 2 * time.Second, now: time.Now}
+}
+
+// directoryRetries is how often a page the API refused with 429 is asked for again.
+const directoryRetries = 3
+
+// page fetches one directory page after Pause, and asks again for one refused with 429, waiting
+// twice as long each time.
+func (s *DirectorySource) page(ctx context.Context, target string) ([]byte, error) {
+	wait := s.Pause
+	for attempt := 0; ; attempt++ {
+		if wait > 0 {
+			t := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return nil, ctx.Err()
+			case <-t.C:
+			}
+		}
+		body, err := fetch(ctx, s.HTTP, target, 16<<20)
+		var status *statusError
+		if !errors.As(err, &status) || status.code != http.StatusTooManyRequests || attempt == directoryRetries {
+			return body, err
+		}
+		wait = max(s.Pause, time.Millisecond) << (attempt + 1)
+	}
 }
 
 type directoryPage struct {
@@ -390,7 +418,7 @@ func (s *DirectorySource) Refresh(ctx context.Context) error {
 			if pages == 500 {
 				return errors.New("stellar.expert: the directory does not end")
 			}
-			body, err := fetch(ctx, s.HTTP, s.BaseURL+next, 16<<20)
+			body, err := s.page(ctx, s.BaseURL+next)
 			if err != nil {
 				return err
 			}
@@ -455,7 +483,15 @@ func fetch(ctx context.Context, client *http.Client, target string, limit int64)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s answered %d", req.URL.Host, resp.StatusCode)
+		return nil, &statusError{host: req.URL.Host, code: resp.StatusCode}
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, limit))
 }
+
+// statusError is an answer other than 200.
+type statusError struct {
+	host string
+	code int
+}
+
+func (e *statusError) Error() string { return fmt.Sprintf("%s answered %d", e.host, e.code) }
