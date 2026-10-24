@@ -1,10 +1,10 @@
 package vaultarchive
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -138,25 +138,50 @@ func TestABuildThatEndsBeforeTheArchiveDoesNotShortenIt(t *testing.T) {
 	}
 }
 
-func TestRebuiltWindowsThatNoLongerLeadIntoTheOnesAfterThemAreNotPublished(t *testing.T) {
-	ctx := context.Background()
-	dir, _ := good(t)
-	before, err := os.ReadFile(filepath.Join(dir, ManifestName))
+// snapshot reads every file under dir.
+func snapshot(t *testing.T, dir string) map[string]string {
+	t.Helper()
+	files := map[string]string{}
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		raw, err := os.ReadFile(path)
+		files[strings.TrimPrefix(path, dir)] = string(raw)
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var fewer []vault.RawEvent
+	return files
+}
+
+func TestARefusedRebuildLeavesTheDirectoryExactlyAsItWas(t *testing.T) {
+	ctx := context.Background()
+	var fewer, none []vault.RawEvent
 	for _, e := range sample() {
 		if e.Ledger != 13 {
 			fewer = append(fewer, e)
 		}
+		if e.Ledger >= WindowLedgers {
+			none = append(none, e)
+		}
 	}
-	if _, err := Build(ctx, memSource{fewer, 4 * WindowLedgers}, dir, head(), 1, WindowLedgers-1); err == nil {
-		t.Fatal("a first window with fewer leaves was accepted in front of a second that expects them")
-	}
-	after, err := os.ReadFile(filepath.Join(dir, ManifestName))
-	if err != nil || !bytes.Equal(before, after) {
-		t.Fatalf("the manifest changed: %v", err)
+	for name, src := range map[string]memSource{
+		"a first window with fewer leaves than the second expects": {fewer, 4 * WindowLedgers},
+		"a first window the source has nothing in":                 {none, 4 * WindowLedgers},
+	} {
+		dir, _ := good(t)
+		before := snapshot(t, dir)
+		if _, err := Build(ctx, src, dir, head(), 1, WindowLedgers-1); err == nil {
+			t.Fatalf("%s was accepted", name)
+		}
+		if after := snapshot(t, dir); !maps.Equal(before, after) {
+			t.Fatalf("%s: the directory changed", name)
+		}
+		if _, err := Load(ctx, DirFetcher(dir), Expect{}); err != nil {
+			t.Fatalf("%s: the directory no longer verifies: %v", name, err)
+		}
 	}
 }
 
