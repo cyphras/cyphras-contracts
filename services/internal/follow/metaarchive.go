@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -103,7 +105,12 @@ func (a *LedgerArchive) get(ctx context.Context, path string) ([]byte, error) {
 	}
 	resp, err := a.client().Do(req)
 	if err != nil {
-		return nil, err
+		// The URL may carry a credential, so only the object's path is reported.
+		var failed *url.Error
+		if errors.As(err, &failed) {
+			err = failed.Err
+		}
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {

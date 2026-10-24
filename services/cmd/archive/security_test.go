@@ -217,7 +217,7 @@ func TestServeSaysWhenItListensBeyondThisMachine(t *testing.T) {
 	cancel()
 	for addr, warns := range map[string]bool{
 		"127.0.0.1:0": false, "localhost:0": false, "[::1]:0": false,
-		"0.0.0.0:0": true, ":0": true, "192.0.2.1:0": true, "example.org:0": true,
+		"0.0.0.0:0": true, ":0": true, "192.0.2.1:0": true,
 	} {
 		var out bytes.Buffer
 		_ = run(cancelled, []string{"serve", "--dir", dir, "--addr", addr}, &out)

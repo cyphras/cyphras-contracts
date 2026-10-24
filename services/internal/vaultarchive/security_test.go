@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,5 +177,55 @@ func TestWindowFilesTheManifestDoesNotListAreRemoved(t *testing.T) {
 	}
 	if _, err := os.Stat(other); err != nil {
 		t.Fatalf("a file that is not a window was removed: %v", err)
+	}
+}
+
+func TestARedirectOffTheBaseHostOrDownToHTTPIsNotFollowed(t *testing.T) {
+	dir, _ := good(t)
+	files := httptest.NewServer(http.FileServer(http.Dir(dir)))
+	defer files.Close()
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, files.URL+r.URL.Path, http.StatusFound)
+	}))
+	defer secure.Close()
+	_, err := ReadManifest(context.Background(), HTTPFetcher{Base: secure.URL, Client: secure.Client()}, Expect{})
+	if err == nil || !strings.Contains(err.Error(), "redirected") {
+		t.Fatalf("a redirect from https to a plain http server: %v", err)
+	}
+
+	same := http.NewServeMux()
+	same.Handle("/moved/", http.StripPrefix("/moved", http.FileServer(http.Dir(dir))))
+	same.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/moved"+r.URL.Path, http.StatusFound)
+	})
+	inside := httptest.NewServer(same)
+	defer inside.Close()
+	if _, err := ReadManifest(context.Background(), HTTPFetcher{Base: inside.URL}, Expect{}); err != nil {
+		t.Fatalf("a redirect inside the host: %v", err)
+	}
+
+	from := httptest.NewRequest(http.MethodGet, "https://mirror.example/manifest.json", nil)
+	for target, refused := range map[string]bool{
+		"https://mirror.example/other":  false,
+		"http://mirror.example/other":   true,
+		"https://elsewhere.example/x":   true,
+		"https://mirror.example:444/x":  true,
+		"https://user@mirror.example/x": false,
+	} {
+		err := followsOnlyOnTheBase(httptest.NewRequest(http.MethodGet, target, nil), []*http.Request{from})
+		if (err != nil) != refused {
+			t.Fatalf("redirect to %s: %v", target, err)
+		}
+	}
+}
+
+func TestAnErrorNamesTheFileAndNotTheURLItWasFetchedFrom(t *testing.T) {
+	_, err := HTTPFetcher{Base: "http://127.0.0.1:1/token-s3cret"}.Get(context.Background(), ManifestName, MaxManifestBytes)
+	if err == nil || strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), ManifestName) {
+		t.Fatalf("error %v", err)
+	}
+	_, err = HTTPFetcher{Base: "http://127.0.0.1:1/token\x7f-s3cret"}.Get(context.Background(), ManifestName, MaxManifestBytes)
+	if err == nil || strings.Contains(err.Error(), "s3cret") {
+		t.Fatalf("error for an unusable base %v", err)
 	}
 }

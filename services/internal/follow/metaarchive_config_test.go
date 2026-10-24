@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
@@ -31,5 +32,13 @@ func TestObjectKeysOfTheLargestLayoutDoNotWrapAround(t *testing.T) {
 	s := archiveSchema{LedgersPerBatch: 65536, BatchesPerPartition: 65536}
 	if got, want := s.objectKey(1), "FFFFFFFF--0-4294967295/FFFFFFFF--0-65535.xdr.zst"; got != want {
 		t.Fatalf("key %s, want %s", got, want)
+	}
+}
+
+func TestAnErrorNamesTheObjectAndNotTheURLOfTheArchive(t *testing.T) {
+	a := &LedgerArchive{BaseURL: "http://127.0.0.1:1/token-s3cret", Passphrase: passphrase, Vault: vaulttest.Vault}
+	_, err := a.Events(context.Background(), 5, 5)
+	if err == nil || strings.Contains(err.Error(), "s3cret") || !strings.Contains(err.Error(), ".config.json") {
+		t.Fatalf("error %v", err)
 	}
 }

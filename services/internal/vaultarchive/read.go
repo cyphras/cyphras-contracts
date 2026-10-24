@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -79,19 +80,45 @@ type HTTPFetcher struct {
 
 var defaultClient = &http.Client{Timeout: 2 * time.Minute}
 
+// followsOnlyOnTheBase refuses a redirect that leaves the host of the base URL or drops from
+// https to http, since the URL is given by whoever publishes the archive and a redirect must not
+// turn the tool into a request to somewhere else.
+func followsOnlyOnTheBase(req *http.Request, via []*http.Request) error {
+	first := via[0].URL
+	switch {
+	case len(via) >= 10:
+		return errors.New("too many redirects")
+	case req.URL.Host != first.Host:
+		return errors.New("redirected to another host")
+	case first.Scheme == "https" && req.URL.Scheme != "https":
+		return fmt.Errorf("redirected from https to %s", req.URL.Scheme)
+	}
+	return nil
+}
+
 // Get implements Fetcher.
 func (h HTTPFetcher) Get(ctx context.Context, name string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(h.Base, "/")+"/"+name, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: the base URL is not usable", name)
 	}
-	client := h.Client
-	if client == nil {
-		client = defaultClient
+	client := defaultClient
+	if h.Client != nil {
+		client = h.Client
+	}
+	if client.CheckRedirect == nil {
+		own := *client
+		own.CheckRedirect = followsOnlyOnTheBase
+		client = &own
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		// The URL may carry a credential, so only the name of the file is reported.
+		var failed *url.Error
+		if errors.As(err, &failed) {
+			err = failed.Err
+		}
+		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
