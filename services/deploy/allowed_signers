@@ -3,3 +3,4 @@
 # release tags against this file, and the file must hold the same lines as the repository's
 # SERVICES_RELEASE_SIGNERS variable, which the release workflow checks with. With no line, nothing
 # is deployed.
+fxjrin@gmail.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIZeDWhMHqg7hip9JHnJ93Fb7mGeDc/h7jWAO2AzGAVV
