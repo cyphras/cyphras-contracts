@@ -1,8 +1,8 @@
 // Command archive builds, checks and serves the canonical archive of a vault's events, format
 // cyphras-vault-archive/1, so a wallet can sync from it when the indexer and the RPC no longer
 // have the history. It needs no Cyphras service: export turns an indexer's raw event archive into
-// the format, rebuild makes the same bytes from the public ledger metadata archive, and verify
-// checks an archive against the vault on chain.
+// the format, rebuild makes the same bytes from the public ledger metadata archive, fetch keeps a
+// directory in step with a published copy, and verify checks an archive against the vault on chain.
 package main
 
 import (
@@ -15,6 +15,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -31,6 +32,7 @@ import (
 const usage = `usage:
   archive export  --dir <indexer archive> --deployment <file> --out <dir> [--vault <id>] [--network <name>]
   archive rebuild --ledger-meta <url> --deployment <file> --out <dir> [--vault <id>] [--network <name>] [--from <ledger>] [--to <ledger> | --rpc <url>] [--workers <n>]
+  archive fetch   --url <base> --out <dir> --deployment <file> [--vault <id>] [--rpc <url>...]
   archive verify  (--dir <dir> | --url <base>) (--rpc <url>... | --format-only) [--deployment <file> [--vault <id>] | --vault <id> --passphrase <text>]
   archive serve   --dir <dir> [--addr 127.0.0.1:8737]`
 
@@ -54,7 +56,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		return errors.New(usage)
 	}
 	commands := map[string]func(context.Context, []string, io.Writer) error{
-		"export": export, "rebuild": rebuild, "verify": verify, "serve": serve,
+		"export": export, "rebuild": rebuild, "fetch": fetch, "verify": verify, "serve": serve,
 	}
 	cmd, ok := commands[args[0]]
 	if !ok {
@@ -176,7 +178,9 @@ func export(ctx context.Context, args []string, out io.Writer) error {
 	if covered == 0 {
 		return errors.New("the event archive covers no ledger")
 	}
-	m, err := vaultarchive.Build(ctx, archive.Reader{Dir: *dir, Vault: v.Vault}, *outDir, header(d, v), 0, covered)
+	// Building from the vault's first window makes every published window come out of the event
+	// archive again, and Build refuses one that would differ from the one in --out.
+	m, err := vaultarchive.Build(ctx, archive.Reader{Dir: *dir, Vault: v.Vault}, *outDir, header(d, v), v.DeployLedger, covered)
 	summary(out, m)
 	return err
 }
@@ -229,6 +233,45 @@ func rebuild(ctx context.Context, args []string, out io.Writer) error {
 	return err
 }
 
+func fetch(ctx context.Context, args []string, out io.Writer) error {
+	fs := flags("fetch", out)
+	url := fs.String("url", "", "the base URL the archive is published at")
+	outDir := fs.String("out", "", "the directory that holds the copy")
+	deployment := fs.String("deployment", "", "the deployment file that pins the vault, network and deploy ledger")
+	vaultID := fs.String("vault", "", "the vault, when the deployment file lists several")
+	var rpcURLs stringList
+	fs.Var(&rpcURLs, "rpc", "an RPC that refuses a published archive claiming more than the chain has, before any window is fetched; give several and each must agree")
+	if err := parse(fs, args); err != nil {
+		return err
+	}
+	if err := require(map[string]string{"url": *url, "out": *outDir, "deployment": *deployment}); err != nil {
+		return err
+	}
+	if err := secureBase(*url); err != nil {
+		return err
+	}
+	d, v, err := target(*deployment, *vaultID, "")
+	if err != nil {
+		return err
+	}
+	want := vaultarchive.Expect{Vault: v.Vault, NetworkPassphrase: d.NetworkPassphrase, DeployLedger: v.DeployLedger}
+	var admits []func(vaultarchive.Manifest) error
+	for _, u := range rpcURLs {
+		view, err := vaultarchive.ReadView(ctx, dialRPC(u), want.Vault, want.NetworkPassphrase)
+		if err != nil {
+			return err
+		}
+		admits = append(admits, view.Admits)
+	}
+	got, err := vaultarchive.Mirror(ctx, vaultarchive.HTTPFetcher{Base: *url, Client: patientClient}, *outDir, want, admits...)
+	if err != nil {
+		return err
+	}
+	summary(out, got.Manifest)
+	fmt.Fprintf(out, "fetched %d windows, %d already present\n", got.Fetched, got.Kept)
+	return nil
+}
+
 func verify(ctx context.Context, args []string, out io.Writer) error {
 	fs := flags("verify", out)
 	dir := fs.String("dir", "", "an archive in a directory")
@@ -244,6 +287,11 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	}
 	if (*dir == "") == (*url == "") {
 		return errors.New("give --dir or --url")
+	}
+	if *url != "" {
+		if err := secureBase(*url); err != nil {
+			return err
+		}
 	}
 	if (len(rpcURLs) == 0) == !*formatOnly {
 		return errors.New("give --rpc, or --format-only to skip the chain checks")
@@ -292,7 +340,23 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	fmt.Fprintln(out, "format checks passed")
 	fmt.Fprintf(out, "chain checks passed for vault %s at ledger %d: %d of its %d leaves, %d nullifiers present\n",
 		want.Vault, report.Ledger, report.Leaves, report.ChainLeaves, report.Nullifiers)
+	if report.TailLeaves > 0 {
+		fmt.Fprintf(out, "the vault is further ahead than its root ring reaches: its %d leaves after the archive were read from the RPC's events\n", report.TailLeaves)
+	}
 	return nil
+}
+
+// secureBase refuses an archive address that is not https, unless it is on this machine, since
+// what plain http carries can be changed on the way.
+func secureBase(base string) error {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" {
+		return errors.New("--url is not an https address")
+	}
+	if u.Scheme == "https" || (u.Scheme == "http" && loopback(net.JoinHostPort(u.Hostname(), "0"))) {
+		return nil
+	}
+	return errors.New("--url must be an https address, or http on this machine")
 }
 
 // stringList is a flag that may be given more than once.

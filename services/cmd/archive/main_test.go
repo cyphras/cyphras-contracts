@@ -373,7 +373,7 @@ func tamperLeaf(t *testing.T, dir string) {
 	}
 	sum := sha256.Sum256(data)
 	m.Windows[0].Bytes, m.Windows[0].SHA256 = int64(len(data)), hex.EncodeToString(sum[:])
-	raw, err = json.Marshal(m)
+	raw, err = m.Canonical()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -490,7 +490,7 @@ func TestTheCommandsRefuseWhatTheyCannotDo(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "out")
 	for name, args := range map[string][]string{
 		"no command":                   nil,
-		"an unknown command":           {"fetch"},
+		"an unknown command":           {"publish"},
 		"a missing flag":               {"export", "--dir", raw, "--out", out},
 		"an extra argument":            {"export", "--dir", raw, "--deployment", deployment, "--out", out, "more"},
 		"another network":              {"export", "--dir", raw, "--deployment", deployment, "--out", out, "--network", "mainnet"},

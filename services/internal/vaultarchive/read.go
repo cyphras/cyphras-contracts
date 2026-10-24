@@ -1,6 +1,7 @@
 package vaultarchive
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"time"
 
@@ -147,11 +149,70 @@ func ReadManifest(ctx context.Context, f Fetcher, want Expect) (Manifest, error)
 	if err != nil {
 		return Manifest{}, err
 	}
-	var m Manifest
-	if err := json.Unmarshal(raw, &m); err != nil {
+	return ParseManifest(raw, want)
+}
+
+// ParseManifest reads and validates the bytes of a manifest. They must be exactly what Canonical
+// writes for what they say, so a manifest that another JSON reader would read differently, with
+// a repeated key, a key in other case, a field of its own or odd spacing, is refused.
+func ParseManifest(raw []byte, want Expect) (Manifest, error) {
+	if err := manifestKeysOnce(raw); err != nil {
 		return Manifest{}, invalid("manifest: %v", err)
 	}
+	var m Manifest
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&m); err != nil {
+		return Manifest{}, invalid("manifest: %v", err)
+	}
+	canonical, err := m.Canonical()
+	if err != nil {
+		return Manifest{}, err
+	}
+	if !bytes.Equal(raw, canonical) {
+		return Manifest{}, invalid("manifest is not in canonical form")
+	}
 	return m, m.Validate(want)
+}
+
+var manifestFields = func() map[string]bool {
+	fields := map[string]bool{}
+	t := reflect.TypeFor[Manifest]()
+	for i := range t.NumField() {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+		fields[name] = true
+	}
+	return fields
+}()
+
+// manifestKeysOnce refuses a manifest whose top-level keys are not exactly the fields of the
+// format, each once. Go reads keys without regard to case and takes the last of a repeated key,
+// other readers do not.
+func manifestKeysOnce(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if open, err := dec.Token(); err != nil || open != json.Delim('{') {
+		return errors.New("not a JSON object")
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, _ := token.(string)
+		switch {
+		case !manifestFields[key]:
+			return fmt.Errorf("the key %.40q is not a field of the format", key)
+		case seen[key]:
+			return fmt.Errorf("the key %q is given twice", key)
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Contents is everything a verified archive holds that the chain can be asked about: the

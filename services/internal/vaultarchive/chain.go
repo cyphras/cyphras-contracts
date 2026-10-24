@@ -7,6 +7,7 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/xdr"
 
+	"github.com/cyphras/cyphras-contracts/services/internal/follow"
 	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/tree"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
@@ -21,9 +22,11 @@ const nullifierBatch = 2_000
 
 // Report is what a chain check found.
 type Report struct {
-	// Leaves is the number of leaves the archive holds and ChainLeaves the vault's.
-	Leaves, ChainLeaves uint64
-	Nullifiers          int
+	// Leaves is the number of leaves the archive holds and ChainLeaves the vault's. TailLeaves is
+	// how many of the vault's leaves after the archive's were read from the RPC's events, which
+	// happens only when the vault is further ahead than its root ring reaches.
+	Leaves, ChainLeaves, TailLeaves uint64
+	Nullifiers                      int
 	// Ledger is the latest ledger the RPC reported while the checks ran.
 	Ledger uint32
 }
@@ -33,6 +36,8 @@ type View struct {
 	client rpc.Client
 	vault  string
 	ring   vault.RootRing
+	// events gives the vault's events after the archive's last ledger.
+	events Source
 	// Next is the vault's leaf count and Latest the ledger of the snapshot.
 	Next   uint64
 	Latest uint32
@@ -79,7 +84,7 @@ func ReadView(ctx context.Context, c rpc.Client, vaultID, passphrase string) (*V
 	if want := uint32((uint64(next) / 2) % vault.RootHistory); ring.Newest != want {
 		return nil, fmt.Errorf("%w: the root ring ends at slot %d, but %d leaves put it at %d", ErrChain, ring.Newest, next, want)
 	}
-	return &View{client: c, vault: vaultID, ring: ring, Next: uint64(next), Latest: latest}, nil
+	return &View{client: c, vault: vaultID, ring: ring, events: follow.RPCSource{Client: c, Contract: vaultID}, Next: uint64(next), Latest: latest}, nil
 }
 
 // Admits refuses a manifest that claims more than the vault has: more leaves than it holds or
@@ -96,12 +101,14 @@ func (v *View) Admits(m Manifest) error {
 
 // Verify asks the vault whether the archive is its own. The archive's commitments, rebuilt into
 // the tree, must give the vault's current root, or the root it held at that many leaves if it
-// has moved on by up to 255 pairs. Every nullifier the archive lists must have an entry, live or
-// archived, so a nullifier made up cannot pass. A nullifier the archive leaves out cannot be
-// seen from here.
+// has moved on by up to 255 pairs. Past that the root ring no longer holds it, and the tree is
+// carried on with the vault's own events after the archive's last ledger, read from the RPC,
+// until it must give the current root; that needs the RPC to still keep those ledgers. Every
+// nullifier the archive lists must have an entry, live or archived, so a nullifier made up cannot
+// pass. A nullifier the archive leaves out cannot be seen from here.
 func (v *View) Verify(ctx context.Context, contents *Contents) (Report, error) {
 	report := Report{Leaves: uint64(len(contents.Commitments)), ChainLeaves: v.Next, Nullifiers: len(contents.Nullifiers), Ledger: v.Latest}
-	if err := v.checkRoot(contents, report); err != nil {
+	if err := v.checkRoot(ctx, contents, &report); err != nil {
 		return report, err
 	}
 	for start := 0; start < len(contents.Nullifiers); start += nullifierBatch {
@@ -183,7 +190,7 @@ func VerifyArchive(ctx context.Context, f Fetcher, want Expect, clients ...rpc.C
 	return contents, report, nil
 }
 
-func (v *View) checkRoot(contents *Contents, report Report) error {
+func (v *View) checkRoot(ctx context.Context, contents *Contents, report *Report) error {
 	if report.Leaves > report.ChainLeaves {
 		return fmt.Errorf("%w: the archive holds %d leaves, the vault %d", ErrChain, report.Leaves, report.ChainLeaves)
 	}
@@ -195,12 +202,64 @@ func (v *View) checkRoot(contents *Contents, report Report) error {
 	}
 	behind := (report.ChainLeaves - report.Leaves) / 2
 	if behind >= vault.RootHistory {
-		return fmt.Errorf("%w: the vault is %d pairs ahead of the archive, past the %d roots it keeps", ErrChain, behind, vault.RootHistory)
+		return v.checkRootThroughEvents(ctx, &t, contents.Manifest.CoveredTo, report, behind)
 	}
 	at := (uint64(v.ring.Newest) + vault.RootHistory - behind) % vault.RootHistory
 	if v.ring.Roots[at] != t.Root() {
 		return fmt.Errorf("%w: the archive's %d leaves give root %s, which the vault never held at that count", ErrChain, report.Leaves, t.Root().Hex())
 	}
+	return nil
+}
+
+// checkRootThroughEvents carries t, the archive's tree, on with the vault's events of the ledgers
+// after covered up to the ledger the root ring was read at, and requires the result to be the
+// vault's current root. Every leaf must follow the one before it, so an event the RPC leaves out
+// or repeats ends in a root the vault does not have.
+func (v *View) checkRootThroughEvents(ctx context.Context, t *tree.Tree, covered uint32, report *Report, behind uint64) error {
+	var events []vault.RawEvent
+	if covered < v.Latest {
+		var err error
+		if events, err = v.events.Events(ctx, covered+1, v.Latest); err != nil {
+			return fmt.Errorf("%w: the vault is %d pairs ahead of the archive, past the %d roots it keeps, and its events after ledger %d cannot be read: %w", ErrChain, behind, vault.RootHistory, covered, err)
+		}
+	}
+	next := report.Leaves
+	var left vault.NewCommitment
+	var leftAt vault.Position
+	for _, e := range events {
+		if e.Contract != v.vault {
+			return fmt.Errorf("%w: an event of contract %.80q among the vault's", ErrChain, e.Contract)
+		}
+		decoded, err := vault.Decode(e)
+		if err != nil {
+			return fmt.Errorf("%w: an event after the archive: %w", ErrChain, err)
+		}
+		leaf, ok := decoded.Body.(vault.NewCommitment)
+		if !ok {
+			continue
+		}
+		if leaf.Index != next {
+			return fmt.Errorf("%w: leaf %d where %d belongs among the events after the archive", ErrChain, leaf.Index, next)
+		}
+		if next%2 == 0 {
+			left, leftAt = leaf, e.Pos()
+		} else {
+			if leftAt.Ledger != e.Ledger || leftAt.Tx != e.Tx {
+				return fmt.Errorf("%w: leaf %d is not the second of a pair in one transaction", ErrChain, leaf.Index)
+			}
+			if _, err := t.AppendPair(left.Commitment, leaf.Commitment); err != nil {
+				return err
+			}
+		}
+		next++
+	}
+	if next != report.ChainLeaves {
+		return fmt.Errorf("%w: the vault is %d pairs ahead of the archive, past the %d roots it keeps, and the events after ledger %d account for %d of its %d leaves", ErrChain, behind, vault.RootHistory, covered, next, report.ChainLeaves)
+	}
+	if t.Root() != v.ring.Current() {
+		return fmt.Errorf("%w: the archive's leaves and the events after it give root %s, not the vault's current root", ErrChain, t.Root().Hex())
+	}
+	report.TailLeaves = next - report.Leaves
 	return nil
 }
 

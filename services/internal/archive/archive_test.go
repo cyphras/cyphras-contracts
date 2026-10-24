@@ -78,6 +78,27 @@ func TestTheArchiveIsReadableByTheServicesThatMountIt(t *testing.T) {
 	}
 }
 
+func TestTheArchiveDirectoryCanBeListedByTheUsersThatReadIt(t *testing.T) {
+	events := []vault.RawEvent{event(3, 1, 0)}
+	fresh := filepath.Join(t.TempDir(), "archive")
+	existing := filepath.Join(t.TempDir(), "archive")
+	if err := os.Mkdir(existing, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, dir := range map[string]string{"a directory the writer creates": fresh, "a directory that exists": existing} {
+		if err := (Writer{Dir: dir}).Append(events, 0, 5); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o755 {
+			t.Fatalf("%s has mode %v", name, info.Mode().Perm())
+		}
+	}
+}
+
 func TestATornLineCannotSwallowTheNextWrite(t *testing.T) {
 	dir := t.TempDir()
 	w := Writer{Dir: dir}

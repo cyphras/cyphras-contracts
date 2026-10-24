@@ -34,6 +34,9 @@ const (
 	MaxLineBytes     = 1 << 20
 )
 
+// maxProducerBytes bounds the free text a manifest carries.
+const maxProducerBytes = 128
+
 // maxExactInteger is the largest integer a JavaScript number holds exactly, which readers in that
 // language need every number of the format to stay under.
 const maxExactInteger = 1<<53 - 1
@@ -88,6 +91,16 @@ func (w *Window) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
+// Canonical is the manifest as it is written and the only form a reader takes: indented by two
+// spaces, fields in the order of the struct, one newline at the end.
+func (m Manifest) Canonical() ([]byte, error) {
+	raw, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(raw, '\n'), nil
+}
+
 // File is the window's path under the base.
 func (w Window) File() string {
 	return fmt.Sprintf("windows/%010d.jsonl.gz", w.Start)
@@ -114,6 +127,8 @@ func (m Manifest) Validate(want Expect) error {
 		return invalid("manifest without a network")
 	case m.DeployLedger == 0:
 		return invalid("manifest without a deploy ledger")
+	case len(m.Producer) > maxProducerBytes || strings.ContainsFunc(m.Producer, func(r rune) bool { return r < ' ' || r > '~' }):
+		return invalid("producer is not printable ASCII of at most %d bytes", maxProducerBytes)
 	case want.Vault != "" && m.Vault != want.Vault:
 		return invalid("archive of vault %s, want %s", m.Vault, want.Vault)
 	case want.NetworkPassphrase != "" && m.NetworkPassphrase != want.NetworkPassphrase:

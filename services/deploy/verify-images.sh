@@ -10,10 +10,11 @@
 #
 #   RELEASE_TAG=services-v1.2.3 RELEASE_COMMIT=<commit> \
 #   INDEXER_IMAGE=ghcr.io/cyphras/cyphras-contracts/indexer@sha256:... RELAYER_IMAGE=... \
-#   KEEPER_IMAGE=... SCREENING_IMAGE=... WATCHER_IMAGE=... ./verify-images.sh
+#   KEEPER_IMAGE=... SCREENING_IMAGE=... WATCHER_IMAGE=... ARCHIVE_IMAGE=... ./verify-images.sh
 #
 # An image variable left unset is skipped, so the host of the off-host watcher sets WATCHER_IMAGE
-# only. Any failure stops the script before anything is pulled.
+# only, and the host that publishes the vault archive sets ARCHIVE_IMAGE. Each variable must hold
+# the image of its own service. Any failure stops the script before anything is pulled.
 set -euo pipefail
 repo=${REPO:-cyphras/cyphras-contracts}
 : "${RELEASE_TAG:?}" "${RELEASE_COMMIT:?}"
@@ -59,13 +60,18 @@ if ! git -C "$here" merge-base --is-ancestor "$RELEASE_COMMIT" origin/dev &&
 fi
 echo "$RELEASE_TAG: signed by a maintainer, at $RELEASE_COMMIT on dev or main"
 checked=0
-for name in INDEXER_IMAGE RELAYER_IMAGE KEEPER_IMAGE SCREENING_IMAGE WATCHER_IMAGE; do
+for name in INDEXER_IMAGE RELAYER_IMAGE KEEPER_IMAGE SCREENING_IMAGE WATCHER_IMAGE ARCHIVE_IMAGE; do
   image=${!name:-}
   if [ -z "$image" ]; then
     continue
   fi
   if ! [[ "$image" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
     echo "$name must name a ghcr.io image by its digest" >&2
+    exit 1
+  fi
+  service=$(printf '%s' "${name%_IMAGE}" | tr 'A-Z' 'a-z')
+  if [[ "$image" != */"$service"@* ]]; then
+    echo "$name must be the $service image" >&2
     exit 1
   fi
   gh attestation verify "oci://$image" --repo "$repo" \

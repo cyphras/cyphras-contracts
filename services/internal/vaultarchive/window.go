@@ -218,12 +218,16 @@ func canonicalXDR(s string) bool {
 	return err == nil && again == s
 }
 
-// gunzip returns the bytes of a gzip file, refusing one that expands past the window limit.
+// gunzip returns the bytes of a gzip file that is one member and nothing else, refusing one that
+// expands past the window limit. A reader that took every member would let a file carry any
+// number of empty ones after the content, past the size its manifest entry accounts for.
 func gunzip(compressed []byte) ([]byte, error) {
-	zr, err := gzip.NewReader(bytes.NewReader(compressed))
+	file := bytes.NewReader(compressed)
+	zr, err := gzip.NewReader(file)
 	if err != nil {
 		return nil, invalid("window is not gzip: %v", err)
 	}
+	zr.Multistream(false)
 	data, err := io.ReadAll(io.LimitReader(zr, MaxWindowBytes+1))
 	if err != nil {
 		return nil, invalid("window is not gzip: %v", err)
@@ -231,7 +235,17 @@ func gunzip(compressed []byte) ([]byte, error) {
 	if len(data) > MaxWindowBytes {
 		return nil, invalid("window expands past %d bytes", MaxWindowBytes)
 	}
+	if file.Len() != 0 {
+		return nil, invalid("window has %d bytes after its gzip member", file.Len())
+	}
 	return data, nil
+}
+
+// maxCompressed is the longest file a window of the manifest's stated size may be: gzip adds
+// little to what it cannot shrink, and a header can carry free text, so the allowance is a small
+// share of the size and a fixed amount.
+func maxCompressed(w Window) int64 {
+	return w.Bytes + w.Bytes/64 + 4096
 }
 
 func gzipBytes(data []byte) ([]byte, error) {
@@ -252,6 +266,9 @@ func gzipBytes(data []byte) ([]byte, error) {
 // check reads a window's file against its manifest entry: size, hash, then every rule of
 // parse, then the counts the entry states.
 func check(w Window, compressed []byte, deployLedger uint32, vaultID string) (content, error) {
+	if int64(len(compressed)) > maxCompressed(w) {
+		return content{}, invalid("window %d is a file of %d bytes, more than the %d its %d bytes of content allow", w.Start, len(compressed), maxCompressed(w), w.Bytes)
+	}
 	data, err := gunzip(compressed)
 	if err != nil {
 		return content{}, fmt.Errorf("window %d: %w", w.Start, err)

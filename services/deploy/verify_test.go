@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -49,8 +50,9 @@ func (r *release) sign(key, tag, commit string, notes ...string) {
 	r.git(append(args, tag, commit)...)
 }
 
-// verify runs the script for a tag and commit, with the given signers in the repository variable.
-func (r *release) verify(tag, commit, variable string) (string, bool) {
+// verify runs the script for a tag and commit, with the given signers in the repository variable
+// and the environment variables given after the indexer image.
+func (r *release) verify(tag, commit, variable string, env ...string) (string, bool) {
 	r.t.Helper()
 	if err := os.WriteFile(filepath.Join(r.dir, "variable"), []byte(variable), 0o600); err != nil {
 		r.t.Fatal(err)
@@ -60,6 +62,7 @@ func (r *release) verify(tag, commit, variable string) (string, bool) {
 		"PATH="+filepath.Join(r.dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"FAKE_VARIABLE="+filepath.Join(r.dir, "variable"), "RELEASE_TAG="+tag, "RELEASE_COMMIT="+commit,
 		"INDEXER_IMAGE=ghcr.io/cyphras/cyphras-contracts/indexer@sha256:"+strings.Repeat("ab", 32))
+	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err == nil
 }
@@ -73,8 +76,9 @@ func TestAReleaseTagIsCheckedOnTheHost(t *testing.T) {
 	dir := t.TempDir()
 	r := &release{t: t, dir: dir, clone: filepath.Join(dir, "clone")}
 	maintainer, stranger := r.key("maintainer"), r.key("stranger")
-	// The GitHub CLI answers with the repository variable and passes every attestation.
-	gh := "#!/bin/sh\ncase \"$1 $2\" in\n\"variable get\") cat \"$FAKE_VARIABLE\" ;;\n\"attestation verify\") exit 0 ;;\n*) exit 1 ;;\nesac\n"
+	// The GitHub CLI answers with the repository variable and passes every attestation but that of
+	// an image whose digest is all e.
+	gh := "#!/bin/sh\ncase \"$1 $2\" in\n\"variable get\") cat \"$FAKE_VARIABLE\" ;;\n\"attestation verify\") case \"$3\" in *eeeeeeee) exit 1 ;; esac; exit 0 ;;\n*) exit 1 ;;\nesac\n"
 	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -127,6 +131,23 @@ func TestAReleaseTagIsCheckedOnTheHost(t *testing.T) {
 	if out, ok := r.verify("services-v1.0.0", reviewed, maintainer); !ok {
 		t.Fatalf("a good release was refused:\n%s", out)
 	}
+	archive := "ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/archive@sha256:"
+	if out, ok := r.verify("services-v1.0.0", reviewed, maintainer, archive+strings.Repeat("cd", 32)); !ok || !strings.Contains(out, "ARCHIVE_IMAGE: attested") {
+		t.Fatalf("an attested archive image was refused or not checked:\n%s", out)
+	}
+	for _, c := range []struct {
+		name, image, says string
+	}{
+		{"an archive image whose attestation fails", archive + strings.Repeat("e", 64), ""},
+		{"an archive image named by a tag", "ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/archive:latest", "ARCHIVE_IMAGE must name a ghcr.io image by its digest"},
+		{"the indexer image under the archive variable", "ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/indexer@sha256:" + strings.Repeat("cd", 32), "ARCHIVE_IMAGE must be the archive image"},
+		{"an image whose name only ends like the service", "ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/notarchive@sha256:" + strings.Repeat("cd", 32), "ARCHIVE_IMAGE must be the archive image"},
+		{"an archive image of another registry", "ARCHIVE_IMAGE=docker.io/cyphras/archive@sha256:" + strings.Repeat("cd", 32), "ARCHIVE_IMAGE must name a ghcr.io image by its digest"},
+	} {
+		if out, ok := r.verify("services-v1.0.0", reviewed, maintainer, c.image); ok || !strings.Contains(out, c.says) {
+			t.Fatalf("%s: passed %v\n%s", c.name, ok, out)
+		}
+	}
 	// In a fixed order, so the case that catches a broken check is always the same.
 	for _, c := range []struct {
 		name, tag, commit, variable, says string
@@ -145,5 +166,33 @@ func TestAReleaseTagIsCheckedOnTheHost(t *testing.T) {
 		if out, ok := r.verify(c.tag, c.commit, c.variable); ok || !strings.Contains(out, c.says) {
 			t.Fatalf("%s: passed %v\n%s", c.name, ok, out)
 		}
+	}
+}
+
+func TestTheReleaseBuildsAnImageForEveryCommand(t *testing.T) {
+	workflow, err := os.ReadFile("../../.github/workflows/services-release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^\s+service: \[([^\]]*)\]$`).FindSubmatch(workflow)
+	if m == nil {
+		t.Fatal("the release workflow lists no services")
+	}
+	released := map[string]bool{}
+	for _, name := range strings.Split(string(m[1]), ",") {
+		released[strings.TrimSpace(name)] = true
+	}
+	commands, err := os.ReadDir("../cmd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range commands {
+		if c.IsDir() && !released[c.Name()] {
+			t.Errorf("cmd/%s has no image in the release", c.Name())
+		}
+		delete(released, c.Name())
+	}
+	for name := range released {
+		t.Errorf("the release builds %s, which is no command", name)
 	}
 }

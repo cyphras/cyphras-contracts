@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -23,6 +24,10 @@ const (
 	// defaultAttemptTimeout bounds one try, its body included, so a stalled object holds a worker
 	// for minutes and not for as long as a window takes.
 	defaultAttemptTimeout = 2 * time.Minute
+	// bufferedBytes is how much of an answer is read inside the try, so that a connection that
+	// drops part way through it is tried again. A ledger file or a window is far smaller; a
+	// larger answer is passed on as it arrives.
+	bufferedBytes = 8 << 20
 )
 
 type retrying struct {
@@ -53,11 +58,11 @@ func (r retrying) RoundTrip(req *http.Request) (*http.Response, error) {
 		ctx, cancel := context.WithTimeout(req.Context(), timeout)
 		resp, err := r.next.RoundTrip(req.WithContext(ctx))
 		last := try == attempts-1
+		if err == nil && !busy(resp.StatusCode) {
+			err = buffer(resp)
+		}
 		switch {
-		case err == nil && !busy(resp.StatusCode):
-			resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
-			return resp, nil
-		case err == nil && last:
+		case err == nil && (!busy(resp.StatusCode) || last):
 			resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 			return resp, nil
 		case err != nil && (req.Context().Err() != nil || !recoverable(err) || last):
@@ -74,6 +79,26 @@ func (r retrying) RoundTrip(req *http.Request) (*http.Response, error) {
 		cancel()
 	}
 	panic("unreachable")
+}
+
+// buffer reads the first bufferedBytes of the answer's body, so a read that fails is the try's
+// failure and not the caller's. It closes the body when it fails.
+func buffer(resp *http.Response) error {
+	head, err := io.ReadAll(io.LimitReader(resp.Body, bufferedBytes+1))
+	if err != nil {
+		resp.Body.Close()
+		return err
+	}
+	if len(head) > bufferedBytes {
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(bytes.NewReader(head), resp.Body), resp.Body}
+		return nil
+	}
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(head))
+	return nil
 }
 
 // busy reports the answers that say to come back later.

@@ -3,7 +3,9 @@ package deploy
 import (
 	"fmt"
 	"math/rand/v2"
+	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 	"testing"
@@ -157,6 +159,188 @@ func TestEveryAddressOfASlash64AndASlash48GetsOneRateLimitKey(t *testing.T) {
 	}
 }
 
+// location is one location block of the vhost: its modifier and pattern as written, and its body.
+type location struct {
+	spec, modifier, pattern, body string
+	re                            *regexp.Regexp
+}
+
+var locationLine = regexp.MustCompile(`^  location (.+) \{$`)
+
+// locations reads the location blocks of a vhost laid out as the file is: one directive a line,
+// a block opened on its own line, and a block that fits a line (limit_except) written on one.
+func locations(t *testing.T, vhost string) []location {
+	t.Helper()
+	var out []location
+	var open *location
+	for _, line := range strings.Split(vhost, "\n") {
+		if open != nil {
+			if line == "  }" {
+				out = append(out, *open)
+				open = nil
+				continue
+			}
+			open.body += strings.TrimSpace(line) + "\n"
+			continue
+		}
+		m := locationLine.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		l := location{spec: m[1]}
+		words := strings.SplitN(m[1], " ", 2)
+		l.modifier, l.pattern = "", m[1]
+		if len(words) == 2 && (words[0] == "=" || words[0] == "~" || words[0] == "~*" || words[0] == "^~") {
+			l.modifier, l.pattern = words[0], words[1]
+		}
+		l.pattern = strings.Trim(l.pattern, `"`)
+		if l.modifier == "~" {
+			// nginx names a capture (?<name>...), Go (?P<name>...).
+			l.re = regexp.MustCompile(strings.ReplaceAll(l.pattern, "(?<", "(?P<"))
+		}
+		open = &l
+	}
+	if open != nil {
+		t.Fatalf("location %s is not closed", open.spec)
+	}
+	return out
+}
+
+// normalise reads a URI as nginx does before it picks a location: percent-escapes decoded, runs of
+// slashes merged, and . and .. segments resolved.
+func normalise(uri string) string {
+	p, err := url.PathUnescape(uri)
+	if err != nil {
+		return uri
+	}
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
+	clean := path.Clean(p)
+	if strings.HasSuffix(p, "/") && clean != "/" {
+		clean += "/"
+	}
+	return clean
+}
+
+// route picks the location nginx would serve a URI from: an exact match, else the longest prefix
+// if it is marked ^~, else the first matching regex in file order, else the longest prefix.
+func route(locs []location, uri string) (*location, map[string]string) {
+	var prefix *location
+	for i, l := range locs {
+		switch {
+		case l.modifier == "=" && l.pattern == uri:
+			return &locs[i], nil
+		case (l.modifier == "" || l.modifier == "^~") && strings.HasPrefix(uri, l.pattern):
+			if prefix == nil || len(l.pattern) > len(prefix.pattern) {
+				prefix = &locs[i]
+			}
+		}
+	}
+	if prefix != nil && prefix.modifier == "^~" {
+		return prefix, nil
+	}
+	for i, l := range locs {
+		if l.re == nil {
+			continue
+		}
+		if m := l.re.FindStringSubmatch(uri); m != nil {
+			names := map[string]string{}
+			for j, name := range l.re.SubexpNames() {
+				if name != "" {
+					names[name] = m[j]
+				}
+			}
+			return &locs[i], names
+		}
+	}
+	return prefix, nil
+}
+
+// The published archive is read from disk by anyone, so it may only ever give out its own two
+// kinds of file, to GET and HEAD, with the headers a page needs to read it and a cache needs to
+// keep it, and none of what identifies the reader.
+func TestPrivateVhostServesThePublishedArchiveReadOnly(t *testing.T) {
+	vhost, err := os.ReadFile("nginx/sites-available/private.cyphras.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	locs := locations(t, string(vhost))
+	for _, network := range []string{"testnet", "mainnet"} {
+		base := "/" + network + "/xlm/archive"
+		dir := "/var/www/cyphras-vault-archive/" + network + "/xlm"
+		served := map[string]string{
+			base + "/manifest.json":               dir + "/manifest.json",
+			base + "/windows/0000017280.jsonl.gz": dir + "/windows/0000017280.jsonl.gz",
+		}
+		// The same files by other spellings of the URI, which nginx normalises before it routes.
+		served[base+"/windows/../manifest.json"] = dir + "/manifest.json"
+		served[base+"//./manifest.json"] = dir + "/manifest.json"
+		served[base+"/%6danifest.json"] = dir + "/manifest.json"
+		served[base+"/windows%2f0000017280.jsonl.gz"] = dir + "/windows/0000017280.jsonl.gz"
+		for uri, file := range served {
+			l, names := route(locs, normalise(uri))
+			if l == nil {
+				t.Fatalf("%s is not routed", uri)
+			}
+			var alias string
+			for _, line := range strings.Split(l.body, "\n") {
+				if rest, ok := strings.CutPrefix(line, "alias "); ok {
+					alias = strings.TrimSuffix(rest, ";")
+				}
+			}
+			for name, value := range names {
+				alias = strings.ReplaceAll(alias, "$"+name, value)
+			}
+			if alias != file {
+				t.Errorf("%s is served from %q, want %q", uri, alias, file)
+			}
+			for _, line := range []string{
+				"limit_except GET { deny all; }", "autoindex off;",
+				`add_header Strict-Transport-Security "max-age=63072000" always;`,
+				`add_header Access-Control-Allow-Origin "*" always;`,
+				`add_header X-Content-Type-Options "nosniff" always;`,
+			} {
+				if !strings.Contains(l.body, line+"\n") {
+					t.Errorf("%s lacks %q", uri, line)
+				}
+			}
+			for _, line := range strings.Split(l.body, "\n") {
+				directive, _, _ := strings.Cut(line, " ")
+				switch directive {
+				case "proxy_pass", "proxy_set_header", "include", "root", "try_files", "index":
+					t.Errorf("%s uses %q", uri, line)
+				}
+			}
+			cache := `add_header Cache-Control "public, max-age=60";`
+			if strings.HasSuffix(file, ".gz") {
+				cache = `add_header Cache-Control "public, max-age=31536000, immutable";`
+			}
+			if !strings.Contains(l.body, cache+"\n") {
+				t.Errorf("%s lacks %q", uri, cache)
+			}
+		}
+		for _, uri := range []string{
+			base, base + "/", base + "/windows/", base + "/windows", base + "/manifest.json/", base + "/manifest.json/x",
+			base + "/manifest.json.bak", base + "/Manifest.json", base + "/index.html", base + "/windows/0000017280.jsonl",
+			base + "/windows/17280.jsonl.gz", base + "/windows/00000172800.jsonl.gz", base + "/windows/0000017280.jsonl.gz/",
+			base + "/windows/0000017280.jsonl.gz.sig", base + "/windows/000001728a.jsonl.gz", base + "/windows/x/0000017280.jsonl.gz",
+			base + "/.git/config", base + "/windows/.0000017280.jsonl.gz", base + "/windows/../../../etc/passwd",
+			base + "/%2e%2e/manifest.json",
+		} {
+			l, _ := route(locs, normalise(uri))
+			if l == nil || strings.TrimSpace(l.body) != "return 404;" {
+				t.Errorf("%s is not answered with 404: %+v", uri, l)
+			}
+		}
+	}
+	for _, l := range locs {
+		if strings.Contains(l.body, "alias") && !strings.Contains(l.spec, "/archive/") {
+			t.Errorf("location %s serves files", l.spec)
+		}
+	}
+}
+
 // The vhost is the privacy boundary of the services: every route that reaches one strips what
 // identifies the client, keeps no access log, and nothing else is served.
 func TestPrivateVhostStripsClientIdentityOnEveryRoute(t *testing.T) {
@@ -179,13 +363,11 @@ func TestPrivateVhostStripsClientIdentityOnEveryRoute(t *testing.T) {
 		}
 	}
 
-	locations := regexp.MustCompile(`location ([^{]+)\{([^}]*)\}`).FindAllStringSubmatch(string(vhost), -1)
 	seen := map[string]string{}
-	for _, l := range locations {
-		path, body := strings.TrimSpace(l[1]), l[2]
-		seen[path] = body
-		if strings.Contains(body, "proxy_pass") && !strings.Contains(body, "include snippets/cyphras-v2-proxy.conf;") {
-			t.Errorf("location %s proxies without the identity-stripping snippet", path)
+	for _, l := range locations(t, string(vhost)) {
+		seen[l.spec] = l.body
+		if strings.Contains(l.body, "proxy_pass") && !strings.Contains(l.body, "include snippets/cyphras-v2-proxy.conf;") {
+			t.Errorf("location %s proxies without the identity-stripping snippet", l.spec)
 		}
 	}
 	for _, path := range []string{

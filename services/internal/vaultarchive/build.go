@@ -2,7 +2,6 @@ package vaultarchive
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -32,6 +31,8 @@ type Header struct {
 // manifest last. A manifest already in dir for the same vault is extended: the windows it holds
 // stay, and building resumes after them, or from the window of from if from is set. A window the
 // source cannot give whole stops the build with the windows before it written and listed.
+// A window the manifest already lists must come out the same, and a build in which one does not
+// is refused, so a published window is never replaced by other bytes.
 // Windows are built in a staging directory and moved in only once the manifest that lists them
 // has validated, so a build that is refused leaves dir exactly as it was.
 func Build(ctx context.Context, src Source, dir string, h Header, from, to uint32) (Manifest, error) {
@@ -83,6 +84,9 @@ func Build(ctx context.Context, src Source, dir string, h Header, from, to uint3
 		if err != nil {
 			failure = fmt.Errorf("window %d: %w", next, err)
 			break
+		}
+		if i := (next - first) / WindowLedgers; i < uint64(kept) && w != existing.Windows[i] {
+			return Manifest{}, fmt.Errorf("window %d is published with sha256 %q and would now be %q: a published window is never rewritten with other bytes", next, existing.Windows[i].SHA256, w.SHA256)
 		}
 		m.Windows = append(m.Windows, w)
 		rebuilt = append(rebuilt, w)
@@ -183,11 +187,11 @@ func buildWindow(ctx context.Context, src Source, stage string, h Header, done [
 }
 
 func writeManifest(dir string, m Manifest) error {
-	raw, err := json.MarshalIndent(m, "", "  ")
+	raw, err := m.Canonical()
 	if err != nil {
 		return err
 	}
-	return writeFile(filepath.Join(dir, ManifestName), append(raw, '\n'))
+	return writeFile(filepath.Join(dir, ManifestName), raw)
 }
 
 // writeFile replaces name in one step, so a reader never sees half a file.
