@@ -5,6 +5,8 @@
 # and set TARGET=live.
 #
 #   NETWORK=testnet ASSET=xlm AGE_IDENTITY=~/.config/age/cyphras.key ./restore.sh indexer indexer.dump.age
+#
+# A dump on an rclone remote is fetched first, as rclone copy offsite:cyphras/testnet/xlm/dumps/<stamp> .
 set -euo pipefail
 cd "$(dirname "$0")"
 : "${NETWORK:?}" "${ASSET:?}" "${AGE_IDENTITY:?}"
