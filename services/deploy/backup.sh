@@ -36,11 +36,16 @@ for service in indexer relayer keeper screening watcher; do
   docker exec "$project-${service}_db-1" pg_dump --format=custom --username="$service" ${extra[@]+"${extra[@]}"} "$service" \
     | age --recipient "$AGE_RECIPIENT" > "$out/$service.dump.age"
 done
+# The indexer keeps appending to the newest archive file, so a copy taken while it writes can fail
+# its checksum; the remote gets a snapshot instead.
+snapshot="backups/$NETWORK/$ASSET/archive-$stamp"
+cp -a "data/$NETWORK/$ASSET/archive" "$snapshot"
+trap 'rm -rf "$snapshot"' EXIT
 if [ "$transport" = rclone ]; then
-  rclone copy "data/$NETWORK/$ASSET/archive/" "$remote/archive/"
+  rclone copy "$snapshot/" "$remote/archive/"
   rclone copy "$out" "$remote/dumps/$stamp"
 else
-  rsync -a "data/$NETWORK/$ASSET/archive/" "$remote/archive/"
+  rsync -a "$snapshot/" "$remote/archive/"
   rsync -a "$out" "$remote/dumps/"
 fi
 find "backups/$NETWORK/$ASSET" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +
