@@ -13,8 +13,8 @@
 #   KEEPER_IMAGE=... SCREENING_IMAGE=... WATCHER_IMAGE=... ARCHIVE_IMAGE=... ./verify-images.sh
 #
 # An image variable left unset is skipped, so the host of the off-host watcher sets WATCHER_IMAGE
-# only, and the host that publishes the vault archive sets ARCHIVE_IMAGE. Any failure stops the
-# script before anything is pulled.
+# only, and the host that publishes the vault archive sets ARCHIVE_IMAGE. Each variable must hold
+# the image of its own service. Any failure stops the script before anything is pulled.
 set -euo pipefail
 repo=${REPO:-cyphras/cyphras-contracts}
 : "${RELEASE_TAG:?}" "${RELEASE_COMMIT:?}"
@@ -67,6 +67,11 @@ for name in INDEXER_IMAGE RELAYER_IMAGE KEEPER_IMAGE SCREENING_IMAGE WATCHER_IMA
   fi
   if ! [[ "$image" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
     echo "$name must name a ghcr.io image by its digest" >&2
+    exit 1
+  fi
+  service=$(printf '%s' "${name%_IMAGE}" | tr 'A-Z' 'a-z')
+  if [[ "$image" != */"$service"@* ]]; then
+    echo "$name must be the $service image" >&2
     exit 1
   fi
   gh attestation verify "oci://$image" --repo "$repo" \

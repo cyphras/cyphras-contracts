@@ -140,6 +140,8 @@ func TestAReleaseTagIsCheckedOnTheHost(t *testing.T) {
 	}{
 		{"an archive image whose attestation fails", archive + strings.Repeat("e", 64), ""},
 		{"an archive image named by a tag", "ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/archive:latest", "ARCHIVE_IMAGE must name a ghcr.io image by its digest"},
+		{"the indexer image under the archive variable", "ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/indexer@sha256:" + strings.Repeat("cd", 32), "ARCHIVE_IMAGE must be the archive image"},
+		{"an image whose name only ends like the service", "ARCHIVE_IMAGE=ghcr.io/cyphras/cyphras-contracts/notarchive@sha256:" + strings.Repeat("cd", 32), "ARCHIVE_IMAGE must be the archive image"},
 		{"an archive image of another registry", "ARCHIVE_IMAGE=docker.io/cyphras/archive@sha256:" + strings.Repeat("cd", 32), "ARCHIVE_IMAGE must name a ghcr.io image by its digest"},
 	} {
 		if out, ok := r.verify("services-v1.0.0", reviewed, maintainer, c.image); ok || !strings.Contains(out, c.says) {
