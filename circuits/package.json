@@ -14,6 +14,7 @@
     "setup:testnet-forgeable": "bash scripts/setup-testnet-forgeable.sh",
     "vectors": "node scripts/gen-vectors.mjs",
     "fixtures:contracts": "node scripts/contract-fixtures.mjs",
+    "fixtures:mainnet-proof": "node scripts/mainnet-proof-fixture.mjs",
     "test": "mocha \"test/**/*.test.mjs\"",
     "format": "prettier --write \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\" \"ceremony/v2/*.mjs\"",
     "format:check": "prettier --check \"reference/**/*.mjs\" \"scripts/**/*.mjs\" \"test/**/*.mjs\" \"ceremony/v2/*.mjs\""

@@ -47,6 +47,8 @@ jobs:
           echo "built    $built"
           echo "deployed $deployed"
           test "$built" = "$deployed"
+      # A proof made with the final ceremony zkey must verify under the key that build embeds.
+      - run: cargo test -p verifier --features mainnet --test mainnet_proof
       - uses: actions/upload-artifact@v4
         if: always()
         with:
