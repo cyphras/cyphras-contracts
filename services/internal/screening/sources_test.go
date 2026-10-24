@@ -102,6 +102,7 @@ func TestTheDirectoryIsDownloadedWhole(t *testing.T) {
 	}))
 	defer srv.Close()
 	s := NewDirectorySource(srv.URL, 24*time.Hour)
+	s.Pause = 0
 	if err := s.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -361,8 +362,51 @@ func TestTheSanctionsListMustBeTheSDNList(t *testing.T) {
 func TestADirectoryPageWithoutRecordsIsRefused(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(`{"error": "rate limited"}`)) }))
 	defer srv.Close()
-	if err := NewDirectorySource(srv.URL, time.Hour).Refresh(context.Background()); err == nil {
+	s := NewDirectorySource(srv.URL, time.Hour)
+	s.Pause = 0
+	if err := s.Refresh(context.Background()); err == nil {
 		t.Fatal("a page without records was read as an empty directory")
+	}
+}
+
+func TestADirectoryPageRefusedForRateIsAskedForAgain(t *testing.T) {
+	refused := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if refused < 2 {
+			refused++
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		records := []directoryRecord{{Address: thief, Name: "Scam"}}
+		_ = json.NewEncoder(w).Encode(directoryPage{Embedded: &struct {
+			Records *[]directoryRecord `json:"records"`
+		}{Records: &records}})
+	}))
+	defer srv.Close()
+	s := NewDirectorySource(srv.URL, time.Hour)
+	s.Pause = time.Millisecond
+	if err := s.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if h, ok := s.Lookup(thief); !ok || h.Reason != ReasonExploit {
+		t.Fatal("the directory read after the retries lost its entry")
+	}
+}
+
+func TestADirectoryThatKeepsRefusingFailsTheRefresh(t *testing.T) {
+	asked := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	s := NewDirectorySource(srv.URL, time.Hour)
+	s.Pause = time.Millisecond
+	if err := s.Refresh(context.Background()); err == nil || !strings.Contains(err.Error(), "429") {
+		t.Fatalf("refresh: %v", err)
+	}
+	if asked != directoryRetries+1 {
+		t.Fatalf("asked %d times", asked)
 	}
 }
 

@@ -68,6 +68,8 @@ type Screener struct {
 	alerts       *alert.Alerter
 	log          *slog.Logger
 	now          func() time.Time
+	// aging is when each source_aging warning was last sent; only RefreshSources uses it.
+	aging map[string]time.Time
 	// lock is the asp account's lock, without which nothing is sent as the account.
 	lock *Lock
 
@@ -208,6 +210,42 @@ func (s *Screener) RefreshSources(ctx context.Context) {
 		s.alerts.Raise(ctx, alert.Critical, "source_unavailable", "screening fails closed: %v", err)
 	} else {
 		s.alerts.Clear(ctx, "source_unavailable", "every source is fresh again")
+	}
+	s.warnAging(ctx)
+}
+
+// agingShare is how much of its maximum age a source may use before it warns.
+const agingShare = 0.75
+
+// warnAging warns, once a day per source, about a source past agingShare of its maximum age: a
+// fetched source whose refreshes keep failing, or a curated list nobody has reviewed, makes
+// screening fail closed once it is stale.
+func (s *Screener) warnAging(ctx context.Context) {
+	now := s.now()
+	if s.aging == nil {
+		s.aging = map[string]time.Time{}
+	}
+	for _, st := range s.check.Statuses() {
+		code := "source_aging_" + st.Name
+		maxAge := time.Duration(st.MaxAge) * time.Second
+		staleAt := st.FetchedAt.Add(maxAge)
+		age := now.Sub(st.FetchedAt)
+		if !st.FetchedAt.IsZero() && age <= time.Duration(float64(maxAge)*agingShare) {
+			if _, warned := s.aging[code]; warned {
+				delete(s.aging, code)
+				s.alerts.Clear(ctx, code, "%s is fresh again", st.Name)
+			}
+			continue
+		}
+		if st.FetchedAt.IsZero() || now.After(staleAt) {
+			continue // source_unavailable already pages
+		}
+		if last, warned := s.aging[code]; warned && now.Sub(last) < 24*time.Hour {
+			continue
+		}
+		s.aging[code] = now
+		s.alerts.Raise(ctx, alert.Warning, code, "%s turns stale at %s, in %s, and screening then fails closed; refresh or review it",
+			st.Name, staleAt.UTC().Format(time.RFC3339), staleAt.Sub(now).Round(time.Minute))
 	}
 }
 
