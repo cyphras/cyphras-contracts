@@ -349,12 +349,12 @@ describe("split unshields over archived vault entries", () => {
       confirm: confirmAll,
     } as const;
     await assert.rejects(alice.unshield(request), isError("fee_above_cap"));
+    // The first part never reached the signer, so nothing of that unshield is left to go on.
+    assert.deepEqual(await alice.continueOperations(account), []);
     // The user agrees to the restore's fee, and the payment is made again with it.
-    await assert.rejects(
-      alice.unshield({ ...request, networkFeeCaps: { restore: 200n * XLM } }),
-      isError("fee_above_cap"),
-    );
-    // Only caps of the whole wallet reach the parts, so the user opens it with them.
+    await alice.unshield({ ...request, networkFeeCaps: { restore: 200n * XLM } });
+    assert.deepEqual(sentOps(world), ["transact"]);
+    // The user opens the wallet with caps of its own for the later parts.
     const raised = await openWallet(world, 0, store, undefined, {
       networkFeeCaps: { restore: 200n * XLM },
     });
