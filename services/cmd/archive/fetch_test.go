@@ -313,3 +313,34 @@ func TestExportFailsWhenAPublishedWindowWouldChange(t *testing.T) {
 		t.Fatal("a refused export changed the published directory")
 	}
 }
+
+func TestARebuildIntoACopyOfTheArchiveFailsWhenAWindowDiffersFromThePublishedOne(t *testing.T) {
+	published, deployment := exportSample(t)
+	events := sample()
+	var fewer []vault.RawEvent
+	for _, e := range events {
+		if e.Ledger != 12 {
+			fewer = append(fewer, e)
+		}
+	}
+	rebuild := func(t *testing.T, from []vault.RawEvent) (string, error) {
+		t.Helper()
+		copied := filepath.Join(t.TempDir(), "copy")
+		if err := os.CopyFS(copied, os.DirFS(published)); err != nil {
+			t.Fatal(err)
+		}
+		_, err := do(t, "rebuild", "--ledger-meta", ledgerArchive(t, from, 3), "--deployment", deployment,
+			"--out", copied, "--from", "1", "--to", fmt.Sprint(3*window-1), "--workers", "4")
+		return copied, err
+	}
+	copied, err := rebuild(t, events)
+	if err != nil {
+		t.Fatalf("ledgers that agree with the published windows: %v", err)
+	}
+	if a, b := snapshot(t, published), snapshot(t, copied); !maps.Equal(a, b) {
+		t.Fatal("a rebuild that agrees changed the copy")
+	}
+	if _, err := rebuild(t, fewer); err == nil || !strings.Contains(err.Error(), "never rewritten") {
+		t.Fatalf("ledgers that differ from the published window: %v", err)
+	}
+}
