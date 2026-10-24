@@ -25,14 +25,15 @@
     }
   ],
   "services": {
-    "tag": "services-v1.0.0",
-    "commit": "3cc2526eef00927d8695908042c66e9f93904e8b",
+    "tag": "services-v1.1.0",
+    "commit": "01e41cd76d481cba8ff1927927b5d735abf6d604",
     "images": {
-      "indexer": "ghcr.io/cyphras/cyphras-contracts/indexer@sha256:274cff89eea5a1164de8cf3e2fa90e65865597af240e98f6b10c49046d1c9bc5",
-      "relayer": "ghcr.io/cyphras/cyphras-contracts/relayer@sha256:14901e9682cfd724886a9a30539d3e745ed64fb349bcaffa7822864500c045f5",
-      "keeper": "ghcr.io/cyphras/cyphras-contracts/keeper@sha256:0958c82dcfdd5195759053ac387e495ab4d02e75e327c53acfae4f8f2139e028",
-      "screening": "ghcr.io/cyphras/cyphras-contracts/screening@sha256:1064877fecf0c6dd38c46f10c36aa8d241690d9f996c607db498b1d7e211b1ad",
-      "watcher": "ghcr.io/cyphras/cyphras-contracts/watcher@sha256:6657aed58bd482d72732b1531a6329c04613c2d03de6de7127194750409921e0"
+      "indexer": "ghcr.io/cyphras/cyphras-contracts/indexer@sha256:6d942a9dbc8290fd4cf9cf7eb2f2d3d13953a0c6050a601a418255682b03969e",
+      "relayer": "ghcr.io/cyphras/cyphras-contracts/relayer@sha256:83efb6aacaac97b154c338b29a5f415fd8c0cd24c43eb130dd6a81b41432bc3c",
+      "keeper": "ghcr.io/cyphras/cyphras-contracts/keeper@sha256:4e133eeb0b2007bb4ce0d5e4ce4389cb19001e384b1653b450f02c254c09b33c",
+      "screening": "ghcr.io/cyphras/cyphras-contracts/screening@sha256:12fde48e2e48d539216ade47a7b27bbf7d1dc432208b2201f188366fa4b009f6",
+      "watcher": "ghcr.io/cyphras/cyphras-contracts/watcher@sha256:46492d016264ffaec814398f1e146e5546263564795383c84de087e26a07f755",
+      "archive": "ghcr.io/cyphras/cyphras-contracts/archive@sha256:89868b6f81dd3a3a2d61e0673a5a10a0214d0a87c93476cbb2e5868735523b53"
     }
   }
 }
