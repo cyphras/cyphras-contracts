@@ -83,7 +83,12 @@ func (w Writer) Append(events []vault.RawEvent, from, to uint32) error {
 	if from > to {
 		return fmt.Errorf("%w: ledgers %d to %d", ErrRange, from, to)
 	}
-	if err := os.MkdirAll(w.Dir, 0o700); err != nil {
+	// The events are public and the services that mount the directory, and the export job, read it
+	// as other users, so its mode is set past the umask, on an existing directory too.
+	if err := os.MkdirAll(w.Dir, 0o755); err != nil {
+		return err
+	}
+	if err := os.Chmod(w.Dir, 0o755); err != nil {
 		return err
 	}
 	var id [8]byte
