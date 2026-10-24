@@ -22,9 +22,11 @@ jobs:
       - run: cargo test
 
   # Anyone can rebuild the deployed mainnet vault from this repository: the build with the
-  # ceremony key must give the wasm hash the deployment record names.
+  # ceremony key must give the wasm hash the deployment record names. It runs on an Apple silicon
+  # host, as the deployed build did: cargo mixes the host triple into symbol hashes, and those set
+  # the function order, so a Linux build holds the same code in another order and hashes apart.
   mainnet-vault:
-    runs-on: ubuntu-latest
+    runs-on: macos-15
     defaults:
       run:
         working-directory: contracts
@@ -40,7 +42,7 @@ jobs:
         run: |
           RUSTFLAGS="--remap-path-prefix=$HOME/.cargo=/cargo" \
             cargo build --target wasm32v1-none --release --locked --features mainnet
-          built=$(sha256sum target/wasm32v1-none/release/vault.wasm | cut -d' ' -f1)
+          built=$(shasum -a 256 target/wasm32v1-none/release/vault.wasm | cut -d' ' -f1)
           deployed=$(jq -r '.vaults[] | select(.asset == "native") | .wasm_hash' ../deployments/mainnet.json)
           echo "built    $built"
           echo "deployed $deployed"
