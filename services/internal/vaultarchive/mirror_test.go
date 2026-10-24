@@ -216,7 +216,7 @@ func TestAMirrorKeepsToTheVaultItWasToldAndToItsOwnCopy(t *testing.T) {
 		t.Fatal("a mirror with no pin was accepted")
 	}
 
-	// A copy of the same vault under another deploy ledger label cannot be carried on.
+	// A copy that is labelled for another network than the published archive cannot be carried on.
 	copyOf := t.TempDir()
 	if _, err := Mirror(ctx, DirFetcher(remote), copyOf, pin()); err != nil {
 		t.Fatal(err)
