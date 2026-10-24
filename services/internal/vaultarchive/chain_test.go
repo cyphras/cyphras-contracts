@@ -173,3 +173,45 @@ func ringOf(roots []fr.Element) xdr.ScVal {
 	newest := uint32((len(roots) - 1) % vault.RootHistory)
 	return vault.Struct(vault.Field{Name: "roots", Value: vault.Vec(ring...)}, vault.Field{Name: "newest", Value: vault.U32(newest)})
 }
+
+// windowFetches counts the windows a Fetcher is asked for, which cost a download each.
+type windowFetches struct {
+	Fetcher
+	windows int
+}
+
+func (w *windowFetches) Get(ctx context.Context, name string, limit int64) ([]byte, error) {
+	if name != ManifestName {
+		w.windows++
+	}
+	return w.Fetcher.Get(ctx, name, limit)
+}
+
+func TestAManifestThatClaimsMoreThanTheVaultHasIsRefusedBeforeAnyWindowIsFetched(t *testing.T) {
+	dir, _ := good(t)
+	c := loaded(t)
+	ctx := context.Background()
+	fetch := &windowFetches{Fetcher: DirFetcher(dir)}
+
+	// The vault holds fewer leaves than the manifest lists.
+	short := chainOf(t, &Contents{Manifest: c.Manifest, Commitments: c.Commitments[:4], Nullifiers: c.Nullifiers})
+	if _, _, err := VerifyArchive(ctx, fetch, Expect{}, short); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), "lists 8 leaves") {
+		t.Fatalf("more leaves than the vault holds: %v", err)
+	}
+
+	// The RPC has not closed the ledger the manifest says it covers.
+	young := chainOf(t, c)
+	young.SetLatest(2 * WindowLedgers)
+	if _, _, err := VerifyArchive(ctx, fetch, Expect{}, young); !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), "latest is") {
+		t.Fatalf("a ledger past the RPC's latest: %v", err)
+	}
+	if fetch.windows != 0 {
+		t.Fatalf("%d windows were fetched for a manifest the chain refuses", fetch.windows)
+	}
+
+	good := chainOf(t, c)
+	contents, report, err := VerifyArchive(ctx, fetch, Expect{}, good)
+	if err != nil || fetch.windows != 2 || report.Leaves != 8 || len(contents.Commitments) != 8 {
+		t.Fatalf("a good archive: %d windows, %+v, %v", fetch.windows, report, err)
+	}
+}

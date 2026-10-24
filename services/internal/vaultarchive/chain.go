@@ -28,62 +28,89 @@ type Report struct {
 	Ledger uint32
 }
 
-// VerifyChain asks the vault whether the archive is its own. The archive's commitments, rebuilt
-// into the tree, must give the vault's current root, or the root it held at that many leaves if
-// it has moved on by up to 255 pairs. Every nullifier the archive lists must have an entry,
-// live or archived, so a nullifier made up cannot pass. A nullifier the archive leaves out
-// cannot be seen from here.
-func VerifyChain(ctx context.Context, c rpc.Client, contents *Contents) (Report, error) {
-	m := contents.Manifest
-	if err := rpc.CheckNetwork(ctx, c, m.NetworkPassphrase); err != nil {
-		return Report{}, err
+// View is what one RPC says about the vault's tree, read in one snapshot.
+type View struct {
+	client rpc.Client
+	vault  string
+	ring   vault.RootRing
+	// Next is the vault's leaf count and Latest the ledger of the snapshot.
+	Next   uint64
+	Latest uint32
+}
+
+// ReadView reads the vault's root ring and leaf count from an RPC of the named network.
+func ReadView(ctx context.Context, c rpc.Client, vaultID, passphrase string) (*View, error) {
+	if err := rpc.CheckNetwork(ctx, c, passphrase); err != nil {
+		return nil, err
 	}
-	rootsKey, err := vault.RootsKey(m.Vault)
+	rootsKey, err := vault.RootsKey(vaultID)
 	if err != nil {
-		return Report{}, err
+		return nil, err
 	}
-	nextKey, err := vault.NextLeafKey(m.Vault)
+	nextKey, err := vault.NextLeafKey(vaultID)
 	if err != nil {
-		return Report{}, err
+		return nil, err
 	}
 	entries, latest, err := rpc.Entries(ctx, c, []xdr.LedgerKey{rootsKey, nextKey})
 	if err != nil {
-		return Report{}, err
+		return nil, err
 	}
 	rootsEntry, ok0 := entries[mustKeyString(rootsKey)]
 	nextEntry, ok1 := entries[mustKeyString(nextKey)]
 	if !ok0 || !ok1 {
-		return Report{}, fmt.Errorf("%w: the vault's tree entries are missing", ErrChain)
+		return nil, fmt.Errorf("%w: the vault's tree entries are missing", ErrChain)
 	}
 	ringVal, err := rpc.ContractValue(rootsEntry)
 	if err != nil {
-		return Report{}, err
+		return nil, err
 	}
 	ring, err := vault.DecodeRootRing(ringVal)
 	if err != nil {
-		return Report{}, err
+		return nil, err
 	}
 	nextVal, err := rpc.ContractValue(nextEntry)
 	if err != nil {
-		return Report{}, err
+		return nil, err
 	}
 	next, ok := nextVal.GetU64()
 	if !ok || next%2 != 0 {
-		return Report{}, fmt.Errorf("%w: the vault's next leaf is not an even u64", ErrChain)
+		return nil, fmt.Errorf("%w: the vault's next leaf is not an even u64", ErrChain)
 	}
-	report := Report{Leaves: uint64(len(contents.Commitments)), ChainLeaves: uint64(next), Nullifiers: len(contents.Nullifiers), Ledger: latest}
-	if err := checkRoot(contents, ring, report); err != nil {
+	return &View{client: c, vault: vaultID, ring: ring, Next: uint64(next), Latest: latest}, nil
+}
+
+// Admits refuses a manifest that claims more than the vault has: more leaves than it holds or
+// ledgers past the one the RPC has closed. It is the check made before any window is fetched.
+func (v *View) Admits(m Manifest) error {
+	if n := len(m.Windows); n > 0 && m.Windows[n-1].Leaves[1] > v.Next {
+		return fmt.Errorf("%w: the manifest lists %d leaves, the vault holds %d", ErrChain, m.Windows[n-1].Leaves[1], v.Next)
+	}
+	if m.CoveredTo > v.Latest {
+		return fmt.Errorf("%w: the manifest covers ledger %d, the RPC's latest is %d", ErrChain, m.CoveredTo, v.Latest)
+	}
+	return nil
+}
+
+// Verify asks the vault whether the archive is its own. The archive's commitments, rebuilt into
+// the tree, must give the vault's current root, or the root it held at that many leaves if it
+// has moved on by up to 255 pairs. Every nullifier the archive lists must have an entry, live or
+// archived, so a nullifier made up cannot pass. A nullifier the archive leaves out cannot be
+// seen from here.
+func (v *View) Verify(ctx context.Context, contents *Contents) (Report, error) {
+	report := Report{Leaves: uint64(len(contents.Commitments)), ChainLeaves: v.Next, Nullifiers: len(contents.Nullifiers), Ledger: v.Latest}
+	if err := v.checkRoot(contents, report); err != nil {
 		return report, err
 	}
 	for start := 0; start < len(contents.Nullifiers); start += nullifierBatch {
 		batch := contents.Nullifiers[start:min(start+nullifierBatch, len(contents.Nullifiers))]
 		keys := make([]xdr.LedgerKey, len(batch))
 		for i, n := range batch {
-			if keys[i], err = vault.NullifierKey(m.Vault, n.Bytes()); err != nil {
+			var err error
+			if keys[i], err = vault.NullifierKey(v.vault, n.Bytes()); err != nil {
 				return report, err
 			}
 		}
-		found, seen, err := rpc.Entries(ctx, c, keys)
+		found, seen, err := rpc.Entries(ctx, v.client, keys)
 		if err != nil {
 			return report, err
 		}
@@ -97,22 +124,65 @@ func VerifyChain(ctx context.Context, c rpc.Client, contents *Contents) (Report,
 	return report, nil
 }
 
-func checkRoot(contents *Contents, ring vault.RootRing, report Report) error {
+// VerifyChain reads the vault through one RPC and verifies contents against it.
+func VerifyChain(ctx context.Context, c rpc.Client, contents *Contents) (Report, error) {
+	v, err := ReadView(ctx, c, contents.Manifest.Vault, contents.Manifest.NetworkPassphrase)
+	if err != nil {
+		return Report{}, err
+	}
+	return v.Verify(ctx, contents)
+}
+
+// VerifyArchive reads the manifest, has every RPC refuse it if it claims more than the vault
+// has, and only then fetches the windows, so a hostile archive costs a manifest and not a
+// download. Every RPC must then confirm the whole archive.
+func VerifyArchive(ctx context.Context, f Fetcher, want Expect, clients ...rpc.Client) (*Contents, Report, error) {
+	m, err := ReadManifest(ctx, f, want)
+	if err != nil {
+		return nil, Report{}, err
+	}
+	views := make([]*View, len(clients))
+	for i, c := range clients {
+		if views[i], err = ReadView(ctx, c, m.Vault, m.NetworkPassphrase); err != nil {
+			return nil, Report{}, err
+		}
+		if err := views[i].Admits(m); err != nil {
+			return nil, Report{}, err
+		}
+	}
+	contents, err := loadWindows(ctx, f, m)
+	if err != nil {
+		return nil, Report{}, err
+	}
+	var report Report
+	for i, v := range views {
+		r, err := v.Verify(ctx, contents)
+		if err != nil {
+			return contents, r, err
+		}
+		if i == 0 || r.Ledger < report.Ledger {
+			report = r
+		}
+	}
+	return contents, report, nil
+}
+
+func (v *View) checkRoot(contents *Contents, report Report) error {
+	if report.Leaves > report.ChainLeaves {
+		return fmt.Errorf("%w: the archive holds %d leaves, the vault %d", ErrChain, report.Leaves, report.ChainLeaves)
+	}
 	var t tree.Tree
 	for i := 0; i+1 < len(contents.Commitments); i += 2 {
 		if _, err := t.AppendPair(contents.Commitments[i], contents.Commitments[i+1]); err != nil {
 			return err
 		}
 	}
-	if report.Leaves > report.ChainLeaves {
-		return fmt.Errorf("%w: the archive holds %d leaves, the vault %d", ErrChain, report.Leaves, report.ChainLeaves)
-	}
 	behind := (report.ChainLeaves - report.Leaves) / 2
 	if behind >= vault.RootHistory {
 		return fmt.Errorf("%w: the vault is %d pairs ahead of the archive, past the %d roots it keeps", ErrChain, behind, vault.RootHistory)
 	}
-	at := (uint64(ring.Newest) + vault.RootHistory - behind) % vault.RootHistory
-	if ring.Roots[at] != t.Root() {
+	at := (uint64(v.ring.Newest) + vault.RootHistory - behind) % vault.RootHistory
+	if v.ring.Roots[at] != t.Root() {
 		return fmt.Errorf("%w: the archive's %d leaves give root %s, which the vault never held at that count", ErrChain, report.Leaves, t.Root().Hex())
 	}
 	return nil

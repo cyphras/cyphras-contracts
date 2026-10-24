@@ -298,19 +298,21 @@ func verify(ctx context.Context, args []string, out io.Writer) error {
 	if *url != "" {
 		fetch = vaultarchive.HTTPFetcher{Base: *url}
 	}
-	contents, err := vaultarchive.Load(ctx, fetch, want)
+	if *formatOnly {
+		contents, err := vaultarchive.Load(ctx, fetch, want)
+		if err != nil {
+			return err
+		}
+		summary(out, contents.Manifest)
+		fmt.Fprintln(out, "format checks passed")
+		return nil
+	}
+	contents, report, err := vaultarchive.VerifyArchive(ctx, fetch, want, dialRPC(*rpcURL))
 	if err != nil {
 		return err
 	}
 	summary(out, contents.Manifest)
 	fmt.Fprintln(out, "format checks passed")
-	if *formatOnly {
-		return nil
-	}
-	report, err := vaultarchive.VerifyChain(ctx, dialRPC(*rpcURL), contents)
-	if err != nil {
-		return err
-	}
 	fmt.Fprintf(out, "chain checks passed at ledger %d: %d of the vault's %d leaves, %d nullifiers present\n",
 		report.Ledger, report.Leaves, report.ChainLeaves, report.Nullifiers)
 	return nil

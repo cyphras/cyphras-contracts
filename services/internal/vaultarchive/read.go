@@ -142,6 +142,10 @@ func Load(ctx context.Context, f Fetcher, want Expect) (*Contents, error) {
 	if err != nil {
 		return nil, err
 	}
+	return loadWindows(ctx, f, m)
+}
+
+func loadWindows(ctx context.Context, f Fetcher, m Manifest) (*Contents, error) {
 	out := &Contents{Manifest: m}
 	spent := map[fr.Element]bool{}
 	for _, w := range m.Windows {

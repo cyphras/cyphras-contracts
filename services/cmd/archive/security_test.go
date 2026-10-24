@@ -7,7 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 )
 
 const (
@@ -75,5 +78,26 @@ func TestTheServerNeverFollowsASymbolicLink(t *testing.T) {
 		if status != http.StatusNotFound || strings.Contains(body, canary) {
 			t.Fatalf("%s: %s answered %d", name, c.path, status)
 		}
+	}
+}
+
+func TestVerifyFetchesNoWindowForAManifestTheVaultCannotHold(t *testing.T) {
+	dir, _ := exportSample(t)
+	var windows atomic.Int32
+	files := http.FileServer(http.Dir(dir))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/windows/") {
+			windows.Add(1)
+		}
+		files.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	fake := chainFake(t, dir)
+	fake.SetLatest(window)
+	t.Cleanup(func(old func(string) rpc.Client) func() { return func() { dialRPC = old } }(dialRPC))
+	dialRPC = func(string) rpc.Client { return fake }
+	_, err := do(t, "verify", "--url", srv.URL, "--rpc", "http://rpc.invalid")
+	if err == nil || windows.Load() != 0 {
+		t.Fatalf("a manifest that covers ledgers the RPC has not closed: %v, %d windows fetched", err, windows.Load())
 	}
 }
