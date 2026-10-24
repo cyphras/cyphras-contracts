@@ -126,6 +126,8 @@ export interface VaultCall {
   readonly transfers: readonly { readonly token: string; readonly args: readonly xdr.ScVal[] }[];
   readonly extend?: (footprint: xdr.LedgerFootprint) => Promise<Extra>;
   readonly attempts?: number;
+  // The addresses the call pays in the pool asset, whose balances there it may restore.
+  readonly payees?: readonly string[];
 }
 
 export interface InvokeContext {
@@ -499,14 +501,27 @@ const entryNames = (keys: readonly xdr.LedgerKey[], o: Owners): string[] => [
   ...new Set(keys.map((k) => entryName(k, o))),
 ];
 
+// The holder of a balance entry in a contract, keyed as the asset contract keys it.
+function holderOf(key: xdr.LedgerKey): string | undefined {
+  if (key.switch().name !== "contractData") return undefined;
+  const k = key.contractData().key();
+  const [name, holder] = k.switch().name === "scvVec" ? (k.vec() ?? []) : [];
+  if (name?.switch().name !== "scvSymbol" || name.sym().toString() !== "Balance") return undefined;
+  return holder?.switch().name === "scvAddress"
+    ? Address.fromScAddress(holder.address()).toString()
+    : undefined;
+}
+
 // An entry a vault call may restore: the pinned vault code, a persistent entry of the vault, or
-// the pool asset contract's instance or a balance in it.
-function restorable(key: xdr.LedgerKey, o: Owners): boolean {
+// the pool asset contract's instance or the balance there of one of `holders`.
+function restorable(key: xdr.LedgerKey, o: Owners, holders: ReadonlySet<string>): boolean {
   if (!isPersistent(key)) return false;
   const name = entryName(key, o);
   if (key.switch().name === "contractCode") return name === "code";
   const contract = Address.fromScAddress(key.contractData().contract()).toString();
-  return contract === o.vault || name === "asset instance" || name === "asset Balance";
+  if (contract === o.vault || name === "asset instance") return true;
+  const holder = name === "asset Balance" ? holderOf(key) : undefined;
+  return holder !== undefined && holders.has(holder);
 }
 
 // The vault's entries of one nullifier, deposit or exit. A call's simulation restores those it
@@ -612,11 +627,10 @@ function simulationFailure(code: number | undefined): CyphrasError {
   });
 }
 
-// What a caller learns of each attempt of a call: that the signer is asked to sign it; its hash
-// just before the signed envelope goes out, and again once the network has the transaction, before
-// the wait for it; and the hash of one the network can no longer take, past its ledger bound.
+// What a caller learns of each attempt of a call: its hash just before the signed envelope goes
+// out, and again once the network has the transaction, before the wait for it; and the hash of one
+// the RPC reports the network can no longer take, past its ledger bound.
 export interface SubmitHooks {
-  readonly onSigning?: () => void;
   readonly onSending?: (hash: string) => Promise<void>;
   readonly onSubmitted?: (hash: string) => Promise<void>;
   readonly onDropped?: (hash: string) => Promise<void>;
@@ -808,10 +822,20 @@ async function attemptCall(
   let data = xdr.SorobanTransactionData.fromXDR(simulation.transactionData, "base64");
   const simulated = data.resources().footprint();
   const inFootprint = [...simulated.readOnly(), ...simulated.readWrite()];
-  // An RPC chooses what a restore covers, so the SDK takes only the call's own entries of the
-  // vault and the pool asset, never another contract's at the signer's cost.
+  const auth = simulation.auth.map((a) => xdr.SorobanAuthorizationEntry.fromXDR(a, "base64"));
+  checkAuth(auth, ctx.vault, call);
+  const inclusion = await inclusionFee(ctx.rpc);
+  const extra = call.extend === undefined ? undefined : await call.extend(simulated);
+  // An RPC chooses what a restore covers, so the SDK takes only entries of the simulated footprint
+  // that are the vault's own, the pool asset's instance, or balances there of the vault, of the
+  // call's payees and of the holders the call's room names; never another's at the signer's cost.
   const known = new Set(inFootprint.map(keyId));
-  const own = (k: xdr.LedgerKey): boolean => known.has(keyId(k)) && restorable(k, ctx);
+  const holders = new Set([
+    ctx.vault,
+    ...(call.payees ?? []),
+    ...(extra?.readWrite ?? []).flatMap((k) => holderOf(k) ?? []),
+  ]);
+  const own = (k: xdr.LedgerKey): boolean => known.has(keyId(k)) && restorable(k, ctx, holders);
   if (!simulation.archived.every(own)) {
     fail("rpc_error", "the simulation restores entries that are not the call's own");
   }
@@ -822,10 +846,6 @@ async function attemptCall(
     }
     return { kind: "restore", data: preamble };
   }
-  const auth = simulation.auth.map((a) => xdr.SorobanAuthorizationEntry.fromXDR(a, "base64"));
-  checkAuth(auth, ctx.vault, call);
-  const inclusion = await inclusionFee(ctx.rpc);
-  const extra = call.extend === undefined ? undefined : await call.extend(simulated);
   const lives = await readEntries(
     ctx.rpc,
     [...inFootprint, ...(extra?.readWrite ?? [])].filter((k) => bounded(k, ctx)),
@@ -839,7 +859,7 @@ async function attemptCall(
       if (
         entry !== undefined &&
         !known.has(keyId(key)) &&
-        restorable(key, ctx) &&
+        restorable(key, ctx, holders) &&
         archivedBy(entry, lives.latestLedger)
       ) {
         restoring.set(keyId(key), entryBytes(entry));
@@ -931,7 +951,6 @@ async function submit(
   if (BigInt(tx.fee) !== fee.total) fail("rpc_error", "the transaction's fee is not the one shown");
   const hash = bytesToHex(Uint8Array.from(tx.hash()));
 
-  hooks.onSigning?.();
   const signedXdr = signedEnvelope(await signer.signTransaction(tx.toXDR(), ctx.networkPassphrase));
   let signed: Transaction | FeeBumpTransaction;
   try {

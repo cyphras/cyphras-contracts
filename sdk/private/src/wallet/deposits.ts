@@ -254,7 +254,9 @@ export async function shield(
           deposit.txHash = hash;
           await core.save();
         },
-        // A transaction past its ledger bound can never land, so it holds the deposit no longer.
+        // A transaction the RPC reports past its ledger bound, which a second provider confirms
+        // when one is set, holds the deposit no longer; a sync revives the deposit from the
+        // vault's events should it land after all.
         onDropped: async (hash) => {
           if (deposit.txHash === hash) deposit.txHash = undefined;
           await core.save();

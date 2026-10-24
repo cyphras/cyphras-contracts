@@ -412,21 +412,26 @@ const view = (plan: Plan): Submission => ({
   fee: plan.fee,
 });
 
-// An error raised once a plan is among the wallet's names it: the plan keeps its notes until its
-// fate is known, whatever became of its submission, so the payment goes again only through retry.
-// An error the SDK did not raise itself, as a signer's or a store's, is wrapped to carry it.
+// An error raised once a plan is among the wallet's names it, and the operation it is a part of:
+// the plan keeps its notes until its fate is known, whatever became of its submission, so the
+// payment goes again only through retry, or as its operation goes on. An error the SDK did not
+// raise itself, as a signer's or a store's, is wrapped to carry it.
 function naming(err: unknown, plan: Plan | undefined): unknown {
   if (plan === undefined) return err;
+  const ids = {
+    planId: plan.id,
+    ...(plan.operationId === undefined ? {} : { operationId: plan.operationId }),
+  };
   if (!(err instanceof CyphrasError)) {
     return new CyphrasError(
       "unexpected_error",
       "the payment's submission stopped on an unexpected error; it may still land",
-      { planId: plan.id },
+      ids,
       { cause: err },
     );
   }
   if ("planId" in err.details) return err;
-  return new CyphrasError(err.code, err.message, { ...err.details, planId: plan.id });
+  return new CyphrasError(err.code, err.message, { ...err.details, ...ids });
 }
 
 // One spend from the review to the submission, with a write-ahead plan saved before anything
@@ -723,9 +728,9 @@ export async function resendConflicted(
 
 // The user's own account submits the unshield and pays the network fee. The plan stays
 // submitted until a sync shows its nullifiers and commitments in one transaction, as for a relayed
-// one; the RPC's word that the transaction succeeded does not confirm it. An error that came before
-// the signer was asked to sign the call says so with details.signed false: nothing of the plan can
-// land then.
+// one; the RPC's word that the transaction succeeded does not confirm it. The call carries the
+// proof to the RPC already in its simulation, and any account can submit a proof, so a plan that
+// stopped on any error may still land.
 async function selfRelay(
   core: Core,
   plan: Plan,
@@ -733,7 +738,6 @@ async function selfRelay(
   caps: Partial<NetworkFeeCaps> | undefined,
 ): Promise<Submission> {
   const ext: ExtData = extDataFromJson(plan.ext);
-  let signing = false;
   try {
     await invokeVault(
       invokeContext(core, caps),
@@ -747,11 +751,9 @@ async function selfRelay(
         ],
         transfers: [],
         extend: transactRoom(core, ext),
+        payees: [ext.recipient, ext.relayer],
       },
       {
-        onSigning: () => {
-          signing = true;
-        },
         onSubmitted: async (hash) => {
           plan.state = "submitted";
           plan.txHash = hash;
@@ -760,18 +762,8 @@ async function selfRelay(
       },
     );
   } catch (err) {
-    if (err instanceof CyphrasError) {
-      plan.error = err.code;
-      await core.save();
-      if (!signing) {
-        throw new CyphrasError(
-          err.code,
-          err.message,
-          { ...err.details, signed: false },
-          { cause: err.cause },
-        );
-      }
-    }
+    plan.error = err instanceof CyphrasError ? err.code : "unexpected_error";
+    await core.save();
     throw err;
   }
   return view(plan);

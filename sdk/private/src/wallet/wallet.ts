@@ -239,10 +239,12 @@ export interface UnshieldRequest {
   readonly relayer?: string | readonly string[];
   readonly selfRelay?: TransactionSigner;
   // Caps of a self-relayed unshield's own transactions over the wallet's, as after the user agreed
-  // to the fee a fee_above_cap error reported. An unshield that failed so keeps its plan and notes
-  // and goes again only through retry with these caps; a split whose first part never reached the
-  // signer leaves nothing behind, and goes again as a new unshield. Later parts of a split take
-  // the caps continueOperations is given.
+  // to the fee a fee_above_cap error reported. An unshield that failed so keeps its plan and notes:
+  // a single one goes again through retry with these caps. A split one, whose errors name its
+  // operationId, goes on when the same request is made again, which continues that operation, with
+  // the same notes for a part that did not go out, rather than start another; these caps then
+  // apply to the parts that call sends. A new split to the same destination for the same amount
+  // needs that operation abandoned first. Later parts take the caps continueOperations is given.
   readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   readonly confirm?: ConfirmSpend;
   readonly notBefore?: number;
@@ -1278,6 +1280,22 @@ export class PrivateWallet {
       const burnToIssuer = request.burnToIssuer === true;
       if (request.split === true && request.amount + maxFee > limits.maxDailyOutflow) {
         checkIssuer(this.#core.deployment.asset.name, request.to, burnToIssuer);
+        // The same request again continues its operation: a part of it may have gone out, and
+        // landed, whatever the error that stopped it said.
+        const same = this.#core.state.operations.find(
+          (op) =>
+            (op.state === "active" || op.state === "blocked") &&
+            op.to === request.to &&
+            op.total === request.amount &&
+            (op.route.kind === "self"
+              ? op.route.account === request.selfRelay?.publicKey
+              : request.selfRelay === undefined),
+        );
+        if (same !== undefined) {
+          await this.#advance(same, request.selfRelay, false, caps);
+          await this.#core.save();
+          return this.#operationView(same);
+        }
         return this.#startSplit(request, maxFee, limits.maxDailyOutflow - maxFee, caps);
       }
       return spend(this.#core, {
@@ -1337,30 +1355,9 @@ export class PrivateWallet {
       state: "active",
       blockedBy: undefined,
     };
-    const { state } = this.#core;
-    state.operations.push(op);
+    this.#core.state.operations.push(op);
     await this.#core.save();
-    try {
-      await this.#nextPart(op, request.selfRelay, undefined, undefined, request.confirm, caps);
-    } catch (err) {
-      // A first part that made no plan, or whose transaction never reached the signer, can never
-      // land: the operation goes as if never made, so that the unshield itself goes again rather
-      // than a second operation beside this one.
-      const part = state.plans.find((p) => p.operationId === op.id);
-      const unsigned = err instanceof CyphrasError && err.details["signed"] === false;
-      if (part === undefined || unsigned) {
-        if (part !== undefined) state.plans.splice(state.plans.indexOf(part), 1);
-        state.operations.splice(state.operations.indexOf(op), 1);
-        await this.#core.save();
-        if (err instanceof CyphrasError) {
-          const details = Object.fromEntries(
-            Object.entries(err.details).filter(([k]) => k !== "planId" && k !== "signed"),
-          );
-          throw new CyphrasError(err.code, err.message, details, { cause: err.cause });
-        }
-      }
-      throw err;
-    }
+    await this.#nextPart(op, request.selfRelay, undefined, undefined, request.confirm, caps);
     return this.#operationView(op);
   }
 
@@ -1370,7 +1367,8 @@ export class PrivateWallet {
       .reduce((s, p) => s + p.amount, 0n);
   }
 
-  // Sends the next part of an operation, or a dead one again with its own notes.
+  // Sends the next part of an operation, or one that did not land again with its own notes. Its
+  // errors name the operation.
   async #nextPart(
     op: Operation,
     signer: TransactionSigner | undefined,
@@ -1402,6 +1400,14 @@ export class PrivateWallet {
       onPlan: (plan) => {
         op.awaiting = plan.id;
       },
+    }).catch((err: unknown) => {
+      if (!(err instanceof CyphrasError) || "operationId" in err.details) throw err;
+      throw new CyphrasError(
+        err.code,
+        err.message,
+        { ...err.details, operationId: op.id },
+        { cause: err.cause },
+      );
     });
   }
 
@@ -1599,7 +1605,11 @@ export class PrivateWallet {
         parts: 1,
         // The plan's destination was agreed to when it was made.
         burnToIssuer: true,
-        onPlan: undefined,
+        // The operation the plan is a part of follows the new plan in its place.
+        onPlan: (next) => {
+          const op = state.operations.find((o) => o.id === plan.operationId);
+          if (op?.awaiting === plan.id) op.awaiting = next.id;
+        },
       });
     });
   }
