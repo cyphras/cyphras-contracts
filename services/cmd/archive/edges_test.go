@@ -194,7 +194,15 @@ func TestARebuildWithAFromPastItsToIsRefusedAndKeepsTheManifest(t *testing.T) {
 	}
 }
 
+func quickRetries(t *testing.T) {
+	t.Helper()
+	old := patientClient
+	patientClient = &http.Client{Timeout: time.Minute, Transport: retrying{next: http.DefaultTransport, delay: time.Millisecond}}
+	t.Cleanup(func() { patientClient = old })
+}
+
 func TestARebuildFromAnArchiveOfAnotherNetworkOrThatFailsWritesNoManifest(t *testing.T) {
+	quickRetries(t)
 	deployment := writeDeployment(t, vaulttest.Vault)
 	wrong := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, ".config.json") {
@@ -376,6 +384,7 @@ func flaky(t *testing.T, base string) string {
 }
 
 func TestARebuildSurvivesAnObjectStoreThatAnswers503And429NowAndThen(t *testing.T) {
+	quickRetries(t)
 	events := sample()
 	deployment := writeDeployment(t, vaulttest.Vault)
 	out := filepath.Join(t.TempDir(), "rebuilt")
