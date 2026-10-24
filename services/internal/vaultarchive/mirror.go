@@ -11,6 +11,10 @@ import (
 	"path/filepath"
 )
 
+// MaxMirrorBytes bounds what one Mirror run stages, counted in the sizes the manifest gives, so a
+// manifest of many large windows cannot fill the disk before anything is found wrong.
+const MaxMirrorBytes = 2 << 30
+
 // Mirrored says what a Mirror run did.
 type Mirrored struct {
 	Manifest Manifest
@@ -23,8 +27,10 @@ type Mirrored struct {
 // window dir already holds is not fetched again, and the files the new manifest does not list are
 // removed. dir only ever grows: a published archive that is behind the copy in dir, or that lists
 // a window of the copy with other content, is refused, and so is any failure, with dir exactly as
-// it was.
-func Mirror(ctx context.Context, remote Fetcher, dir string, want Expect) (Mirrored, error) {
+// it was. Each admit is asked about the published manifest before any window is fetched, and may
+// refuse it, as Admits does for a manifest that claims more than the chain has. The windows to
+// fetch may not add up to more than MaxMirrorBytes.
+func Mirror(ctx context.Context, remote Fetcher, dir string, want Expect, admits ...func(Manifest) error) (Mirrored, error) {
 	if want.Vault == "" || want.NetworkPassphrase == "" {
 		return Mirrored{}, errors.New("a mirror needs to know which vault and network it is of")
 	}
@@ -35,6 +41,11 @@ func Mirror(ctx context.Context, remote Fetcher, dir string, want Expect) (Mirro
 	published, err := ParseManifest(raw, want)
 	if err != nil {
 		return Mirrored{}, err
+	}
+	for _, admit := range admits {
+		if err := admit(published); err != nil {
+			return Mirrored{}, err
+		}
 	}
 	if err := refuseLinks(dir, published); err != nil {
 		return Mirrored{}, err
@@ -67,6 +78,7 @@ func Mirror(ctx context.Context, remote Fetcher, dir string, want Expect) (Mirro
 	}()
 	source := &layered{remote: remote, local: DirFetcher(dir), stage: stage, held: map[string]bool{}}
 	var fetched []Window
+	var staged int64
 	for _, w := range published.Windows {
 		switch {
 		case w.Events == 0:
@@ -74,7 +86,11 @@ func Mirror(ctx context.Context, remote Fetcher, dir string, want Expect) (Mirro
 			source.held[w.File()] = true
 		default:
 			fetched = append(fetched, w)
+			staged += w.Bytes
 		}
+	}
+	if staged > MaxMirrorBytes {
+		return Mirrored{}, invalid("the windows to fetch add up to %d bytes, more than the %d a mirror takes in one run", staged, int64(MaxMirrorBytes))
 	}
 	if _, err := loadWindows(ctx, source, published); err != nil {
 		return Mirrored{}, err

@@ -334,3 +334,48 @@ func TestABuildNeverRewritesAPublishedWindowWithOtherBytes(t *testing.T) {
 		t.Fatal("a refused rebuild changed the directory")
 	}
 }
+
+func TestAMirrorAsksEveryAdmitBeforeItFetchesAWindow(t *testing.T) {
+	remote := published(t, 3)
+	dir := filepath.Join(t.TempDir(), "copy")
+	refuse := errors.New("the chain has less")
+	spy := &asking{Fetcher: DirFetcher(remote)}
+	agree := func(Manifest) error { return nil }
+	if _, err := Mirror(context.Background(), spy, dir, pin(), agree, func(Manifest) error { return refuse }); !errors.Is(err, refuse) {
+		t.Fatalf("a manifest an admit refused: %v", err)
+	}
+	if len(spy.names) != 1 || spy.names[0] != ManifestName {
+		t.Fatalf("a refused manifest cost %v", spy.names)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a refused mirror left %s: %v", dir, err)
+	}
+	if _, err := Mirror(context.Background(), DirFetcher(remote), dir, pin(), agree); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAMirrorRefusesAManifestOfMoreWindowsThanItWillStage(t *testing.T) {
+	remote := t.TempDir()
+	m := Manifest{Format: Format, Network: "testnet", NetworkPassphrase: passphrase, Vault: vaulttest.Vault, DeployLedger: deploy,
+		WindowLedgers: WindowLedgers, Producer: "test"}
+	for i := range uint32(40) {
+		start := windowStart(deploy) + i*WindowLedgers
+		m.Windows = append(m.Windows, Window{
+			Start: start, End: start + WindowLedgers - 1, Events: 1, Leaves: [2]uint64{0, 0}, Nullifiers: 1,
+			Bytes: MaxWindowBytes, SHA256: strings.Repeat("ab", 32),
+		})
+		m.CoveredTo = start + WindowLedgers - 1
+	}
+	writeManifestFile(t, remote, m)
+	dir := filepath.Join(t.TempDir(), "copy")
+	spy := &asking{Fetcher: DirFetcher(remote)}
+	_, err := Mirror(context.Background(), spy, dir, pin())
+	mustInvalid(t, "forty windows of the largest size", err, "more than")
+	if len(spy.names) != 1 {
+		t.Fatalf("asked for %v", spy.names)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a refused mirror left %s: %v", dir, err)
+	}
+}

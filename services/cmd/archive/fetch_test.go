@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
+	"github.com/cyphras/cyphras-contracts/services/internal/rpc"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 	"github.com/cyphras/cyphras-contracts/services/internal/vaultarchive"
@@ -342,5 +343,60 @@ func TestARebuildIntoACopyOfTheArchiveFailsWhenAWindowDiffersFromThePublishedOne
 	}
 	if _, err := rebuild(t, fewer); err == nil || !strings.Contains(err.Error(), "never rewritten") {
 		t.Fatalf("ledgers that differ from the published window: %v", err)
+	}
+}
+
+func TestFetchWithAnRPCRefusesAManifestOfLedgersThatHaveNotHappenedBeforeAnyWindow(t *testing.T) {
+	published, deployment := exportSample(t)
+	fake := chainFake(t, published)
+	t.Cleanup(func(old func(string) rpc.Client) func() { return func() { dialRPC = old } }(dialRPC))
+	dialRPC = func(string) rpc.Client { return fake }
+
+	// An honest archive passes the RPC, and a manifest of 5000 empty windows to far past the
+	// RPC's latest ledger does not.
+	url, _ := serveArchive(t, published)
+	out := filepath.Join(t.TempDir(), "copy")
+	if _, err := do(t, "fetch", "--url", url, "--out", out, "--deployment", deployment, "--rpc", "http://rpc.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	m := vaultarchive.Manifest{
+		Format: vaultarchive.Format, Network: "testnet", NetworkPassphrase: passphrase, Vault: vaulttest.Vault,
+		DeployLedger: deployAt, WindowLedgers: window, Producer: "test",
+	}
+	for i := range uint32(5000) {
+		m.Windows = append(m.Windows, vaultarchive.Window{Start: i * window, End: (i+1)*window - 1})
+	}
+	m.CoveredTo = 5000*window - 1
+	hostile := t.TempDir()
+	raw, err := m.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostile, "manifest.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hostileURL, hostileAsked := serveArchive(t, hostile)
+	before := snapshot(t, out)
+	fresh := filepath.Join(t.TempDir(), "fresh")
+	for _, target := range []string{out, fresh} {
+		_, err := do(t, "fetch", "--url", hostileURL, "--out", target, "--deployment", deployment, "--rpc", "http://rpc.invalid")
+		if err == nil || !strings.Contains(err.Error(), "RPC's latest") {
+			t.Fatalf("a manifest past the chain: %v", err)
+		}
+	}
+	if after := snapshot(t, out); !maps.Equal(before, after) {
+		t.Fatal("a refused fetch changed the copy")
+	}
+	if _, err := os.Stat(fresh); !os.IsNotExist(err) {
+		t.Fatalf("a refused fetch left %s: %v", fresh, err)
+	}
+	if got := hostileAsked(); len(got) != 2 {
+		t.Fatalf("the hostile archive was asked for %v", got)
+	}
+
+	// Without an RPC the format is all that is checked, so the same manifest is taken: the flag
+	// is what protects a long-lived copy.
+	if _, err := do(t, "fetch", "--url", hostileURL, "--out", filepath.Join(t.TempDir(), "unchecked"), "--deployment", deployment); err != nil {
+		t.Fatalf("a manifest of empty windows without an RPC: %v", err)
 	}
 }

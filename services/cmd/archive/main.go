@@ -32,7 +32,7 @@ import (
 const usage = `usage:
   archive export  --dir <indexer archive> --deployment <file> --out <dir> [--vault <id>] [--network <name>]
   archive rebuild --ledger-meta <url> --deployment <file> --out <dir> [--vault <id>] [--network <name>] [--from <ledger>] [--to <ledger> | --rpc <url>] [--workers <n>]
-  archive fetch   --url <base> --out <dir> --deployment <file> [--vault <id>]
+  archive fetch   --url <base> --out <dir> --deployment <file> [--vault <id>] [--rpc <url>...]
   archive verify  (--dir <dir> | --url <base>) (--rpc <url>... | --format-only) [--deployment <file> [--vault <id>] | --vault <id> --passphrase <text>]
   archive serve   --dir <dir> [--addr 127.0.0.1:8737]`
 
@@ -239,6 +239,8 @@ func fetch(ctx context.Context, args []string, out io.Writer) error {
 	outDir := fs.String("out", "", "the directory that holds the copy")
 	deployment := fs.String("deployment", "", "the deployment file that pins the vault, network and deploy ledger")
 	vaultID := fs.String("vault", "", "the vault, when the deployment file lists several")
+	var rpcURLs stringList
+	fs.Var(&rpcURLs, "rpc", "an RPC that refuses a published archive claiming more than the chain has, before any window is fetched; give several and each must agree")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -253,7 +255,15 @@ func fetch(ctx context.Context, args []string, out io.Writer) error {
 		return err
 	}
 	want := vaultarchive.Expect{Vault: v.Vault, NetworkPassphrase: d.NetworkPassphrase, DeployLedger: v.DeployLedger}
-	got, err := vaultarchive.Mirror(ctx, vaultarchive.HTTPFetcher{Base: *url, Client: patientClient}, *outDir, want)
+	var admits []func(vaultarchive.Manifest) error
+	for _, u := range rpcURLs {
+		view, err := vaultarchive.ReadView(ctx, dialRPC(u), want.Vault, want.NetworkPassphrase)
+		if err != nil {
+			return err
+		}
+		admits = append(admits, view.Admits)
+	}
+	got, err := vaultarchive.Mirror(ctx, vaultarchive.HTTPFetcher{Base: *url, Client: patientClient}, *outDir, want, admits...)
 	if err != nil {
 		return err
 	}
