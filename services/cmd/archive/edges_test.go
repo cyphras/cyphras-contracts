@@ -262,7 +262,7 @@ func TestTheServerHandlesTraversalContentTypesAndRanges(t *testing.T) {
 		}
 		defer conn.Close()
 		var req strings.Builder
-		fmt.Fprintf(&req, "%s %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n", method, target)
+		fmt.Fprintf(&req, "%s %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n", method, target)
 		for k, v := range header {
 			fmt.Fprintf(&req, "%s: %s\r\n", k, v)
 		}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -169,5 +170,59 @@ func TestTheChainChecksNeedToKnowWhichVaultTheArchiveIsOf(t *testing.T) {
 	}
 	if _, err := do(t, "verify", "--dir", dir, "--format-only"); err != nil {
 		t.Fatalf("the format checks need no pin: %v", err)
+	}
+}
+
+func TestTheServerRefusesAPageThatReachesItUnderAnotherName(t *testing.T) {
+	dir, _ := exportSample(t)
+	srv := httptest.NewServer(handler(dir))
+	defer srv.Close()
+	get := func(host, path string) *http.Response {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Host = host
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+	for _, host := range []string{"rebind.evil.example", "rebind.evil.example:8737", "127.0.0.1.evil.example", "10.0.0.5:8737"} {
+		resp := get(host, "/manifest.json")
+		if resp.StatusCode != http.StatusForbidden || resp.Header.Get("Access-Control-Allow-Origin") != "" {
+			t.Fatalf("host %q: %d %v", host, resp.StatusCode, resp.Header)
+		}
+	}
+	for _, host := range []string{"127.0.0.1", "127.0.0.1:8737", "localhost", "LOCALHOST:8737", "[::1]:8737", "[::1]"} {
+		if resp := get(host, "/manifest.json"); resp.StatusCode != http.StatusOK {
+			t.Fatalf("host %q: %d", host, resp.StatusCode)
+		}
+	}
+	for _, path := range []string{"/manifest.json", "/windows/0000000000.jsonl.gz", "/nothing"} {
+		if resp := get("127.0.0.1", path); resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+			t.Fatalf("%s: %v", path, resp.Header)
+		}
+	}
+	if resp := get("evil.example", "/manifest.json"); resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("a refused request: %v", resp.Header)
+	}
+}
+
+func TestServeSaysWhenItListensBeyondThisMachine(t *testing.T) {
+	dir, _ := exportSample(t)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for addr, warns := range map[string]bool{
+		"127.0.0.1:0": false, "localhost:0": false, "[::1]:0": false,
+		"0.0.0.0:0": true, ":0": true, "192.0.2.1:0": true, "example.org:0": true,
+	} {
+		var out bytes.Buffer
+		_ = run(cancelled, []string{"serve", "--dir", dir, "--addr", addr}, &out)
+		if got := strings.Contains(out.String(), "warning"); got != warns {
+			t.Fatalf("%s: warning %v, output %q", addr, got, out.String())
+		}
 	}
 }

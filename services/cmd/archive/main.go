@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -352,8 +353,36 @@ func serve(ctx context.Context, args []string, out io.Writer) error {
 	if err := require(map[string]string{"dir": *dir}); err != nil {
 		return err
 	}
+	if !loopback(*addr) {
+		fmt.Fprintf(out, "warning: %s is not a loopback address; anyone who can reach it can read the archive, and requests that name another host are refused\n", *addr)
+	}
 	fmt.Fprintf(out, "serving %s on http://%s\n", *dir, *addr)
 	return httpapi.Serve(ctx, *addr, handler(*dir))
+}
+
+// loopback reports whether a listen address is only reachable from this machine.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// localHosts are the names a page on this machine reaches the server by. Any other name in the
+// Host header is a page that rebound its own domain to this address.
+var localHosts = map[string]bool{"127.0.0.1": true, "localhost": true, "[::1]": true, "::1": true}
+
+func localHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	return localHosts[strings.ToLower(host)]
 }
 
 var served = regexp.MustCompile(`^/(manifest\.json|windows/[0-9]{10}\.jsonl\.gz)$`)
@@ -362,6 +391,11 @@ var served = regexp.MustCompile(`^/(manifest\.json|windows/[0-9]{10}\.jsonl\.gz)
 // symbolic link is never followed, so a directory someone else made cannot leak a file.
 func handler(dir string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if !localHost(r.Host) {
+			http.Error(w, "unexpected host", http.StatusForbidden)
+			return
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		switch {
 		case r.Method == http.MethodOptions:
