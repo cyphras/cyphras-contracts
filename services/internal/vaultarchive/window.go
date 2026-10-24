@@ -14,6 +14,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/fr"
+	"github.com/cyphras/cyphras-contracts/services/internal/tree"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
 )
 
@@ -141,6 +142,9 @@ func parse(data []byte, start, end, deployLedger uint32, vaultID string, firstLe
 			spent[body.Nullifier] = true
 			c.nullifiers = append(c.nullifiers, body.Nullifier)
 		case vault.NewCommitment:
+			if body.Index >= tree.Capacity {
+				return content{}, invalid("line %d: leaf %d is past the %d the tree holds", n, body.Index, tree.Capacity)
+			}
 			if body.Index != c.leaves[1] {
 				return content{}, invalid("line %d: leaf %d where %d belongs", n, body.Index, c.leaves[1])
 			}

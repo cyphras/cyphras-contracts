@@ -13,6 +13,7 @@ import (
 	"github.com/stellar/go-stellar-sdk/strkey"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/archive"
+	"github.com/cyphras/cyphras-contracts/services/internal/tree"
 )
 
 // Format names the version of the layout; a reader refuses any other.
@@ -127,6 +128,12 @@ func (m Manifest) Validate(want Expect) error {
 		}
 		if w.Leaves[0] != leaves || w.Leaves[1] < w.Leaves[0] || (w.Leaves[1]-w.Leaves[0])%2 != 0 {
 			return invalid("window %d holds leaves %d to %d after %d", i, w.Leaves[0], w.Leaves[1], leaves)
+		}
+		if w.Leaves[1] > tree.Capacity {
+			return invalid("window %d ends at leaf %d, past the %d the tree holds", i, w.Leaves[1], tree.Capacity)
+		}
+		if w.Events > maxExactInteger || w.Nullifiers > maxExactInteger {
+			return invalid("window %d counts more than a JavaScript number holds exactly", i)
 		}
 		if w.Events < 0 || w.Nullifiers < 0 || w.Bytes < 0 || w.Bytes > MaxWindowBytes || uint64(w.Events) < uint64(w.Nullifiers)+w.Leaves[1]-w.Leaves[0] {
 			return invalid("window %d counts do not fit", i)

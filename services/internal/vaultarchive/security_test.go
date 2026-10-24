@@ -3,6 +3,7 @@ package vaultarchive
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"maps"
 	"net/http"
@@ -12,7 +13,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/cyphras/cyphras-contracts/services/internal/fr"
+	"github.com/cyphras/cyphras-contracts/services/internal/tree"
 	"github.com/cyphras/cyphras-contracts/services/internal/vault"
+	"github.com/cyphras/cyphras-contracts/services/internal/vault/vaulttest"
 )
 
 // linkOutside moves a file, or the windows directory, of the archive in dir to outside and leaves
@@ -253,4 +259,53 @@ func TestAnErrorNamesTheFileAndNotTheURLItWasFetchedFrom(t *testing.T) {
 	if err == nil || strings.Contains(err.Error(), "s3cret") {
 		t.Fatalf("error for an unusable base %v", err)
 	}
+}
+
+func TestNumbersPastTheTreeOrWhatJavaScriptHoldsAreRefused(t *testing.T) {
+	const exact = 1<<53 - 1
+	for name, c := range map[string]struct {
+		reason string
+		change func(w *Window)
+	}{
+		"leaves past the tree":                {"the tree holds", func(w *Window) { w.Leaves[1] = 1<<32 + 2; w.Events = 1<<32 + 2 }},
+		"more events than a number holds":     {"exactly", func(w *Window) { w.Events = exact + 1 }},
+		"more nullifiers than a number holds": {"exactly", func(w *Window) { w.Events, w.Nullifiers = exact+2, exact+1 }},
+		"more bytes than a window may":        {"counts do not fit", func(w *Window) { w.Bytes = exact + 1 }},
+	} {
+		dir, _ := good(t)
+		m := readManifestFile(t, dir)
+		c.change(&m.Windows[0])
+		raw, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ManifestName), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err = ReadManifest(context.Background(), DirFetcher(dir), Expect{})
+		mustInvalid(t, name, err, c.reason)
+	}
+
+	leaf := func(index uint64) vault.RawEvent {
+		e := sample()[7]
+		e.Value = mustB64(t, vault.Struct(
+			vault.Field{Name: "index", Value: vault.U64(index)},
+			vault.Field{Name: "commitment", Value: vaulttest.Field(fr.SetUint64(1))},
+			vault.Field{Name: "encrypted_output", Value: vault.Bytes(make([]byte, vault.CiphertextLen))},
+		))
+		return e
+	}
+	left, right := leaf(tree.Capacity), leaf(tree.Capacity+1)
+	right.Index++
+	_, _, err := encode([]vault.RawEvent{left, right}, 0, WindowLedgers-1, deploy, vaulttest.Vault, tree.Capacity)
+	mustInvalid(t, "a leaf index past the tree", err, "the tree holds")
+}
+
+func mustB64(t *testing.T, v xdr.ScVal) string {
+	t.Helper()
+	s, err := xdr.MarshalBase64(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }
