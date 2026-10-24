@@ -131,7 +131,7 @@ func TestAMirrorRestoresTheWindowsDirectoryOfACopyThatLostIt(t *testing.T) {
 	sameFiles(t, remote, dir)
 }
 
-func TestAMirrorRefusesAWindowThatIsADirectoryOrAFifo(t *testing.T) {
+func TestAMirrorRefusesAWindowThatIsADirectory(t *testing.T) {
 	remote := published(t, 2)
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, Window{Start: 0}.File()), 0o755); err != nil {
