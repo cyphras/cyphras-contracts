@@ -241,12 +241,14 @@ export interface UnshieldRequest {
   readonly relayer?: string | readonly string[];
   readonly selfRelay?: TransactionSigner;
   // Caps of a self-relayed unshield's own transactions over the wallet's, as after the user agreed
-  // to the fee a fee_above_cap error reported. An unshield that failed so keeps its plan and notes:
-  // a single one goes again through retry with these caps. A split one, whose errors name its
-  // operationId, stays open: the same split request again, same amount and route, continues it
-  // with these caps for the parts that call sends, and any other unshield to that destination fails
-  // with operation_open until the operation is done, or abandoned with its sent parts settled.
-  // Later parts take the caps continueOperations is given.
+  // to the fee a fee_above_cap error reported. An unshield that failed so keeps its plan and notes,
+  // and no other unshield to its destination goes while it may still land: one fails with
+  // operation_open, naming the planId of a single unshield or the operationId of a split one. A
+  // single one goes again through retry with these caps; it stops blocking once it lands, or is
+  // dead after its deadline with its nullifiers unspent. A split one goes on when the same split
+  // request, same amount and route, is made again, with these caps for the parts that call sends,
+  // and blocks until it is done, or abandoned with its sent parts settled. Later parts take the
+  // caps continueOperations is given.
   readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   readonly confirm?: ConfirmSpend;
   readonly notBefore?: number;
@@ -1276,6 +1278,22 @@ export class PrivateWallet {
     return this.#run(async () => {
       const caps = feeCapsOf(request.networkFeeCaps);
       await this.#sync(false);
+      // A single unshield to this destination that has not landed nor died may still land,
+      // whatever error stopped it: it goes again only through retry, with its own notes.
+      const pending = this.#core.state.plans.find(
+        (p) =>
+          p.kind === "unshield" &&
+          p.operationId === undefined &&
+          p.to === request.to &&
+          isActive(p),
+      );
+      if (pending !== undefined) {
+        fail(
+          "operation_open",
+          "an unshield to this destination may still land; send it again with retry, or wait until it lands or its deadline passes",
+          { planId: pending.id },
+        );
+      }
       // An open operation to this destination may still pay, whatever error stopped it: only the
       // same split request continues it, and no other unshield there goes beside it.
       const open = this.#openOperation(request.to);
@@ -1574,7 +1592,8 @@ export class PrivateWallet {
   /**
    * Stops a split unshield that is not done: nothing more of it is sent. Parts already sent are
    * followed as before, and count as sent once they land. Another unshield to its destination
-   * fails with operation_open until those parts have settled, landed or dead.
+   * fails with operation_open until those parts have settled, landed or dead after their deadline
+   * with their nullifiers unspent.
    */
   abandonOperation(operationId: string): Promise<OperationView> {
     return this.#run(async () => {
@@ -1590,7 +1609,8 @@ export class PrivateWallet {
    * Proves a stalled or dead payment again with the same notes, so at most one of the two can
    * land. The relayer, the fee cap and self-relay may differ from the first attempt; by default it
    * goes the way the plan went: through its relayer first, then the others, or self-relayed, which
-   * needs selfRelay again.
+   * needs selfRelay again. It is the way on for an unshield that a new unshield to the same
+   * destination is refused for with operation_open.
    */
   retry(planId: string, request: RetryRequest = {}): Promise<Submission> {
     return this.#run(async () => {
