@@ -352,26 +352,36 @@ func (r Reader) file(name string) ([]finished, error) {
 	return done, scanner.Err()
 }
 
-// LastCovered returns the last ledger of the newest file's coverage, or 0 for an empty archive.
+// LastCovered returns the last ledger of the newest coverage, or 0 for an archive with none. A
+// newest file that holds no finished write, such as one a crash left empty or torn, is passed over.
 func LastCovered(dir string) (uint32, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 	if err != nil || len(files) == 0 {
 		return 0, err
 	}
 	slices.Sort(files)
-	f, err := os.Open(files[len(files)-1])
+	for i := len(files) - 1; i >= 0; i-- {
+		last, found, err := coveredIn(files[i])
+		if err != nil || found {
+			return last, err
+		}
+	}
+	return 0, nil
+}
+
+func coveredIn(name string) (last uint32, found bool, err error) {
+	f, err := os.Open(name)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer f.Close()
-	var last uint32
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), maxRead)
 	for scanner.Scan() {
 		var l line
 		if json.Unmarshal(scanner.Bytes(), &l) == nil && l.Covered != nil {
-			last = max(last, l.Covered[1])
+			last, found = max(last, l.Covered[1]), true
 		}
 	}
-	return last, scanner.Err()
+	return last, found, scanner.Err()
 }
