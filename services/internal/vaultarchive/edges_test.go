@@ -386,7 +386,7 @@ func TestTheRootRingIsReadRightAtItsEdges(t *testing.T) {
 		onChain := &Contents{Manifest: manifestOnly(), Commitments: all[:2*c.vlt]}
 		f := chainOf(t, onChain)
 		got := &Contents{Manifest: manifestOnly(), Commitments: all[:2*c.archive]}
-		report, err := VerifyChain(context.Background(), f, got)
+		report, err := VerifyChain(context.Background(), f, pinOf(got), got)
 		if c.ok && err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -402,7 +402,7 @@ func TestAnArchiveWithAPairReplacedByItsNeighbourIsRefused(t *testing.T) {
 	for k := range 9 {
 		got := &Contents{Manifest: manifestOnly(), Commitments: append([]fr.Element(nil), all...)}
 		copy(got.Commitments[2*k:2*k+2], all[2*k+2:2*k+4])
-		if _, err := VerifyChain(context.Background(), f, got); !errors.Is(err, ErrChain) {
+		if _, err := VerifyChain(context.Background(), f, pinOf(got), got); !errors.Is(err, ErrChain) {
 			t.Fatalf("pair %d replaced by its neighbour: %v", k, err)
 		}
 	}
@@ -415,7 +415,7 @@ func TestNullifiersAreCheckedAcrossEveryBatchBoundary(t *testing.T) {
 	}
 	build := func() *Contents { return &Contents{Manifest: manifestOnly(), Nullifiers: all} }
 	f := chainOf(t, build())
-	if _, err := VerifyChain(context.Background(), f, build()); err != nil {
+	if _, err := VerifyChain(context.Background(), f, pinOf(build()), build()); err != nil {
 		t.Fatal(err)
 	}
 	if calls := f.CallCount("getLedgerEntries"); calls != 1+11 {
@@ -428,7 +428,7 @@ func TestNullifiersAreCheckedAcrossEveryBatchBoundary(t *testing.T) {
 			t.Fatal(err)
 		}
 		f.DeleteEntry(key)
-		_, err = VerifyChain(context.Background(), f, build())
+		_, err = VerifyChain(context.Background(), f, pinOf(build()), build())
 		if !errors.Is(err, ErrChain) || !strings.Contains(err.Error(), all[missing].Hex()) {
 			t.Fatalf("nullifier %d missing: %v", missing, err)
 		}
@@ -449,11 +449,11 @@ func (s shortChange) GetLedgerEntries(ctx context.Context, req protocol.GetLedge
 func TestAnRPCThatReturnsFewerEntriesThanAskedFailsTheChecks(t *testing.T) {
 	c := loaded(t)
 	f := chainOf(t, c)
-	if _, err := VerifyChain(context.Background(), shortChange{f}, c); !errors.Is(err, ErrChain) {
+	if _, err := VerifyChain(context.Background(), shortChange{f}, pinOf(c), c); !errors.Is(err, ErrChain) {
 		t.Fatalf("an RPC that drops the last entry of the tree read: %v", err)
 	}
 	only := &Contents{Manifest: manifestOnly(), Nullifiers: []fr.Element{fr.SetUint64(1), fr.SetUint64(2), fr.SetUint64(3)}}
-	if _, err := VerifyChain(context.Background(), shortChange{chainOf(t, only)}, only); !errors.Is(err, ErrChain) {
+	if _, err := VerifyChain(context.Background(), shortChange{chainOf(t, only)}, pinOf(only), only); !errors.Is(err, ErrChain) {
 		t.Fatalf("an RPC that drops the last nullifier: %v", err)
 	}
 }
@@ -462,7 +462,7 @@ func TestTheNetworkOfTheRPCMustBeTheArchivesEvenWhenTheEntriesMatch(t *testing.T
 	c := loaded(t)
 	f := chainOf(t, c)
 	f.Passphrase = "Public Global Stellar Network ; September 2015"
-	if _, err := VerifyChain(context.Background(), f, c); err == nil || !strings.Contains(err.Error(), "serves") {
+	if _, err := VerifyChain(context.Background(), f, pinOf(c), c); err == nil || !strings.Contains(err.Error(), "serves") {
 		t.Fatalf("an RPC of another network with the same entries: %v", err)
 	}
 	if f.CallCount("getLedgerEntries") != 0 {

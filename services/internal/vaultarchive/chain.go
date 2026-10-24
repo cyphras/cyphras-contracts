@@ -127,9 +127,16 @@ func (v *View) Verify(ctx context.Context, contents *Contents) (Report, error) {
 	return report, nil
 }
 
-// VerifyChain reads the vault through one RPC and verifies contents against it.
-func VerifyChain(ctx context.Context, c rpc.Client, contents *Contents) (Report, error) {
-	v, err := ReadView(ctx, c, contents.Manifest.Vault, contents.Manifest.NetworkPassphrase)
+// VerifyChain reads the vault the pin names through one RPC and verifies contents against it.
+// The contents must be of that vault: what the archive says about itself is never the question.
+func VerifyChain(ctx context.Context, c rpc.Client, want Expect, contents *Contents) (Report, error) {
+	if want.Vault == "" || want.NetworkPassphrase == "" {
+		return Report{}, errors.New("vault archive: a chain check needs the vault and network to check against")
+	}
+	if err := contents.Manifest.Validate(want); err != nil {
+		return Report{}, err
+	}
+	v, err := ReadView(ctx, c, want.Vault, want.NetworkPassphrase)
 	if err != nil {
 		return Report{}, err
 	}
@@ -140,13 +147,19 @@ func VerifyChain(ctx context.Context, c rpc.Client, contents *Contents) (Report,
 // has, and only then fetches the windows, so a hostile archive costs a manifest and not a
 // download. Every RPC must then confirm the whole archive.
 func VerifyArchive(ctx context.Context, f Fetcher, want Expect, clients ...rpc.Client) (*Contents, Report, error) {
+	if len(clients) == 0 {
+		return nil, Report{}, errors.New("vault archive: a chain check needs an RPC")
+	}
+	if want.Vault == "" || want.NetworkPassphrase == "" {
+		return nil, Report{}, errors.New("vault archive: a chain check needs the vault and network to check against")
+	}
 	m, err := ReadManifest(ctx, f, want)
 	if err != nil {
 		return nil, Report{}, err
 	}
 	views := make([]*View, len(clients))
 	for i, c := range clients {
-		if views[i], err = ReadView(ctx, c, m.Vault, m.NetworkPassphrase); err != nil {
+		if views[i], err = ReadView(ctx, c, want.Vault, want.NetworkPassphrase); err != nil {
 			return nil, Report{}, err
 		}
 		if err := views[i].Admits(m); err != nil {
