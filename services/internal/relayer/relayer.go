@@ -48,8 +48,8 @@ const (
 	// request goes again.
 	CodeRestoreNeeded = "restore_needed"
 	// CodeNetworkFeeHigh refuses a call whose network fee, as simulated now, is more than the fee
-	// the request pays the relayer or than the relayer's cap on resource fees; the answer names
-	// that network fee in stroops. The client self-relays, or sends the payment again once the
+	// the request pays the relayer, or whose resource fee is more than the relayer's cap; the
+	// answer names the network fee the call would be charged as simulated, in stroops. The client self-relays, or sends the payment again once the
 	// network's fees fall.
 	CodeNetworkFeeHigh = "network_fee_high"
 )
@@ -97,6 +97,11 @@ type Config struct {
 	// ExitKeys is how many exits queued ahead of a relayed exit in the ledger it lands in still
 	// leave its footprint room for it to queue; 4 when unset.
 	ExitKeys uint32
+	// QuoteFloor, when set, is the least fee a quote names, in stroops, converted to the asset
+	// and rounded up to the tier. An operator lifts with it a quote the confirmed transactions no
+	// longer move, as when the network's fees rose for good and every relay at the old quote is
+	// refused.
+	QuoteFloor int64
 }
 
 func (c *Config) defaults() {
@@ -619,6 +624,9 @@ func (r *Relayer) Quote(ctx context.Context) (*big.Int, error) {
 		return nil, ErrNoQuote
 	}
 	fee := r.cfg.Pricing.QuoteAt(r.costs.ResourceFee()+inclusion, r.Margin())
+	if floor := r.FloorFee(); floor != nil && fee.Cmp(floor) < 0 {
+		fee = floor
+	}
 	r.chainMu.RLock()
 	inst := r.inst
 	r.chainMu.RUnlock()
@@ -627,6 +635,31 @@ func (r *Relayer) Quote(ctx context.Context) (*big.Int, error) {
 	}
 	r.quotes.publish(r.now(), fee)
 	return fee, nil
+}
+
+// CheckQuoteFloor refuses a QuoteFloor whose fee is above the vault's max_fee, at which no quote
+// could ever be given.
+func (r *Relayer) CheckQuoteFloor(ctx context.Context) error {
+	floor := r.FloorFee()
+	if floor == nil {
+		return nil
+	}
+	inst, _, _, err := rpc.VaultInstance(ctx, r.rpc, r.cfg.Vault)
+	if err != nil {
+		return err
+	}
+	if floor.Cmp(inst.Limits.MaxFee) > 0 {
+		return fmt.Errorf("relayer: QUOTE_FLOOR makes a fee of %v, above the vault's max_fee %v", floor, inst.Limits.MaxFee)
+	}
+	return nil
+}
+
+// FloorFee is QuoteFloor as a fee in the asset on the tier, or nil when no floor is set.
+func (r *Relayer) FloorFee() *big.Int {
+	if r.cfg.QuoteFloor <= 0 {
+		return nil
+	}
+	return r.cfg.Pricing.QuoteAt(r.cfg.QuoteFloor, 0)
 }
 
 func (r *Relayer) view() (*vault.Instance, uint32, int64) {
@@ -1106,16 +1139,19 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 		case errors.Is(err, submit.ErrRestoreNeeded):
 			return "", fail(http.StatusUnprocessableEntity, CodeRestoreNeeded)
 		case errors.As(err, &capped):
-			return "", networkFeeHigh(capped.Inclusion + capped.Resource)
+			return "", networkFeeHigh(capped.Expected)
 		case errors.Is(err, submit.ErrSimulation):
 			return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
 		}
 		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)
 	}
-	// The network may charge the whole fee of the envelope: the inclusion fee it bids and the
-	// resource fee it declares, refundable part included. A relay is cost-only, so that must not
-	// be more than the fee the request pays.
-	if cost := prepared.Tx.MaxFee(); r.cfg.Pricing.ToAsset(cost).Cmp(req.Ext.Fee) > 0 {
+	// A relay is cost-only: what the network charges when the call goes as simulated must not be
+	// more than the fee the request pays. The envelope may declare more, refunded unless used: the
+	// resource margin, against refundable charges above the simulation's, and the rent and events
+	// of the exit queue's other path, which a call takes only when an exit lands in its ledger
+	// first. Only then is the relayer charged above the fee, by at most that headroom, which
+	// RESOURCE_FEE_CAP bounds with the rest of the envelope.
+	if cost := prepared.Expected; r.cfg.Pricing.ToAsset(cost).Cmp(req.Ext.Fee) > 0 {
 		return "", networkFeeHigh(cost)
 	}
 	if r.guarded() {

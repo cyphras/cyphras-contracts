@@ -143,6 +143,13 @@ func settings(base *service.Base) (watcher.Config, error) {
 	if cfg.EarlyWindow, err = config.Duration("EARLY_WINDOW", 2*time.Hour); err != nil {
 		return cfg, err
 	}
+	switch config.Env("STATE_SIZE_ALERTS", "on") {
+	case "on":
+	case "off":
+		cfg.SkipStateSize = true
+	default:
+		return cfg, fmt.Errorf("STATE_SIZE_ALERTS must be on or off")
+	}
 	if path := config.Env("HOT_ACCOUNTS_FILE", ""); path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {

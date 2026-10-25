@@ -80,6 +80,9 @@ type Config struct {
 	// outflow window used within that long after midnight UTC.
 	EarlyWindow time.Duration
 	EarlyShare  int64
+	// SkipStateSize leaves the network's state size to another watcher of the same network, so
+	// its alerts, which concern every vault on it, are raised once.
+	SkipStateSize bool
 }
 
 // Watcher follows one vault and runs the checks.
@@ -119,8 +122,7 @@ type Watcher struct {
 	authorized *bool
 	// faulted is set while ingest is stopped by a fault.
 	faulted bool
-	// stateLevel is the highest of stateLevels the network's state passed since it was last under
-	// the lowest, 0 while it is.
+	// stateLevel is the highest of stateLevels that has paged and not cleared, 0 for none.
 	stateLevel int64
 	// beat, when set, is pinged after each healthy reconciliation.
 	beat func(context.Context) error

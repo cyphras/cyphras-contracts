@@ -105,6 +105,13 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	if err != nil {
 		return nil, err
 	}
+	floor, err := config.Int("QUOTE_FLOOR", 0)
+	if err == nil && floor < 0 {
+		err = errors.New("QUOTE_FLOOR must not be negative")
+	}
+	if err != nil {
+		return nil, err
+	}
 	freshRoots, err := config.Int("FRESH_ROOTS", 200)
 	if err == nil && (freshRoots < 1 || freshRoots > vault.RootHistory) {
 		err = fmt.Errorf("FRESH_ROOTS must be 1 to %d", vault.RootHistory)
@@ -161,10 +168,14 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	r, err := relayer.New(ctx, relayer.Config{
 		Vault: base.Vault.Vault, NetworkID: base.NetworkID, Asset: base.Vault.Asset, FeeAddress: feeAddress,
 		Pricing: pricing, LedgerSeconds: 5, MaxHeld: 1000, Jitter: 10 * time.Minute, Key: key, FreshRoots: uint32(freshRoots), ExitKeys: exitKeys,
+		QuoteFloor: floor,
 	}, base.RPC, engine, channels,
 		relayer.ScreeningClient{URL: screenURL, Token: token, HTTP: &http.Client{Timeout: 5 * time.Second}},
 		relayer.NewStore(pool), bootstrap, base.Alerts, base.Log)
 	if err != nil {
+		return nil, err
+	}
+	if err := r.CheckQuoteFloor(ctx); err != nil {
 		return nil, err
 	}
 	// Every relayed fee goes to the fee address, so the vault would refuse every relay if it could

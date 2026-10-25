@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -290,12 +292,21 @@ func ReadSorobanState(ctx context.Context, c Client) (SorobanState, error) {
 	if len(window) == 0 || cost == nil || cost.SorobanStateTargetSizeBytes <= 0 {
 		return SorobanState{}, errors.New("rpc: the network's state size settings are missing")
 	}
+	for _, n := range window {
+		if uint64(n) > maxStateSample {
+			return SorobanState{}, fmt.Errorf("rpc: the network's state size window holds an implausible %d bytes", uint64(n))
+		}
+	}
 	st := SorobanState{Average: StateAverage(window), Target: int64(cost.SorobanStateTargetSizeBytes), Growth: int64(cost.SorobanStateRentFeeGrowthFactor)}
 	low, high := int64(cost.RentFee1KbSorobanStateSizeLow), int64(cost.RentFee1KbSorobanStateSizeHigh)
 	st.Rent1KB = RentPerKB(st.Average, low, high, st.Target, st.Growth)
 	st.TargetRent1KB = RentPerKB(st.Target, low, high, st.Target, st.Growth)
 	return st, nil
 }
+
+// maxStateSample bounds a plausible sample of the live Soroban state size, 10 TB, far above any
+// network's and low enough that sums and products of it cannot overflow.
+const maxStateSample = 10_000_000_000_000
 
 // StateAverage is the mean of the network's window of live Soroban state sizes.
 func StateAverage(window []xdr.Uint64) int64 {
@@ -315,7 +326,16 @@ func RentPerKB(size, low, high, target, growth int64) int64 {
 	if size < target {
 		fee = ceilDiv((high-low)*size, target) + low
 	} else {
-		fee = high + ceilDiv((high-low)*(size-target)*growth, target)
+		// The product passes int64 for a state far above its target; the fee then saturates.
+		over := new(big.Int).Mul(big.NewInt(high-low), big.NewInt(size-target))
+		over.Mul(over, big.NewInt(growth))
+		over.Add(over, big.NewInt(target-1))
+		over.Quo(over, big.NewInt(target))
+		over.Add(over, big.NewInt(high))
+		fee = math.MaxInt64
+		if over.IsInt64() {
+			fee = over.Int64()
+		}
 	}
 	return max(fee, 1000)
 }

@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -38,7 +39,7 @@ func (r *recorder) all() []alert.Alert {
 	return slices.Clone(r.alerts)
 }
 
-func TestTheStateSizeWarnsOnceAtEachLevelAndClearsUnderTheLowest(t *testing.T) {
+func TestTheStateSizeAlertsOnceAtEachLevelAndClearsAMarginUnderIt(t *testing.T) {
 	w, fake, pages := stateWatcher(rpctest.Mainnet)
 	ctx := context.Background()
 	// Mainnet's target is 3 GB; each step is the window's average, in bytes.
@@ -47,19 +48,21 @@ func TestTheStateSizeWarnsOnceAtEachLevelAndClearsUnderTheLowest(t *testing.T) {
 		want    []string
 	}{
 		{1_612_000_000, nil},
-		{2_549_999_999, nil},
+		{2_099_999_999, nil},
+		{2_100_000_000, []string{"state_size_70"}},
+		{2_160_000_000, nil},
+		{2_050_000_000, nil},
 		{2_550_000_000, []string{"state_size_85"}},
-		{2_580_000_000, nil},
-		{2_550_000_000, nil},
+		{2_490_000_000, nil},
 		{2_850_000_000, []string{"state_size_95"}},
-		{2_700_000_000, nil},
-		{2_850_000_000, nil},
 		{3_009_000_000, []string{"state_size_100"}},
-		{2_990_000_000, nil},
-		{3_009_000_000, nil},
-		{2_549_999_999, []string{"state_size_85_resolved", "state_size_95_resolved", "state_size_100_resolved"}},
-		{2_400_000_000, nil},
-		{2_700_000_000, []string{"state_size_85"}},
+		{2_950_000_000, nil},
+		{2_930_000_000, []string{"state_size_100_resolved"}},
+		{3_000_000_000, []string{"state_size_100"}},
+		{2_480_000_000, []string{"state_size_100_resolved", "state_size_95_resolved", "state_size_85_resolved"}},
+		{2_030_000_000, []string{"state_size_70_resolved"}},
+		{2_000_000_000, nil},
+		{2_200_000_000, []string{"state_size_70"}},
 	}
 	seen := 0
 	for i, s := range steps {
@@ -78,16 +81,23 @@ func TestTheStateSizeWarnsOnceAtEachLevelAndClearsUnderTheLowest(t *testing.T) {
 			t.Fatalf("step %d at %d bytes: alerts %v, want %v", i, s.average, codes, s.want)
 		}
 		for _, a := range got {
-			if !strings.HasSuffix(a.Code, "_resolved") && a.Severity != alert.Warning {
+			want := alert.Warning
+			switch {
+			case strings.HasSuffix(a.Code, "_resolved"):
+				want = alert.Info
+			case a.Code == "state_size_100":
+				want = alert.Critical
+			}
+			if a.Severity != want {
 				t.Fatalf("step %d: %s is %s", i, a.Code, a.Severity)
 			}
 		}
 	}
 	all := pages.all()
-	if msg := all[2].Message; !strings.Contains(msg, "3.009 GB, 100.3% of its 3.000 GB target") || !strings.Contains(msg, "rents for 415000 stroops a period, against 10000 at the target") {
+	if msg := all[3].Message; !strings.Contains(msg, "3.009 GB, 100.3% of its 3.000 GB target") || !strings.Contains(msg, "rents for 415000 stroops a period, against 10000 at the target") {
 		t.Fatalf("message %q", msg)
 	}
-	if msg := all[3].Message; !strings.Contains(msg, "84.9%") {
+	if msg := all[4].Message; !strings.Contains(msg, "97.6%") || !strings.Contains(msg, "under 98%") {
 		t.Fatalf("resolved message %q", msg)
 	}
 }
@@ -103,7 +113,7 @@ func TestAStateAlreadyAboveItsTargetRaisesTheHighestLevelAlone(t *testing.T) {
 		}
 	}
 	all := pages.all()
-	if len(all) != 1 || all[0].Code != "state_size_100" || !strings.Contains(all[0].Message, "4.011 GB, 100.2% of its 4.000 GB target") {
+	if len(all) != 1 || all[0].Code != "state_size_100" || all[0].Severity != alert.Critical || !strings.Contains(all[0].Message, "4.011 GB, 100.2% of its 4.000 GB target") {
 		t.Fatalf("alerts %+v", all)
 	}
 }
@@ -121,5 +131,39 @@ func TestTheStateSizeCheckFailsWithoutTheNetworksSettings(t *testing.T) {
 	}
 	if len(pages.all()) != 0 {
 		t.Fatal("a failed read raised an alert")
+	}
+}
+
+// A window no network can hold is an error, which the check's failure count pages, and clears
+// nothing that is open.
+func TestAnImplausibleStateSizeIsAnErrorAndClearsNothing(t *testing.T) {
+	w, fake, pages := stateWatcher(rpctest.Mainnet)
+	setWindow(fake, 2_550_000_000)
+	if err := w.CheckStateSize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, window := range [][]uint64{{math.MaxUint64, 1}, {10_000_000_000_001}, {math.MaxUint64 / 2, math.MaxUint64 / 2}} {
+		setWindow(fake, window...)
+		if err := w.CheckStateSize(context.Background()); err == nil {
+			t.Fatalf("window %v was read", window)
+		}
+	}
+	if codes := codesOf(pages.all()); !slices.Equal(codes, []string{"state_size_70"}) && !slices.Equal(codes, []string{"state_size_85"}) {
+		t.Fatalf("alerts %v", codes)
+	}
+}
+
+// A watcher that leaves the state size to another one of its network reads nothing for it.
+func TestAWatcherThatSkipsTheStateSizeReadsNothing(t *testing.T) {
+	testnet := rpctest.Mainnet
+	testnet.StateTarget, testnet.StateSize = 4_000_000_000, 4_011_000_000
+	w, fake, pages := stateWatcher(testnet)
+	w.cfg.SkipStateSize = true
+	reads := fake.CallCount("getLedgerEntries")
+	if err := w.CheckStateSize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fake.CallCount("getLedgerEntries") != reads || len(pages.all()) != 0 {
+		t.Fatal("a skipping watcher checked the state size")
 	}
 }

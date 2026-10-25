@@ -94,8 +94,8 @@ func TestANetworkFeeAboveTheCapIsRefusedWithItsFee(t *testing.T) {
 	h.untouched("above the cap")
 }
 
-// The check takes the envelope's whole fee: a cost exactly equal to the fee paid is relayed, one
-// stroop more is not.
+// The check takes the fee the call is charged as simulated: one exactly equal to the fee paid is
+// relayed, one stroop more is not.
 func TestARelayIsSentWhenItsNetworkFeeEqualsTheFeePaid(t *testing.T) {
 	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t) })
 	const paid = 5_000_000
@@ -128,7 +128,9 @@ func TestARelayIsSentWhenItsNetworkFeeEqualsTheFeePaid(t *testing.T) {
 	if err := xdr.SafeUnmarshalBase64((*sent)[0], &env); err != nil {
 		t.Fatal(err)
 	}
-	if env.Fee() != paid {
+	// The envelope declares the reserve for the exit queue's other path on top, refunded unless the
+	// call takes that path.
+	if env.Fee() <= paid {
 		t.Fatalf("the envelope bids %d stroops", env.Fee())
 	}
 }
