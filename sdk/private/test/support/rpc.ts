@@ -870,6 +870,15 @@ export class MockRpc {
         if (bump !== undefined && !this.#bumpValid(bump)) {
           return { status: "ERROR", hash, latestLedger: this.vault.ledger };
         }
+        // Core refuses a Soroban transaction sent alone whose fee is below its resource fee.
+        const own = tx.toEnvelope().v1().tx().ext();
+        if (
+          bump === undefined &&
+          own.switch() === 1 &&
+          BigInt(tx.fee) < BigInt(own.sorobanData().resourceFee().toString())
+        ) {
+          return { status: "ERROR", hash, latestLedger: this.vault.ledger };
+        }
         if (this.sendOnce !== undefined) {
           const status = this.sendOnce;
           this.sendOnce = undefined;
