@@ -92,7 +92,8 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
-	log.Info("watching", "vault", base.Vault.Vault, "hot_accounts", len(cfg.HotAccounts), "health_urls", len(cfg.HealthURLs))
+	log.Info("watching", "vault", base.Vault.Vault, "hot_accounts", len(cfg.HotAccounts), "health_urls", len(cfg.HealthURLs),
+		"state_size_alerts", !cfg.SkipStateSize)
 	w.Run(ctx, f, time.Second)
 }
 
@@ -142,6 +143,13 @@ func settings(base *service.Base) (watcher.Config, error) {
 	}
 	if cfg.EarlyWindow, err = config.Duration("EARLY_WINDOW", 2*time.Hour); err != nil {
 		return cfg, err
+	}
+	switch config.Env("STATE_SIZE_ALERTS", "on") {
+	case "on":
+	case "off":
+		cfg.SkipStateSize = true
+	default:
+		return cfg, fmt.Errorf("STATE_SIZE_ALERTS must be on or off")
 	}
 	if path := config.Env("HOT_ACCOUNTS_FILE", ""); path != "" {
 		data, err := os.ReadFile(path)

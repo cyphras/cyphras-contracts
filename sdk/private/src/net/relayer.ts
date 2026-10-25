@@ -14,6 +14,9 @@ export interface RelayerHealth extends ServiceIdentity {
 
 export interface Quote {
   readonly fee: bigint;
+  // The fee of a payment the vault queues, which writes an exit entry: one beyond what is left of
+  // today's outflow window, or any while an exit waits. Undefined when the relayer relays none.
+  readonly queuedFee: bigint | undefined;
   readonly asset: string;
   readonly tier: bigint;
   readonly marginBps: number;
@@ -37,6 +40,8 @@ const RELAYER_ERRORS = [
   "unavailable",
   // The call needs archived vault entries restored, whose rent the relayer does not pay.
   "restore_needed",
+  // The network fee of the call, as the relayer simulated it now, is more than the fee it is paid.
+  "network_fee_high",
 ] as const;
 
 export type RelayerError = (typeof RELAYER_ERRORS)[number] | "unknown";
@@ -49,7 +54,13 @@ export type SubmitResult =
       readonly hash: string | undefined;
       readonly heldId: string | undefined;
     }
-  | { readonly accepted: false; readonly error: RelayerError; readonly reason: number | undefined };
+  | {
+      readonly accepted: false;
+      readonly error: RelayerError;
+      readonly reason: number | undefined;
+      // In stroops: the network fee a network_fee_high refusal names.
+      readonly networkFee: bigint | undefined;
+    };
 
 /** A transaction the relayer submitted, as it reports it. */
 export interface RelayedTx {
@@ -124,6 +135,7 @@ export class RelayerClient {
     const f = Fields.of(body, "quote_invalid", "relayer quote");
     return {
       fee: f.amount("fee"),
+      queuedFee: f.has("queued_fee") ? f.amount("queued_fee") : undefined,
       asset: f.string("asset"),
       tier: f.amount("tier"),
       marginBps: f.integer("margin_bps"),
@@ -152,10 +164,17 @@ export class RelayerClient {
       return { accepted: true, hash: undefined, heldId: id };
     }
     const f = Fields.of(reply.body ?? {}, "service_rejected", "relayer error");
+    const error = errorCode(f.has("error") ? f.string("error") : "");
+    let networkFee: bigint | undefined;
+    if (error === "network_fee_high" && f.has("network_fee")) {
+      networkFee = f.amount("network_fee");
+      if (networkFee < 0n) f.fault("network_fee is negative");
+    }
     return {
       accepted: false,
-      error: errorCode(f.has("error") ? f.string("error") : ""),
+      error,
       reason: f.has("reason") ? f.integer("reason") : undefined,
+      networkFee,
     };
   }
 

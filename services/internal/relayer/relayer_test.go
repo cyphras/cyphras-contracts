@@ -343,7 +343,7 @@ func TestTheQuoteCoversTheCostWithAPublishedMargin(t *testing.T) {
 	}
 	c := NewCosts(777, nil)
 	for i := range Samples - 1 {
-		c.Add(int64(i))
+		c.Add(int64(600 + i))
 	}
 	if c.ResourceFee() != 777 {
 		t.Fatal("bootstrap value not used before 50 samples")
@@ -356,11 +356,14 @@ func TestTheQuoteCoversTheCostWithAPublishedMargin(t *testing.T) {
 	}
 	var q quotes
 	now := time.Unix(0, 0)
-	q.publish(now, big.NewInt(300))
-	q.publish(now.Add(time.Minute), big.NewInt(200))
-	q.publish(now.Add(4*time.Minute), big.NewInt(400))
+	q.publish(now, big.NewInt(300), nil)
+	q.publish(now.Add(time.Minute), big.NewInt(200), big.NewInt(500))
+	q.publish(now.Add(4*time.Minute), big.NewInt(400), big.NewInt(450))
 	if q.lowest(now.Add(5*time.Minute)).Int64() != 200 || q.lowest(now.Add(7*time.Minute)).Int64() != 400 {
 		t.Fatal("lowest quote of the last five minutes")
+	}
+	if q.lowestQueued(now.Add(5*time.Minute)).Int64() != 450 || q.lowestQueued(now.Add(7*time.Minute)).Int64() != 450 || q.lowestQueued(now.Add(10*time.Minute)) != nil {
+		t.Fatal("lowest queued quote of the last five minutes")
 	}
 }
 

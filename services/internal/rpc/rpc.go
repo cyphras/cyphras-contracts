@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strings"
@@ -260,4 +262,101 @@ func BaseReserve(ctx context.Context, c Client) (int64, error) {
 		return 0, fmt.Errorf("rpc: the latest ledger's header: %w", err)
 	}
 	return int64(header.BaseReserve), nil
+}
+
+// SorobanState is the size of the live Soroban state the network prices rent by, in bytes, and
+// the rent of 1 KiB of persistent state over a rent period at it and at the network's target size,
+// above which rent grows by the growth factor.
+type SorobanState struct {
+	Average, Target, Growth int64
+	Rent1KB, TargetRent1KB  int64
+}
+
+// ReadSorobanState reads the window of live Soroban state sizes and the rent settings.
+func ReadSorobanState(ctx context.Context, c Client) (SorobanState, error) {
+	windowKey := vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingLiveSorobanStateSizeWindow)
+	costKey := vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostV0)
+	entries, _, err := Entries(ctx, c, []xdr.LedgerKey{windowKey, costKey})
+	if err != nil {
+		return SorobanState{}, err
+	}
+	var window []xdr.Uint64
+	var cost *xdr.ConfigSettingContractLedgerCostV0
+	for _, e := range entries {
+		if s := e.Data.ConfigSetting; s != nil && s.LiveSorobanStateSizeWindow != nil {
+			window = *s.LiveSorobanStateSizeWindow
+		} else if s != nil && s.ContractLedgerCost != nil {
+			cost = s.ContractLedgerCost
+		}
+	}
+	if cost == nil {
+		return SorobanState{}, errors.New("rpc: the network's state size settings are missing")
+	}
+	if err := CheckStateWindow(window, int64(cost.SorobanStateTargetSizeBytes)); err != nil {
+		return SorobanState{}, err
+	}
+	// A near-empty reading would clear every alert on the state's size; a network that holds so
+	// little is far from any level anyway.
+	if StateAverage(window) < int64(cost.SorobanStateTargetSizeBytes)/100 {
+		return SorobanState{}, errors.New("rpc: the network's state size window averages under 1% of its target")
+	}
+	st := SorobanState{Average: StateAverage(window), Target: int64(cost.SorobanStateTargetSizeBytes), Growth: int64(cost.SorobanStateRentFeeGrowthFactor)}
+	low, high := int64(cost.RentFee1KbSorobanStateSizeLow), int64(cost.RentFee1KbSorobanStateSizeHigh)
+	st.Rent1KB = RentPerKB(st.Average, low, high, st.Target, st.Growth)
+	st.TargetRent1KB = RentPerKB(st.Target, low, high, st.Target, st.Growth)
+	return st, nil
+}
+
+// maxStateSample bounds a plausible sample of the live Soroban state size, 10 TB, far above any
+// network's and low enough that sums and products of it cannot overflow.
+const maxStateSample = 10_000_000_000_000
+
+// CheckStateWindow refuses a window of live Soroban state sizes, or a target, that no network
+// holds: an empty window, an empty or oversized sample, or a target beyond maxStateSample. Such a
+// reading is a broken or hostile RPC, not a state to price by.
+func CheckStateWindow(window []xdr.Uint64, target int64) error {
+	if len(window) == 0 {
+		return errors.New("rpc: the network's state size window is empty")
+	}
+	if target <= 0 || target > maxStateSample {
+		return fmt.Errorf("rpc: the network's state size target of %d bytes is implausible", target)
+	}
+	for _, n := range window {
+		if n == 0 || uint64(n) > maxStateSample {
+			return fmt.Errorf("rpc: the network's state size window holds an implausible %d bytes", uint64(n))
+		}
+	}
+	return nil
+}
+
+// StateAverage is the mean of the network's window of live Soroban state sizes.
+func StateAverage(window []xdr.Uint64) int64 {
+	var sum uint64
+	for _, n := range window {
+		sum += uint64(n)
+	}
+	return int64(sum / uint64(len(window)))
+}
+
+// RentPerKB is the network's rent for 1 KiB of persistent state over a rent period, which grows
+// with the size of the Soroban state as the host computes it.
+func RentPerKB(size, low, high, target, growth int64) int64 {
+	target = max(target, 1)
+	ceilDiv := func(a, b int64) int64 { return (a + b - 1) / b }
+	var fee int64
+	if size < target {
+		fee = ceilDiv((high-low)*size, target) + low
+	} else {
+		// The product passes int64 for a state far above its target; the fee then saturates.
+		over := new(big.Int).Mul(big.NewInt(high-low), big.NewInt(size-target))
+		over.Mul(over, big.NewInt(growth))
+		over.Add(over, big.NewInt(target-1))
+		over.Quo(over, big.NewInt(target))
+		over.Add(over, big.NewInt(high))
+		fee = math.MaxInt64
+		if over.IsInt64() {
+			fee = over.Int64()
+		}
+	}
+	return max(fee, 1000)
 }

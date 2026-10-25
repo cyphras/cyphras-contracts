@@ -51,6 +51,15 @@ func ceilDiv(a, b *big.Int) *big.Int {
 	return q
 }
 
+// ToAsset converts a cost in stroops to the pool asset's smallest units, rounded up.
+func (p Pricing) ToAsset(costStroops int64) *big.Int {
+	cost := big.NewInt(costStroops)
+	if !p.Native {
+		cost = ceilDiv(new(big.Int).Mul(cost, p.PerStroopNum), p.PerStroopDen)
+	}
+	return cost
+}
+
 // Quote is roundUp(toAsset(cost) * (10000 + margin) / 10000, tier).
 func (p Pricing) Quote(costStroops int64) *big.Int {
 	return p.QuoteAt(costStroops, p.MarginBps)
@@ -58,37 +67,65 @@ func (p Pricing) Quote(costStroops int64) *big.Int {
 
 // QuoteAt is Quote with another margin, capped at MaxMarginBps.
 func (p Pricing) QuoteAt(costStroops, marginBps int64) *big.Int {
-	cost := big.NewInt(costStroops)
-	if !p.Native {
-		cost = ceilDiv(new(big.Int).Mul(cost, p.PerStroopNum), p.PerStroopDen)
-	}
+	cost := p.ToAsset(costStroops)
 	margin := min(marginBps, MaxMarginBps)
 	withMargin := ceilDiv(new(big.Int).Mul(cost, big.NewInt(10_000+margin)), big.NewInt(10_000))
 	return new(big.Int).Mul(ceilDiv(withMargin, p.Tier), p.Tier)
 }
 
+// SampleMultiple bounds a sample at that many times the median of a full window, or of the
+// bootstrap value before, so dear relays a client pays for cannot lift the quote past twice the
+// median: lifting the median itself takes half the window, 25 relays, for each doubling.
+const SampleMultiple = 2
+
 // Costs learns the resource fee from the relayer's own confirmed transactions only, so nobody can
-// move the quote by sending requests that are simulated or refused.
+// move the quote by sending requests that are simulated or refused. A sample is the resource fee
+// the relay was expected to be charged when it was sent, the measure the network fee check takes,
+// so a relay that costs what the samples did passes the check at the quote.
 type Costs struct {
 	mu        sync.Mutex
 	bootstrap int64
 	samples   []int64
 }
 
-// NewCosts starts from the stored samples, newest last, and the bootstrap value.
+// NewCosts starts from the stored samples, newest last, and the bootstrap value. A full window is
+// held against its own median, as the running relayer held it, not against the bootstrap value,
+// which a quote learned after it rose no longer has anything to do with.
 func NewCosts(bootstrap int64, stored []int64) *Costs {
 	c := &Costs{bootstrap: bootstrap}
+	if len(stored) < Samples {
+		for _, s := range stored {
+			c.Add(s)
+		}
+		return c
+	}
+	stored = stored[len(stored)-Samples:]
+	sorted := slices.Clone(stored)
+	slices.Sort(sorted)
+	median := sorted[len(sorted)/2]
 	for _, s := range stored {
-		c.Add(s)
+		if s > 0 {
+			c.samples = append(c.samples, min(s, SampleMultiple*median))
+		}
 	}
 	return c
 }
 
-// Add records the resource fee charged to a confirmed transaction.
+// Add records the resource fee of a confirmed transaction, within SampleMultiple of the median.
+// A sample of 0, from a confirmation that reported no fee, is not taken.
 func (c *Costs) Add(resourceFee int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.samples = append(c.samples, resourceFee)
+	if resourceFee <= 0 {
+		return
+	}
+	reference := c.bootstrap
+	if len(c.samples) >= Samples {
+		sorted := slices.Clone(c.samples)
+		slices.Sort(sorted)
+		reference = sorted[len(sorted)/2]
+	}
+	c.samples = append(c.samples, min(resourceFee, SampleMultiple*reference))
 	if len(c.samples) > Samples {
 		c.samples = c.samples[len(c.samples)-Samples:]
 	}
@@ -108,21 +145,22 @@ func (c *Costs) ResourceFee() int64 {
 }
 
 // quotes remembers what was quoted, so a fee is accepted at or above the lowest quote of the last
-// five minutes.
+// five minutes: the fee of a payment the vault pays at once, and the fee of one it queues, nil
+// when that is above max_fee.
 type quotes struct {
 	mu      sync.Mutex
 	history []quoted
 }
 
 type quoted struct {
-	at  time.Time
-	fee *big.Int
+	at          time.Time
+	fee, queued *big.Int
 }
 
-func (q *quotes) publish(now time.Time, fee *big.Int) {
+func (q *quotes) publish(now time.Time, fee, queued *big.Int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.history = append(q.history, quoted{at: now, fee: fee})
+	q.history = append(q.history, quoted{at: now, fee: fee, queued: queued})
 	cutoff := now.Add(-QuoteLifetime)
 	i := 0
 	for i < len(q.history) && q.history[i].at.Before(cutoff) {
@@ -131,14 +169,28 @@ func (q *quotes) publish(now time.Time, fee *big.Int) {
 	q.history = q.history[i:]
 }
 
-// newest returns the latest quote published since a time.
-func (q *quotes) newest(since time.Time) *big.Int {
+// newest returns the latest quote published since a time, with its queued fee.
+func (q *quotes) newest(since time.Time) (fee, queued *big.Int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if n := len(q.history); n > 0 && !q.history[n-1].at.Before(since) {
-		return q.history[n-1].fee
+		return q.history[n-1].fee, q.history[n-1].queued
 	}
-	return nil
+	return nil, nil
+}
+
+// lowestQueued returns the lowest queued fee quoted within the lifetime, or nil.
+func (q *quotes) lowestQueued(now time.Time) *big.Int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	cutoff := now.Add(-QuoteLifetime)
+	var low *big.Int
+	for _, h := range q.history {
+		if !h.at.Before(cutoff) && h.queued != nil && (low == nil || h.queued.Cmp(low) < 0) {
+			low = h.queued
+		}
+	}
+	return low
 }
 
 // lowest returns the lowest fee quoted within the lifetime, or nil.

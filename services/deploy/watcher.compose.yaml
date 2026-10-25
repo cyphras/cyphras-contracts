@@ -35,6 +35,8 @@ services:
       ALERT_WEBHOOKS_FILE: /run/secrets/watcher_alert_webhooks
       HEARTBEAT_URL_FILE: /run/secrets/watcher_heartbeat_url
       HOT_ACCOUNTS_FILE: /etc/cyphras/hot-accounts
+      # The watcher on the services host raises the network's state size alerts.
+      STATE_SIZE_ALERTS: "off"
     volumes:
       - ../../deployments/${NETWORK:?}.json:/etc/cyphras/deployment.json:ro
       - ./hot-accounts/${NETWORK}-${ASSET:?}:/etc/cyphras/hot-accounts:ro

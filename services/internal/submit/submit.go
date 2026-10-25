@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"slices"
 	"sync"
 	"time"
@@ -57,6 +58,18 @@ var (
 	// ErrExpired reports a transaction whose time bound passed before it was included.
 	ErrExpired = errors.New("submit: transaction expired unconfirmed")
 )
+
+// FeeCapError is ErrFeeCap with the fees the simulation asked for, in stroops, and the fee the
+// network would charge when the call goes as simulated, as Prepared.Expected.
+type FeeCapError struct {
+	Resource, Inclusion, Expected, Cap int64
+}
+
+func (e *FeeCapError) Error() string {
+	return fmt.Sprintf("%v: %d stroops, the cap is %d", ErrFeeCap, e.Resource, e.Cap)
+}
+
+func (e *FeeCapError) Unwrap() error { return ErrFeeCap }
 
 // Engine prepares, signs, sends and tracks transactions.
 type Engine struct {
@@ -146,18 +159,17 @@ func (e *Engine) ledgerCosts(ctx context.Context) (ledgerCosts, error) {
 		return ledgerCosts{}, errors.New("ledger costs: the network's settings are missing")
 	}
 	c, a := cost.ContractLedgerCost, archival.StateArchivalSettings
-	var size uint64
-	for _, n := range *state.LiveSorobanStateSizeWindow {
-		size += uint64(n)
+	if err := rpc.CheckStateWindow(*state.LiveSorobanStateSizeWindow, int64(c.SorobanStateTargetSizeBytes)); err != nil {
+		return ledgerCosts{}, fmt.Errorf("ledger costs: %w", err)
 	}
-	size /= uint64(len(*state.LiveSorobanStateSizeWindow))
+	size := rpc.StateAverage(*state.LiveSorobanStateSizeWindow)
 	e.costs = ledgerCosts{
 		at: e.now(), instruction: int64(compute.ContractCompute.FeeRatePerInstructionsIncrement),
 		readEntry: int64(c.FeeDiskReadLedgerEntry), writeEntry: int64(c.FeeWriteLedgerEntry),
 		read1KB: int64(c.FeeDiskRead1Kb), write1KB: int64(ext.ContractLedgerCostExt.FeeWrite1Kb),
 		historical1KB: int64(historical.ContractHistoricalData.FeeHistorical1Kb), txSize1KB: int64(bandwidth.ContractBandwidth.FeeTxSize1Kb),
 		events1KB:       int64(events.ContractEvents.FeeContractEvents1Kb),
-		rent1KB:         rentPerKB(int64(size), int64(c.RentFee1KbSorobanStateSizeLow), int64(c.RentFee1KbSorobanStateSizeHigh), int64(c.SorobanStateTargetSizeBytes), int64(c.SorobanStateRentFeeGrowthFactor)),
+		rent1KB:         rpc.RentPerKB(size, int64(c.RentFee1KbSorobanStateSizeLow), int64(c.RentFee1KbSorobanStateSizeHigh), int64(c.SorobanStateTargetSizeBytes), int64(c.SorobanStateRentFeeGrowthFactor)),
 		rentDenominator: int64(a.PersistentRentRateDenominator), minPersistentTTL: uint32(a.MinPersistentTtl),
 		maxInstructions: uint32(compute.ContractCompute.TxMaxInstructions),
 		maxReadEntries:  uint32(c.TxMaxDiskReadEntries), maxWriteEntries: uint32(c.TxMaxWriteLedgerEntries),
@@ -165,19 +177,6 @@ func (e *Engine) ledgerCosts(ctx context.Context) (ledgerCosts, error) {
 		maxReadBytes: uint32(c.TxMaxDiskReadBytes), maxWrites: uint32(c.TxMaxWriteBytes),
 	}
 	return e.costs, nil
-}
-
-// rentPerKB is the network's rent for 1 KiB of persistent state over a rent period, which grows
-// with the size of the Soroban state as the host computes it.
-func rentPerKB(size, low, high, target, growth int64) int64 {
-	target = max(target, 1)
-	var fee int64
-	if size < target {
-		fee = ceilDiv((high-low)*size, target) + low
-	} else {
-		fee = high + ceilDiv((high-low)*(size-target)*growth, target)
-	}
-	return max(fee, 1000)
 }
 
 func ceilDiv(a, b int64) int64 {
@@ -249,17 +248,22 @@ type Extend func(ctx context.Context, footprint xdr.LedgerFootprint) (Extra, err
 // ttlEntryBytes is the size of the TTL entry the network writes with a persistent entry's rent.
 const ttlEntryBytes = 48
 
-// addExtra adds x to the simulated transaction data and returns the fee it adds: the network's fee
-// for the entries, instructions, written bytes and transaction size it adds, all non-refundable,
-// and the rent and event fee the other path may need, which is refunded when it goes unused.
-func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData, x Extra) (int64, error) {
+// maxReserve bounds the rent reserve of the other path, far above any resource fee cap and far
+// below where the fees added to it could overflow.
+const maxReserve = 1 << 50
+
+// addExtra adds x to the simulated transaction data and returns the fees it adds: charged, the
+// network's fee for the entries, instructions, written bytes and transaction size it adds, all
+// non-refundable, and reserve, the rent and event fee the other path may need, which is refunded
+// when it goes unused.
+func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData, x Extra) (charged, reserve int64, err error) {
 	c, err := e.ledgerCosts(ctx)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	before, err := data.MarshalBinary()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	fp := &data.Resources.Footprint
 	keyOf := func(k xdr.LedgerKey) string {
@@ -324,16 +328,47 @@ func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData,
 	res.Instructions, res.WriteBytes = xdr.Uint32(instructions), xdr.Uint32(writeBytes)
 	after, err := data.MarshalBinary()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	grown := uint64(len(after) - len(before))
 	fee += perKB(grown, c.txSize1KB) + perKB(grown, c.historical1KB)
 	if x.NewBytes > 0 {
-		ledgers := int64(max(x.RentLedgers, c.minPersistentTTL))
-		fee += ceilDiv(int64(x.NewBytes)*c.rent1KB*ledgers, 1024*max(c.rentDenominator, 1)) + c.writeEntry + perKB(ttlEntryBytes, c.write1KB)
+		// Rent, the write of its TTL entry included, is charged only for an entry the call creates.
+		reserve += c.newEntryRent(x.NewBytes, x.RentLedgers)
 	}
-	fee += perKB(uint64(x.EventBytes), c.events1KB)
-	return fee, nil
+	reserve += perKB(uint64(x.EventBytes), c.events1KB)
+	return fee, reserve, nil
+}
+
+// newEntryRent is the rent of a new persistent entry of a size, for the longer of ledgers and the
+// network's least TTL, with the write of its TTL entry.
+func (c ledgerCosts) newEntryRent(bytes, ledgers uint32) int64 {
+	rent := new(big.Int).Mul(big.NewInt(int64(bytes)), big.NewInt(c.rent1KB))
+	rent.Mul(rent, big.NewInt(int64(max(ledgers, c.minPersistentTTL))))
+	rent.Add(rent, big.NewInt(1024*max(c.rentDenominator, 1)-1))
+	rent.Quo(rent, big.NewInt(1024*max(c.rentDenominator, 1)))
+	// Far above the target the rent passes int64; held under it, sums stay above any cap.
+	if rent.Cmp(big.NewInt(maxReserve)) > 0 {
+		rent.SetInt64(maxReserve)
+	}
+	return rent.Int64() + c.writeEntry + perKB(ttlEntryBytes, c.write1KB)
+}
+
+// SimulatedRefundablePct is how much above the refundable fee it measures stellar-rpc's
+// simulation names it, in percent, as its MinResourceFee carries it.
+const SimulatedRefundablePct = 115
+
+// NewEntryFee is what a call that also creates a persistent entry of a size, live for ledgers,
+// adds to its simulated resource fee: the write of the entry and its bytes, charged in full, and
+// its rent with the write of its TTL entry, refundable, which the simulation names
+// SimulatedRefundablePct of. The network's settings set it, so no request moves it.
+func (e *Engine) NewEntryFee(ctx context.Context, bytes, ledgers uint32) (int64, error) {
+	c, err := e.ledgerCosts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	rent := c.newEntryRent(bytes, ledgers)
+	return c.writeEntry + perKB(uint64(bytes), c.write1KB) + ceilDiv(rent*SimulatedRefundablePct, 100), nil
 }
 
 // liveBound reads the persistent entries of a footprint and returns the first ledger in which one
@@ -425,7 +460,12 @@ type Prepared struct {
 	Seq          int64
 	InclusionFee int64
 	ResourceFee  int64
-	MaxTime      int64
+	// Expected is the fee the network charges when the call goes as simulated: the inclusion fee
+	// bid, the simulated resource fee, its own refundable rent and events included, and the
+	// non-refundable fee of the resources padding and Extra add, which the network charges in
+	// full. The resource margin and Extra's reserve for the other path are refunded unless used.
+	Expected int64
+	MaxTime  int64
 	// MaxLedger, when set, is the first ledger that may no longer include the transaction.
 	MaxLedger uint32
 	// Return is the simulated return value of the call.
@@ -542,13 +582,13 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 	if n := restoredEntries(data); n > 0 && e.RefuseRestores {
 		return nil, fmt.Errorf("%w: the call would restore %d entries", ErrRestoreNeeded, n)
 	}
-	var extra int64
+	var extra, reserve int64
 	if extend != nil {
 		x, err := extend(ctx, data.Resources.Footprint)
 		if err != nil {
 			return nil, err
 		}
-		if extra, err = e.addExtra(ctx, &data, x); err != nil {
+		if extra, reserve, err = e.addExtra(ctx, &data, x); err != nil {
 			return nil, err
 		}
 	}
@@ -560,11 +600,12 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 	if _, invoke := sop.(invokeOp); !invoke {
 		margin, limit = 0, e.TTLFeeCap()
 	}
-	resource := sim.MinResourceFee + sim.MinResourceFee*margin/100 + padding + extra
+	resource := sim.MinResourceFee + sim.MinResourceFee*margin/100 + padding + extra + reserve
+	expected := inclusion + sim.MinResourceFee + padding + extra
 	// The padding's fees come from the network's settings as the RPC reports them, so the cap
 	// bounds the whole fee.
 	if limit > 0 && resource > limit {
-		return nil, fmt.Errorf("%w: %d stroops, the cap is %d", ErrFeeCap, resource, limit)
+		return nil, &FeeCapError{Resource: resource, Inclusion: inclusion, Expected: expected, Cap: limit}
 	}
 	if e.RefuseRestores {
 		// The simulation marks only the entries it read, not those extend added, and an entry that
@@ -606,8 +647,8 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 	if err != nil {
 		return nil, err
 	}
-	return &Prepared{Account: a, Tx: tx, Seq: a.seq + 1, InclusionFee: inclusion, ResourceFee: resource, MaxTime: maxTime, MaxLedger: maxLedger, Return: ret,
-		SimulatedAt: uint32(sim.LatestLedger)}, nil
+	return &Prepared{Account: a, Tx: tx, Seq: a.seq + 1, InclusionFee: inclusion, ResourceFee: resource, Expected: expected, MaxTime: maxTime, MaxLedger: maxLedger,
+		Return: ret, SimulatedAt: uint32(sim.LatestLedger)}, nil
 }
 
 // Signed is a transaction accepted for inclusion.

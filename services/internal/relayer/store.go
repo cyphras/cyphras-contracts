@@ -32,6 +32,8 @@ ALTER TABLE relays ADD COLUMN IF NOT EXISTS nullifier1 text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS channel text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS request text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS simulated_at bigint;
+ALTER TABLE relays ADD COLUMN IF NOT EXISTS expected_resource_fee bigint;
+ALTER TABLE relays ADD COLUMN IF NOT EXISTS finished_at bigint;
 CREATE INDEX IF NOT EXISTS relays_confirmed ON relays (ledger) WHERE outcome = 'success';
 CREATE INDEX IF NOT EXISTS relays_pending ON relays (tx_hash) WHERE outcome = 'pending';
 CREATE INDEX IF NOT EXISTS relays_settled ON relays (ledger) WHERE outcome IN ('success', 'failed');
@@ -69,6 +71,12 @@ type Record struct {
 	// are kept only while the transaction is pending.
 	Request     string
 	SimulatedAt uint32
+	// ExpectedResourceFee is the resource fee the relay was expected to be charged when it was
+	// sent, which the quote learns from once it is confirmed.
+	ExpectedResourceFee int64
+	// FinishedAt is when the outcome was seen, in Unix seconds, shortly after the public close of
+	// its ledger, so the loss budget's day survives a restart.
+	FinishedAt int64
 }
 
 type store struct {
@@ -83,11 +91,12 @@ func NewStore(pool *pgxpool.Pool) store {
 // sent records a transaction the network accepted, before its outcome is known.
 func (s store) sent(ctx context.Context, r Record) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO relays (tx_hash, outcome, kind, fee, destination, screening, nullifier0, nullifier1, channel,
-		request, simulated_at)
+		request, simulated_at, expected_resource_fee)
 		VALUES ($1, 'pending', $2, $3::numeric, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''),
-		NULLIF($9, ''), NULLIF($10, 0))
+		NULLIF($9, ''), NULLIF($10, 0), NULLIF($11, 0))
 		ON CONFLICT (tx_hash) DO NOTHING`,
-		r.Hash, r.Kind, r.Fee, r.Destination, r.Screening, r.Nullifiers[0], r.Nullifiers[1], r.Channel, r.Request, int64(r.SimulatedAt))
+		r.Hash, r.Kind, r.Fee, r.Destination, r.Screening, r.Nullifiers[0], r.Nullifiers[1], r.Channel, r.Request, int64(r.SimulatedAt),
+		r.ExpectedResourceFee)
 	return err
 }
 
@@ -103,15 +112,16 @@ func (s store) finish(ctx context.Context, r Record) error {
 		ledger, networkFee, resourceFee = &l, &n, &f
 	}
 	_, err := s.pool.Exec(ctx, `UPDATE relays SET outcome = $2, ledger = $3, network_fee = $4, resource_fee = $5, exit_id = $6,
-		request = NULL, simulated_at = NULL
-		WHERE tx_hash = $1 AND outcome = 'pending'`, r.Hash, r.Outcome, ledger, networkFee, resourceFee, exitID)
+		finished_at = NULLIF($7, 0), request = NULL, simulated_at = NULL
+		WHERE tx_hash = $1 AND outcome = 'pending'`, r.Hash, r.Outcome, ledger, networkFee, resourceFee, exitID, r.FinishedAt)
 	return err
 }
 
 // pending lists the transactions sent but not yet finished.
 func (s store) pending(ctx context.Context) ([]Record, error) {
-	rows, err := s.pool.Query(ctx, `SELECT tx_hash, COALESCE(destination, ''), COALESCE(nullifier0, ''), COALESCE(nullifier1, ''),
-		COALESCE(channel, ''), COALESCE(request, ''), COALESCE(simulated_at, 0) FROM relays WHERE outcome = 'pending' ORDER BY tx_hash`)
+	rows, err := s.pool.Query(ctx, `SELECT tx_hash, fee::text, COALESCE(destination, ''), COALESCE(nullifier0, ''), COALESCE(nullifier1, ''),
+		COALESCE(channel, ''), COALESCE(request, ''), COALESCE(simulated_at, 0), COALESCE(expected_resource_fee, 0)
+		FROM relays WHERE outcome = 'pending' ORDER BY tx_hash`)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +130,8 @@ func (s store) pending(ctx context.Context) ([]Record, error) {
 	for rows.Next() {
 		var r Record
 		var simulated int64
-		if err := rows.Scan(&r.Hash, &r.Destination, &r.Nullifiers[0], &r.Nullifiers[1], &r.Channel, &r.Request, &simulated); err != nil {
+		if err := rows.Scan(&r.Hash, &r.Fee, &r.Destination, &r.Nullifiers[0], &r.Nullifiers[1], &r.Channel, &r.Request, &simulated,
+			&r.ExpectedResourceFee); err != nil {
 			return nil, err
 		}
 		r.SimulatedAt = uint32(simulated)
@@ -211,9 +222,12 @@ func (s store) lookup(ctx context.Context, hash string) (string, *uint64, bool, 
 	return outcome, &id, true, nil
 }
 
-// recentResourceFees returns the resource fees of the last n confirmed relays, oldest first.
+// recentResourceFees returns the samples of the last n confirmed relays, oldest first: the
+// resource fee each was expected to be charged. A relay recorded without it gives none, since the
+// fee it was charged sits under the measure the network fee check takes.
 func (s store) recentResourceFees(ctx context.Context, n int) ([]int64, error) {
-	rows, err := s.pool.Query(ctx, `SELECT resource_fee FROM relays WHERE outcome = 'success' ORDER BY ledger DESC LIMIT $1`, n)
+	rows, err := s.pool.Query(ctx, `SELECT expected_resource_fee FROM relays WHERE outcome = 'success' AND expected_resource_fee IS NOT NULL
+		ORDER BY ledger DESC LIMIT $1`, n)
 	if err != nil {
 		return nil, err
 	}
@@ -223,4 +237,38 @@ func (s store) recentResourceFees(ctx context.Context, n int) ([]int64, error) {
 	}
 	slices.Reverse(fees)
 	return fees, nil
+}
+
+// charge is what a confirmed relay paid the network and was paid, at the ledger it landed in,
+// with when its outcome was seen, 0 when the record does not say.
+type charge struct {
+	hash       string
+	ledger     uint32
+	fee        string
+	networkFee int64
+	finishedAt int64
+}
+
+// recentCharges returns the confirmed relays that landed within lossWindow ledgers of the newest
+// one recorded, whatever ledger an RPC reports now.
+func (s store) recentCharges(ctx context.Context) ([]charge, error) {
+	rows, err := s.pool.Query(ctx, `SELECT tx_hash, ledger, fee::text, network_fee, COALESCE(finished_at, 0) FROM relays
+		WHERE outcome = 'success' AND network_fee IS NOT NULL
+			AND ledger >= (SELECT COALESCE(max(ledger), 0) FROM relays WHERE outcome = 'success') - $1
+		ORDER BY ledger`, int64(lossWindow))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []charge
+	for rows.Next() {
+		var c charge
+		var ledger int64
+		if err := rows.Scan(&c.hash, &ledger, &c.fee, &c.networkFee, &c.finishedAt); err != nil {
+			return nil, err
+		}
+		c.ledger = uint32(ledger)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }

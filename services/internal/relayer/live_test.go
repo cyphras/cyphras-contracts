@@ -157,8 +157,8 @@ func TestARememberedRestoreRefusalHoldsBackNoOtherRequest(t *testing.T) {
 func TestRestoreRefusalsAreRememberedConcurrentlyWithinTheirBound(t *testing.T) {
 	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t) })
 	h.needsRestore(800_000)
-	if h.r.restores.ttl != time.Minute || h.r.restores.max != maxVerdicts {
-		t.Fatalf("remembered for %s, at most %d", h.r.restores.ttl, h.r.restores.max)
+	if h.r.brief.ttl != time.Minute || h.r.brief.max != maxVerdicts {
+		t.Fatalf("remembered for %s, at most %d", h.r.brief.ttl, h.r.brief.max)
 	}
 	reqs := make([]Request, 16)
 	for i := range reqs {
@@ -180,7 +180,7 @@ func TestRestoreRefusalsAreRememberedConcurrentlyWithinTheirBound(t *testing.T) 
 		if codes[i] != CodeRestoreNeeded && codes[i] != CodeUnavailable {
 			t.Fatalf("request %d: %q", i, codes[i])
 		}
-		if remembered := h.r.restores.recall(statementKey(req), h.clock()) != nil; remembered != (codes[i] == CodeRestoreNeeded) {
+		if remembered := h.r.brief.recall(statementKey(req), h.clock()) != nil; remembered != (codes[i] == CodeRestoreNeeded) {
 			t.Fatalf("request %d answered %q, remembered %v", i, codes[i], remembered)
 		}
 	}
@@ -188,7 +188,7 @@ func TestRestoreRefusalsAreRememberedConcurrentlyWithinTheirBound(t *testing.T) 
 		t.Fatalf("%d transactions sent", h.sends())
 	}
 
-	v := verdicts{ttl: restoreVerdictLifetime, max: maxVerdicts}
+	v := verdicts{ttl: briefVerdictLifetime, max: maxVerdicts}
 	now := h.clock()
 	var first [32]byte
 	for i := range maxVerdicts + 5 {

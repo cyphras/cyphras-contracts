@@ -26,7 +26,12 @@ describe("a relayer that refuses to pay for a restore", () => {
       {} as Parameters<RelayerClient["submit"]>[0],
       {} as Parameters<RelayerClient["submit"]>[1],
     );
-    assert.deepEqual(result, { accepted: false, error: "restore_needed", reason: undefined });
+    assert.deepEqual(result, {
+      accepted: false,
+      error: "restore_needed",
+      reason: undefined,
+      networkFee: undefined,
+    });
   });
 
   it("tells the caller to self-relay or restore the vault, and the payment goes self-relayed", async () => {

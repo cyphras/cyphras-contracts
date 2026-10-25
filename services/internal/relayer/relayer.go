@@ -47,6 +47,12 @@ const (
 	// relayer does not pay: the client self-relays, or anyone restores the entries and the same
 	// request goes again.
 	CodeRestoreNeeded = "restore_needed"
+	// CodeNetworkFeeHigh refuses a call whose network fee, as simulated now, is more than the fee
+	// the request pays the relayer, or whose declared resource fee is more than the relayer's cap.
+	// The answer names, in stroops, the network fee the check took: the one the call would be
+	// charged as simulated, or above the cap the whole fee its envelope would declare. The client
+	// self-relays, or sends the payment again once the network's fees fall.
+	CodeNetworkFeeHigh = "network_fee_high"
 )
 
 // Config fixes what the relayer serves.
@@ -92,9 +98,21 @@ type Config struct {
 	// ExitKeys is how many exits queued ahead of a relayed exit in the ledger it lands in still
 	// leave its footprint room for it to queue; 4 when unset.
 	ExitKeys uint32
+	// QuoteFloor, when set, is the least fee a quote names, in stroops, converted to the asset
+	// and rounded up to the tier. An operator lifts with it a quote the confirmed transactions no
+	// longer move, as when the network's fees rose for good and every relay at the old quote is
+	// refused.
+	QuoteFloor int64
+	// LossBudget is how much, in stroops, confirmed relays may be charged above the fees they paid
+	// within lossWindow ledgers, about a day, before the network fee check takes each envelope's
+	// whole fee, which the network never exceeds, until the window rolls; 20,000,000 when unset.
+	LossBudget int64
 }
 
 func (c *Config) defaults() {
+	if c.LossBudget == 0 {
+		c.LossBudget = 20_000_000
+	}
 	if c.DeadlineMargin == 0 {
 		c.DeadlineMargin = 20
 	}
@@ -165,15 +183,20 @@ type Relayer struct {
 	clock   *ledgerClock
 	known   spentSet
 	told    verdicts
-	// restores remembers, by statement, a verified request refused for archived entries, briefly,
-	// since anyone may restore them at any time.
-	restores verdicts
+	// brief remembers, by statement, a verified request refused for what may pass at any time,
+	// archived entries anyone may restore or a high network fee.
+	brief verdicts
 	// nfNext is the next ledger whose new_nullifier events the spent set takes in; only Run uses it.
 	nfNext uint32
 	// following counts the transactions being followed to their outcome.
 	following sync.WaitGroup
 	// exitSlot holds a token while none of this relayer's exits that queue is in flight.
 	exitSlot chan struct{}
+	// losses holds what confirmed relays were charged above their fees, read from the records on
+	// the first refresh.
+	losses       losses
+	lossesLoaded bool
+	belowCost    belowCost
 
 	mu       sync.Mutex
 	inflight map[fr.Element]bool
@@ -236,10 +259,11 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		races: &breaker{failures: cfg.RaceFailures, window: cfg.RaceWindow, pause: cfg.GuardedFor},
 		clock: &ledgerClock{fallback: float64(cfg.LedgerSeconds)},
 		known: spentSet{max: maxKnownSpent}, told: verdicts{ttl: verdictLifetime, max: maxVerdicts},
-		restores: verdicts{ttl: restoreVerdictLifetime, max: maxVerdicts},
+		brief:    verdicts{ttl: briefVerdictLifetime, max: maxVerdicts},
 		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[string]*heldRequest{},
 		exitSlot: make(chan struct{}, 1),
 	}
+	r.losses.now = func() time.Time { return r.now() }
 	r.exitSlot <- struct{}{}
 	for _, ok := range past {
 		r.results.add(ok)
@@ -256,8 +280,9 @@ const (
 	// verdictLifetime is how long a refusal is answered from memory; maxVerdicts bounds them.
 	verdictLifetime = 10 * time.Minute
 	maxVerdicts     = 10_000
-	// restoreVerdictLifetime is how long a restore_needed refusal is answered from memory.
-	restoreVerdictLifetime = time.Minute
+	// briefVerdictLifetime is how long a restore_needed or network_fee_high refusal is answered
+	// from memory.
+	briefVerdictLifetime = time.Minute
 )
 
 // guarded reports the mode relaying takes while clients keep winning races against it: deadlines
@@ -290,6 +315,12 @@ func (r *Relayer) Refresh(ctx context.Context) error {
 	r.clock.observe(h.LatestLedger, h.LatestLedgerCloseTime)
 	if err := r.db.forgetCooldowns(ctx, r.now().Unix()-strikeMemory); err != nil {
 		return err
+	}
+	if err := r.loadLosses(ctx); err != nil {
+		return err
+	}
+	if !r.overBudget() {
+		r.alerts.Clear(ctx, "relay_loss_budget", "relays were charged less than the loss budget above their fees within the last day; the network fee check takes the expected charge again")
 	}
 	if err := r.readRoots(ctx); err != nil {
 		return err
@@ -592,12 +623,17 @@ func mustKeyString(k xdr.LedgerKey) string {
 var ErrNoQuote = errors.New("relayer: no quote")
 
 // CurrentQuote serves the quote Refresh published in the last 15 seconds, so a client's request
-// for a quote costs no RPC call, and prices anew only when there is none.
-func (r *Relayer) CurrentQuote(ctx context.Context) (*big.Int, error) {
-	if fee := r.quotes.newest(r.now().Add(-15 * time.Second)); fee != nil {
-		return fee, nil
+// for a quote costs no RPC call, and prices anew only when there is none. queued is the fee of a
+// payment the vault queues, nil when that is above max_fee.
+func (r *Relayer) CurrentQuote(ctx context.Context) (fee, queued *big.Int, err error) {
+	if fee, queued := r.quotes.newest(r.now().Add(-15 * time.Second)); fee != nil {
+		return fee, queued, nil
 	}
-	return r.Quote(ctx)
+	if _, err := r.Quote(ctx); err != nil {
+		return nil, nil, err
+	}
+	fee, queued = r.quotes.newest(time.Time{})
+	return fee, queued, nil
 }
 
 // Margin is the published margin: the configured one plus the share of relays that failed on
@@ -606,21 +642,114 @@ func (r *Relayer) Margin() int64 {
 	return min(r.cfg.Pricing.MarginBps+r.results.failureBps(), MaxMarginBps)
 }
 
-// Quote prices one relayed transaction now and remembers the price for QuoteLifetime.
+// queuedExtra is what a relay whose payment the vault queues adds to its simulated resource fee:
+// the exit entry it writes, with its rent, as the network's settings price it.
+func (r *Relayer) queuedExtra(ctx context.Context) (int64, error) {
+	return r.engine.NewEntryFee(ctx, vault.ExitEntryBytes, vault.EntryTTL)
+}
+
+// wouldQueue reports whether the vault, as last read, queues a payment of outflow, the payout and
+// the fee: while its exit queue holds an exit, or when today's outflow window has no room for it.
+// A private transfer's fee is an outflow too.
+func wouldQueue(inst *vault.Instance, closedAt int64, outflow *big.Int) bool {
+	if outflow.Sign() <= 0 {
+		return false
+	}
+	if inst.Status.ExitHead != inst.Status.ExitTail {
+		return true
+	}
+	today := inst.Status.OutflowOn(uint64(closedAt) / 86_400)
+	return today.Add(today, outflow).Cmp(inst.Limits.MaxDailyOutflow) > 0
+}
+
+// Quote prices one relayed transaction now and remembers the price for QuoteLifetime: the fee of a
+// payment the vault pays at once and of one it queues, whose exit entry costs about as much again.
+// When the vault queues every payment, the published fee is the queued one.
 func (r *Relayer) Quote(ctx context.Context) (*big.Int, error) {
 	inclusion, err := r.engine.InclusionFee(ctx)
 	if err != nil {
 		return nil, ErrNoQuote
 	}
-	fee := r.cfg.Pricing.QuoteAt(r.costs.ResourceFee()+inclusion, r.Margin())
-	r.chainMu.RLock()
-	inst := r.inst
-	r.chainMu.RUnlock()
-	if inst == nil || fee.Cmp(inst.Limits.MaxFee) > 0 {
+	extra, err := r.queuedExtra(ctx)
+	if err != nil {
 		return nil, ErrNoQuote
 	}
-	r.quotes.publish(r.now(), fee)
+	price := func(cost int64) *big.Int {
+		fee := r.cfg.Pricing.QuoteAt(cost, r.Margin())
+		if floor := r.FloorFee(); floor != nil && fee.Cmp(floor) < 0 {
+			fee = floor
+		}
+		return fee
+	}
+	cost := r.costs.ResourceFee() + inclusion
+	fee, queued := price(cost), price(cost+extra)
+	inst, _, closedAt := r.view()
+	if inst == nil {
+		return nil, ErrNoQuote
+	}
+	if wouldQueue(inst, closedAt, fee) {
+		fee = queued
+	}
+	if fee.Cmp(inst.Limits.MaxFee) > 0 {
+		why := "the costs of the confirmed relays"
+		if floor := r.FloorFee(); floor != nil && floor.Cmp(inst.Limits.MaxFee) > 0 {
+			why = fmt.Sprintf("QUOTE_FLOOR, a fee of %v", floor)
+		}
+		r.alerts.Raise(ctx, alert.Warning, "quote_above_max_fee", "the quote %v is above the vault's max_fee %v because of %s; the relayer gives no quote and relays nothing", fee, inst.Limits.MaxFee, why)
+		return nil, ErrNoQuote
+	}
+	r.alerts.Clear(ctx, "quote_above_max_fee", "the relayer quotes within the vault's max_fee again")
+	if queued.Cmp(inst.Limits.MaxFee) > 0 {
+		queued = nil
+	}
+	r.quotes.publish(r.now(), fee, queued)
 	return fee, nil
+}
+
+// minimumFee is the least fee a request may pay now: the lowest quote of the last five minutes for
+// a payment the vault pays at once, or the lowest queued one for a payment it queues, as the vault
+// last read decides from the request's own outflow.
+func (r *Relayer) minimumFee(req Request) *failure {
+	inst, _, closedAt := r.view()
+	if inst == nil {
+		return fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	low := r.quotes.lowest(r.now())
+	if wouldQueue(inst, closedAt, new(big.Int).Sub(req.Ext.Fee, req.Ext.ExtAmount)) {
+		low = r.quotes.lowestQueued(r.now())
+	}
+	if low == nil {
+		return fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	if req.Ext.Fee.Cmp(low) < 0 {
+		return fail(http.StatusBadRequest, CodeFeeTooLow)
+	}
+	return nil
+}
+
+// CheckQuoteFloor refuses a QuoteFloor whose fee is above the vault's max_fee, at which no quote
+// could ever be given.
+func (r *Relayer) CheckQuoteFloor(ctx context.Context) error {
+	floor := r.FloorFee()
+	if floor == nil {
+		return nil
+	}
+	inst, _, _, err := rpc.VaultInstance(ctx, r.rpc, r.cfg.Vault)
+	if err != nil {
+		return err
+	}
+	if floor.Cmp(inst.Limits.MaxFee) > 0 {
+		return fmt.Errorf("relayer: QUOTE_FLOOR makes a fee of %v, above the vault's max_fee %v", floor, inst.Limits.MaxFee)
+	}
+	return nil
+}
+
+// FloorFee is QuoteFloor as a fee in the asset on the tier, or nil when no floor is set.
+func (r *Relayer) FloorFee() *big.Int {
+	if r.cfg.QuoteFloor <= 0 {
+		return nil
+	}
+	return r.cfg.Pricing.QuoteAt(r.cfg.QuoteFloor, 0)
 }
 
 func (r *Relayer) view() (*vault.Instance, uint32, int64) {
@@ -634,6 +763,8 @@ type failure struct {
 	status int
 	code   string
 	reason *uint32
+	// networkFee is the network fee in stroops of a call refused with CodeNetworkFeeHigh.
+	networkFee *int64
 	// settled marks an answer the same proof would get again, which is kept for a while.
 	settled bool
 }
@@ -641,6 +772,10 @@ type failure struct {
 func (f *failure) Error() string { return f.code }
 
 func fail(status int, code string) *failure { return &failure{status: status, code: code} }
+
+func networkFeeHigh(stroops int64) *failure {
+	return &failure{status: http.StatusUnprocessableEntity, code: CodeNetworkFeeHigh, networkFee: &stroops}
+}
 
 // settledFail is fail for an answer that does not change when the same proof is sent again soon.
 func settledFail(status int, code string) *failure {
@@ -666,12 +801,8 @@ func (r *Relayer) check(req Request) *failure {
 	if e.Fee.Cmp(inst.Limits.MaxFee) > 0 {
 		return fail(http.StatusBadRequest, CodeFeeAboveCap)
 	}
-	low := r.quotes.lowest(r.now())
-	if low == nil {
-		return fail(http.StatusServiceUnavailable, CodeUnavailable)
-	}
-	if e.Fee.Cmp(low) < 0 {
-		return fail(http.StatusBadRequest, CodeFeeTooLow)
+	if f := r.minimumFee(req); f != nil {
+		return f
 	}
 	outflow := new(big.Int).Sub(e.Fee, e.ExtAmount)
 	if outflow.Cmp(inst.Limits.MaxDailyOutflow) > 0 {
@@ -779,7 +910,7 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	if f := r.told.recall(proofKey(req), r.now()); f != nil {
 		return Accepted{}, f
 	}
-	if f := r.restores.recall(statementKey(req), r.now()); f != nil {
+	if f := r.brief.recall(statementKey(req), r.now()); f != nil {
 		return Accepted{}, f
 	}
 	if f := r.local(ctx, req); f != nil {
@@ -806,8 +937,8 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	hash, f := r.relay(ctx, req)
 	if f != nil {
 		r.unclaim(req.Proof.Nullifiers)
-		if f.code == CodeRestoreNeeded {
-			r.restores.remember(statementKey(req), *f, r.now())
+		if f.code == CodeRestoreNeeded || f.code == CodeNetworkFeeHigh {
+			r.brief.remember(statementKey(req), *f, r.now())
 		}
 		return Accepted{}, f
 	}
@@ -975,13 +1106,8 @@ func (r *Relayer) sendHeld(id string, req Request) {
 	}
 	// The fee was accepted against the quotes of the moment of the request; when it is sent it
 	// must still cover what relaying costs then.
-	low := r.quotes.lowest(r.now())
-	if low == nil {
-		fail(&failure{code: CodeUnavailable})
-		return
-	}
-	if req.Ext.Fee.Cmp(low) < 0 {
-		fail(&failure{code: CodeFeeTooLow})
+	if f := r.minimumFee(req); f != nil {
+		fail(f)
 		return
 	}
 	if f := r.guard(req); f != nil {
@@ -1087,15 +1213,36 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	}
 	prepared, slot, err := r.prepare(ctx, ch, op, req)
 	if err != nil {
-		// Not kept as settled: once anyone restores the entries, the same request can go, so it is
-		// remembered for a minute only.
-		if errors.Is(err, submit.ErrRestoreNeeded) {
+		// Neither is kept as settled: once anyone restores the entries, or the network's fees fall,
+		// the same request can go, so it is remembered for a minute only.
+		var capped *submit.FeeCapError
+		switch {
+		case errors.Is(err, submit.ErrRestoreNeeded):
 			return "", fail(http.StatusUnprocessableEntity, CodeRestoreNeeded)
-		}
-		if errors.Is(err, submit.ErrSimulation) {
+		case errors.As(err, &capped):
+			return "", networkFeeHigh(capped.Inclusion + capped.Resource)
+		case errors.Is(err, submit.ErrSimulation):
 			return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
 		}
 		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	// A relay is cost-only: what the network charges when the call goes as simulated must not be
+	// more than the fee the request pays. The envelope may declare more, refunded unless used: the
+	// resource margin, against refundable charges above the simulation's, and the rent and events
+	// of the exit queue's other path, which a call takes only when an exit lands in its ledger
+	// first. Only then is the relayer charged above the fee, by at most that headroom, which
+	// RESOURCE_FEE_CAP bounds with the rest of the envelope. Once that headroom cost more than
+	// LossBudget within a day, the whole envelope fee must be covered until the window rolls.
+	cost := prepared.Expected
+	over := r.overBudget()
+	if over {
+		cost = prepared.Tx.MaxFee()
+	}
+	if r.cfg.Pricing.ToAsset(cost).Cmp(req.Ext.Fee) > 0 {
+		if !over && r.paidTheQuote(req, slot) {
+			r.refusedAtQuote(req, cost)
+		}
+		return "", networkFeeHigh(cost)
 	}
 	if r.guarded() {
 		if f := r.fresh(ctx, req); f != nil {
@@ -1119,7 +1266,8 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	release = false
 	r.setStatus(signed.Hash, txStatus{Status: "pending"})
 	rec := Record{Hash: signed.Hash, Kind: "transfer", Fee: req.Ext.Fee.String(), Channel: ch.ID, Request: requestKey(req),
-		Nullifiers: [2]string{req.Proof.Nullifiers[0].Hex(), req.Proof.Nullifiers[1].Hex()}, SimulatedAt: prepared.SimulatedAt}
+		Nullifiers: [2]string{req.Proof.Nullifiers[0].Hex(), req.Proof.Nullifiers[1].Hex()}, SimulatedAt: prepared.SimulatedAt,
+		ExpectedResourceFee: r.sample(prepared, slot)}
 	if req.Ext.ExtAmount.Sign() < 0 {
 		rec.Kind, rec.Destination, rec.Screening = "unshield", req.Ext.Recipient, "allow"
 	}
@@ -1207,6 +1355,31 @@ func (r *Relayer) exitRoom(req Request, queued *bool) submit.Extend {
 	}
 }
 
+// paidTheQuote reports whether a request paid the published quote for the path its simulation
+// took, so a refusal of one the relayer's last read of the vault priced on the other path is not
+// taken for a quote under the cost.
+func (r *Relayer) paidTheQuote(req Request, queued bool) bool {
+	if r.minimumFee(req) != nil {
+		return false
+	}
+	if !queued {
+		return true
+	}
+	low := r.quotes.lowestQueued(r.now())
+	return low != nil && req.Ext.Fee.Cmp(low) >= 0
+}
+
+// sample is what the quote learns from a relay once it is confirmed: the resource fee it was
+// expected to be charged. A relay whose payment queued gives none, 0: the queued quote adds the
+// exit entry to the paid-at-once cost, as the network's settings price it, and a day of queued
+// relays must neither lift nor lower the cost of a payment the vault pays at once.
+func (r *Relayer) sample(p *submit.Prepared, queued bool) int64 {
+	if queued {
+		return 0
+	}
+	return p.Expected - p.InclusionFee
+}
+
 func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, slot bool, nfs [2]fr.Element, rec Record) {
 	defer r.following.Done()
 	res, err := r.engine.Track(r.ctx, s)
@@ -1228,12 +1401,14 @@ func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, slot bool, nfs [2
 // receiving, rests the notes and the destination and puts relaying in its guarded mode; one that
 // points at the relayer itself counts toward pausing relaying altogether.
 func (r *Relayer) finish(res submit.Result, sent Record) {
-	rec := Record{Hash: res.Hash, Ledger: res.Ledger, NetworkFee: res.FeeCharged, ResourceFee: res.ResourceFeeCharged}
+	rec := Record{Hash: res.Hash, Ledger: res.Ledger, NetworkFee: res.FeeCharged, ResourceFee: res.ResourceFeeCharged, FinishedAt: r.now().Unix()}
 	switch res.Outcome {
 	case submit.Success:
 		rec.Outcome, rec.ExitID = outcomeSuccess, r.queuedExit(res.Events)
 		r.setStatus(res.Hash, txStatus{Status: "success", ExitID: rec.ExitID})
-		r.costs.Add(res.ResourceFeeCharged)
+		// A relay recorded without its expected charge, or whose payment queued, gives no sample.
+		r.costs.Add(sent.ExpectedResourceFee)
+		r.chargedAbove(res, sent.Fee)
 		r.results.add(true)
 		r.known.add(sentNullifiers(sent)...)
 		r.log.Info("confirmed", "tx", res.Hash, "ledger", res.Ledger, "network_fee", res.FeeCharged)
