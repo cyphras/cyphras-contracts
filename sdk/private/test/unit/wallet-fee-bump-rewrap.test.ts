@@ -175,6 +175,138 @@ describe("a fee-bumped transaction that lands inside another account's fee bump"
   });
 });
 
+describe("replies that lag or lie about a fee-bumped transaction", () => {
+  it("does not read a re-wrapped restore as refused from replies one ledger behind", async () => {
+    const world = await archivedWorld(16_900_000_000);
+    let lag = 0;
+    const rewrapped = rewrapping(world);
+    const fetch: FetchLike = async (input, init) => {
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      const reply = await rewrapped(input, init);
+      if (body?.method === "sendTransaction") lag = 2;
+      if (body?.method === "getTransaction" && lag > 0) {
+        lag--;
+        const result = {
+          status: "NOT_FOUND",
+          latestLedger: world.vault.ledger - 1,
+          oldestLedger: 1,
+        };
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), {
+          status: 200,
+        });
+      }
+      return reply;
+    };
+    const restore = await PrivateWallet.restoreVault(
+      opted(world, "donor"),
+      restoreOptions(world, fetch, { restore: 2_000n * XLM }),
+    );
+    assert.equal(restore.txHash, hashOf(world.rpc.bumps[0]));
+    assert.equal(world.rpc.archived.size, 0);
+  });
+
+  // A primary that answers getTransaction honestly but for envelopeXdr, which it swaps for `swap`
+  // of the envelope that landed, and a second provider that reaches the same ledger honestly and
+  // keeps what it is asked.
+  function forging(world: World, swap: (landed: string) => unknown, asked: string[]): FetchLike {
+    return async (input, init) => {
+      const body =
+        init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
+      if (new URL(input).origin === SECOND) {
+        if (body?.method === "getTransaction") asked.push(body.params.hash);
+        return world.fetch(RPC, init);
+      }
+      const res = await world.fetch(input, init);
+      if (body?.method !== "getTransaction") return res;
+      const reply = (await res.json()) as { result: Record<string, unknown> };
+      const landed = reply.result["envelopeXdr"];
+      if (typeof landed === "string") reply.result["envelopeXdr"] = swap(landed);
+      return new Response(JSON.stringify(reply), { status: 200 });
+    };
+  }
+
+  // A fee bump of the forger's own around the transaction that landed, never sent anywhere.
+  function phantom(world: World, made: string[]): (landed: string) => string {
+    const forger = world.signer("phantom");
+    return (landed) => {
+      const passphrase = world.deployment.networkPassphrase;
+      const tx = TransactionBuilder.fromXDR(landed, passphrase);
+      const inner = tx instanceof FeeBumpTransaction ? tx.innerTransaction : (tx as Transaction);
+      const fake = TransactionBuilder.buildFeeBumpTransaction(
+        forger.publicKey,
+        "100000",
+        inner,
+        passphrase,
+      );
+      made.push(hashOf(fake));
+      return fake.toXDR();
+    };
+  }
+
+  it("keeps a plain deposit's own hash and ID whatever envelope the primary claims", async () => {
+    for (const swap of ["phantom", "number"] as const) {
+      const world = await createWorld();
+      const asked: string[] = [];
+      const made: string[] = [];
+      const alice = await openWallet(
+        {
+          ...world,
+          fetch: forging(world, swap === "phantom" ? phantom(world, made) : () => 7, asked),
+        },
+        0,
+        undefined,
+        undefined,
+        { secondRpcUrl: SECOND },
+      );
+      const receipt = await alice.shield({
+        amount: 10n * XLM,
+        signer: world.signer("alice depositor"),
+      });
+      const own = hashOf(world.rpc.sent[0]);
+      assert.equal(receipt.txHash, own, swap);
+      assert.equal(typeof receipt.depositId, "number", swap);
+      assert.equal((await alice.deposits())[0]?.txHash, own, swap);
+      assert.ok(
+        made.every((h) => !asked.includes(h)),
+        swap,
+      );
+    }
+  });
+
+  it("does not take a fee bump the second provider never saw for a fee-bumped deposit", async () => {
+    const world = await createWorld();
+    const asked: string[] = [];
+    const made: string[] = [];
+    const alice = await openWallet(
+      { ...world, fetch: forging(world, phantom(world, made), asked) },
+      0,
+      undefined,
+      undefined,
+      { secondRpcUrl: SECOND },
+    );
+    world.rpc.archived.add(id(instanceOf(world)));
+    world.rpc.simulated = {
+      readOnly: [],
+      readWrite: [instanceOf(world), rootsOf(world)],
+      instructions: 1_000_000,
+      readBytes: 1_000,
+      writeBytes: 1_000,
+      fee: 5_000_000_000,
+    };
+    const receipt = await alice.shield({
+      amount: 10n * XLM,
+      signer: opted(world, "alice depositor"),
+      networkFeeCaps: { restore: 1_000n * XLM },
+    });
+    const inner = hashOf(world.rpc.sent[0]);
+    assert.ok(made.length > 0);
+    assert.ok(!made.includes(receipt.txHash));
+    assert.equal(receipt.txHash, inner);
+    assert.equal(typeof receipt.depositId, "number");
+  });
+});
+
 describe("a fee bump the network refuses", () => {
   it("is reported refused once the transaction's sequence number went to another one", async () => {
     const world = await archivedWorld(16_900_000_000);
