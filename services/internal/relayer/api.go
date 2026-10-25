@@ -27,16 +27,22 @@ func (r *Relayer) Handler() http.Handler {
 		httpapi.JSON(w, status, body)
 	})
 	mux.HandleFunc("GET /v1/quote", func(w http.ResponseWriter, req *http.Request) {
-		fee, err := r.CurrentQuote(req.Context())
+		fee, queued, err := r.CurrentQuote(req.Context())
 		if err != nil {
 			httpapi.Fail(w, http.StatusServiceUnavailable, CodeUnavailable)
 			return
 		}
-		httpapi.JSON(w, http.StatusOK, map[string]any{
+		out := map[string]any{
 			"fee": fee.String(), "asset": r.cfg.Asset, "tier": r.cfg.Pricing.Tier.String(), "margin_bps": r.Margin(),
 			"valid_until": r.now().Add(QuoteLifetime).Unix(), "fee_address": r.cfg.FeeAddress, "vault": r.cfg.Vault,
 			"network_id": hex.EncodeToString(r.cfg.NetworkID[:]),
-		})
+		}
+		// A payment the vault queues, an exit beyond today's window or behind a queued one, pays
+		// this instead; none is given when it is above max_fee.
+		if queued != nil {
+			out["queued_fee"] = queued.String()
+		}
+		httpapi.JSON(w, http.StatusOK, out)
 	})
 	mux.HandleFunc("POST /v1/submit", func(w http.ResponseWriter, req *http.Request) {
 		// Sending can wait for a channel and for the network to take the transaction, longer than

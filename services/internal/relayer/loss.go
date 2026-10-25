@@ -4,49 +4,68 @@ import (
 	"context"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/alert"
+	"github.com/cyphras/cyphras-contracts/services/internal/fr"
 	"github.com/cyphras/cyphras-contracts/services/internal/submit"
 )
 
-// lossWindow is how many ledgers the loss budget covers, about a day.
-const lossWindow = 17_280
+const (
+	// lossWindow is how many ledgers the loss budget covers, about a day.
+	lossWindow = 17_280
+	// lossAge is how long a loss is kept at least, whatever ledger an RPC reports, so one tip far
+	// ahead cannot drop the day's losses.
+	lossAge = 24 * time.Hour
+)
 
-// losses keeps, by ledger, what confirmed relays were charged above the fees they paid, in the
-// asset's smallest units.
+// losses keeps, by transaction, what confirmed relays were charged above the fees they paid, in
+// the asset's smallest units. A loss is dropped once it is both lossWindow ledgers behind the tip
+// and lossAge old.
 type losses struct {
-	mu      sync.Mutex
-	latest  uint32
-	entries []lossEntry
+	mu  sync.Mutex
+	now func() time.Time
+	by  map[string]lossEntry
 }
 
 type lossEntry struct {
 	ledger uint32
+	at     time.Time
 	amount *big.Int
 }
 
-func (l *losses) add(ledger uint32, amount *big.Int) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.entries = append(l.entries, lossEntry{ledger: ledger, amount: amount})
-	l.latest = max(l.latest, ledger)
+func (l *losses) clock() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
 }
 
-// sum returns the losses of the lossWindow ledgers up to the newest ledger seen, latest or a
-// loss's, and forgets older ones.
+// add records a transaction's loss once, however often it is seen.
+func (l *losses) add(hash string, ledger uint32, amount *big.Int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.by == nil {
+		l.by = map[string]lossEntry{}
+	}
+	if _, ok := l.by[hash]; !ok {
+		l.by[hash] = lossEntry{ledger: ledger, at: l.clock(), amount: amount}
+	}
+}
+
+// sum returns the losses not yet dropped at the tip latest, and drops the others.
 func (l *losses) sum(latest uint32) *big.Int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.latest = max(l.latest, latest)
-	keep := l.entries[:0]
+	now := l.clock()
 	total := new(big.Int)
-	for _, e := range l.entries {
-		if e.ledger+lossWindow > l.latest {
-			keep = append(keep, e)
-			total.Add(total, e.amount)
+	for hash, e := range l.by {
+		if uint64(e.ledger)+lossWindow <= uint64(latest) && now.Sub(e.at) >= lossAge {
+			delete(l.by, hash)
+			continue
 		}
+		total.Add(total, e.amount)
 	}
-	l.entries = keep
 	return total
 }
 
@@ -63,7 +82,8 @@ func (r *Relayer) loss(charged int64, fee string) *big.Int {
 	return over
 }
 
-// loadLosses reads the losses of the last day from the relay records once.
+// loadLosses reads the losses of the last day from the relay records once. A loss already
+// followed in this run, a relay resumed before the first refresh, is not counted again.
 func (r *Relayer) loadLosses(ctx context.Context, latest uint32) error {
 	if r.lossesLoaded {
 		return nil
@@ -78,7 +98,7 @@ func (r *Relayer) loadLosses(ctx context.Context, latest uint32) error {
 	}
 	for _, c := range charges {
 		if over := r.loss(c.networkFee, c.fee); over != nil {
-			r.losses.add(c.ledger, over)
+			r.losses.add(c.hash, c.ledger, over)
 		}
 	}
 	r.lossesLoaded = true
@@ -93,13 +113,14 @@ func (r *Relayer) overBudget() bool {
 }
 
 // chargedAbove records a confirmed relay charged more than the fee it paid, which happens only
-// when the call took a path its simulation did not, or the RPC misreported its costs, and alerts.
+// when the call took a path its simulation did not, used more refundable resources than it saw,
+// or the RPC misreported its costs, and alerts.
 func (r *Relayer) chargedAbove(res submit.Result, fee string) {
 	over := r.loss(res.FeeCharged, fee)
 	if over == nil {
 		return
 	}
-	r.losses.add(res.Ledger, over)
+	r.losses.add(res.Hash, res.Ledger, over)
 	_, latest, _ := r.view()
 	total := r.losses.sum(latest)
 	r.log.Warn("charged above its fee", "tx", res.Hash, "network_fee", res.FeeCharged, "fee", fee)
@@ -108,5 +129,55 @@ func (r *Relayer) chargedAbove(res submit.Result, fee string) {
 	if r.overBudget() {
 		r.alerts.Raise(r.ctx, alert.Warning, "relay_loss_budget", "relays were charged %v above their fees within the last day, more than the budget of %d; until that falls under it, the network fee check takes each envelope's whole fee, so most relays are refused with network_fee_high",
 			total, r.cfg.LossBudget)
+	}
+}
+
+const (
+	// belowCostRequests requests paying the published quote, with no note in common, refused for
+	// their network fee within belowCostWindow, mean the quote no longer covers what relays cost.
+	belowCostRequests = 3
+	belowCostWindow   = time.Hour
+)
+
+// belowCost remembers the nullifiers of requests that paid the published quote and were refused
+// for their network fee, so the same notes, under any number of proofs, count once.
+type belowCost struct {
+	mu   sync.Mutex
+	seen map[fr.Element]time.Time
+	hits []time.Time
+}
+
+// refusedAtQuote counts a request that paid the published quote and was refused for its network
+// fee, and alerts once belowCostRequests of them, with no note in common, came within the window.
+func (r *Relayer) refusedAtQuote(req Request, cost int64) {
+	b := &r.belowCost
+	now := r.now()
+	b.mu.Lock()
+	if b.seen == nil {
+		b.seen = map[fr.Element]time.Time{}
+	}
+	for nf, at := range b.seen {
+		if now.Sub(at) >= belowCostWindow {
+			delete(b.seen, nf)
+		}
+	}
+	keep := b.hits[:0]
+	for _, at := range b.hits {
+		if now.Sub(at) < belowCostWindow {
+			keep = append(keep, at)
+		}
+	}
+	b.hits = keep
+	_, known0 := b.seen[req.Proof.Nullifiers[0]]
+	_, known1 := b.seen[req.Proof.Nullifiers[1]]
+	b.seen[req.Proof.Nullifiers[0]], b.seen[req.Proof.Nullifiers[1]] = now, now
+	if !known0 && !known1 {
+		b.hits = append(b.hits, now)
+	}
+	hits := len(b.hits)
+	b.mu.Unlock()
+	if hits >= belowCostRequests {
+		r.alerts.Raise(r.ctx, alert.Warning, "quote_below_cost", "%d requests paying the published quote were refused for their network fee within %s, the last at %d stroops: the quote no longer covers what relays cost; it moves only with confirmed relays, so set QUOTE_FLOOR or wait for costs to fall",
+			hits, belowCostWindow, cost)
 	}
 }

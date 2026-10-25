@@ -333,20 +333,42 @@ func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData,
 	grown := uint64(len(after) - len(before))
 	fee += perKB(grown, c.txSize1KB) + perKB(grown, c.historical1KB)
 	if x.NewBytes > 0 {
-		ledgers := int64(max(x.RentLedgers, c.minPersistentTTL))
 		// Rent, the write of its TTL entry included, is charged only for an entry the call creates.
-		rent := new(big.Int).Mul(big.NewInt(int64(x.NewBytes)), big.NewInt(c.rent1KB))
-		rent.Mul(rent, big.NewInt(ledgers))
-		rent.Add(rent, big.NewInt(1024*max(c.rentDenominator, 1)-1))
-		rent.Quo(rent, big.NewInt(1024*max(c.rentDenominator, 1)))
-		// Far above the target the rent passes int64; held under it, the sum stays above any cap.
-		if rent.Cmp(big.NewInt(maxReserve)) > 0 {
-			rent.SetInt64(maxReserve)
-		}
-		reserve += rent.Int64() + c.writeEntry + perKB(ttlEntryBytes, c.write1KB)
+		reserve += c.newEntryRent(x.NewBytes, x.RentLedgers)
 	}
 	reserve += perKB(uint64(x.EventBytes), c.events1KB)
 	return fee, reserve, nil
+}
+
+// newEntryRent is the rent of a new persistent entry of a size, for the longer of ledgers and the
+// network's least TTL, with the write of its TTL entry.
+func (c ledgerCosts) newEntryRent(bytes, ledgers uint32) int64 {
+	rent := new(big.Int).Mul(big.NewInt(int64(bytes)), big.NewInt(c.rent1KB))
+	rent.Mul(rent, big.NewInt(int64(max(ledgers, c.minPersistentTTL))))
+	rent.Add(rent, big.NewInt(1024*max(c.rentDenominator, 1)-1))
+	rent.Quo(rent, big.NewInt(1024*max(c.rentDenominator, 1)))
+	// Far above the target the rent passes int64; held under it, sums stay above any cap.
+	if rent.Cmp(big.NewInt(maxReserve)) > 0 {
+		rent.SetInt64(maxReserve)
+	}
+	return rent.Int64() + c.writeEntry + perKB(ttlEntryBytes, c.write1KB)
+}
+
+// SimulatedRefundablePct is how much above the refundable fee it measures stellar-rpc's
+// simulation names it, in percent, as its MinResourceFee carries it.
+const SimulatedRefundablePct = 115
+
+// NewEntryFee is what a call that also creates a persistent entry of a size, live for ledgers,
+// adds to its simulated resource fee: the write of the entry and its bytes, charged in full, and
+// its rent, which the simulation names SimulatedRefundablePct of. The network's settings set it,
+// so no request moves it.
+func (e *Engine) NewEntryFee(ctx context.Context, bytes, ledgers uint32) (int64, error) {
+	c, err := e.ledgerCosts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	rent := c.newEntryRent(bytes, ledgers)
+	return c.writeEntry + perKB(uint64(bytes), c.write1KB) + ceilDiv(rent*SimulatedRefundablePct, 100), nil
 }
 
 // liveBound reads the persistent entries of a footprint and returns the first ledger in which one

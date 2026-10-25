@@ -295,6 +295,11 @@ func ReadSorobanState(ctx context.Context, c Client) (SorobanState, error) {
 	if err := CheckStateWindow(window, int64(cost.SorobanStateTargetSizeBytes)); err != nil {
 		return SorobanState{}, err
 	}
+	// A near-empty reading would clear every alert on the state's size; a network that holds so
+	// little is far from any level anyway.
+	if StateAverage(window) < int64(cost.SorobanStateTargetSizeBytes)/100 {
+		return SorobanState{}, errors.New("rpc: the network's state size window averages under 1% of its target")
+	}
 	st := SorobanState{Average: StateAverage(window), Target: int64(cost.SorobanStateTargetSizeBytes), Growth: int64(cost.SorobanStateRentFeeGrowthFactor)}
 	low, high := int64(cost.RentFee1KbSorobanStateSizeLow), int64(cost.RentFee1KbSorobanStateSizeHigh)
 	st.Rent1KB = RentPerKB(st.Average, low, high, st.Target, st.Growth)
@@ -307,9 +312,8 @@ func ReadSorobanState(ctx context.Context, c Client) (SorobanState, error) {
 const maxStateSample = 10_000_000_000_000
 
 // CheckStateWindow refuses a window of live Soroban state sizes, or a target, that no network
-// holds: an empty window, an empty or oversized sample, a target beyond maxStateSample, or an
-// average under 1% of the target. Such a reading is a broken or hostile RPC, not a state to price
-// or to clear an alert by.
+// holds: an empty window, an empty or oversized sample, or a target beyond maxStateSample. Such a
+// reading is a broken or hostile RPC, not a state to price by.
 func CheckStateWindow(window []xdr.Uint64, target int64) error {
 	if len(window) == 0 {
 		return errors.New("rpc: the network's state size window is empty")
@@ -321,9 +325,6 @@ func CheckStateWindow(window []xdr.Uint64, target int64) error {
 		if n == 0 || uint64(n) > maxStateSample {
 			return fmt.Errorf("rpc: the network's state size window holds an implausible %d bytes", uint64(n))
 		}
-	}
-	if StateAverage(window) < target/100 {
-		return errors.New("rpc: the network's state size window averages under 1% of its target")
 	}
 	return nil
 }

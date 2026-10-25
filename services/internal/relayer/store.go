@@ -219,10 +219,10 @@ func (s store) lookup(ctx context.Context, hash string) (string, *uint64, bool, 
 }
 
 // recentResourceFees returns the samples of the last n confirmed relays, oldest first: the
-// resource fee each was expected to be charged, or for a relay recorded without it, the one it was
-// charged.
+// resource fee each was expected to be charged. A relay recorded without it gives none, since the
+// fee it was charged sits under the measure the network fee check takes.
 func (s store) recentResourceFees(ctx context.Context, n int) ([]int64, error) {
-	rows, err := s.pool.Query(ctx, `SELECT COALESCE(expected_resource_fee, resource_fee) FROM relays WHERE outcome = 'success'
+	rows, err := s.pool.Query(ctx, `SELECT expected_resource_fee FROM relays WHERE outcome = 'success' AND expected_resource_fee IS NOT NULL
 		ORDER BY ledger DESC LIMIT $1`, n)
 	if err != nil {
 		return nil, err
@@ -237,6 +237,7 @@ func (s store) recentResourceFees(ctx context.Context, n int) ([]int64, error) {
 
 // charge is what a confirmed relay paid the network and was paid, at the ledger it landed in.
 type charge struct {
+	hash       string
 	ledger     uint32
 	fee        string
 	networkFee int64
@@ -244,7 +245,7 @@ type charge struct {
 
 // recentCharges returns the confirmed relays that landed at or after a ledger.
 func (s store) recentCharges(ctx context.Context, since uint32) ([]charge, error) {
-	rows, err := s.pool.Query(ctx, `SELECT ledger, fee::text, network_fee FROM relays
+	rows, err := s.pool.Query(ctx, `SELECT tx_hash, ledger, fee::text, network_fee FROM relays
 		WHERE outcome = 'success' AND ledger >= $1 AND network_fee IS NOT NULL ORDER BY ledger`, int64(since))
 	if err != nil {
 		return nil, err
@@ -254,7 +255,7 @@ func (s store) recentCharges(ctx context.Context, since uint32) ([]charge, error
 	for rows.Next() {
 		var c charge
 		var ledger int64
-		if err := rows.Scan(&ledger, &c.fee, &c.networkFee); err != nil {
+		if err := rows.Scan(&c.hash, &ledger, &c.fee, &c.networkFee); err != nil {
 			return nil, err
 		}
 		c.ledger = uint32(ledger)

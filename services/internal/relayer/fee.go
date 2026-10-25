@@ -74,8 +74,8 @@ func (p Pricing) QuoteAt(costStroops, marginBps int64) *big.Int {
 }
 
 // SampleMultiple bounds a sample at that many times the median of a full window, or of the
-// bootstrap value before, so a few dear relays a client pays for cannot lift the quote for
-// everyone: lifting the median takes half the window, 25 relays, for each doubling.
+// bootstrap value before, so dear relays a client pays for cannot lift the quote past twice the
+// median: lifting the median itself takes half the window, 25 relays, for each doubling.
 const SampleMultiple = 2
 
 // Costs learns the resource fee from the relayer's own confirmed transactions only, so nobody can
@@ -88,11 +88,25 @@ type Costs struct {
 	samples   []int64
 }
 
-// NewCosts starts from the stored samples, newest last, and the bootstrap value.
+// NewCosts starts from the stored samples, newest last, and the bootstrap value. A full window is
+// held against its own median, as the running relayer held it, not against the bootstrap value,
+// which a quote learned after it rose no longer has anything to do with.
 func NewCosts(bootstrap int64, stored []int64) *Costs {
 	c := &Costs{bootstrap: bootstrap}
+	if len(stored) < Samples {
+		for _, s := range stored {
+			c.Add(s)
+		}
+		return c
+	}
+	stored = stored[len(stored)-Samples:]
+	sorted := slices.Clone(stored)
+	slices.Sort(sorted)
+	median := sorted[len(sorted)/2]
 	for _, s := range stored {
-		c.Add(s)
+		if s > 0 {
+			c.samples = append(c.samples, min(s, SampleMultiple*median))
+		}
 	}
 	return c
 }
@@ -131,21 +145,22 @@ func (c *Costs) ResourceFee() int64 {
 }
 
 // quotes remembers what was quoted, so a fee is accepted at or above the lowest quote of the last
-// five minutes.
+// five minutes: the fee of a payment the vault pays at once, and the fee of one it queues, nil
+// when that is above max_fee.
 type quotes struct {
 	mu      sync.Mutex
 	history []quoted
 }
 
 type quoted struct {
-	at  time.Time
-	fee *big.Int
+	at          time.Time
+	fee, queued *big.Int
 }
 
-func (q *quotes) publish(now time.Time, fee *big.Int) {
+func (q *quotes) publish(now time.Time, fee, queued *big.Int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.history = append(q.history, quoted{at: now, fee: fee})
+	q.history = append(q.history, quoted{at: now, fee: fee, queued: queued})
 	cutoff := now.Add(-QuoteLifetime)
 	i := 0
 	for i < len(q.history) && q.history[i].at.Before(cutoff) {
@@ -154,14 +169,28 @@ func (q *quotes) publish(now time.Time, fee *big.Int) {
 	q.history = q.history[i:]
 }
 
-// newest returns the latest quote published since a time.
-func (q *quotes) newest(since time.Time) *big.Int {
+// newest returns the latest quote published since a time, with its queued fee.
+func (q *quotes) newest(since time.Time) (fee, queued *big.Int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if n := len(q.history); n > 0 && !q.history[n-1].at.Before(since) {
-		return q.history[n-1].fee
+		return q.history[n-1].fee, q.history[n-1].queued
 	}
-	return nil
+	return nil, nil
+}
+
+// lowestQueued returns the lowest queued fee quoted within the lifetime, or nil.
+func (q *quotes) lowestQueued(now time.Time) *big.Int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	cutoff := now.Add(-QuoteLifetime)
+	var low *big.Int
+	for _, h := range q.history {
+		if !h.at.Before(cutoff) && h.queued != nil && (low == nil || h.queued.Cmp(low) < 0) {
+			low = h.queued
+		}
+	}
+	return low
 }
 
 // lowest returns the lowest fee quoted within the lifetime, or nil.

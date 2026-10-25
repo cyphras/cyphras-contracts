@@ -196,6 +196,7 @@ type Relayer struct {
 	// the first refresh.
 	losses       losses
 	lossesLoaded bool
+	belowCost    belowCost
 
 	mu       sync.Mutex
 	inflight map[fr.Element]bool
@@ -262,6 +263,7 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[string]*heldRequest{},
 		exitSlot: make(chan struct{}, 1),
 	}
+	r.losses.now = func() time.Time { return r.now() }
 	r.exitSlot <- struct{}{}
 	for _, ok := range past {
 		r.results.add(ok)
@@ -621,12 +623,17 @@ func mustKeyString(k xdr.LedgerKey) string {
 var ErrNoQuote = errors.New("relayer: no quote")
 
 // CurrentQuote serves the quote Refresh published in the last 15 seconds, so a client's request
-// for a quote costs no RPC call, and prices anew only when there is none.
-func (r *Relayer) CurrentQuote(ctx context.Context) (*big.Int, error) {
-	if fee := r.quotes.newest(r.now().Add(-15 * time.Second)); fee != nil {
-		return fee, nil
+// for a quote costs no RPC call, and prices anew only when there is none. queued is the fee of a
+// payment the vault queues, nil when that is above max_fee.
+func (r *Relayer) CurrentQuote(ctx context.Context) (fee, queued *big.Int, err error) {
+	if fee, queued := r.quotes.newest(r.now().Add(-15 * time.Second)); fee != nil {
+		return fee, queued, nil
 	}
-	return r.Quote(ctx)
+	if _, err := r.Quote(ctx); err != nil {
+		return nil, nil, err
+	}
+	fee, queued = r.quotes.newest(time.Time{})
+	return fee, queued, nil
 }
 
 // Margin is the published margin: the configured one plus the share of relays that failed on
@@ -635,21 +642,53 @@ func (r *Relayer) Margin() int64 {
 	return min(r.cfg.Pricing.MarginBps+r.results.failureBps(), MaxMarginBps)
 }
 
-// Quote prices one relayed transaction now and remembers the price for QuoteLifetime.
+// queuedExtra is what a relay whose payment the vault queues adds to its simulated resource fee:
+// the exit entry it writes, with its rent, as the network's settings price it.
+func (r *Relayer) queuedExtra(ctx context.Context) (int64, error) {
+	return r.engine.NewEntryFee(ctx, vault.ExitEntryBytes, vault.EntryTTL)
+}
+
+// wouldQueue reports whether the vault, as last read, queues a payment of outflow, the payout and
+// the fee: while its exit queue holds an exit, or when today's outflow window has no room for it.
+// A private transfer's fee is an outflow too.
+func wouldQueue(inst *vault.Instance, closedAt int64, outflow *big.Int) bool {
+	if outflow.Sign() <= 0 {
+		return false
+	}
+	if inst.Status.ExitHead != inst.Status.ExitTail {
+		return true
+	}
+	today := inst.Status.OutflowOn(uint64(closedAt) / 86_400)
+	return today.Add(today, outflow).Cmp(inst.Limits.MaxDailyOutflow) > 0
+}
+
+// Quote prices one relayed transaction now and remembers the price for QuoteLifetime: the fee of a
+// payment the vault pays at once and of one it queues, whose exit entry costs about as much again.
+// When the vault queues every payment, the published fee is the queued one.
 func (r *Relayer) Quote(ctx context.Context) (*big.Int, error) {
 	inclusion, err := r.engine.InclusionFee(ctx)
 	if err != nil {
 		return nil, ErrNoQuote
 	}
-	fee := r.cfg.Pricing.QuoteAt(r.costs.ResourceFee()+inclusion, r.Margin())
-	if floor := r.FloorFee(); floor != nil && fee.Cmp(floor) < 0 {
-		fee = floor
+	extra, err := r.queuedExtra(ctx)
+	if err != nil {
+		return nil, ErrNoQuote
 	}
-	r.chainMu.RLock()
-	inst := r.inst
-	r.chainMu.RUnlock()
+	price := func(cost int64) *big.Int {
+		fee := r.cfg.Pricing.QuoteAt(cost, r.Margin())
+		if floor := r.FloorFee(); floor != nil && fee.Cmp(floor) < 0 {
+			fee = floor
+		}
+		return fee
+	}
+	cost := r.costs.ResourceFee() + inclusion
+	fee, queued := price(cost), price(cost+extra)
+	inst, _, closedAt := r.view()
 	if inst == nil {
 		return nil, ErrNoQuote
+	}
+	if wouldQueue(inst, closedAt, fee) {
+		fee = queued
 	}
 	if fee.Cmp(inst.Limits.MaxFee) > 0 {
 		why := "the costs of the confirmed relays"
@@ -660,8 +699,32 @@ func (r *Relayer) Quote(ctx context.Context) (*big.Int, error) {
 		return nil, ErrNoQuote
 	}
 	r.alerts.Clear(ctx, "quote_above_max_fee", "the relayer quotes within the vault's max_fee again")
-	r.quotes.publish(r.now(), fee)
+	if queued.Cmp(inst.Limits.MaxFee) > 0 {
+		queued = nil
+	}
+	r.quotes.publish(r.now(), fee, queued)
 	return fee, nil
+}
+
+// minimumFee is the least fee a request may pay now: the lowest quote of the last five minutes for
+// a payment the vault pays at once, or the lowest queued one for a payment it queues, as the vault
+// last read decides from the request's own outflow.
+func (r *Relayer) minimumFee(req Request) *failure {
+	inst, _, closedAt := r.view()
+	if inst == nil {
+		return fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	low := r.quotes.lowest(r.now())
+	if wouldQueue(inst, closedAt, new(big.Int).Sub(req.Ext.Fee, req.Ext.ExtAmount)) {
+		low = r.quotes.lowestQueued(r.now())
+	}
+	if low == nil {
+		return fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	if req.Ext.Fee.Cmp(low) < 0 {
+		return fail(http.StatusBadRequest, CodeFeeTooLow)
+	}
+	return nil
 }
 
 // CheckQuoteFloor refuses a QuoteFloor whose fee is above the vault's max_fee, at which no quote
@@ -738,12 +801,8 @@ func (r *Relayer) check(req Request) *failure {
 	if e.Fee.Cmp(inst.Limits.MaxFee) > 0 {
 		return fail(http.StatusBadRequest, CodeFeeAboveCap)
 	}
-	low := r.quotes.lowest(r.now())
-	if low == nil {
-		return fail(http.StatusServiceUnavailable, CodeUnavailable)
-	}
-	if e.Fee.Cmp(low) < 0 {
-		return fail(http.StatusBadRequest, CodeFeeTooLow)
+	if f := r.minimumFee(req); f != nil {
+		return f
 	}
 	outflow := new(big.Int).Sub(e.Fee, e.ExtAmount)
 	if outflow.Cmp(inst.Limits.MaxDailyOutflow) > 0 {
@@ -1047,13 +1106,8 @@ func (r *Relayer) sendHeld(id string, req Request) {
 	}
 	// The fee was accepted against the quotes of the moment of the request; when it is sent it
 	// must still cover what relaying costs then.
-	low := r.quotes.lowest(r.now())
-	if low == nil {
-		fail(&failure{code: CodeUnavailable})
-		return
-	}
-	if req.Ext.Fee.Cmp(low) < 0 {
-		fail(&failure{code: CodeFeeTooLow})
+	if f := r.minimumFee(req); f != nil {
+		fail(f)
 		return
 	}
 	if f := r.guard(req); f != nil {
@@ -1180,10 +1234,14 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	// RESOURCE_FEE_CAP bounds with the rest of the envelope. Once that headroom cost more than
 	// LossBudget within a day, the whole envelope fee must be covered until the window rolls.
 	cost := prepared.Expected
-	if r.overBudget() {
+	over := r.overBudget()
+	if over {
 		cost = prepared.Tx.MaxFee()
 	}
 	if r.cfg.Pricing.ToAsset(cost).Cmp(req.Ext.Fee) > 0 {
+		if !over && r.minimumFee(req) == nil {
+			r.refusedAtQuote(req, cost)
+		}
 		return "", networkFeeHigh(cost)
 	}
 	if r.guarded() {
@@ -1209,7 +1267,7 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	r.setStatus(signed.Hash, txStatus{Status: "pending"})
 	rec := Record{Hash: signed.Hash, Kind: "transfer", Fee: req.Ext.Fee.String(), Channel: ch.ID, Request: requestKey(req),
 		Nullifiers: [2]string{req.Proof.Nullifiers[0].Hex(), req.Proof.Nullifiers[1].Hex()}, SimulatedAt: prepared.SimulatedAt,
-		ExpectedResourceFee: prepared.Expected - prepared.InclusionFee}
+		ExpectedResourceFee: r.sample(prepared, slot)}
 	if req.Ext.ExtAmount.Sign() < 0 {
 		rec.Kind, rec.Destination, rec.Screening = "unshield", req.Ext.Recipient, "allow"
 	}
@@ -1297,6 +1355,17 @@ func (r *Relayer) exitRoom(req Request, queued *bool) submit.Extend {
 	}
 }
 
+// sample is what the quote learns from a relay once it is confirmed: the resource fee it was
+// expected to be charged. A relay whose payment queued gives none, 0: the queued quote adds the
+// exit entry to the paid-at-once cost, as the network's settings price it, and a day of queued
+// relays must neither lift nor lower the cost of a payment the vault pays at once.
+func (r *Relayer) sample(p *submit.Prepared, queued bool) int64 {
+	if queued {
+		return 0
+	}
+	return p.Expected - p.InclusionFee
+}
+
 func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, slot bool, nfs [2]fr.Element, rec Record) {
 	defer r.following.Done()
 	res, err := r.engine.Track(r.ctx, s)
@@ -1323,11 +1392,8 @@ func (r *Relayer) finish(res submit.Result, sent Record) {
 	case submit.Success:
 		rec.Outcome, rec.ExitID = outcomeSuccess, r.queuedExit(res.Events)
 		r.setStatus(res.Hash, txStatus{Status: "success", ExitID: rec.ExitID})
-		sample := sent.ExpectedResourceFee
-		if sample == 0 {
-			sample = res.ResourceFeeCharged
-		}
-		r.costs.Add(sample)
+		// A relay recorded without its expected charge, or whose payment queued, gives no sample.
+		r.costs.Add(sent.ExpectedResourceFee)
 		r.chargedAbove(res, sent.Fee)
 		r.results.add(true)
 		r.known.add(sentNullifiers(sent)...)

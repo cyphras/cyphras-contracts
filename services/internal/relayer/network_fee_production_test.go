@@ -23,8 +23,9 @@ func (h *harness) steadyState(settings rpctest.Settings, charged int64) {
 	for range Samples {
 		h.r.costs.Add(charged)
 	}
+	// Past the engine's hour of cached network settings, and the bootstrap quotes' lifetime.
 	h.mu.Lock()
-	h.now = h.now.Add(QuoteLifetime + time.Second)
+	h.now = h.now.Add(time.Hour + time.Second)
 	h.mu.Unlock()
 	h.fake.CloseTime = h.now.Unix()
 	if err := h.r.Refresh(context.Background()); err != nil {

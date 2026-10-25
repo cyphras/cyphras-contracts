@@ -176,7 +176,7 @@ func TestChargesAboveTheFeeAreBudgetedPerDay(t *testing.T) {
 	}
 
 	// A restart reads the day's losses from the records.
-	h.r.losses, h.r.lossesLoaded = losses{}, false
+	h.r.losses, h.r.lossesLoaded = losses{now: h.clock}, false
 	if err := h.r.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +184,10 @@ func TestChargesAboveTheFeeAreBudgetedPerDay(t *testing.T) {
 		t.Fatal("the losses were not read back")
 	}
 	// Once the day has passed, the expected charge is taken again.
+	h.mu.Lock()
+	h.now = h.now.Add(lossAge)
+	h.mu.Unlock()
+	h.fake.CloseTime = h.now.Unix()
 	h.setLatest(1001+lossWindow, true)
 	if h.r.overBudget() || h.r.alerts.Open("relay_loss_budget") {
 		t.Fatal("the window did not roll")
@@ -222,6 +226,13 @@ func TestARentReserveBeyondInt64IsRefusedAboveTheCap(t *testing.T) {
 	huge := rpctest.Mainnet
 	huge.StateTarget, huge.StateSize = 1_000, 10_000_000_000_000
 	h.fake.SetSettings(huge)
+	// Past the engine's hour of cached network settings.
+	h.mu.Lock()
+	h.now = h.now.Add(time.Hour + time.Second)
+	h.mu.Unlock()
+	h.fake.CloseTime = h.now.Unix()
+	// Above max_fee, the quote fails too.
+	_ = h.r.Refresh(context.Background())
 	h.plainSimulation(500_000)
 	_, f := h.r.Submit(context.Background(), h.forged(t, feeAddress, 0, 5_000_000))
 	if fee := networkFeeOf(t, f); fee <= 50_000_000 {
