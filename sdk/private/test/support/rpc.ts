@@ -26,19 +26,34 @@ interface TxRecord {
   result?: string;
 }
 
-// The result of a call that touched an archived entry it did not restore, as core reports it.
-const entryArchivedResult = (): string =>
-  new xdr.TransactionResult({
-    feeCharged: xdr.Int64.fromString("100"),
-    result: xdr.TransactionResultResult.txFailed([
-      xdr.OperationResult.opInner(
-        xdr.OperationResultTr.invokeHostFunction(
-          xdr.InvokeHostFunctionResult.invokeHostFunctionEntryArchived(),
-        ),
+// The result of a call that touched an archived entry it did not restore, as core reports it, for
+// a transaction sent alone or inside a fee bump, which names the inner one by its hash.
+function entryArchivedResult(inner?: Buffer): string {
+  const results = [
+    xdr.OperationResult.opInner(
+      xdr.OperationResultTr.invokeHostFunction(
+        xdr.InvokeHostFunctionResult.invokeHostFunctionEntryArchived(),
       ),
-    ]),
+    ),
+  ];
+  return new xdr.TransactionResult({
+    feeCharged: xdr.Int64.fromString("100"),
+    result:
+      inner === undefined
+        ? xdr.TransactionResultResult.txFailed(results)
+        : xdr.TransactionResultResult.txFeeBumpInnerFailed(
+            new xdr.InnerTransactionResultPair({
+              transactionHash: inner,
+              result: new xdr.InnerTransactionResult({
+                feeCharged: xdr.Int64.fromString("100"),
+                result: xdr.InnerTransactionResultResult.txFailed(results),
+                ext: new xdr.InnerTransactionResultExt(0),
+              }),
+            }),
+          ),
     ext: new xdr.TransactionResultExt(0),
   }).toXDR("base64");
+}
 
 // A diagnostic event naming a host error, as the host emits for a failed call.
 export function diagnostic(error: xdr.ScError): string {
@@ -177,6 +192,10 @@ export class MockRpc {
   // The transactions sent, in order, and how many entries a footprint may declare, write and read
   // from disk.
   sent: Transaction[] = [];
+  // The fee bumps taken, in order, whose inner transactions are among `sent`, and the hash of each
+  // by the hash of the transaction inside it.
+  bumps: FeeBumpTransaction[] = [];
+  readonly #inner = new Map<string, string>();
   maxFootprintEntries = 400;
   maxWriteEntries = 200;
   maxDiskReadEntries = 200;
@@ -713,6 +732,24 @@ export class MockRpc {
     return tx;
   }
 
+  // A fee bump core takes from protocol 23: signed by its fee source, with a Soroban transaction
+  // inside, and an inclusion fee above the inner's resource fee of at least 100 stroops for each of
+  // its two operations, whatever the inner's own fee; one whose inner fee is at least its resource
+  // fee must also bid at least the inner's rate.
+  #bumpValid(bump: FeeBumpTransaction): boolean {
+    const inner = bump.innerTransaction;
+    const payer = this.accounts.get(bump.feeSource);
+    if (!bump.signatures.some((s) => payer?.keypair.verify(bump.hash(), s.signature()))) {
+      return false;
+    }
+    const ext = inner.toEnvelope().v1().tx().ext();
+    if (ext.switch() !== 1) return false;
+    const resource = BigInt(ext.sorobanData().resourceFee().toString());
+    const outer = BigInt(bump.fee) - resource;
+    const own = BigInt(inner.fee) - resource;
+    return outer >= 200n && (own < 0n || outer * 100n >= own * 200n);
+  }
+
   #meta(record: TxRecord): string {
     const events = record.events.map(
       (e) =>
@@ -822,9 +859,17 @@ export class MockRpc {
         }
       }
       case "sendTransaction": {
-        const tx = this.#parse(params["transaction"] as string);
-        const hash = bytesToHex(Uint8Array.from(tx.hash()));
-        this.sentFees.push(BigInt(tx.fee));
+        const envelope = TransactionBuilder.fromXDR(
+          params["transaction"] as string,
+          this.passphrase,
+        );
+        const bump = envelope instanceof FeeBumpTransaction ? envelope : undefined;
+        const tx = bump === undefined ? (envelope as Transaction) : bump.innerTransaction;
+        const hash = bytesToHex(Uint8Array.from(envelope.hash()));
+        this.sentFees.push(BigInt(envelope.fee));
+        if (bump !== undefined && !this.#bumpValid(bump)) {
+          return { status: "ERROR", hash, latestLedger: this.vault.ledger };
+        }
         if (this.sendOnce !== undefined) {
           const status = this.sendOnce;
           this.sendOnce = undefined;
@@ -844,6 +889,10 @@ export class MockRpc {
         }
         account.sequence++;
         this.sent.push(tx);
+        if (bump !== undefined) {
+          this.bumps.push(bump);
+          this.#inner.set(bytesToHex(Uint8Array.from(tx.hash())), hash);
+        }
         const others = this.beforeApply;
         this.beforeApply = undefined;
         others?.();
@@ -890,7 +939,7 @@ export class MockRpc {
             returnValue: xdr.ScVal.scvVoid(),
             events: [],
             diagnostics: [diagnostic(xdr.ScError.sceValue(xdr.ScErrorCode.scecInvalidInput()))],
-            result: entryArchivedResult(),
+            result: entryArchivedResult(bump === undefined ? undefined : tx.hash()),
           });
           return { status: "PENDING", hash, latestLedger: this.vault.ledger };
         }
@@ -931,7 +980,9 @@ export class MockRpc {
         return { status: "PENDING", hash, latestLedger: this.vault.ledger };
       }
       case "getTransaction": {
-        const record = this.records.get(params["hash"] as string);
+        // RPC finds a fee bump by its own hash and by the one of the transaction inside it.
+        const asked = params["hash"] as string;
+        const record = this.records.get(this.#inner.get(asked) ?? asked);
         const base = { latestLedger: this.vault.ledger, oldestLedger: this.oldestLedger };
         if (record === undefined) return { ...base, status: "NOT_FOUND" };
         return {

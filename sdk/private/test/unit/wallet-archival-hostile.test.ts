@@ -279,16 +279,17 @@ describe("network fee caps a caller gives", () => {
     assert.deepEqual(ops(world), []);
   });
 
-  it("refuses a fee above what one transaction carries before the user is asked", async () => {
+  it("refuses a fee above what a fee-bumped transaction carries before the user is asked", async () => {
     const { world, alice } = await funded();
     world.rpc.archived.add(id(vaultData(world, "instance")));
-    simulate(world, [vaultData(world, "instance"), vaultData(world, "Roots")], 5_000_000_000);
+    // One stroop above the 2^50 stroops of resource fee stellar-core takes.
+    simulate(world, [vaultData(world, "instance"), vaultData(world, "Roots")], 2 ** 50 + 1);
     const shown: NetworkFee[] = [];
-    const err = await unshield(world, alice, payer(world, shown), { restore: 1_000n * XLM }).catch(
+    const err = await unshield(world, alice, payer(world, shown), { restore: 2n ** 51n }).catch(
       (e: unknown) => e,
     );
     assert.ok(isError("fee_above_limit")(err), String(err));
-    assert.equal(details(err)["limit"], "4294967295");
+    assert.equal(details(err)["limit"], (2n ** 50n).toString());
     assert.deepEqual(shown, []);
     assert.deepEqual(ops(world), []);
   });
