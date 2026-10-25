@@ -48,6 +48,10 @@ var (
 	ErrSimulation = errors.New("submit: simulation failed")
 	// ErrFeeCap reports a simulation whose resource fee is above the cap. It is an ErrSimulation.
 	ErrFeeCap = fmt.Errorf("%w: the resource fee is above the cap", ErrSimulation)
+	// ErrRestoreNeeded reports a call that needs archived entries restored: its simulation asks
+	// for a restore first, or, with RefuseRestores set, restores them within the call. It is an
+	// ErrSimulation.
+	ErrRestoreNeeded = fmt.Errorf("%w: archived entries need a restore", ErrSimulation)
 	// ErrRejected reports a transaction the network refused without including it.
 	ErrRejected = errors.New("submit: transaction rejected")
 	// ErrExpired reports a transaction whose time bound passed before it was included.
@@ -70,6 +74,9 @@ type Engine struct {
 	// MaxTTLFee, when set, takes the place of MaxResourceFee for footprint extensions and
 	// restorations, whose fee is mostly the rent of the entries they keep alive.
 	MaxTTLFee int64
+	// RefuseRestores refuses an invocation whose simulation restores archived entries within it,
+	// whose rent the source would pay, before the fee caps are checked.
+	RefuseRestores bool
 	// Validity is how long a signed transaction may wait for inclusion.
 	Validity time.Duration
 	// Poll is the interval between getTransaction calls.
@@ -326,6 +333,14 @@ func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData,
 	return fee, nil
 }
 
+// restoredEntries counts the archived entries a simulation marks for the call to restore.
+func restoredEntries(data xdr.SorobanTransactionData) int {
+	if data.Ext.V != 1 || data.Ext.ResourceExt == nil {
+		return 0
+	}
+	return len(data.Ext.ResourceExt.ArchivedSorobanEntries)
+}
+
 // classic reports an entry of an account or a trustline, which the network reads from disk.
 func classic(k xdr.LedgerKey) bool {
 	return k.Type == xdr.LedgerEntryTypeAccount || k.Type == xdr.LedgerEntryTypeTrustline
@@ -480,11 +495,14 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 		return nil, fmt.Errorf("%w: %s", ErrSimulation, sim.Error)
 	}
 	if sim.RestorePreamble != nil {
-		return nil, fmt.Errorf("%w: archived entries need a separate restore", ErrSimulation)
+		return nil, fmt.Errorf("%w: they need a separate restore first", ErrRestoreNeeded)
 	}
 	var data xdr.SorobanTransactionData
 	if err := xdr.SafeUnmarshalBase64(sim.TransactionDataXDR, &data); err != nil {
 		return nil, fmt.Errorf("simulation data: %w", err)
+	}
+	if n := restoredEntries(data); n > 0 && e.RefuseRestores {
+		return nil, fmt.Errorf("%w: the call would restore %d entries", ErrRestoreNeeded, n)
 	}
 	var extra int64
 	if extend != nil {

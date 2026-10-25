@@ -43,6 +43,10 @@ const (
 	CodeRejected    = "rejected"
 	CodeRateLimited = "rate_limited"
 	CodeUnavailable = "unavailable"
+	// CodeRestoreNeeded refuses a call that needs archived entries restored first, whose rent the
+	// relayer does not pay: the client self-relays, or anyone restores the entries and the same
+	// request goes again.
+	CodeRestoreNeeded = "restore_needed"
 )
 
 // Config fixes what the relayer serves.
@@ -207,6 +211,8 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		return nil, err
 	}
 	cfg.defaults()
+	// Relaying is cost-only, and a restore costs far more than a relay earns.
+	engine.RefuseRestores = true
 	samples, err := db.recentResourceFees(ctx, Samples)
 	if err != nil {
 		return nil, err
@@ -1069,6 +1075,10 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	}
 	prepared, slot, err := r.prepare(ctx, ch, op, req)
 	if err != nil {
+		// Not kept as settled: once anyone restores the entries, the same request can go.
+		if errors.Is(err, submit.ErrRestoreNeeded) {
+			return "", fail(http.StatusUnprocessableEntity, CodeRestoreNeeded)
+		}
 		if errors.Is(err, submit.ErrSimulation) {
 			return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
 		}
@@ -1317,8 +1327,10 @@ func (r *Relayer) classify(res submit.Result, sent Record) cause {
 		case xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded:
 			return r.resourceCause(ctx, sent)
 		case xdr.InvokeHostFunctionResultCodeInvokeHostFunctionEntryArchived:
-			// Only contract data archives, and the keeper keeps the vault's alive: with a contract
-			// destination, its own balance in the asset contract is the entry its owner let lapse.
+			// No call whose simulation found an entry archived is sent, so this entry archived
+			// between the simulation and the call's ledger. The keeper keeps the vault's alive: with
+			// a contract destination, its own balance in the asset contract is the entry its owner
+			// let lapse.
 			if contractAddress(sent.Destination) {
 				return causeReceive
 			}

@@ -664,3 +664,49 @@ func TestACallTheChainMovedUnderIsSimulatedAgain(t *testing.T) {
 		t.Fatalf("conflicts every time: %v", err)
 	}
 }
+
+func TestACallThatNeedsARestoreIsRefusedWhereRestoresAreRefused(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	marked := func(fee int64) {
+		h.fake.Simulate = func(protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+			key, _ := vault.InstanceKey("CBYJTWEOBJL52FA7J7JNDVM65TW64PXO2EIQBF5YVEE3OROZSBVMP2N5")
+			data, _ := xdr.MarshalBase64(xdr.SorobanTransactionData{
+				Ext:       xdr.SorobanTransactionDataExt{V: 1, ResourceExt: &xdr.SorobanResourcesExtV0{ArchivedSorobanEntries: []xdr.Uint32{0}}},
+				Resources: xdr.SorobanResources{Footprint: xdr.LedgerFootprint{ReadWrite: []xdr.LedgerKey{key}}},
+			})
+			return protocol.SimulateTransactionResponse{TransactionDataXDR: data, MinResourceFee: fee, Results: []protocol.SimulateHostFunctionResult{{}}}, nil
+		}
+	}
+	// By default a call restores what its simulation marks, within the fee cap, and keeps the marks.
+	marked(50_000)
+	p, err := h.engine.Prepare(ctx, h.account, invoke())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ext := p.Tx.ToXDR().V1.Tx.Ext.SorobanData.Ext; ext.V != 1 || len(ext.ResourceExt.ArchivedSorobanEntries) != 1 {
+		t.Fatalf("the marks were dropped: %+v", ext)
+	}
+	// Where restores are refused, a marked call is refused before the fee cap is weighed.
+	h.engine.RefuseRestores, h.engine.MaxResourceFee = true, 1_000_000
+	for _, fee := range []int64{50_000, 1_110_000_000} {
+		marked(fee)
+		if _, err := h.engine.Prepare(ctx, h.account, invoke()); !errors.Is(err, ErrRestoreNeeded) || !errors.Is(err, ErrSimulation) || errors.Is(err, ErrFeeCap) {
+			t.Fatalf("a restore of %d stroops: %v", fee, err)
+		}
+	}
+	// A simulation that asks for a separate restore first is refused either way.
+	h.fake.Simulate = func(protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		data, _ := xdr.MarshalBase64(xdr.SorobanTransactionData{})
+		return protocol.SimulateTransactionResponse{RestorePreamble: &protocol.RestorePreamble{TransactionDataXDR: data, MinResourceFee: 1_000}}, nil
+	}
+	for _, refuse := range []bool{true, false} {
+		h.engine.RefuseRestores = refuse
+		if _, err := h.engine.Prepare(ctx, h.account, invoke()); !errors.Is(err, ErrRestoreNeeded) || !errors.Is(err, ErrSimulation) {
+			t.Fatalf("a restore preamble: %v", err)
+		}
+	}
+	if h.fake.CallCount("sendTransaction") != 0 {
+		t.Fatal("a transaction was sent")
+	}
+}
