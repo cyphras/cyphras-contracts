@@ -58,6 +58,17 @@ var (
 	ErrExpired = errors.New("submit: transaction expired unconfirmed")
 )
 
+// FeeCapError is ErrFeeCap with the fees the simulation asked for, in stroops.
+type FeeCapError struct {
+	Resource, Inclusion, Cap int64
+}
+
+func (e *FeeCapError) Error() string {
+	return fmt.Sprintf("%v: %d stroops, the cap is %d", ErrFeeCap, e.Resource, e.Cap)
+}
+
+func (e *FeeCapError) Unwrap() error { return ErrFeeCap }
+
 // Engine prepares, signs, sends and tracks transactions.
 type Engine struct {
 	RPC        rpc.Client
@@ -564,7 +575,7 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 	// The padding's fees come from the network's settings as the RPC reports them, so the cap
 	// bounds the whole fee.
 	if limit > 0 && resource > limit {
-		return nil, fmt.Errorf("%w: %d stroops, the cap is %d", ErrFeeCap, resource, limit)
+		return nil, &FeeCapError{Resource: resource, Inclusion: inclusion, Cap: limit}
 	}
 	if e.RefuseRestores {
 		// The simulation marks only the entries it read, not those extend added, and an entry that

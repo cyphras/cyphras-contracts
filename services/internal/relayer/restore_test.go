@@ -117,7 +117,7 @@ func (h *harness) plainSimulation(fee int64) {
 func (h *harness) later() {
 	h.t.Helper()
 	h.mu.Lock()
-	h.now = h.now.Add(restoreVerdictLifetime)
+	h.now = h.now.Add(briefVerdictLifetime)
 	h.mu.Unlock()
 	h.fake.CloseTime = h.now.Unix()
 	if err := h.r.Refresh(context.Background()); err != nil {
@@ -160,9 +160,9 @@ func TestARelayThatNeedsARestoreIsRefusedBeforeAnythingIsSigned(t *testing.T) {
 		t.Fatalf("%d transactions sent", h.sent)
 	}
 
-	// The cost-only cap still refuses a call that needs no restore.
+	// The cost-only cap still refuses a call that needs no restore, for its network fee.
 	h.plainSimulation(60_000_000)
-	if code, out := h.post(fixture(t, "unshield_muxed")); code != http.StatusUnprocessableEntity || out["error"] != CodeRejected {
+	if code, out := h.post(fixture(t, "unshield_muxed")); code != http.StatusUnprocessableEntity || out["error"] != CodeNetworkFeeHigh {
 		t.Fatalf("a call above the cap: %d %v", code, out)
 	}
 	// Once someone restored the entries, the same proof is relayed after the minute.

@@ -47,6 +47,11 @@ const (
 	// relayer does not pay: the client self-relays, or anyone restores the entries and the same
 	// request goes again.
 	CodeRestoreNeeded = "restore_needed"
+	// CodeNetworkFeeHigh refuses a call whose network fee, as simulated now, is more than the fee
+	// the request pays the relayer or than the relayer's cap on resource fees; the answer names
+	// that network fee in stroops. The client self-relays, or sends the payment again once the
+	// network's fees fall.
+	CodeNetworkFeeHigh = "network_fee_high"
 )
 
 // Config fixes what the relayer serves.
@@ -165,9 +170,9 @@ type Relayer struct {
 	clock   *ledgerClock
 	known   spentSet
 	told    verdicts
-	// restores remembers, by statement, a verified request refused for archived entries, briefly,
-	// since anyone may restore them at any time.
-	restores verdicts
+	// brief remembers, by statement, a verified request refused for what may pass at any time,
+	// archived entries anyone may restore or a high network fee.
+	brief verdicts
 	// nfNext is the next ledger whose new_nullifier events the spent set takes in; only Run uses it.
 	nfNext uint32
 	// following counts the transactions being followed to their outcome.
@@ -236,7 +241,7 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		races: &breaker{failures: cfg.RaceFailures, window: cfg.RaceWindow, pause: cfg.GuardedFor},
 		clock: &ledgerClock{fallback: float64(cfg.LedgerSeconds)},
 		known: spentSet{max: maxKnownSpent}, told: verdicts{ttl: verdictLifetime, max: maxVerdicts},
-		restores: verdicts{ttl: restoreVerdictLifetime, max: maxVerdicts},
+		brief:    verdicts{ttl: briefVerdictLifetime, max: maxVerdicts},
 		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[string]*heldRequest{},
 		exitSlot: make(chan struct{}, 1),
 	}
@@ -256,8 +261,9 @@ const (
 	// verdictLifetime is how long a refusal is answered from memory; maxVerdicts bounds them.
 	verdictLifetime = 10 * time.Minute
 	maxVerdicts     = 10_000
-	// restoreVerdictLifetime is how long a restore_needed refusal is answered from memory.
-	restoreVerdictLifetime = time.Minute
+	// briefVerdictLifetime is how long a restore_needed or network_fee_high refusal is answered
+	// from memory.
+	briefVerdictLifetime = time.Minute
 )
 
 // guarded reports the mode relaying takes while clients keep winning races against it: deadlines
@@ -634,6 +640,8 @@ type failure struct {
 	status int
 	code   string
 	reason *uint32
+	// networkFee is the network fee in stroops of a call refused with CodeNetworkFeeHigh.
+	networkFee *int64
 	// settled marks an answer the same proof would get again, which is kept for a while.
 	settled bool
 }
@@ -641,6 +649,10 @@ type failure struct {
 func (f *failure) Error() string { return f.code }
 
 func fail(status int, code string) *failure { return &failure{status: status, code: code} }
+
+func networkFeeHigh(stroops int64) *failure {
+	return &failure{status: http.StatusUnprocessableEntity, code: CodeNetworkFeeHigh, networkFee: &stroops}
+}
 
 // settledFail is fail for an answer that does not change when the same proof is sent again soon.
 func settledFail(status int, code string) *failure {
@@ -779,7 +791,7 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	if f := r.told.recall(proofKey(req), r.now()); f != nil {
 		return Accepted{}, f
 	}
-	if f := r.restores.recall(statementKey(req), r.now()); f != nil {
+	if f := r.brief.recall(statementKey(req), r.now()); f != nil {
 		return Accepted{}, f
 	}
 	if f := r.local(ctx, req); f != nil {
@@ -806,8 +818,8 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	hash, f := r.relay(ctx, req)
 	if f != nil {
 		r.unclaim(req.Proof.Nullifiers)
-		if f.code == CodeRestoreNeeded {
-			r.restores.remember(statementKey(req), *f, r.now())
+		if f.code == CodeRestoreNeeded || f.code == CodeNetworkFeeHigh {
+			r.brief.remember(statementKey(req), *f, r.now())
 		}
 		return Accepted{}, f
 	}
@@ -1087,15 +1099,24 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	}
 	prepared, slot, err := r.prepare(ctx, ch, op, req)
 	if err != nil {
-		// Not kept as settled: once anyone restores the entries, the same request can go, so it is
-		// remembered for a minute only.
-		if errors.Is(err, submit.ErrRestoreNeeded) {
+		// Neither is kept as settled: once anyone restores the entries, or the network's fees fall,
+		// the same request can go, so it is remembered for a minute only.
+		var capped *submit.FeeCapError
+		switch {
+		case errors.Is(err, submit.ErrRestoreNeeded):
 			return "", fail(http.StatusUnprocessableEntity, CodeRestoreNeeded)
-		}
-		if errors.Is(err, submit.ErrSimulation) {
+		case errors.As(err, &capped):
+			return "", networkFeeHigh(capped.Inclusion + capped.Resource)
+		case errors.Is(err, submit.ErrSimulation):
 			return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
 		}
 		return "", fail(http.StatusServiceUnavailable, CodeUnavailable)
+	}
+	// The network may charge the whole fee of the envelope: the inclusion fee it bids and the
+	// resource fee it declares, refundable part included. A relay is cost-only, so that must not
+	// be more than the fee the request pays.
+	if cost := prepared.Tx.MaxFee(); r.cfg.Pricing.ToAsset(cost).Cmp(req.Ext.Fee) > 0 {
+		return "", networkFeeHigh(cost)
 	}
 	if r.guarded() {
 		if f := r.fresh(ctx, req); f != nil {

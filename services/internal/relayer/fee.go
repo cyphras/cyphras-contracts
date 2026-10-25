@@ -51,6 +51,15 @@ func ceilDiv(a, b *big.Int) *big.Int {
 	return q
 }
 
+// ToAsset converts a cost in stroops to the pool asset's smallest units, rounded up.
+func (p Pricing) ToAsset(costStroops int64) *big.Int {
+	cost := big.NewInt(costStroops)
+	if !p.Native {
+		cost = ceilDiv(new(big.Int).Mul(cost, p.PerStroopNum), p.PerStroopDen)
+	}
+	return cost
+}
+
 // Quote is roundUp(toAsset(cost) * (10000 + margin) / 10000, tier).
 func (p Pricing) Quote(costStroops int64) *big.Int {
 	return p.QuoteAt(costStroops, p.MarginBps)
@@ -58,10 +67,7 @@ func (p Pricing) Quote(costStroops int64) *big.Int {
 
 // QuoteAt is Quote with another margin, capped at MaxMarginBps.
 func (p Pricing) QuoteAt(costStroops, marginBps int64) *big.Int {
-	cost := big.NewInt(costStroops)
-	if !p.Native {
-		cost = ceilDiv(new(big.Int).Mul(cost, p.PerStroopNum), p.PerStroopDen)
-	}
+	cost := p.ToAsset(costStroops)
 	margin := min(marginBps, MaxMarginBps)
 	withMargin := ceilDiv(new(big.Int).Mul(cost, big.NewInt(10_000+margin)), big.NewInt(10_000))
 	return new(big.Int).Mul(ceilDiv(withMargin, p.Tier), p.Tier)

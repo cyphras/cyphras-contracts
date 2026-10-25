@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/cyphras/cyphras-contracts/services/internal/httpapi"
@@ -53,11 +54,14 @@ func (r *Relayer) Handler() http.Handler {
 		}
 		accepted, f := r.Submit(req.Context(), parsed)
 		if f != nil {
+			out := map[string]any{"error": f.code}
 			if f.reason != nil {
-				httpapi.JSON(w, f.status, map[string]any{"error": f.code, "reason": *f.reason})
-				return
+				out["reason"] = *f.reason
 			}
-			httpapi.Fail(w, f.status, f.code)
+			if f.networkFee != nil {
+				out["network_fee"] = strconv.FormatInt(*f.networkFee, 10)
+			}
+			httpapi.JSON(w, f.status, out)
 			return
 		}
 		httpapi.JSON(w, http.StatusAccepted, accepted)
