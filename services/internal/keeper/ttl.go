@@ -158,11 +158,11 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 	}
 	others, err = k.extend(ctx, others, renewWithin, maxTTL-1, latest)
 	fail(err)
-	nfFailures, err := k.nullifiers(ctx, maxTTL)
+	nfs, err := k.nullifiers(ctx, maxTTL)
 	if err != nil {
 		fail(fmt.Errorf("nullifiers: %w", err))
 	}
-	failures = append(failures, nfFailures...)
+	failures = append(failures, nfs.failures...)
 
 	// An entry of the vault's own a day below holdWithin has missed a day of renewals, long before
 	// the vault's writes would make users pay for it.
@@ -177,7 +177,7 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 	} else {
 		k.alerts.Clear(ctx, "ttl_behind", "the vault's instance, code and tree entries are held again")
 	}
-	urgent := 0
+	urgent := nfs.urgent
 	var archived []string
 	for _, t := range slices.Concat(own, queued, others) {
 		if t.urgent(latest) {
@@ -187,6 +187,10 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 			archived = append(archived, t.name)
 		}
 	}
+	if nfs.archived > 0 {
+		archived = append(archived, fmt.Sprintf("%d nullifiers", nfs.archived))
+	}
+	// One page a cycle: the alerter drops a repeat of the same code, so a second one would be lost.
 	if len(failures) > 0 {
 		if urgent > 0 {
 			msg := fmt.Sprintf("%d entries are archived or within 14 days of expiry and could not be restored or extended: %v", urgent, failures)
@@ -359,17 +363,25 @@ func footprint(readOnly, readWrite []xdr.LedgerKey) xdr.TransactionExt {
 	}}
 }
 
+// nullifierRun is what a run over the spent-nullifier entries left undone: the failures, and the
+// entries within 14 days of expiry or archived among the ones it could not extend.
+type nullifierRun struct {
+	failures         []string
+	urgent, archived int
+}
+
 // nullifiers extends spent-nullifier entries. Each entry's last known end of life is kept, so
 // only entries that may be due are read again.
-func (k *Keeper) nullifiers(ctx context.Context, maxTTL uint32) ([]string, error) {
+func (k *Keeper) nullifiers(ctx context.Context, maxTTL uint32) (nullifierRun, error) {
+	var run nullifierRun
 	_, latest, err := k.chainTime(ctx)
 	if err != nil {
-		return nil, err
+		return run, err
 	}
 	rows, err := k.chain.Pool.Query(ctx, `SELECT seq, nullifier FROM nullifiers
 		WHERE live_until IS NULL OR live_until < $1 ORDER BY seq`, int64(latest+renewWithin+ledgersPerDay))
 	if err != nil {
-		return nil, err
+		return run, err
 	}
 	type nf struct {
 		seq int64
@@ -381,25 +393,24 @@ func (k *Keeper) nullifiers(ctx context.Context, maxTTL uint32) ([]string, error
 		var raw []byte
 		if err := rows.Scan(&seq, &raw); err != nil {
 			rows.Close()
-			return nil, err
+			return run, err
 		}
 		e, err := fr.SetBytes([32]byte(raw))
 		if err != nil {
 			rows.Close()
-			return nil, err
+			return run, err
 		}
 		key, err := vault.NullifierKey(k.cfg.Vault, e.Bytes())
 		if err != nil {
 			rows.Close()
-			return nil, err
+			return run, err
 		}
 		list = append(list, nf{seq, key})
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return run, err
 	}
-	var failures []string
 	const readBatch = 200
 	for start := 0; start < len(list); start += readBatch {
 		chunk := list[start:min(start+readBatch, len(list))]
@@ -409,19 +420,18 @@ func (k *Keeper) nullifiers(ctx context.Context, maxTTL uint32) ([]string, error
 		}
 		items, latest, err := k.read(ctx, items)
 		if err != nil {
-			return nil, err
+			return run, err
 		}
 		items, err = k.extend(ctx, items, renewWithin, maxTTL-1, latest)
 		if err != nil {
-			failures = append(failures, err.Error())
-			urgent := 0
+			run.failures = append(run.failures, err.Error())
 			for _, t := range items {
 				if t.urgent(latest) {
-					urgent++
+					run.urgent++
 				}
-			}
-			if urgent > 0 {
-				k.alerts.Raise(ctx, alert.Critical, "entry_expiring", "%d nullifier entries are within 14 days of expiry and could not be extended", urgent)
+				if t.liveUntil == nil {
+					run.archived++
+				}
 			}
 		}
 		// The life recorded for an extended entry is the least its extension gave it, so the entry
@@ -431,11 +441,11 @@ func (k *Keeper) nullifiers(ctx context.Context, maxTTL uint32) ([]string, error
 				continue
 			}
 			if _, err := k.chain.Pool.Exec(ctx, `UPDATE nullifiers SET live_until = $2 WHERE seq = $1`, chunk[i].seq, int64(*t.liveUntil)); err != nil {
-				return nil, err
+				return run, err
 			}
 		}
 	}
-	return failures, nil
+	return run, nil
 }
 
 // Watch pages when the last complete TTL cycle is more than two hours old.
