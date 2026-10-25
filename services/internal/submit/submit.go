@@ -48,6 +48,10 @@ var (
 	ErrSimulation = errors.New("submit: simulation failed")
 	// ErrFeeCap reports a simulation whose resource fee is above the cap. It is an ErrSimulation.
 	ErrFeeCap = fmt.Errorf("%w: the resource fee is above the cap", ErrSimulation)
+	// ErrRestoreNeeded reports a call that needs archived entries restored: its simulation asks
+	// for a restore first, or, with RefuseRestores set, restores them within the call. It is an
+	// ErrSimulation.
+	ErrRestoreNeeded = fmt.Errorf("%w: archived entries need a restore", ErrSimulation)
 	// ErrRejected reports a transaction the network refused without including it.
 	ErrRejected = errors.New("submit: transaction rejected")
 	// ErrExpired reports a transaction whose time bound passed before it was included.
@@ -70,6 +74,12 @@ type Engine struct {
 	// MaxTTLFee, when set, takes the place of MaxResourceFee for footprint extensions and
 	// restorations, whose fee is mostly the rent of the entries they keep alive.
 	MaxTTLFee int64
+	// RefuseRestores refuses a transaction whose simulation restores archived entries within it,
+	// whose rent the source would pay, and one whose footprint holds an archived entry the
+	// simulation did not mark. It also bounds the transaction to the ledgers in which every
+	// persistent entry of its footprint is live, so an entry that lapses in flight drops the
+	// transaction for free.
+	RefuseRestores bool
 	// Validity is how long a signed transaction may wait for inclusion.
 	Validity time.Duration
 	// Poll is the interval between getTransaction calls.
@@ -326,6 +336,49 @@ func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData,
 	return fee, nil
 }
 
+// liveBound reads the persistent entries of a footprint and returns the first ledger in which one
+// of them is no longer live, or 0 when none of them exists yet. It fails with ErrRestoreNeeded when
+// one is not live in the first ledger the transaction can land in: the one after the newer of the
+// read's ledger and simulated, the simulation's.
+func (e *Engine) liveBound(ctx context.Context, fp xdr.LedgerFootprint, simulated uint32) (uint32, error) {
+	var keys []xdr.LedgerKey
+	for _, k := range slices.Concat(fp.ReadOnly, fp.ReadWrite) {
+		if k.Type == xdr.LedgerEntryTypeContractCode ||
+			(k.Type == xdr.LedgerEntryTypeContractData && k.ContractData.Durability == xdr.ContractDataDurabilityPersistent) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	entries, latest, err := rpc.Entries(ctx, e.RPC, keys)
+	if err != nil {
+		return 0, fmt.Errorf("footprint lives: %w", err)
+	}
+	closed := max(latest, simulated)
+	var bound uint32
+	for _, entry := range entries {
+		if entry.LiveUntil == nil {
+			continue
+		}
+		if *entry.LiveUntil <= closed {
+			return 0, fmt.Errorf("%w: an entry the call touches is archived", ErrRestoreNeeded)
+		}
+		if b := *entry.LiveUntil + 1; bound == 0 || b < bound {
+			bound = b
+		}
+	}
+	return bound, nil
+}
+
+// restoredEntries counts the archived entries a simulation marks for the call to restore.
+func restoredEntries(data xdr.SorobanTransactionData) int {
+	if data.Ext.V != 1 || data.Ext.ResourceExt == nil {
+		return 0
+	}
+	return len(data.Ext.ResourceExt.ArchivedSorobanEntries)
+}
+
 // classic reports an entry of an account or a trustline, which the network reads from disk.
 func classic(k xdr.LedgerKey) bool {
 	return k.Type == xdr.LedgerEntryTypeAccount || k.Type == xdr.LedgerEntryTypeTrustline
@@ -480,11 +533,14 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 		return nil, fmt.Errorf("%w: %s", ErrSimulation, sim.Error)
 	}
 	if sim.RestorePreamble != nil {
-		return nil, fmt.Errorf("%w: archived entries need a separate restore", ErrSimulation)
+		return nil, fmt.Errorf("%w: they need a separate restore first", ErrRestoreNeeded)
 	}
 	var data xdr.SorobanTransactionData
 	if err := xdr.SafeUnmarshalBase64(sim.TransactionDataXDR, &data); err != nil {
 		return nil, fmt.Errorf("simulation data: %w", err)
+	}
+	if n := restoredEntries(data); n > 0 && e.RefuseRestores {
+		return nil, fmt.Errorf("%w: the call would restore %d entries", ErrRestoreNeeded, n)
 	}
 	var extra int64
 	if extend != nil {
@@ -509,6 +565,18 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 	// bounds the whole fee.
 	if limit > 0 && resource > limit {
 		return nil, fmt.Errorf("%w: %d stroops, the cap is %d", ErrFeeCap, resource, limit)
+	}
+	if e.RefuseRestores {
+		// The simulation marks only the entries it read, not those extend added, and an entry that
+		// archives before the call's ledger would fail the call on chain.
+		bound, err := e.liveBound(ctx, data.Resources.Footprint, sim.LatestLedger)
+		if err != nil {
+			return nil, err
+		}
+		if bound > 0 && (maxLedger == 0 || bound < maxLedger) {
+			maxLedger = bound
+			pre.LedgerBounds = &txnbuild.LedgerBounds{MaxLedger: maxLedger}
+		}
 	}
 	data.ResourceFee = xdr.Int64(resource)
 	sop.setExt(xdr.TransactionExt{V: 1, SorobanData: &data})

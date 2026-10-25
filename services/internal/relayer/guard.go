@@ -173,6 +173,21 @@ func proofKey(req Request) [32]byte {
 	return out
 }
 
+// statementKey identifies a proof by its public inputs alone: the statement it proves, which every
+// re-randomization of the proof shares. Only a verified proof may be remembered under it, or a
+// broken one with another's inputs would answer for that other request.
+func statementKey(req Request) [32]byte {
+	p := req.Proof
+	h := sha256.New()
+	for _, e := range []fr.Element{p.Root, p.PublicAmount, p.ExtDataHash, p.Nullifiers[0], p.Nullifiers[1], p.Commitments[0], p.Commitments[1]} {
+		b := e.Bytes()
+		h.Write(b[:])
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
 func (v *verdicts) remember(key [32]byte, f failure, now time.Time) {
 	v.mu.Lock()
 	defer v.mu.Unlock()

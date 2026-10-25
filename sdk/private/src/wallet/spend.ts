@@ -615,6 +615,17 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
         retryOf = plan.id;
         continue;
       }
+      if (result.error === "restore_needed") {
+        const way =
+          intent.kind === "unshield"
+            ? "retry the payment with selfRelay, whose account pays the restore within a networkFeeCaps.restore the user agreed to, or restore them with restoreVault and retry it"
+            : "restore them with restoreVault, then retry the payment";
+        throw new CyphrasError(
+          "service_rejected",
+          `the vault's entries are archived and the relayer does not pay to restore them: ${way}`,
+          { code: result.error },
+        );
+      }
       throw new CyphrasError("service_rejected", "the relayer refused the submission", {
         code: result.error,
         ...(result.reason === undefined ? {} : { reason: result.reason }),

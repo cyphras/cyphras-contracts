@@ -35,6 +35,8 @@ const RELAYER_ERRORS = [
   "rejected",
   "rate_limited",
   "unavailable",
+  // The call needs archived vault entries restored, whose rent the relayer does not pay.
+  "restore_needed",
 ] as const;
 
 export type RelayerError = (typeof RELAYER_ERRORS)[number] | "unknown";

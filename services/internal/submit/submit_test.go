@@ -664,3 +664,96 @@ func TestACallTheChainMovedUnderIsSimulatedAgain(t *testing.T) {
 		t.Fatalf("conflicts every time: %v", err)
 	}
 }
+
+func TestACallThatNeedsARestoreIsRefusedWhereRestoresAreRefused(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	marked := func(fee int64) {
+		h.fake.Simulate = func(protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+			key, _ := vault.InstanceKey("CBYJTWEOBJL52FA7J7JNDVM65TW64PXO2EIQBF5YVEE3OROZSBVMP2N5")
+			data, _ := xdr.MarshalBase64(xdr.SorobanTransactionData{
+				Ext:       xdr.SorobanTransactionDataExt{V: 1, ResourceExt: &xdr.SorobanResourcesExtV0{ArchivedSorobanEntries: []xdr.Uint32{0}}},
+				Resources: xdr.SorobanResources{Footprint: xdr.LedgerFootprint{ReadWrite: []xdr.LedgerKey{key}}},
+			})
+			return protocol.SimulateTransactionResponse{TransactionDataXDR: data, MinResourceFee: fee, Results: []protocol.SimulateHostFunctionResult{{}}}, nil
+		}
+	}
+	// By default a call restores what its simulation marks, within the fee cap, and keeps the marks.
+	marked(50_000)
+	p, err := h.engine.Prepare(ctx, h.account, invoke())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ext := p.Tx.ToXDR().V1.Tx.Ext.SorobanData.Ext; ext.V != 1 || len(ext.ResourceExt.ArchivedSorobanEntries) != 1 {
+		t.Fatalf("the marks were dropped: %+v", ext)
+	}
+	// Where restores are refused, a marked call is refused before the fee cap is weighed.
+	h.engine.RefuseRestores, h.engine.MaxResourceFee = true, 1_000_000
+	for _, fee := range []int64{50_000, 1_110_000_000} {
+		marked(fee)
+		if _, err := h.engine.Prepare(ctx, h.account, invoke()); !errors.Is(err, ErrRestoreNeeded) || !errors.Is(err, ErrSimulation) || errors.Is(err, ErrFeeCap) {
+			t.Fatalf("a restore of %d stroops: %v", fee, err)
+		}
+	}
+	// A simulation that asks for a separate restore first is refused either way.
+	h.fake.Simulate = func(protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		data, _ := xdr.MarshalBase64(xdr.SorobanTransactionData{})
+		return protocol.SimulateTransactionResponse{RestorePreamble: &protocol.RestorePreamble{TransactionDataXDR: data, MinResourceFee: 1_000}}, nil
+	}
+	for _, refuse := range []bool{true, false} {
+		h.engine.RefuseRestores = refuse
+		if _, err := h.engine.Prepare(ctx, h.account, invoke()); !errors.Is(err, ErrRestoreNeeded) || !errors.Is(err, ErrSimulation) {
+			t.Fatalf("a restore preamble: %v", err)
+		}
+	}
+	if h.fake.CallCount("sendTransaction") != 0 {
+		t.Fatal("a transaction was sent")
+	}
+}
+
+func TestWhereRestoresAreRefusedTheFootprintMustStayLiveUntilTheCallsLedger(t *testing.T) {
+	h := newHarness(t)
+	h.fake.SetSettings(rpctest.Mainnet)
+	ctx := context.Background()
+	contract := "CBYJTWEOBJL52FA7J7JNDVM65TW64PXO2EIQBF5YVEE3OROZSBVMP2N5"
+	simulated, _ := vault.InstanceKey(contract)
+	added, _ := vault.ExitKey(contract, 9)
+	latest := h.fake.LatestLedger()
+	far, near, archived := latest+100_000, latest+2, latest-1
+	h.fake.SetContractData(simulated, vault.U64(0), 10, &far)
+	h.fake.Simulate = func(protocol.SimulateTransactionRequest) (protocol.SimulateTransactionResponse, error) {
+		data, _ := xdr.MarshalBase64(xdr.SorobanTransactionData{Resources: xdr.SorobanResources{Footprint: xdr.LedgerFootprint{ReadOnly: []xdr.LedgerKey{simulated}}}})
+		return protocol.SimulateTransactionResponse{TransactionDataXDR: data, MinResourceFee: 50_000, Results: []protocol.SimulateHostFunctionResult{{}}}, nil
+	}
+	room := func(context.Context, xdr.LedgerFootprint) (Extra, error) {
+		return Extra{ReadWrite: []xdr.LedgerKey{added}}, nil
+	}
+	h.engine.RefuseRestores = true
+
+	// An entry added after the simulation, archived, which the simulation could not mark.
+	h.fake.SetContractData(added, vault.U64(0), 10, &archived)
+	if _, err := h.engine.PrepareUntil(ctx, h.account, invoke(), latest+120, room); !errors.Is(err, ErrRestoreNeeded) {
+		t.Fatalf("an archived added entry: %v", err)
+	}
+	// One that lapses two ledgers on bounds the call to the ledgers it is live in.
+	h.fake.SetContractData(added, vault.U64(0), 10, &near)
+	p, err := h.engine.PrepareUntil(ctx, h.account, invoke(), latest+120, room)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bounds := p.Tx.ToXDR().V1.Tx.Cond.V2.LedgerBounds; p.MaxLedger != near+1 || bounds == nil || uint32(bounds.MaxLedger) != near+1 {
+		t.Fatalf("bounded at %d, %+v", p.MaxLedger, bounds)
+	}
+	// With every entry far from expiry, or not yet made, the caller's bound stands.
+	h.fake.SetContractData(added, vault.U64(0), 10, &far)
+	if p, err := h.engine.PrepareUntil(ctx, h.account, invoke(), latest+120, room); err != nil || p.MaxLedger != latest+120 {
+		t.Fatalf("bounded at %d: %v", p.MaxLedger, err)
+	}
+	// Without the refusal nothing is read and the bound is the caller's.
+	h.engine.RefuseRestores = false
+	h.fake.SetContractData(added, vault.U64(0), 10, &archived)
+	reads := h.fake.CallCount("getLedgerEntries")
+	if p, err := h.engine.PrepareUntil(ctx, h.account, invoke(), latest+120, room); err != nil || p.MaxLedger != latest+120 || h.fake.CallCount("getLedgerEntries") != reads {
+		t.Fatalf("without the refusal: %v", err)
+	}
+}

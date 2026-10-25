@@ -459,3 +459,27 @@ func TestTheVaultsEntriesHoldAtEachNetworksRent(t *testing.T) {
 		}
 	}
 }
+
+func TestAnArchivedEntryTheKeeperCannotRestorePagesForARestoreByHand(t *testing.T) {
+	h := newHarness(t)
+	h.sync()
+	latest := h.chain.Ledger
+	h.vaultLive(latest + holdWithin + renewStep)
+	archived := latest - 1
+	h.fake.SetEntry(vault.CodeKey([32]byte{9}), xdr.LedgerEntryData{Type: xdr.LedgerEntryTypeContractCode, ContractCode: &xdr.ContractCodeEntry{Hash: xdr.Hash{9}}}, 10, &archived)
+	// The code's restore costs more than TTL_FEE_CAP allows, as on mainnet.
+	h.simFail = func(d string) bool { return strings.HasPrefix(d, "restore") }
+	h.playTTL = true
+	if err := h.k.TTLCycle(context.Background()); err == nil {
+		t.Fatal("the cycle completed")
+	}
+	var paged string
+	for _, p := range h.pages {
+		if p.Code == "entry_expiring" {
+			paged = p.Message
+		}
+	}
+	if !strings.Contains(paged, "archived: vault code") || !strings.Contains(paged, "restore them by hand") {
+		t.Fatalf("entry_expiring paged %q", paged)
+	}
+}
