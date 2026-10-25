@@ -338,8 +338,9 @@ func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData,
 
 // liveBound reads the persistent entries of a footprint and returns the first ledger in which one
 // of them is no longer live, or 0 when none of them exists yet. It fails with ErrRestoreNeeded when
-// one is archived already.
-func (e *Engine) liveBound(ctx context.Context, fp xdr.LedgerFootprint) (uint32, error) {
+// one is not live in the first ledger the transaction can land in: the one after the newer of the
+// read's ledger and simulated, the simulation's.
+func (e *Engine) liveBound(ctx context.Context, fp xdr.LedgerFootprint, simulated uint32) (uint32, error) {
 	var keys []xdr.LedgerKey
 	for _, k := range slices.Concat(fp.ReadOnly, fp.ReadWrite) {
 		if k.Type == xdr.LedgerEntryTypeContractCode ||
@@ -354,12 +355,13 @@ func (e *Engine) liveBound(ctx context.Context, fp xdr.LedgerFootprint) (uint32,
 	if err != nil {
 		return 0, fmt.Errorf("footprint lives: %w", err)
 	}
+	closed := max(latest, simulated)
 	var bound uint32
 	for _, entry := range entries {
 		if entry.LiveUntil == nil {
 			continue
 		}
-		if *entry.LiveUntil < latest {
+		if *entry.LiveUntil <= closed {
 			return 0, fmt.Errorf("%w: an entry the call touches is archived", ErrRestoreNeeded)
 		}
 		if b := *entry.LiveUntil + 1; bound == 0 || b < bound {
@@ -565,9 +567,9 @@ func (e *Engine) PrepareUntil(ctx context.Context, a *Account, op txnbuild.Opera
 		return nil, fmt.Errorf("%w: %d stroops, the cap is %d", ErrFeeCap, resource, limit)
 	}
 	if e.RefuseRestores {
-		// The simulation marks only the entries it read; those extend added it did not, and an
-		// entry that archives before the call's ledger, would fail the call on chain instead.
-		bound, err := e.liveBound(ctx, data.Resources.Footprint)
+		// The simulation marks only the entries it read, not those extend added, and an entry that
+		// archives before the call's ledger would fail the call on chain.
+		bound, err := e.liveBound(ctx, data.Resources.Footprint, sim.LatestLedger)
 		if err != nil {
 			return nil, err
 		}

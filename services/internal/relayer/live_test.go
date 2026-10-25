@@ -180,7 +180,7 @@ func TestRestoreRefusalsAreRememberedConcurrentlyWithinTheirBound(t *testing.T) 
 		if codes[i] != CodeRestoreNeeded && codes[i] != CodeUnavailable {
 			t.Fatalf("request %d: %q", i, codes[i])
 		}
-		if remembered := h.r.restores.recall(proofKey(req), h.clock()) != nil; remembered != (codes[i] == CodeRestoreNeeded) {
+		if remembered := h.r.restores.recall(statementKey(req), h.clock()) != nil; remembered != (codes[i] == CodeRestoreNeeded) {
 			t.Fatalf("request %d answered %q, remembered %v", i, codes[i], remembered)
 		}
 	}

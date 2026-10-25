@@ -165,8 +165,8 @@ type Relayer struct {
 	clock   *ledgerClock
 	known   spentSet
 	told    verdicts
-	// restores remembers a request refused for archived entries, briefly, since anyone may restore
-	// them at any time.
+	// restores remembers, by statement, a verified request refused for archived entries, briefly,
+	// since anyone may restore them at any time.
 	restores verdicts
 	// nfNext is the next ledger whose new_nullifier events the spent set takes in; only Run uses it.
 	nfNext uint32
@@ -779,7 +779,7 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	if f := r.told.recall(proofKey(req), r.now()); f != nil {
 		return Accepted{}, f
 	}
-	if f := r.restores.recall(proofKey(req), r.now()); f != nil {
+	if f := r.restores.recall(statementKey(req), r.now()); f != nil {
 		return Accepted{}, f
 	}
 	if f := r.local(ctx, req); f != nil {
@@ -807,7 +807,7 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	if f != nil {
 		r.unclaim(req.Proof.Nullifiers)
 		if f.code == CodeRestoreNeeded {
-			r.restores.remember(proofKey(req), *f, r.now())
+			r.restores.remember(statementKey(req), *f, r.now())
 		}
 		return Accepted{}, f
 	}
