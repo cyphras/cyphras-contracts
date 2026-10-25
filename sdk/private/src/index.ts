@@ -24,6 +24,8 @@ export type { Verification, ServiceState } from "./wallet/services.ts";
 export type { ExitPart, PlanState, Route } from "./wallet/state.ts";
 export type { SyncLimits } from "./wallet/sources.ts";
 export type {
+  FeeEntry,
+  FeeEntryKind,
   FeeReason,
   NetworkFee,
   NetworkFeeCaps,

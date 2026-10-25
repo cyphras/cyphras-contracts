@@ -17,7 +17,7 @@ import {
   PINNED_DEPLOYMENTS,
   resolveDeployment,
 } from "../deployments.ts";
-import { CyphrasError, fail } from "../errors.ts";
+import { CyphrasError, type ErrorCode, fail } from "../errors.ts";
 import {
   type AddressKey,
   type FullViewingKeys,
@@ -95,6 +95,7 @@ import {
   checkIssuer,
   followHeld,
   quoteSpend,
+  relayerRefusal,
   resendConflicted,
   spend,
   submissionOf,
@@ -315,6 +316,12 @@ export interface PlanView extends Submission {
   // The relayer's last word on a pending plan: held until its not_before, pending, success or
   // failed, or unknown when the relayer could not say. The chain's evidence alone confirms it.
   readonly relayerStatus: string | undefined;
+  // The relayer's code for its last refusal or failure of a relayed plan's request, as
+  // restore_needed or network_fee_high, a held or resent one's too; undefined for a self-relayed
+  // plan. The last error that stopped the plan's submission, by the SDK's code and message:
+  // service_rejected for a relayer's refusal.
+  readonly relayerCode: string | undefined;
+  readonly lastError: { readonly code: ErrorCode; readonly message: string } | undefined;
   // The payment may still land, or failed by the wallet's last reading of the chain only: paying
   // it again goes through retry, which spends the same notes. A new unshield to its destination is
   // refused while it is prepared or submitted.
@@ -410,6 +417,24 @@ function partFate(
       q.inputs.some((i) => part.inputs.some((input) => input.nf === i.nf)),
   );
   return ours ? "unpaid" : "blocked";
+}
+
+const relayed = (p: Plan): boolean => p.route.kind === "relayer";
+
+// The last error that stopped a plan's submission, with its message, which a plan saved by an
+// earlier release lacks: a relayer's refusal says it again from its code.
+function lastErrorOf(p: Plan): PlanView["lastError"] {
+  if (p.error === undefined) return undefined;
+  if (relayed(p)) {
+    return {
+      code: "service_rejected",
+      message: p.errorMessage ?? relayerRefusal(p.kind, p.error, undefined, undefined).message,
+    };
+  }
+  return {
+    code: p.error as ErrorCode,
+    message: p.errorMessage ?? `the submission stopped with ${p.error}`,
+  };
 }
 
 // A view-only wallet has no seed, so its store key comes from the viewing key: its state is as
@@ -1143,6 +1168,8 @@ export class PrivateWallet {
           p.exit === undefined ? undefined : p.exit.confirmed && p.exit.account === undefined,
         operationId: p.operationId,
         relayerStatus: p.relayerStatus,
+        relayerCode: relayed(p) ? p.error : undefined,
+        lastError: lastErrorOf(p),
         mustRetry: isActive(p) || p.state === "dead",
         needsUserDecision: isActive(p) && (state.rootCheck?.ledger ?? 0) >= p.deadline,
         retryOf: p.retryOf,
@@ -1363,6 +1390,7 @@ export class PrivateWallet {
         relayer: undefined,
         warnings: [],
         parts,
+        queued: false,
       }));
     if (!confirmed) fail("not_confirmed", "a split unshield must be confirmed as a whole");
     const op: Operation = {

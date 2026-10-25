@@ -3,7 +3,7 @@ import {
   Address,
   FeeBumpTransaction,
   Operation,
-  type Transaction,
+  Transaction,
   TransactionBuilder,
   xdr,
 } from "@stellar/stellar-base";
@@ -28,15 +28,34 @@ import { accountKey } from "./state.ts";
  */
 export type FeeReason = "network" | "restore" | "rent";
 
+/**
+ * What a ledger entry a fee restores or renews is to the pool: the vault's code, its instance, its
+ * tree (Roots, Frontier, NextLeaf), a balance in the pool asset contract, that contract's instance,
+ * a record of one nullifier, deposit or exit, or any other entry.
+ */
+export type FeeEntryKind = "code" | "instance" | "tree" | "balance" | "asset" | "record" | "other";
+
+/** A ledger entry a fee restores or renews: its kind, its name in `entries`, and its key as base64 XDR. */
+export interface FeeEntry {
+  readonly kind: FeeEntryKind;
+  readonly name: string;
+  readonly key: string;
+}
+
 /** The network fee of a Stellar transaction the SDK built, in stroops. */
 export interface NetworkFee {
   // What the transaction bids for inclusion, and what its simulated resources cost.
   readonly inclusion: bigint;
   readonly resource: bigint;
   readonly total: bigint;
-  // Why the resource fee is what it is, and the entries it restores or renews, by name.
+  // Why the resource fee is what it is, and the entries it restores or renews, by name, and one by
+  // one with their kinds and keys.
   readonly reason: FeeReason;
   readonly entries: readonly string[];
+  readonly feeEntries: readonly FeeEntry[];
+  // The total is above what one transaction's fee field holds, so the transaction goes inside a fee
+  // bump from the same account, and the signer signs both.
+  readonly feeBump: boolean;
 }
 
 /** The most the SDK lets a transaction it builds pay, in stroops. */
@@ -55,6 +74,9 @@ export const DEFAULT_NETWORK_FEE_CAPS: NetworkFeeCaps = {
 
 // The most a transaction envelope's fee field holds, in stroops.
 const MAX_ENVELOPE_FEE = 4_294_967_295n;
+// The most a fee bump pays in all here, in stroops: stellar-core takes a Soroban resource fee of at
+// most 2^50 (MAX_RESOURCE_FEE in TransactionFrame.cpp), and a fee bump's fee field is an int64.
+const MAX_BUMPED_FEE = 2n ** 50n;
 
 // Caps a caller gives, checked: each present one a bigint of at least 0, the inclusion cap within
 // what an envelope holds. Caps left undefined are dropped, so they keep the caps they would replace.
@@ -91,11 +113,21 @@ export interface VaultRestore {
  * the signed transaction envelope as base64 XDR, or an object carrying it as `signedTxXdr`. A
  * signer that can ask its user implements confirmFee: every transaction the SDK builds shows it the
  * network fee before signing, and goes ahead only on true.
+ *
+ * A transaction whose fee is above what one envelope's fee field holds, 4,294,967,295 stroops, goes
+ * inside a fee bump that the same account pays (NetworkFee.feeBump). After one confirmFee for the
+ * whole fee, signTransaction is called twice: first with the transaction, whose fee field is 0, and
+ * then with the fee-bump envelope (ENVELOPE_TYPE_TX_FEE_BUMP) that holds it signed; each result must
+ * be the envelope it was given with signatures added. A signer that cannot sign a fee-bump envelope
+ * sets signsFeeBumps to false: such a fee then fails with fee_above_limit before anything is signed.
+ * A reply to the fee bump that declines fails with signer_rejected, and one that is not the fee bump
+ * signed with signer_mismatch, both with details.feeBump; nothing is sent then.
  */
 export interface TransactionSigner {
   readonly publicKey: string;
   signTransaction(xdr: string, networkPassphrase: string): Promise<unknown>;
   confirmFee?(fee: NetworkFee): boolean | Promise<boolean>;
+  readonly signsFeeBumps?: boolean;
 }
 
 /**
@@ -501,6 +533,23 @@ const entryNames = (keys: readonly xdr.LedgerKey[], o: Owners): string[] => [
   ...new Set(keys.map((k) => entryName(k, o))),
 ];
 
+const TREE = new Set(["Roots", "Frontier", "NextLeaf"]);
+
+// The kind of an entry by the name entryName gives it, which names its owner.
+function entryKind(name: string): FeeEntryKind {
+  if (name === "code" || name === "instance") return name;
+  if (TREE.has(name)) return "tree";
+  if (PER_ITEM.has(name)) return "record";
+  if (name === "asset Balance") return "balance";
+  return name === "asset instance" ? "asset" : "other";
+}
+
+const feeEntriesOf = (keys: readonly xdr.LedgerKey[], o: Owners): FeeEntry[] =>
+  keys.map((k) => {
+    const name = entryName(k, o);
+    return { kind: entryKind(name), name, key: keyId(k) };
+  });
+
 // The holder of a balance entry in a contract, keyed as the asset contract keys it.
 function holderOf(key: xdr.LedgerKey): string | undefined {
   if (key.switch().name !== "contractData") return undefined;
@@ -564,33 +613,81 @@ async function readEntries(
   return { latestLedger, entries };
 }
 
-// The fee shown for a transaction, refused above what an envelope carries, whatever the caps, and
-// above the caps: a restore or a renewal may take the caps' room for a restore beyond the resource
-// cap.
+// The fee shown for a transaction that bids `bid` for inclusion, refused above what it can carry,
+// whatever the caps, and above the caps: a restore or a renewal may take the caps' room for a
+// restore beyond the resource cap. One above what an envelope's fee field holds goes in a fee bump,
+// unless the signer cannot sign one. A fee bump counts as two operations, so it bids twice to keep
+// the same rate per operation (FeeBumpTransactionFrame::getNumOperations is the inner's plus one).
 function checkFee(
   caps: NetworkFeeCaps,
-  inclusion: bigint,
+  bid: bigint,
   resource: bigint,
   reason: FeeReason,
-  entries: readonly string[],
+  keys: readonly xdr.LedgerKey[],
+  o: Owners,
+  signer: TransactionSigner,
 ): NetworkFee {
+  const entries = entryNames(keys, o);
+  const bumps = signer.signsFeeBumps !== false;
+  const feeBump = bumps && bid + resource > MAX_ENVELOPE_FEE;
+  const inclusion = feeBump ? bid * 2n : bid;
   const details = {
     inclusion: inclusion.toString(),
     resource: resource.toString(),
     reason,
-    ...(entries.length === 0 ? {} : { entries: entries.join(",") }),
+    ...(entries.length === 0
+      ? {}
+      : { entries: entries.join(","), entryKinds: entries.map(entryKind).join(",") }),
   };
-  if (inclusion + resource > MAX_ENVELOPE_FEE) {
-    fail("fee_above_limit", "the network fee is above what one transaction carries", {
-      ...details,
-      limit: MAX_ENVELOPE_FEE.toString(),
-    });
+  if (inclusion + resource > (bumps ? MAX_BUMPED_FEE : MAX_ENVELOPE_FEE)) {
+    if (bumps) {
+      fail("fee_above_limit", "the network fee is above what a fee-bumped transaction carries", {
+        ...details,
+        limit: MAX_BUMPED_FEE.toString(),
+      });
+    }
+    fail(
+      "fee_above_limit",
+      "the network fee is above what one transaction carries, and the signer does not sign fee bumps",
+      { ...details, limit: MAX_ENVELOPE_FEE.toString(), feeBump: "unsupported" },
+    );
   }
   const room = reason === "network" ? caps.resource : caps.resource + caps.restore;
   if (inclusion > caps.inclusion || resource > room) {
     fail("fee_above_cap", "the network fee is above the cap", details);
   }
-  return { inclusion, resource, total: inclusion + resource, reason, entries };
+  return {
+    inclusion,
+    resource,
+    total: inclusion + resource,
+    reason,
+    entries,
+    feeEntries: feeEntriesOf(keys, o),
+    feeBump,
+  };
+}
+
+// The transaction `make` builds for a fee, from the inclusion fee and the Soroban data it is given:
+// one whose fee field holds the whole fee, or, for a fee bump, one whose fee field is 0, as the
+// resource fee may not fit that field. From protocol 23 stellar-core takes an inner Soroban
+// transaction whose fee is below its resource fee, the fee bump paying it all
+// (FeeBumpTransactionFrame::commonValidPreSeqNum, and TransactionFrame, which checks
+// `resourceFee > getFullFee()` only where the transaction pays its own fee).
+function priced(
+  fee: NetworkFee,
+  data: xdr.SorobanTransactionData,
+  networkPassphrase: string,
+  make: (inclusion: bigint, data: xdr.SorobanTransactionData) => Transaction,
+): Transaction {
+  if (!fee.feeBump) return make(fee.inclusion, data);
+  const unpriced = new xdr.SorobanTransactionData({
+    ext: data.ext(),
+    resources: data.resources(),
+    resourceFee: xdr.Int64.fromString("0"),
+  });
+  const envelope = make(0n, unpriced).toEnvelope();
+  envelope.v1().tx().ext(new xdr.TransactionExt(1, data));
+  return new Transaction(envelope, networkPassphrase);
 }
 
 async function sequenceOf(rpc: SorobanRpc, account: string): Promise<string> {
@@ -606,16 +703,46 @@ async function inclusionFee(rpc: SorobanRpc): Promise<bigint> {
   return quoted > MIN_INCLUSION_FEE ? quoted : MIN_INCLUSION_FEE;
 }
 
-function signedEnvelope(value: unknown): string {
+function signedEnvelope(value: unknown, details: ErrorDetails): string {
   if (isDeclinedSignature(value, "signedTxXdr")) {
-    return fail("signer_rejected", "the signer declined to sign the transaction");
+    return fail("signer_rejected", "the signer declined to sign the transaction", details);
   }
   if (typeof value === "string") return value;
   if (typeof value === "object" && value !== null) {
     const signed = (value as Record<string, unknown>)["signedTxXdr"];
     if (typeof signed === "string") return signed;
   }
-  return fail("signer_mismatch", "the signer returned no transaction envelope");
+  return fail("signer_mismatch", "the signer returned no transaction envelope", details);
+}
+
+// Has the signer sign a transaction or a fee bump, and returns the envelope it signed, which may
+// add signatures but not change what it was given.
+async function signedBy(
+  signer: TransactionSigner,
+  tx: Transaction | FeeBumpTransaction,
+  networkPassphrase: string,
+): Promise<{ readonly envelope: string; readonly signed: Transaction | FeeBumpTransaction }> {
+  const bump = tx instanceof FeeBumpTransaction;
+  const what = bump ? "fee bump" : "transaction";
+  const details: ErrorDetails = bump ? { feeBump: true } : {};
+  const envelope = signedEnvelope(
+    await signer.signTransaction(tx.toXDR(), networkPassphrase),
+    details,
+  );
+  let signed: Transaction | FeeBumpTransaction;
+  try {
+    signed = TransactionBuilder.fromXDR(envelope, networkPassphrase);
+  } catch {
+    return fail("signer_mismatch", "the signer returned an unreadable envelope", details);
+  }
+  if (
+    signed instanceof FeeBumpTransaction !== bump ||
+    bytesToHex(Uint8Array.from(signed.hash())) !== bytesToHex(Uint8Array.from(tx.hash()))
+  ) {
+    fail("signer_mismatch", `the signer returned a different ${what}`, details);
+  }
+  if (signed.signatures.length === 0) fail("signer_mismatch", `the ${what} is not signed`, details);
+  return { envelope, signed };
 }
 
 function simulationFailure(code: number | undefined): CyphrasError {
@@ -636,8 +763,9 @@ export interface SubmitHooks {
   readonly onDropped?: (hash: string) => Promise<void>;
 }
 
-// Builds, simulates, signs and submits one vault call with the signer's account as source, then
-// waits until the transaction is final. A transaction the RPC reports the network refused, or did
+// Builds, simulates, signs and submits one vault call with the signer's account as source, inside
+// a fee bump the same account pays when its fee is above what one envelope holds, then waits until
+// the transaction is final. A transaction the RPC reports the network refused, or did
 // not take before its time bound passed, fails with details.refused. The call restores the
 // archived entries its simulation marks, within the caps' room for a restore; when the RPC asks
 // for a RestoreFootprint transaction first, the signer sends that one before the call, and a
@@ -901,16 +1029,12 @@ async function attemptCall(
     inclusion,
     BigInt(data.resourceFee().toString()),
     reason,
-    entryNames(reason === "restore" ? restored : reason === "rent" ? renewed : [], ctx),
-  );
-  const sent = await submit(
+    reason === "restore" ? restored : reason === "rent" ? renewed : [],
     ctx,
     signer,
-    build(inclusion, data, auth, maxLedger),
-    fee,
-    hooks,
-    maxLedger,
   );
+  const tx = priced(fee, data, ctx.networkPassphrase, (bid, d) => build(bid, d, auth, maxLedger));
+  const sent = await submit(ctx, signer, tx, fee, hooks, maxLedger);
   if (sent.kind === "dropped")
     return { kind: "dropped", hash: sent.hash, maxLedger: maxLedger ?? 0 };
   const { hash, status } = sent;
@@ -934,8 +1058,8 @@ type Sent =
     }
   | { readonly kind: "dropped"; readonly hash: string };
 
-// Shows the fee to the signer, has it sign the transaction, sends the signed envelope and waits
-// until the transaction is final.
+// Shows the fee to the signer, has it sign the transaction, and for a fee bump then the fee bump
+// that holds it signed, sends the signed envelope and waits until the transaction is final.
 async function submit(
   ctx: Pick<InvokeContext, "rpc" | "networkPassphrase" | "now" | "sleep">,
   signer: TransactionSigner,
@@ -947,22 +1071,26 @@ async function submit(
   if (signer.confirmFee !== undefined && !(await signer.confirmFee(fee))) {
     fail("not_confirmed", "the network fee was not confirmed");
   }
-  // The builder adds the resource fee of the Soroban data to the inclusion fee it is given.
-  if (BigInt(tx.fee) !== fee.total) fail("rpc_error", "the transaction's fee is not the one shown");
-  const hash = bytesToHex(Uint8Array.from(tx.hash()));
-
-  const signedXdr = signedEnvelope(await signer.signTransaction(tx.toXDR(), ctx.networkPassphrase));
-  let signed: Transaction | FeeBumpTransaction;
-  try {
-    signed = TransactionBuilder.fromXDR(signedXdr, ctx.networkPassphrase);
-  } catch {
-    return fail("signer_mismatch", "the signer returned an unreadable envelope");
+  // The builder adds the resource fee of the Soroban data to the inclusion fee it is given; a fee
+  // bump pays the whole fee.
+  if (BigInt(tx.fee) !== (fee.feeBump ? 0n : fee.total)) {
+    fail("rpc_error", "the transaction's fee is not the one shown");
   }
-  // The signer may add signatures but not change the transaction.
-  if (signed instanceof FeeBumpTransaction || bytesToHex(Uint8Array.from(signed.hash())) !== hash) {
-    fail("signer_mismatch", "the signer returned a different transaction");
+  let { envelope: signedXdr, signed } = await signedBy(signer, tx, ctx.networkPassphrase);
+  if (fee.feeBump) {
+    const bump = TransactionBuilder.buildFeeBumpTransaction(
+      signer.publicKey,
+      (fee.inclusion / 2n).toString(),
+      signed as Transaction,
+      ctx.networkPassphrase,
+    );
+    if (BigInt(bump.fee) !== fee.total)
+      fail("rpc_error", "the fee bump's fee is not the one shown");
+    ({ envelope: signedXdr, signed } = await signedBy(signer, bump, ctx.networkPassphrase));
   }
-  if (signed.signatures.length === 0) fail("signer_mismatch", "the transaction is not signed");
+  // A fee bump is sent, found and followed by its own hash, which commits to the signed transaction
+  // inside it; the RPC finds it by either.
+  const hash = bytesToHex(Uint8Array.from(signed.hash()));
 
   const deadline = ctx.now() + (TIMEOUT_SECONDS + 30) * 1000;
   // Once the RPC holds the last ledger a bound transaction could land in, it can land no more.
@@ -1026,15 +1154,17 @@ async function restoreSent(
   const sequence = await sequenceOf(ctx.rpc, signer.publicKey);
   const inclusion = await inclusionFee(ctx.rpc);
   const resource = BigInt(data.resourceFee().toString());
-  const fee = checkFee(ctx.feeCaps, inclusion, resource, "restore", entryNames(keys, ctx));
-  const tx = new TransactionBuilder(new Account(signer.publicKey, sequence), {
-    fee: inclusion.toString(),
-    networkPassphrase: ctx.networkPassphrase,
-    sorobanData: data,
-  })
-    .addOperation(Operation.restoreFootprint({}))
-    .setTimeout(TIMEOUT_SECONDS)
-    .build();
+  const fee = checkFee(ctx.feeCaps, inclusion, resource, "restore", keys, ctx, signer);
+  const tx = priced(fee, data, ctx.networkPassphrase, (bid, sorobanData) =>
+    new TransactionBuilder(new Account(signer.publicKey, sequence), {
+      fee: bid.toString(),
+      networkPassphrase: ctx.networkPassphrase,
+      sorobanData,
+    })
+      .addOperation(Operation.restoreFootprint({}))
+      .setTimeout(TIMEOUT_SECONDS)
+      .build(),
+  );
   let sent: Sent;
   try {
     sent = await submit(ctx, signer, tx, fee, {}, undefined);
