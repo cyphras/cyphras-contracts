@@ -626,6 +626,23 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
           { code: result.error },
         );
       }
+      if (result.error === "network_fee_high") {
+        const fee = result.networkFee === undefined ? "" : ` (${result.networkFee} stroops)`;
+        const way =
+          intent.kind === "unshield"
+            ? "retry the payment with selfRelay, whose account pays the network fee within a networkFeeCaps.resource the user agreed to for this payment, or retry it later"
+            : "retry the payment later";
+        throw new CyphrasError(
+          "service_rejected",
+          `the network fee is high now${fee}, more than the relayer's fee covers: ${way}`,
+          {
+            code: result.error,
+            ...(result.networkFee === undefined
+              ? {}
+              : { networkFee: result.networkFee.toString() }),
+          },
+        );
+      }
       throw new CyphrasError("service_rejected", "the relayer refused the submission", {
         code: result.error,
         ...(result.reason === undefined ? {} : { reason: result.reason }),

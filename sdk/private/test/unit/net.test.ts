@@ -462,20 +462,37 @@ describe("relayer client", () => {
       "rejected",
       "rate_limited",
       "unavailable",
+      "restore_needed",
+      "network_fee_high",
     ]) {
       const result = await new RelayerClient("http://r", reply(400, { error })).submit(proof, ext);
-      assert.deepEqual(result, { accepted: false, error, reason: undefined });
+      assert.deepEqual(result, {
+        accepted: false,
+        error,
+        reason: undefined,
+        networkFee: undefined,
+      });
     }
     const refused = await new RelayerClient(
       "http://r",
       reply(403, { error: "refused", reason: 1 }),
     ).submit(proof, ext);
-    assert.deepEqual(refused, { accepted: false, error: "refused", reason: 1 });
+    assert.deepEqual(refused, {
+      accepted: false,
+      error: "refused",
+      reason: 1,
+      networkFee: undefined,
+    });
     const odd = await new RelayerClient("http://r", reply(418, { error: "teapot" })).submit(
       proof,
       ext,
     );
-    assert.deepEqual(odd, { accepted: false, error: "unknown", reason: undefined });
+    assert.deepEqual(odd, {
+      accepted: false,
+      error: "unknown",
+      reason: undefined,
+      networkFee: undefined,
+    });
     await assert.rejects(
       new RelayerClient("http://r", reply(503, { error: "unavailable" })).quote(),
       (err: unknown) =>

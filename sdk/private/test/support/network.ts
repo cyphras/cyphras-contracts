@@ -342,7 +342,7 @@ export class MockRelayer {
   // transactions sent fail on the host's storage, which the relayer reports as failed with the
   // code "unavailable" and rests nothing for, or fail on chain otherwise, which it reports as
   // failed with the code "rejected".
-  failures: { error: string; reason?: number }[] = [];
+  failures: { error: string; reason?: number; network_fee?: string }[] = [];
   conflictNext = 0;
   failNext = 0;
   // The nullifiers of requests held in memory, which a second submission may not claim.
