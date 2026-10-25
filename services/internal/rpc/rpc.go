@@ -261,3 +261,61 @@ func BaseReserve(ctx context.Context, c Client) (int64, error) {
 	}
 	return int64(header.BaseReserve), nil
 }
+
+// SorobanState is the size of the live Soroban state the network prices rent by, in bytes, and
+// the rent of 1 KiB of persistent state over a rent period at it and at the network's target size,
+// above which rent grows by the growth factor.
+type SorobanState struct {
+	Average, Target, Growth int64
+	Rent1KB, TargetRent1KB  int64
+}
+
+// ReadSorobanState reads the window of live Soroban state sizes and the rent settings.
+func ReadSorobanState(ctx context.Context, c Client) (SorobanState, error) {
+	windowKey := vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingLiveSorobanStateSizeWindow)
+	costKey := vault.ConfigSettingKey(xdr.ConfigSettingIdConfigSettingContractLedgerCostV0)
+	entries, _, err := Entries(ctx, c, []xdr.LedgerKey{windowKey, costKey})
+	if err != nil {
+		return SorobanState{}, err
+	}
+	var window []xdr.Uint64
+	var cost *xdr.ConfigSettingContractLedgerCostV0
+	for _, e := range entries {
+		if s := e.Data.ConfigSetting; s != nil && s.LiveSorobanStateSizeWindow != nil {
+			window = *s.LiveSorobanStateSizeWindow
+		} else if s != nil && s.ContractLedgerCost != nil {
+			cost = s.ContractLedgerCost
+		}
+	}
+	if len(window) == 0 || cost == nil || cost.SorobanStateTargetSizeBytes <= 0 {
+		return SorobanState{}, errors.New("rpc: the network's state size settings are missing")
+	}
+	st := SorobanState{Average: StateAverage(window), Target: int64(cost.SorobanStateTargetSizeBytes), Growth: int64(cost.SorobanStateRentFeeGrowthFactor)}
+	low, high := int64(cost.RentFee1KbSorobanStateSizeLow), int64(cost.RentFee1KbSorobanStateSizeHigh)
+	st.Rent1KB = RentPerKB(st.Average, low, high, st.Target, st.Growth)
+	st.TargetRent1KB = RentPerKB(st.Target, low, high, st.Target, st.Growth)
+	return st, nil
+}
+
+// StateAverage is the mean of the network's window of live Soroban state sizes.
+func StateAverage(window []xdr.Uint64) int64 {
+	var sum uint64
+	for _, n := range window {
+		sum += uint64(n)
+	}
+	return int64(sum / uint64(len(window)))
+}
+
+// RentPerKB is the network's rent for 1 KiB of persistent state over a rent period, which grows
+// with the size of the Soroban state as the host computes it.
+func RentPerKB(size, low, high, target, growth int64) int64 {
+	target = max(target, 1)
+	ceilDiv := func(a, b int64) int64 { return (a + b - 1) / b }
+	var fee int64
+	if size < target {
+		fee = ceilDiv((high-low)*size, target) + low
+	} else {
+		fee = high + ceilDiv((high-low)*(size-target)*growth, target)
+	}
+	return max(fee, 1000)
+}

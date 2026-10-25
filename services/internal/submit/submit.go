@@ -157,18 +157,14 @@ func (e *Engine) ledgerCosts(ctx context.Context) (ledgerCosts, error) {
 		return ledgerCosts{}, errors.New("ledger costs: the network's settings are missing")
 	}
 	c, a := cost.ContractLedgerCost, archival.StateArchivalSettings
-	var size uint64
-	for _, n := range *state.LiveSorobanStateSizeWindow {
-		size += uint64(n)
-	}
-	size /= uint64(len(*state.LiveSorobanStateSizeWindow))
+	size := rpc.StateAverage(*state.LiveSorobanStateSizeWindow)
 	e.costs = ledgerCosts{
 		at: e.now(), instruction: int64(compute.ContractCompute.FeeRatePerInstructionsIncrement),
 		readEntry: int64(c.FeeDiskReadLedgerEntry), writeEntry: int64(c.FeeWriteLedgerEntry),
 		read1KB: int64(c.FeeDiskRead1Kb), write1KB: int64(ext.ContractLedgerCostExt.FeeWrite1Kb),
 		historical1KB: int64(historical.ContractHistoricalData.FeeHistorical1Kb), txSize1KB: int64(bandwidth.ContractBandwidth.FeeTxSize1Kb),
 		events1KB:       int64(events.ContractEvents.FeeContractEvents1Kb),
-		rent1KB:         rentPerKB(int64(size), int64(c.RentFee1KbSorobanStateSizeLow), int64(c.RentFee1KbSorobanStateSizeHigh), int64(c.SorobanStateTargetSizeBytes), int64(c.SorobanStateRentFeeGrowthFactor)),
+		rent1KB:         rpc.RentPerKB(size, int64(c.RentFee1KbSorobanStateSizeLow), int64(c.RentFee1KbSorobanStateSizeHigh), int64(c.SorobanStateTargetSizeBytes), int64(c.SorobanStateRentFeeGrowthFactor)),
 		rentDenominator: int64(a.PersistentRentRateDenominator), minPersistentTTL: uint32(a.MinPersistentTtl),
 		maxInstructions: uint32(compute.ContractCompute.TxMaxInstructions),
 		maxReadEntries:  uint32(c.TxMaxDiskReadEntries), maxWriteEntries: uint32(c.TxMaxWriteLedgerEntries),
@@ -176,19 +172,6 @@ func (e *Engine) ledgerCosts(ctx context.Context) (ledgerCosts, error) {
 		maxReadBytes: uint32(c.TxMaxDiskReadBytes), maxWrites: uint32(c.TxMaxWriteBytes),
 	}
 	return e.costs, nil
-}
-
-// rentPerKB is the network's rent for 1 KiB of persistent state over a rent period, which grows
-// with the size of the Soroban state as the host computes it.
-func rentPerKB(size, low, high, target, growth int64) int64 {
-	target = max(target, 1)
-	var fee int64
-	if size < target {
-		fee = ceilDiv((high-low)*size, target) + low
-	} else {
-		fee = high + ceilDiv((high-low)*(size-target)*growth, target)
-	}
-	return max(fee, 1000)
 }
 
 func ceilDiv(a, b int64) int64 {
