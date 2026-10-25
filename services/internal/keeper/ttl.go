@@ -178,14 +178,24 @@ func (k *Keeper) TTLCycle(ctx context.Context) error {
 		k.alerts.Clear(ctx, "ttl_behind", "the vault's instance, code and tree entries are held again")
 	}
 	urgent := 0
+	var archived []string
 	for _, t := range slices.Concat(own, queued, others) {
 		if t.urgent(latest) {
 			urgent++
 		}
+		if !t.gone() && t.liveUntil == nil {
+			archived = append(archived, t.name)
+		}
 	}
 	if len(failures) > 0 {
 		if urgent > 0 {
-			k.alerts.Raise(ctx, alert.Critical, "entry_expiring", "%d entries are within 14 days of expiry and could not be extended: %v", urgent, failures)
+			msg := fmt.Sprintf("%d entries are archived or within 14 days of expiry and could not be restored or extended: %v", urgent, failures)
+			// An entry can cost more to restore than TTL_FEE_CAP lets the keeper pay, as the vault's
+			// code does on mainnet, so its restore is sent by hand from another account.
+			if len(archived) > 0 {
+				msg += fmt.Sprintf("; archived: %s; restore them by hand with a RestoreFootprint from an account that pays their rent", strings.Join(archived, ", "))
+			}
+			k.alerts.Raise(ctx, alert.Critical, "entry_expiring", "%s", msg)
 		}
 		return fmt.Errorf("ttl cycle incomplete: %v", failures)
 	}
