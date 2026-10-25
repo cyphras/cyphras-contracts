@@ -33,6 +33,7 @@ ALTER TABLE relays ADD COLUMN IF NOT EXISTS channel text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS request text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS simulated_at bigint;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS expected_resource_fee bigint;
+ALTER TABLE relays ADD COLUMN IF NOT EXISTS finished_at bigint;
 CREATE INDEX IF NOT EXISTS relays_confirmed ON relays (ledger) WHERE outcome = 'success';
 CREATE INDEX IF NOT EXISTS relays_pending ON relays (tx_hash) WHERE outcome = 'pending';
 CREATE INDEX IF NOT EXISTS relays_settled ON relays (ledger) WHERE outcome IN ('success', 'failed');
@@ -73,6 +74,9 @@ type Record struct {
 	// ExpectedResourceFee is the resource fee the relay was expected to be charged when it was
 	// sent, which the quote learns from once it is confirmed.
 	ExpectedResourceFee int64
+	// FinishedAt is when the outcome was seen, in Unix seconds, shortly after the public close of
+	// its ledger, so the loss budget's day survives a restart.
+	FinishedAt int64
 }
 
 type store struct {
@@ -108,8 +112,8 @@ func (s store) finish(ctx context.Context, r Record) error {
 		ledger, networkFee, resourceFee = &l, &n, &f
 	}
 	_, err := s.pool.Exec(ctx, `UPDATE relays SET outcome = $2, ledger = $3, network_fee = $4, resource_fee = $5, exit_id = $6,
-		request = NULL, simulated_at = NULL
-		WHERE tx_hash = $1 AND outcome = 'pending'`, r.Hash, r.Outcome, ledger, networkFee, resourceFee, exitID)
+		finished_at = NULLIF($7, 0), request = NULL, simulated_at = NULL
+		WHERE tx_hash = $1 AND outcome = 'pending'`, r.Hash, r.Outcome, ledger, networkFee, resourceFee, exitID, r.FinishedAt)
 	return err
 }
 
@@ -235,18 +239,23 @@ func (s store) recentResourceFees(ctx context.Context, n int) ([]int64, error) {
 	return fees, nil
 }
 
-// charge is what a confirmed relay paid the network and was paid, at the ledger it landed in.
+// charge is what a confirmed relay paid the network and was paid, at the ledger it landed in,
+// with when its outcome was seen, 0 when the record does not say.
 type charge struct {
 	hash       string
 	ledger     uint32
 	fee        string
 	networkFee int64
+	finishedAt int64
 }
 
-// recentCharges returns the confirmed relays that landed at or after a ledger.
-func (s store) recentCharges(ctx context.Context, since uint32) ([]charge, error) {
-	rows, err := s.pool.Query(ctx, `SELECT tx_hash, ledger, fee::text, network_fee FROM relays
-		WHERE outcome = 'success' AND ledger >= $1 AND network_fee IS NOT NULL ORDER BY ledger`, int64(since))
+// recentCharges returns the confirmed relays that landed within lossWindow ledgers of the newest
+// one recorded, whatever ledger an RPC reports now.
+func (s store) recentCharges(ctx context.Context) ([]charge, error) {
+	rows, err := s.pool.Query(ctx, `SELECT tx_hash, ledger, fee::text, network_fee, COALESCE(finished_at, 0) FROM relays
+		WHERE outcome = 'success' AND network_fee IS NOT NULL
+			AND ledger >= (SELECT COALESCE(max(ledger), 0) FROM relays WHERE outcome = 'success') - $1
+		ORDER BY ledger`, int64(lossWindow))
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +264,7 @@ func (s store) recentCharges(ctx context.Context, since uint32) ([]charge, error
 	for rows.Next() {
 		var c charge
 		var ledger int64
-		if err := rows.Scan(&c.hash, &ledger, &c.fee, &c.networkFee); err != nil {
+		if err := rows.Scan(&c.hash, &ledger, &c.fee, &c.networkFee, &c.finishedAt); err != nil {
 			return nil, err
 		}
 		c.ledger = uint32(ledger)

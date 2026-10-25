@@ -240,3 +240,38 @@ func TestARentReserveBeyondInt64IsRefusedAboveTheCap(t *testing.T) {
 	}
 	h.untouched("a reserve beyond int64")
 }
+
+// A restart whose first tip is far ahead keeps the day's losses from the records: the day is the
+// records' own, by ledger and by time, not the tip's.
+func TestARestartWithAFarAheadTipKeepsTheDaysLosses(t *testing.T) {
+	h := newHarness(t, vault.Status{}, func(c *Config) { c.Key = trapdoorKey(t) })
+	h.productionEngine()
+	h.unthrottled()
+	h.plainSimulation(500_000)
+	// The bootstrap quote, charged 30 XLM above it, past the 2 XLM default budget.
+	const fee = 1_100_000
+	h.confirmedAs(fee-100, 300_000_000)
+	if f := h.relayAt(fee, false, 30_000); f != nil {
+		t.Fatalf("the relay: %s", f.code)
+	}
+	if !h.r.overBudget() {
+		t.Fatal("30 XLM over the fee left the budget unspent")
+	}
+	for _, tip := range []uint32{4_000_000_000, 1001} {
+		h.r.losses, h.r.lossesLoaded = losses{now: h.clock}, false
+		h.setLatest(tip, true)
+		if got := h.r.losses.sum(tip); got.Int64() != 300_000_000 || !h.r.overBudget() {
+			t.Fatalf("after a restart at tip %d: %v, over the budget %t", tip, got, h.r.overBudget())
+		}
+	}
+	// The stored loss keeps its own time: a day later, a window behind, it is gone.
+	h.mu.Lock()
+	h.now = h.now.Add(lossAge)
+	h.mu.Unlock()
+	h.fake.CloseTime = h.now.Unix()
+	h.r.losses, h.r.lossesLoaded = losses{now: h.clock}, false
+	h.setLatest(1001+lossWindow, true)
+	if h.r.overBudget() {
+		t.Fatal("a loss a day old stayed after a restart")
+	}
+}

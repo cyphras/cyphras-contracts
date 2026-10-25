@@ -360,8 +360,8 @@ const SimulatedRefundablePct = 115
 
 // NewEntryFee is what a call that also creates a persistent entry of a size, live for ledgers,
 // adds to its simulated resource fee: the write of the entry and its bytes, charged in full, and
-// its rent, which the simulation names SimulatedRefundablePct of. The network's settings set it,
-// so no request moves it.
+// its rent with the write of its TTL entry, refundable, which the simulation names
+// SimulatedRefundablePct of. The network's settings set it, so no request moves it.
 func (e *Engine) NewEntryFee(ctx context.Context, bytes, ledgers uint32) (int64, error) {
 	c, err := e.ledgerCosts(ctx)
 	if err != nil {

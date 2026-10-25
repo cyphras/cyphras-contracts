@@ -316,7 +316,7 @@ func (r *Relayer) Refresh(ctx context.Context) error {
 	if err := r.db.forgetCooldowns(ctx, r.now().Unix()-strikeMemory); err != nil {
 		return err
 	}
-	if err := r.loadLosses(ctx, h.LatestLedger); err != nil {
+	if err := r.loadLosses(ctx); err != nil {
 		return err
 	}
 	if !r.overBudget() {
@@ -1239,7 +1239,7 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 		cost = prepared.Tx.MaxFee()
 	}
 	if r.cfg.Pricing.ToAsset(cost).Cmp(req.Ext.Fee) > 0 {
-		if !over && r.minimumFee(req) == nil {
+		if !over && r.paidTheQuote(req, slot) {
 			r.refusedAtQuote(req, cost)
 		}
 		return "", networkFeeHigh(cost)
@@ -1355,6 +1355,20 @@ func (r *Relayer) exitRoom(req Request, queued *bool) submit.Extend {
 	}
 }
 
+// paidTheQuote reports whether a request paid the published quote for the path its simulation
+// took, so a refusal of one the relayer's last read of the vault priced on the other path is not
+// taken for a quote under the cost.
+func (r *Relayer) paidTheQuote(req Request, queued bool) bool {
+	if r.minimumFee(req) != nil {
+		return false
+	}
+	if !queued {
+		return true
+	}
+	low := r.quotes.lowestQueued(r.now())
+	return low != nil && req.Ext.Fee.Cmp(low) >= 0
+}
+
 // sample is what the quote learns from a relay once it is confirmed: the resource fee it was
 // expected to be charged. A relay whose payment queued gives none, 0: the queued quote adds the
 // exit entry to the paid-at-once cost, as the network's settings price it, and a day of queued
@@ -1387,7 +1401,7 @@ func (r *Relayer) follow(s *submit.Signed, ch *submit.Account, slot bool, nfs [2
 // receiving, rests the notes and the destination and puts relaying in its guarded mode; one that
 // points at the relayer itself counts toward pausing relaying altogether.
 func (r *Relayer) finish(res submit.Result, sent Record) {
-	rec := Record{Hash: res.Hash, Ledger: res.Ledger, NetworkFee: res.FeeCharged, ResourceFee: res.ResourceFeeCharged}
+	rec := Record{Hash: res.Hash, Ledger: res.Ledger, NetworkFee: res.FeeCharged, ResourceFee: res.ResourceFeeCharged, FinishedAt: r.now().Unix()}
 	switch res.Outcome {
 	case submit.Success:
 		rec.Outcome, rec.ExitID = outcomeSuccess, r.queuedExit(res.Events)

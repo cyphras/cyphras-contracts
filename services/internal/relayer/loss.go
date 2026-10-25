@@ -43,13 +43,21 @@ func (l *losses) clock() time.Time {
 
 // add records a transaction's loss once, however often it is seen.
 func (l *losses) add(hash string, ledger uint32, amount *big.Int) {
+	l.addAt(hash, ledger, time.Time{}, amount)
+}
+
+// addAt is add for a loss seen at a known time; a zero time is now.
+func (l *losses) addAt(hash string, ledger uint32, at time.Time, amount *big.Int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.by == nil {
 		l.by = map[string]lossEntry{}
 	}
+	if at.IsZero() {
+		at = l.clock()
+	}
 	if _, ok := l.by[hash]; !ok {
-		l.by[hash] = lossEntry{ledger: ledger, at: l.clock(), amount: amount}
+		l.by[hash] = lossEntry{ledger: ledger, at: at, amount: amount}
 	}
 }
 
@@ -82,23 +90,25 @@ func (r *Relayer) loss(charged int64, fee string) *big.Int {
 	return over
 }
 
-// loadLosses reads the losses of the last day from the relay records once. A loss already
-// followed in this run, a relay resumed before the first refresh, is not counted again.
-func (r *Relayer) loadLosses(ctx context.Context, latest uint32) error {
+// loadLosses reads the losses of the last day from the relay records once. The day is the
+// records' own, the window of ledgers up to the newest recorded and each loss's time, so no tip an
+// RPC reports, however far ahead, makes a restart forget it. A loss already followed in this run,
+// a relay resumed before the first refresh, is not counted again.
+func (r *Relayer) loadLosses(ctx context.Context) error {
 	if r.lossesLoaded {
 		return nil
 	}
-	since := uint32(0)
-	if latest > lossWindow {
-		since = latest - lossWindow
-	}
-	charges, err := r.db.recentCharges(ctx, since)
+	charges, err := r.db.recentCharges(ctx)
 	if err != nil {
 		return err
 	}
 	for _, c := range charges {
 		if over := r.loss(c.networkFee, c.fee); over != nil {
-			r.losses.add(c.hash, c.ledger, over)
+			var at time.Time
+			if c.finishedAt > 0 {
+				at = time.Unix(c.finishedAt, 0)
+			}
+			r.losses.addAt(c.hash, c.ledger, at, over)
 		}
 	}
 	r.lossesLoaded = true
