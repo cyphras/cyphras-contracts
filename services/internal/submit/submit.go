@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"slices"
 	"sync"
 	"time"
@@ -158,6 +159,9 @@ func (e *Engine) ledgerCosts(ctx context.Context) (ledgerCosts, error) {
 		return ledgerCosts{}, errors.New("ledger costs: the network's settings are missing")
 	}
 	c, a := cost.ContractLedgerCost, archival.StateArchivalSettings
+	if err := rpc.CheckStateWindow(*state.LiveSorobanStateSizeWindow, int64(c.SorobanStateTargetSizeBytes)); err != nil {
+		return ledgerCosts{}, fmt.Errorf("ledger costs: %w", err)
+	}
 	size := rpc.StateAverage(*state.LiveSorobanStateSizeWindow)
 	e.costs = ledgerCosts{
 		at: e.now(), instruction: int64(compute.ContractCompute.FeeRatePerInstructionsIncrement),
@@ -244,6 +248,10 @@ type Extend func(ctx context.Context, footprint xdr.LedgerFootprint) (Extra, err
 // ttlEntryBytes is the size of the TTL entry the network writes with a persistent entry's rent.
 const ttlEntryBytes = 48
 
+// maxReserve bounds the rent reserve of the other path, far above any resource fee cap and far
+// below where the fees added to it could overflow.
+const maxReserve = 1 << 50
+
 // addExtra adds x to the simulated transaction data and returns the fees it adds: charged, the
 // network's fee for the entries, instructions, written bytes and transaction size it adds, all
 // non-refundable, and reserve, the rent and event fee the other path may need, which is refunded
@@ -327,7 +335,15 @@ func (e *Engine) addExtra(ctx context.Context, data *xdr.SorobanTransactionData,
 	if x.NewBytes > 0 {
 		ledgers := int64(max(x.RentLedgers, c.minPersistentTTL))
 		// Rent, the write of its TTL entry included, is charged only for an entry the call creates.
-		reserve += ceilDiv(int64(x.NewBytes)*c.rent1KB*ledgers, 1024*max(c.rentDenominator, 1)) + c.writeEntry + perKB(ttlEntryBytes, c.write1KB)
+		rent := new(big.Int).Mul(big.NewInt(int64(x.NewBytes)), big.NewInt(c.rent1KB))
+		rent.Mul(rent, big.NewInt(ledgers))
+		rent.Add(rent, big.NewInt(1024*max(c.rentDenominator, 1)-1))
+		rent.Quo(rent, big.NewInt(1024*max(c.rentDenominator, 1)))
+		// Far above the target the rent passes int64; held under it, the sum stays above any cap.
+		if rent.Cmp(big.NewInt(maxReserve)) > 0 {
+			rent.SetInt64(maxReserve)
+		}
+		reserve += rent.Int64() + c.writeEntry + perKB(ttlEntryBytes, c.write1KB)
 	}
 	reserve += perKB(uint64(x.EventBytes), c.events1KB)
 	return fee, reserve, nil

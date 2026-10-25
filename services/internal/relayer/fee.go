@@ -73,8 +73,15 @@ func (p Pricing) QuoteAt(costStroops, marginBps int64) *big.Int {
 	return new(big.Int).Mul(ceilDiv(withMargin, p.Tier), p.Tier)
 }
 
+// SampleMultiple bounds a sample at that many times the median of a full window, or of the
+// bootstrap value before, so a few dear relays a client pays for cannot lift the quote for
+// everyone: lifting the median takes half the window, 25 relays, for each doubling.
+const SampleMultiple = 2
+
 // Costs learns the resource fee from the relayer's own confirmed transactions only, so nobody can
-// move the quote by sending requests that are simulated or refused.
+// move the quote by sending requests that are simulated or refused. A sample is the resource fee
+// the relay was expected to be charged when it was sent, the measure the network fee check takes,
+// so a relay that costs what the samples did passes the check at the quote.
 type Costs struct {
 	mu        sync.Mutex
 	bootstrap int64
@@ -90,11 +97,21 @@ func NewCosts(bootstrap int64, stored []int64) *Costs {
 	return c
 }
 
-// Add records the resource fee charged to a confirmed transaction.
+// Add records the resource fee of a confirmed transaction, within SampleMultiple of the median.
+// A sample of 0, from a confirmation that reported no fee, is not taken.
 func (c *Costs) Add(resourceFee int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.samples = append(c.samples, resourceFee)
+	if resourceFee <= 0 {
+		return
+	}
+	reference := c.bootstrap
+	if len(c.samples) >= Samples {
+		sorted := slices.Clone(c.samples)
+		slices.Sort(sorted)
+		reference = sorted[len(sorted)/2]
+	}
+	c.samples = append(c.samples, min(resourceFee, SampleMultiple*reference))
 	if len(c.samples) > Samples {
 		c.samples = c.samples[len(c.samples)-Samples:]
 	}

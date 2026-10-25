@@ -48,9 +48,10 @@ const (
 	// request goes again.
 	CodeRestoreNeeded = "restore_needed"
 	// CodeNetworkFeeHigh refuses a call whose network fee, as simulated now, is more than the fee
-	// the request pays the relayer, or whose resource fee is more than the relayer's cap; the
-	// answer names the network fee the call would be charged as simulated, in stroops. The client self-relays, or sends the payment again once the
-	// network's fees fall.
+	// the request pays the relayer, or whose declared resource fee is more than the relayer's cap.
+	// The answer names, in stroops, the network fee the check took: the one the call would be
+	// charged as simulated, or above the cap the whole fee its envelope would declare. The client
+	// self-relays, or sends the payment again once the network's fees fall.
 	CodeNetworkFeeHigh = "network_fee_high"
 )
 
@@ -102,9 +103,16 @@ type Config struct {
 	// longer move, as when the network's fees rose for good and every relay at the old quote is
 	// refused.
 	QuoteFloor int64
+	// LossBudget is how much, in stroops, confirmed relays may be charged above the fees they paid
+	// within lossWindow ledgers, about a day, before the network fee check takes each envelope's
+	// whole fee, which the network never exceeds, until the window rolls; 20,000,000 when unset.
+	LossBudget int64
 }
 
 func (c *Config) defaults() {
+	if c.LossBudget == 0 {
+		c.LossBudget = 20_000_000
+	}
 	if c.DeadlineMargin == 0 {
 		c.DeadlineMargin = 20
 	}
@@ -184,6 +192,10 @@ type Relayer struct {
 	following sync.WaitGroup
 	// exitSlot holds a token while none of this relayer's exits that queue is in flight.
 	exitSlot chan struct{}
+	// losses holds what confirmed relays were charged above their fees, read from the records on
+	// the first refresh.
+	losses       losses
+	lossesLoaded bool
 
 	mu       sync.Mutex
 	inflight map[fr.Element]bool
@@ -301,6 +313,12 @@ func (r *Relayer) Refresh(ctx context.Context) error {
 	r.clock.observe(h.LatestLedger, h.LatestLedgerCloseTime)
 	if err := r.db.forgetCooldowns(ctx, r.now().Unix()-strikeMemory); err != nil {
 		return err
+	}
+	if err := r.loadLosses(ctx, h.LatestLedger); err != nil {
+		return err
+	}
+	if !r.overBudget() {
+		r.alerts.Clear(ctx, "relay_loss_budget", "relays were charged less than the loss budget above their fees within the last day; the network fee check takes the expected charge again")
 	}
 	if err := r.readRoots(ctx); err != nil {
 		return err
@@ -630,9 +648,18 @@ func (r *Relayer) Quote(ctx context.Context) (*big.Int, error) {
 	r.chainMu.RLock()
 	inst := r.inst
 	r.chainMu.RUnlock()
-	if inst == nil || fee.Cmp(inst.Limits.MaxFee) > 0 {
+	if inst == nil {
 		return nil, ErrNoQuote
 	}
+	if fee.Cmp(inst.Limits.MaxFee) > 0 {
+		why := "the costs of the confirmed relays"
+		if floor := r.FloorFee(); floor != nil && floor.Cmp(inst.Limits.MaxFee) > 0 {
+			why = fmt.Sprintf("QUOTE_FLOOR, a fee of %v", floor)
+		}
+		r.alerts.Raise(ctx, alert.Warning, "quote_above_max_fee", "the quote %v is above the vault's max_fee %v because of %s; the relayer gives no quote and relays nothing", fee, inst.Limits.MaxFee, why)
+		return nil, ErrNoQuote
+	}
+	r.alerts.Clear(ctx, "quote_above_max_fee", "the relayer quotes within the vault's max_fee again")
 	r.quotes.publish(r.now(), fee)
 	return fee, nil
 }
@@ -1139,7 +1166,7 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 		case errors.Is(err, submit.ErrRestoreNeeded):
 			return "", fail(http.StatusUnprocessableEntity, CodeRestoreNeeded)
 		case errors.As(err, &capped):
-			return "", networkFeeHigh(capped.Expected)
+			return "", networkFeeHigh(capped.Inclusion + capped.Resource)
 		case errors.Is(err, submit.ErrSimulation):
 			return "", settledFail(http.StatusUnprocessableEntity, CodeRejected)
 		}
@@ -1150,8 +1177,13 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	// resource margin, against refundable charges above the simulation's, and the rent and events
 	// of the exit queue's other path, which a call takes only when an exit lands in its ledger
 	// first. Only then is the relayer charged above the fee, by at most that headroom, which
-	// RESOURCE_FEE_CAP bounds with the rest of the envelope.
-	if cost := prepared.Expected; r.cfg.Pricing.ToAsset(cost).Cmp(req.Ext.Fee) > 0 {
+	// RESOURCE_FEE_CAP bounds with the rest of the envelope. Once that headroom cost more than
+	// LossBudget within a day, the whole envelope fee must be covered until the window rolls.
+	cost := prepared.Expected
+	if r.overBudget() {
+		cost = prepared.Tx.MaxFee()
+	}
+	if r.cfg.Pricing.ToAsset(cost).Cmp(req.Ext.Fee) > 0 {
 		return "", networkFeeHigh(cost)
 	}
 	if r.guarded() {
@@ -1176,7 +1208,8 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	release = false
 	r.setStatus(signed.Hash, txStatus{Status: "pending"})
 	rec := Record{Hash: signed.Hash, Kind: "transfer", Fee: req.Ext.Fee.String(), Channel: ch.ID, Request: requestKey(req),
-		Nullifiers: [2]string{req.Proof.Nullifiers[0].Hex(), req.Proof.Nullifiers[1].Hex()}, SimulatedAt: prepared.SimulatedAt}
+		Nullifiers: [2]string{req.Proof.Nullifiers[0].Hex(), req.Proof.Nullifiers[1].Hex()}, SimulatedAt: prepared.SimulatedAt,
+		ExpectedResourceFee: prepared.Expected - prepared.InclusionFee}
 	if req.Ext.ExtAmount.Sign() < 0 {
 		rec.Kind, rec.Destination, rec.Screening = "unshield", req.Ext.Recipient, "allow"
 	}
@@ -1290,7 +1323,12 @@ func (r *Relayer) finish(res submit.Result, sent Record) {
 	case submit.Success:
 		rec.Outcome, rec.ExitID = outcomeSuccess, r.queuedExit(res.Events)
 		r.setStatus(res.Hash, txStatus{Status: "success", ExitID: rec.ExitID})
-		r.costs.Add(res.ResourceFeeCharged)
+		sample := sent.ExpectedResourceFee
+		if sample == 0 {
+			sample = res.ResourceFeeCharged
+		}
+		r.costs.Add(sample)
+		r.chargedAbove(res, sent.Fee)
 		r.results.add(true)
 		r.known.add(sentNullifiers(sent)...)
 		r.log.Info("confirmed", "tx", res.Hash, "ledger", res.Ledger, "network_fee", res.FeeCharged)

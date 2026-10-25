@@ -92,7 +92,8 @@ func main() {
 	if err != nil {
 		service.Fatal(log, "config", err)
 	}
-	log.Info("watching", "vault", base.Vault.Vault, "hot_accounts", len(cfg.HotAccounts), "health_urls", len(cfg.HealthURLs))
+	log.Info("watching", "vault", base.Vault.Vault, "hot_accounts", len(cfg.HotAccounts), "health_urls", len(cfg.HealthURLs),
+		"state_size_alerts", !cfg.SkipStateSize)
 	w.Run(ctx, f, time.Second)
 }
 

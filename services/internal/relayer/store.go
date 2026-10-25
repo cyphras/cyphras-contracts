@@ -32,6 +32,7 @@ ALTER TABLE relays ADD COLUMN IF NOT EXISTS nullifier1 text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS channel text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS request text;
 ALTER TABLE relays ADD COLUMN IF NOT EXISTS simulated_at bigint;
+ALTER TABLE relays ADD COLUMN IF NOT EXISTS expected_resource_fee bigint;
 CREATE INDEX IF NOT EXISTS relays_confirmed ON relays (ledger) WHERE outcome = 'success';
 CREATE INDEX IF NOT EXISTS relays_pending ON relays (tx_hash) WHERE outcome = 'pending';
 CREATE INDEX IF NOT EXISTS relays_settled ON relays (ledger) WHERE outcome IN ('success', 'failed');
@@ -69,6 +70,9 @@ type Record struct {
 	// are kept only while the transaction is pending.
 	Request     string
 	SimulatedAt uint32
+	// ExpectedResourceFee is the resource fee the relay was expected to be charged when it was
+	// sent, which the quote learns from once it is confirmed.
+	ExpectedResourceFee int64
 }
 
 type store struct {
@@ -83,11 +87,12 @@ func NewStore(pool *pgxpool.Pool) store {
 // sent records a transaction the network accepted, before its outcome is known.
 func (s store) sent(ctx context.Context, r Record) error {
 	_, err := s.pool.Exec(ctx, `INSERT INTO relays (tx_hash, outcome, kind, fee, destination, screening, nullifier0, nullifier1, channel,
-		request, simulated_at)
+		request, simulated_at, expected_resource_fee)
 		VALUES ($1, 'pending', $2, $3::numeric, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''),
-		NULLIF($9, ''), NULLIF($10, 0))
+		NULLIF($9, ''), NULLIF($10, 0), NULLIF($11, 0))
 		ON CONFLICT (tx_hash) DO NOTHING`,
-		r.Hash, r.Kind, r.Fee, r.Destination, r.Screening, r.Nullifiers[0], r.Nullifiers[1], r.Channel, r.Request, int64(r.SimulatedAt))
+		r.Hash, r.Kind, r.Fee, r.Destination, r.Screening, r.Nullifiers[0], r.Nullifiers[1], r.Channel, r.Request, int64(r.SimulatedAt),
+		r.ExpectedResourceFee)
 	return err
 }
 
@@ -110,8 +115,9 @@ func (s store) finish(ctx context.Context, r Record) error {
 
 // pending lists the transactions sent but not yet finished.
 func (s store) pending(ctx context.Context) ([]Record, error) {
-	rows, err := s.pool.Query(ctx, `SELECT tx_hash, COALESCE(destination, ''), COALESCE(nullifier0, ''), COALESCE(nullifier1, ''),
-		COALESCE(channel, ''), COALESCE(request, ''), COALESCE(simulated_at, 0) FROM relays WHERE outcome = 'pending' ORDER BY tx_hash`)
+	rows, err := s.pool.Query(ctx, `SELECT tx_hash, fee::text, COALESCE(destination, ''), COALESCE(nullifier0, ''), COALESCE(nullifier1, ''),
+		COALESCE(channel, ''), COALESCE(request, ''), COALESCE(simulated_at, 0), COALESCE(expected_resource_fee, 0)
+		FROM relays WHERE outcome = 'pending' ORDER BY tx_hash`)
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +126,8 @@ func (s store) pending(ctx context.Context) ([]Record, error) {
 	for rows.Next() {
 		var r Record
 		var simulated int64
-		if err := rows.Scan(&r.Hash, &r.Destination, &r.Nullifiers[0], &r.Nullifiers[1], &r.Channel, &r.Request, &simulated); err != nil {
+		if err := rows.Scan(&r.Hash, &r.Fee, &r.Destination, &r.Nullifiers[0], &r.Nullifiers[1], &r.Channel, &r.Request, &simulated,
+			&r.ExpectedResourceFee); err != nil {
 			return nil, err
 		}
 		r.SimulatedAt = uint32(simulated)
@@ -211,9 +218,12 @@ func (s store) lookup(ctx context.Context, hash string) (string, *uint64, bool, 
 	return outcome, &id, true, nil
 }
 
-// recentResourceFees returns the resource fees of the last n confirmed relays, oldest first.
+// recentResourceFees returns the samples of the last n confirmed relays, oldest first: the
+// resource fee each was expected to be charged, or for a relay recorded without it, the one it was
+// charged.
 func (s store) recentResourceFees(ctx context.Context, n int) ([]int64, error) {
-	rows, err := s.pool.Query(ctx, `SELECT resource_fee FROM relays WHERE outcome = 'success' ORDER BY ledger DESC LIMIT $1`, n)
+	rows, err := s.pool.Query(ctx, `SELECT COALESCE(expected_resource_fee, resource_fee) FROM relays WHERE outcome = 'success'
+		ORDER BY ledger DESC LIMIT $1`, n)
 	if err != nil {
 		return nil, err
 	}
@@ -223,4 +233,32 @@ func (s store) recentResourceFees(ctx context.Context, n int) ([]int64, error) {
 	}
 	slices.Reverse(fees)
 	return fees, nil
+}
+
+// charge is what a confirmed relay paid the network and was paid, at the ledger it landed in.
+type charge struct {
+	ledger     uint32
+	fee        string
+	networkFee int64
+}
+
+// recentCharges returns the confirmed relays that landed at or after a ledger.
+func (s store) recentCharges(ctx context.Context, since uint32) ([]charge, error) {
+	rows, err := s.pool.Query(ctx, `SELECT ledger, fee::text, network_fee FROM relays
+		WHERE outcome = 'success' AND ledger >= $1 AND network_fee IS NOT NULL ORDER BY ledger`, int64(since))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []charge
+	for rows.Next() {
+		var c charge
+		var ledger int64
+		if err := rows.Scan(&ledger, &c.fee, &c.networkFee); err != nil {
+			return nil, err
+		}
+		c.ledger = uint32(ledger)
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }

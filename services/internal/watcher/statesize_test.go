@@ -134,15 +134,15 @@ func TestTheStateSizeCheckFailsWithoutTheNetworksSettings(t *testing.T) {
 	}
 }
 
-// A window no network can hold is an error, which the check's failure count pages, and clears
-// nothing that is open.
+// A window no network can hold, too large, empty or under 1% of the target, is an error, which the
+// check's failure count pages, and clears nothing that is open.
 func TestAnImplausibleStateSizeIsAnErrorAndClearsNothing(t *testing.T) {
 	w, fake, pages := stateWatcher(rpctest.Mainnet)
 	setWindow(fake, 2_550_000_000)
 	if err := w.CheckStateSize(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	for _, window := range [][]uint64{{math.MaxUint64, 1}, {10_000_000_000_001}, {math.MaxUint64 / 2, math.MaxUint64 / 2}} {
+	for _, window := range [][]uint64{{math.MaxUint64, 1}, {10_000_000_000_001}, {math.MaxUint64 / 2, math.MaxUint64 / 2}, {0, 0}, {0, 2_550_000_000}, {29_000_000}} {
 		setWindow(fake, window...)
 		if err := w.CheckStateSize(context.Background()); err == nil {
 			t.Fatalf("window %v was read", window)

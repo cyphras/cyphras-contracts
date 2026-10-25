@@ -289,13 +289,11 @@ func ReadSorobanState(ctx context.Context, c Client) (SorobanState, error) {
 			cost = s.ContractLedgerCost
 		}
 	}
-	if len(window) == 0 || cost == nil || cost.SorobanStateTargetSizeBytes <= 0 {
+	if cost == nil {
 		return SorobanState{}, errors.New("rpc: the network's state size settings are missing")
 	}
-	for _, n := range window {
-		if uint64(n) > maxStateSample {
-			return SorobanState{}, fmt.Errorf("rpc: the network's state size window holds an implausible %d bytes", uint64(n))
-		}
+	if err := CheckStateWindow(window, int64(cost.SorobanStateTargetSizeBytes)); err != nil {
+		return SorobanState{}, err
 	}
 	st := SorobanState{Average: StateAverage(window), Target: int64(cost.SorobanStateTargetSizeBytes), Growth: int64(cost.SorobanStateRentFeeGrowthFactor)}
 	low, high := int64(cost.RentFee1KbSorobanStateSizeLow), int64(cost.RentFee1KbSorobanStateSizeHigh)
@@ -307,6 +305,28 @@ func ReadSorobanState(ctx context.Context, c Client) (SorobanState, error) {
 // maxStateSample bounds a plausible sample of the live Soroban state size, 10 TB, far above any
 // network's and low enough that sums and products of it cannot overflow.
 const maxStateSample = 10_000_000_000_000
+
+// CheckStateWindow refuses a window of live Soroban state sizes, or a target, that no network
+// holds: an empty window, an empty or oversized sample, a target beyond maxStateSample, or an
+// average under 1% of the target. Such a reading is a broken or hostile RPC, not a state to price
+// or to clear an alert by.
+func CheckStateWindow(window []xdr.Uint64, target int64) error {
+	if len(window) == 0 {
+		return errors.New("rpc: the network's state size window is empty")
+	}
+	if target <= 0 || target > maxStateSample {
+		return fmt.Errorf("rpc: the network's state size target of %d bytes is implausible", target)
+	}
+	for _, n := range window {
+		if n == 0 || uint64(n) > maxStateSample {
+			return fmt.Errorf("rpc: the network's state size window holds an implausible %d bytes", uint64(n))
+		}
+	}
+	if StateAverage(window) < target/100 {
+		return errors.New("rpc: the network's state size window averages under 1% of its target")
+	}
+	return nil
+}
 
 // StateAverage is the mean of the network's window of live Soroban state sizes.
 func StateAverage(window []xdr.Uint64) int64 {

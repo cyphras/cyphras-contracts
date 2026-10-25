@@ -343,7 +343,7 @@ func TestTheQuoteCoversTheCostWithAPublishedMargin(t *testing.T) {
 	}
 	c := NewCosts(777, nil)
 	for i := range Samples - 1 {
-		c.Add(int64(i))
+		c.Add(int64(600 + i))
 	}
 	if c.ResourceFee() != 777 {
 		t.Fatal("bootstrap value not used before 50 samples")

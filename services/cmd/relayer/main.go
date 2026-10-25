@@ -112,6 +112,13 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	if err != nil {
 		return nil, err
 	}
+	lossBudget, err := config.Int("RELAY_LOSS_BUDGET", 20_000_000)
+	if err == nil && lossBudget < 1 {
+		err = errors.New("RELAY_LOSS_BUDGET must be positive")
+	}
+	if err != nil {
+		return nil, err
+	}
 	freshRoots, err := config.Int("FRESH_ROOTS", 200)
 	if err == nil && (freshRoots < 1 || freshRoots > vault.RootHistory) {
 		err = fmt.Errorf("FRESH_ROOTS must be 1 to %d", vault.RootHistory)
@@ -168,7 +175,7 @@ func build(ctx context.Context, base *service.Base) (*relayer.Relayer, error) {
 	r, err := relayer.New(ctx, relayer.Config{
 		Vault: base.Vault.Vault, NetworkID: base.NetworkID, Asset: base.Vault.Asset, FeeAddress: feeAddress,
 		Pricing: pricing, LedgerSeconds: 5, MaxHeld: 1000, Jitter: 10 * time.Minute, Key: key, FreshRoots: uint32(freshRoots), ExitKeys: exitKeys,
-		QuoteFloor: floor,
+		QuoteFloor: floor, LossBudget: lossBudget,
 	}, base.RPC, engine, channels,
 		relayer.ScreeningClient{URL: screenURL, Token: token, HTTP: &http.Client{Timeout: 5 * time.Second}},
 		relayer.NewStore(pool), bootstrap, base.Alerts, base.Log)
