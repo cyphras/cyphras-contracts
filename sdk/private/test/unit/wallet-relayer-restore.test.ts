@@ -43,6 +43,7 @@ describe("a relayer that refuses to pay for a restore", () => {
     assert.equal(refused.code, "service_rejected");
     assert.equal(refused.details["code"], "restore_needed");
     assert.match(refused.message, /selfRelay/);
+    assert.match(refused.message, /networkFeeCaps\.restore/);
     assert.match(refused.message, /restoreVault/);
     const planId = refused.details["planId"];
     assert.equal(typeof planId, "string");

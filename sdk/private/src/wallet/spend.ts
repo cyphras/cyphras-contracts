@@ -618,7 +618,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       if (result.error === "restore_needed") {
         const way =
           intent.kind === "unshield"
-            ? "retry the payment with selfRelay, whose account pays the restore, or restore them with restoreVault and retry it"
+            ? "retry the payment with selfRelay, whose account pays the restore within a networkFeeCaps.restore the user agreed to, or restore them with restoreVault and retry it"
             : "restore them with restoreVault, then retry the payment";
         throw new CyphrasError(
           "service_rejected",
