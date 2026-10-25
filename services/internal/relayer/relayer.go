@@ -165,6 +165,9 @@ type Relayer struct {
 	clock   *ledgerClock
 	known   spentSet
 	told    verdicts
+	// restores remembers a request refused for archived entries, briefly, since anyone may restore
+	// them at any time.
+	restores verdicts
 	// nfNext is the next ledger whose new_nullifier events the spent set takes in; only Run uses it.
 	nfNext uint32
 	// following counts the transactions being followed to their outcome.
@@ -233,6 +236,7 @@ func New(ctx context.Context, cfg Config, client rpc.Client, engine *submit.Engi
 		races: &breaker{failures: cfg.RaceFailures, window: cfg.RaceWindow, pause: cfg.GuardedFor},
 		clock: &ledgerClock{fallback: float64(cfg.LedgerSeconds)},
 		known: spentSet{max: maxKnownSpent}, told: verdicts{ttl: verdictLifetime, max: maxVerdicts},
+		restores: verdicts{ttl: restoreVerdictLifetime, max: maxVerdicts},
 		inflight: map[fr.Element]bool{}, statuses: map[string]txStatus{}, heldBy: map[string]*heldRequest{},
 		exitSlot: make(chan struct{}, 1),
 	}
@@ -252,6 +256,8 @@ const (
 	// verdictLifetime is how long a refusal is answered from memory; maxVerdicts bounds them.
 	verdictLifetime = 10 * time.Minute
 	maxVerdicts     = 10_000
+	// restoreVerdictLifetime is how long a restore_needed refusal is answered from memory.
+	restoreVerdictLifetime = time.Minute
 )
 
 // guarded reports the mode relaying takes while clients keep winning races against it: deadlines
@@ -773,6 +779,9 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	if f := r.told.recall(proofKey(req), r.now()); f != nil {
 		return Accepted{}, f
 	}
+	if f := r.restores.recall(proofKey(req), r.now()); f != nil {
+		return Accepted{}, f
+	}
 	if f := r.local(ctx, req); f != nil {
 		if f.settled {
 			r.told.remember(proofKey(req), *f, r.now())
@@ -797,6 +806,9 @@ func (r *Relayer) Submit(ctx context.Context, req Request) (Accepted, *failure) 
 	hash, f := r.relay(ctx, req)
 	if f != nil {
 		r.unclaim(req.Proof.Nullifiers)
+		if f.code == CodeRestoreNeeded {
+			r.restores.remember(proofKey(req), *f, r.now())
+		}
 		return Accepted{}, f
 	}
 	return Accepted{Hash: hash}, nil
@@ -1075,7 +1087,8 @@ func (r *Relayer) send(_ context.Context, req Request) (string, *failure) {
 	}
 	prepared, slot, err := r.prepare(ctx, ch, op, req)
 	if err != nil {
-		// Not kept as settled: once anyone restores the entries, the same request can go.
+		// Not kept as settled: once anyone restores the entries, the same request can go, so it is
+		// remembered for a minute only.
 		if errors.Is(err, submit.ErrRestoreNeeded) {
 			return "", fail(http.StatusUnprocessableEntity, CodeRestoreNeeded)
 		}
@@ -1327,10 +1340,10 @@ func (r *Relayer) classify(res submit.Result, sent Record) cause {
 		case xdr.InvokeHostFunctionResultCodeInvokeHostFunctionResourceLimitExceeded:
 			return r.resourceCause(ctx, sent)
 		case xdr.InvokeHostFunctionResultCodeInvokeHostFunctionEntryArchived:
-			// No call whose simulation found an entry archived is sent, so this entry archived
-			// between the simulation and the call's ledger. The keeper keeps the vault's alive: with
-			// a contract destination, its own balance in the asset contract is the entry its owner
-			// let lapse.
+			// The relayer sends no call whose footprint the RPC reported archived, and bounds each
+			// to the ledgers in which its entries are live, so this one met an entry the RPC
+			// misreported. The keeper keeps the vault's alive: with a contract destination, its own
+			// balance in the asset contract is the entry its owner let lapse.
 			if contractAddress(sent.Destination) {
 				return causeReceive
 			}
