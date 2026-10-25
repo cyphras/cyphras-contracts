@@ -11,6 +11,7 @@ import type { SpendNote } from "../transaction.ts";
 import type { PoolStats } from "../net/indexer.ts";
 import {
   type ChainView,
+  type QueuedExitEntry,
   balanceKey,
   exitKey,
   payKeys,
@@ -53,13 +54,17 @@ export interface Core {
 
 export const newId = (): string => bytesToHex(randomBytes(16));
 
-export function invokeContext(core: Core): InvokeContext {
+// With `caps`, checked by feeCapsOf, a call's own caps over the wallet's, as after its user agreed
+// to a restore's fee.
+export function invokeContext(core: Core, caps?: Partial<NetworkFeeCaps>): InvokeContext {
   return {
     rpc: core.services.rpc,
     second: core.services.second?.rpc,
     networkPassphrase: core.deployment.networkPassphrase,
     vault: core.deployment.vault,
-    feeCaps: core.feeCaps,
+    vaultWasmHash: core.deployment.vaultWasmHash,
+    asset: core.deployment.asset.contract,
+    feeCaps: { ...core.feeCaps, ...caps },
     now: () => core.now(),
     sleep: (ms: number) => core.sleep(ms),
   };
@@ -200,6 +205,30 @@ export function releaseRoom(core: Core, max: number): Room {
     }
     return otherPath(keys, balances);
   };
+}
+
+// Who the exits among these IDs pay: the recipient of each payout and the relayer of each fee.
+const payeesOf = (exits: Map<bigint, QueuedExitEntry>): string[] =>
+  [...exits.values()].flatMap((e) => [
+    ...(e.payout > 0n ? [e.recipient] : []),
+    ...(e.fee > 0n ? [e.relayer] : []),
+  ]);
+
+// Who a release of up to `max` exits pays: the payees of the exits from the queue's head it handles,
+// read as releaseRoom reads the queue.
+export async function releasePayees(core: Core, max: number): Promise<string[]> {
+  const { status } = await core.services.vault.instance();
+  const head = status.exitHead;
+  const queued = status.exitTail - head;
+  const n = queued < BigInt(max) ? queued : BigInt(max);
+  const ids: bigint[] = [];
+  for (let id = head; id < head + n; id++) ids.push(id);
+  return payeesOf(await core.services.vault.exits(ids));
+}
+
+// Who a claim of a stranded exit pays once it is queued again.
+export async function claimPayees(core: Core, id: bigint): Promise<string[]> {
+  return payeesOf(await core.services.vault.stranded([id]));
 }
 
 export function chainReads(core: Core): ChainReads {

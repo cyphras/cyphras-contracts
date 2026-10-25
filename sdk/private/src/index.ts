@@ -23,7 +23,13 @@ export type { ExitPosition } from "./wallet/exits.ts";
 export type { Verification, ServiceState } from "./wallet/services.ts";
 export type { ExitPart, PlanState, Route } from "./wallet/state.ts";
 export type { SyncLimits } from "./wallet/sources.ts";
-export type { NetworkFee, NetworkFeeCaps, TransactionSigner } from "./vault/invoke.ts";
+export type {
+  FeeReason,
+  NetworkFee,
+  NetworkFeeCaps,
+  TransactionSigner,
+  VaultRestore,
+} from "./vault/invoke.ts";
 
 export { isKeyDerivationMessage, keySource, signatureMessage } from "./keysource.ts";
 export type {

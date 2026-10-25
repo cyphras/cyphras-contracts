@@ -21,9 +21,24 @@ interface TxRecord {
   ledger: number;
   returnValue: xdr.ScVal;
   events: EmittedEvent[];
-  // The diagnostic events of a failure, as base64 XDR.
+  // The diagnostic events of a failure, as base64 XDR, and its TransactionResult.
   diagnostics?: string[];
+  result?: string;
 }
+
+// The result of a call that touched an archived entry it did not restore, as core reports it.
+const entryArchivedResult = (): string =>
+  new xdr.TransactionResult({
+    feeCharged: xdr.Int64.fromString("100"),
+    result: xdr.TransactionResultResult.txFailed([
+      xdr.OperationResult.opInner(
+        xdr.OperationResultTr.invokeHostFunction(
+          xdr.InvokeHostFunctionResult.invokeHostFunctionEntryArchived(),
+        ),
+      ),
+    ]),
+    ext: new xdr.TransactionResultExt(0),
+  }).toXDR("base64");
 
 // A diagnostic event naming a host error, as the host emits for a failed call.
 export function diagnostic(error: xdr.ScError): string {
@@ -165,6 +180,21 @@ export class MockRpc {
   maxFootprintEntries = 400;
   maxWriteEntries = 200;
   maxDiskReadEntries = 200;
+  // Test hooks for state archival: entries the network evicted, which RPC returns with a TTL of 0;
+  // the TTLs of others by key, where not the network's least TTL of a persistent entry ahead;
+  // entries no other hook models; how many of the next calls fail on an archived entry; the keys
+  // the next simulation of a call asks to restore first, and the resource fee of a restore; how
+  // many of the next restores fail; and the marks of archived entries the simulation reports in
+  // place of its own.
+  readonly archived = new Set<string>();
+  readonly ttl = new Map<string, number>();
+  readonly extraEntries = new Map<string, xdr.LedgerEntryData>();
+  archiveNext = 0;
+  preambleNext: xdr.LedgerKey[] | undefined;
+  restoreFee = 1000;
+  restoreFailNext = 0;
+  simulatedMarks: number[] | undefined;
+  readonly minPersistentTtl = 2_073_600;
 
   constructor(vault: MockVault, passphrase: string) {
     this.vault = vault;
@@ -316,21 +346,76 @@ export class MockRpc {
     return entries;
   }
 
+  // The ledger up to which an entry lives, 0 once evicted.
+  liveUntil(id: string): number {
+    return this.archived.has(id)
+      ? 0
+      : (this.ttl.get(id) ?? this.vault.ledger + this.minPersistentTtl);
+  }
+
+  // Whether an entry is archived in a ledger.
+  archivedAt(id: string, ledger: number): boolean {
+    return (
+      this.#data(xdr.LedgerKey.fromXDR(id, "base64")) !== undefined && this.liveUntil(id) < ledger
+    );
+  }
+
+  #data(key: xdr.LedgerKey): xdr.LedgerEntryData | undefined {
+    return this.extraEntries.get(key.toXDR("base64")) ?? this.#entry(key);
+  }
+
+  // Brings an entry back, live for the network's least TTL of a persistent entry from `ledger`.
+  #restore(id: string, ledger: number): void {
+    this.archived.delete(id);
+    this.ttl.set(id, ledger + this.minPersistentTtl - 1);
+  }
+
   #entries(keys: string[]): unknown[] {
     const out: unknown[] = [];
     for (const id of keys) {
       const key = xdr.LedgerKey.fromXDR(id, "base64");
-      const data = this.#entry(key);
+      const data = this.#data(key);
       if (data !== undefined) {
         out.push({
           key: id,
           xdr: data.toXDR("base64"),
           lastModifiedLedgerSeq: this.vault.ledger,
-          liveUntilLedgerSeq: this.vault.ledger + 100_000,
+          liveUntilLedgerSeq: this.liveUntil(id),
         });
       }
     }
     return out;
+  }
+
+  // Transaction data with the marks of the archived read-write entries the call restores.
+  #marked(data: xdr.SorobanTransactionData): xdr.SorobanTransactionData {
+    const at = this.vault.ledger + 1;
+    const marks =
+      this.simulatedMarks ??
+      data
+        .resources()
+        .footprint()
+        .readWrite()
+        .flatMap((k, i) => (this.archivedAt(k.toXDR("base64"), at) ? [i] : []));
+    if (marks.length === 0) return data;
+    return new xdr.SorobanTransactionData({
+      ext: new xdr.SorobanTransactionDataExt(
+        1,
+        new xdr.SorobanResourcesExtV0({ archivedSorobanEntries: marks }),
+      ),
+      resources: data.resources(),
+      resourceFee: data.resourceFee(),
+    });
+  }
+
+  // What a RestoreFootprint transaction of these keys restores: those archived, with the fee.
+  #restoreData(keys: readonly xdr.LedgerKey[]): xdr.SorobanTransactionData {
+    const at = this.vault.ledger + 1;
+    const restored = keys.filter((k) => this.archivedAt(k.toXDR("base64"), at));
+    return new SorobanDataBuilder()
+      .setResourceFee(this.restoreFee)
+      .setFootprint([], restored)
+      .build();
   }
 
   // The network's Soroban settings: the public network's at ledger 64,754,596, with the limits on
@@ -685,6 +770,14 @@ export class MockRpc {
         };
       case "simulateTransaction": {
         const tx = this.#parse(params["transaction"] as string);
+        if (tx.operations[0]?.type === "restoreFootprint") {
+          const keys = tx.toEnvelope().v1().tx().ext().sorobanData().resources().footprint();
+          return {
+            transactionData: this.#restoreData(keys.readWrite()).toXDR("base64"),
+            minResourceFee: String(this.restoreFee),
+            latestLedger: this.vault.ledger,
+          };
+        }
         const { fn, args, source } = this.#invoke(tx);
         // The footprint holds what the call writes that depends on the vault's state now.
         const written = this.#written(fn, args);
@@ -700,9 +793,19 @@ export class MockRpc {
           } else {
             data.setFootprint([], written);
           }
+          const preamble = this.preambleNext;
+          this.preambleNext = undefined;
           return {
-            transactionData: data.build().toXDR("base64"),
+            transactionData: this.#marked(data.build()).toXDR("base64"),
             minResourceFee: String(this.simulated?.fee ?? 1000),
+            ...(preamble === undefined
+              ? {}
+              : {
+                  restorePreamble: {
+                    transactionData: this.#restoreData(preamble).toXDR("base64"),
+                    minResourceFee: String(this.restoreFee),
+                  },
+                }),
             results: [
               {
                 auth: this.#auth(fn, args, tx).map((a) => a.toXDR("base64")),
@@ -734,12 +837,66 @@ export class MockRpc {
         if (account === undefined || !signed || BigInt(tx.sequence) !== account.sequence + 1n) {
           return { status: "ERROR", hash, latestLedger: this.vault.ledger };
         }
+        // A transaction past its ledger bound is refused, or dropped unapplied once it passes it.
+        const bound = tx.ledgerBounds?.maxLedger ?? 0;
+        if (bound !== 0 && bound <= this.vault.ledger + 1) {
+          return { status: "ERROR", hash, latestLedger: this.vault.ledger };
+        }
         account.sequence++;
         this.sent.push(tx);
-        const { fn, args, source } = this.#invoke(tx);
         const others = this.beforeApply;
         this.beforeApply = undefined;
         others?.();
+        if (bound !== 0 && bound <= this.vault.ledger + 1) {
+          account.sequence--;
+          return { status: "PENDING", hash, latestLedger: this.vault.ledger };
+        }
+        const resources = tx.toEnvelope().v1().tx().ext().sorobanData();
+        if (tx.operations[0]?.type === "restoreFootprint") {
+          if (this.restoreFailNext > 0) {
+            this.restoreFailNext--;
+            this.records.set(hash, {
+              status: "FAILED",
+              ledger: this.vault.ledger,
+              returnValue: xdr.ScVal.scvVoid(),
+              events: [],
+            });
+          } else {
+            this.run(hash, () => {
+              for (const k of resources.resources().footprint().readWrite()) {
+                this.#restore(k.toXDR("base64"), this.vault.ledger);
+              }
+            });
+          }
+          return { status: "PENDING", hash, latestLedger: this.vault.ledger };
+        }
+        const { fn, args, source } = this.#invoke(tx);
+        // The network restores the archived read-write entries the data marks, and fails the call
+        // on any other archived entry it touches.
+        const at = this.vault.ledger + 1;
+        const footprint = resources.resources().footprint();
+        const ext = resources.ext();
+        const marks = new Set(ext.switch() === 1 ? ext.resourceExt().archivedSorobanEntries() : []);
+        const unrestored =
+          footprint.readOnly().some((k) => this.archivedAt(k.toXDR("base64"), at)) ||
+          footprint
+            .readWrite()
+            .some((k, i) => !marks.has(i) && this.archivedAt(k.toXDR("base64"), at));
+        if (this.archiveNext > 0 || unrestored) {
+          if (this.archiveNext > 0) this.archiveNext--;
+          this.records.set(hash, {
+            status: "FAILED",
+            ledger: this.vault.ledger,
+            returnValue: xdr.ScVal.scvVoid(),
+            events: [],
+            diagnostics: [diagnostic(xdr.ScError.sceValue(xdr.ScErrorCode.scecInvalidInput()))],
+            result: entryArchivedResult(),
+          });
+          return { status: "PENDING", hash, latestLedger: this.vault.ledger };
+        }
+        footprint.readWrite().forEach((k, i) => {
+          if (marks.has(i)) this.#restore(k.toXDR("base64"), at);
+        });
         const failed = this.failNext > 0;
         const conflict =
           !failed &&
@@ -785,6 +942,7 @@ export class MockRpc {
           ...(record.diagnostics === undefined || this.diagnosticsInMeta
             ? {}
             : { diagnosticEventsXdr: record.diagnostics }),
+          ...(record.result === undefined ? {} : { resultXdr: record.result }),
         };
       }
       case "getEvents":

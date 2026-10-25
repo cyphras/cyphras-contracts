@@ -18,7 +18,7 @@ import { addressKeyFor, type AddressKey } from "../keys.ts";
 import type { HeldRequest, Quote, RelayerClient } from "../net/relayer.ts";
 import { proveTransaction } from "../proving.ts";
 import { buildTransaction, type BuiltTransaction, type ExtTerms } from "../transaction.ts";
-import { type TransactionSigner, invokeVault } from "../vault/invoke.ts";
+import { type NetworkFeeCaps, type TransactionSigner, invokeVault } from "../vault/invoke.ts";
 import type { VaultInstance } from "../vault/state.ts";
 import {
   type Core,
@@ -81,6 +81,8 @@ export interface SpendIntent {
   readonly maxFee: bigint;
   readonly relayers: readonly RelayerClient[];
   readonly selfRelay: TransactionSigner | undefined;
+  // The caps of a self-relayed unshield's own transaction, over the wallet's.
+  readonly feeCaps: Partial<NetworkFeeCaps> | undefined;
   readonly confirm: ConfirmSpend | undefined;
   readonly notBefore: number | undefined;
   // A retry spends the stalled plan's notes, so at most one of the two can land.
@@ -410,21 +412,26 @@ const view = (plan: Plan): Submission => ({
   fee: plan.fee,
 });
 
-// An error raised once a plan is among the wallet's names it: the plan keeps its notes until its
-// fate is known, whatever became of its submission, so the payment goes again only through retry.
-// An error the SDK did not raise itself, as a signer's or a store's, is wrapped to carry it.
+// An error raised once a plan is among the wallet's names it, and the operation it is a part of:
+// the plan keeps its notes until its fate is known, whatever became of its submission, so the
+// payment goes again only through retry, or as its operation goes on. An error the SDK did not
+// raise itself, as a signer's or a store's, is wrapped to carry it.
 function naming(err: unknown, plan: Plan | undefined): unknown {
   if (plan === undefined) return err;
+  const ids = {
+    planId: plan.id,
+    ...(plan.operationId === undefined ? {} : { operationId: plan.operationId }),
+  };
   if (!(err instanceof CyphrasError)) {
     return new CyphrasError(
       "unexpected_error",
       "the payment's submission stopped on an unexpected error; it may still land",
-      { planId: plan.id },
+      ids,
       { cause: err },
     );
   }
   if ("planId" in err.details) return err;
-  return new CyphrasError(err.code, err.message, { ...err.details, planId: plan.id });
+  return new CyphrasError(err.code, err.message, { ...err.details, ...ids });
 }
 
 // One spend from the review to the submission, with a write-ahead plan saved before anything
@@ -586,7 +593,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       await core.save();
 
       if (relay === undefined) {
-        return await selfRelay(core, plan, intent.selfRelay as TransactionSigner);
+        return await selfRelay(core, plan, intent.selfRelay as TransactionSigner, intent.feeCaps);
       }
       const result = await relay.client.submit(plan.proof, plan.ext, intent.notBefore);
       if (result.accepted) {
@@ -721,12 +728,19 @@ export async function resendConflicted(
 
 // The user's own account submits the unshield and pays the network fee. The plan stays
 // submitted until a sync shows its nullifiers and commitments in one transaction, as for a relayed
-// one; the RPC's word that the transaction succeeded does not confirm it.
-async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Promise<Submission> {
+// one; the RPC's word that the transaction succeeded does not confirm it. The call carries the
+// proof to the RPC already in its simulation, and any account can submit a proof, so a plan that
+// stopped on any error may still land.
+async function selfRelay(
+  core: Core,
+  plan: Plan,
+  signer: TransactionSigner,
+  caps: Partial<NetworkFeeCaps> | undefined,
+): Promise<Submission> {
   const ext: ExtData = extDataFromJson(plan.ext);
   try {
     await invokeVault(
-      invokeContext(core),
+      invokeContext(core, caps),
       signer,
       {
         fn: "transact",
@@ -737,6 +751,7 @@ async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Pro
         ],
         transfers: [],
         extend: transactRoom(core, ext),
+        payees: [ext.recipient, ext.relayer],
       },
       {
         onSubmitted: async (hash) => {
@@ -747,10 +762,8 @@ async function selfRelay(core: Core, plan: Plan, signer: TransactionSigner): Pro
       },
     );
   } catch (err) {
-    if (err instanceof CyphrasError) {
-      plan.error = err.code;
-      await core.save();
-    }
+    plan.error = err instanceof CyphrasError ? err.code : "unexpected_error";
+    await core.save();
     throw err;
   }
   return view(plan);

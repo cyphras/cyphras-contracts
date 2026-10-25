@@ -11,8 +11,16 @@ export interface LedgerEntry {
 
 export interface LedgerEntries {
   readonly latestLedger: number;
-  // Keyed by the base64 XDR of each requested key; keys with no live entry are absent.
+  // Keyed by the base64 XDR of each requested key; keys with no entry are absent. An archived
+  // entry is present, with a liveUntilLedger at or before latestLedger, 0 once the network evicted
+  // it.
   readonly entries: ReadonlyMap<string, LedgerEntry>;
+}
+
+// A RestoreFootprint transaction a call needs to land first: its Soroban data and resource fee.
+export interface RestorePreamble {
+  readonly transactionData: xdr.SorobanTransactionData;
+  readonly minResourceFee: bigint;
 }
 
 export interface Simulation {
@@ -21,7 +29,10 @@ export interface Simulation {
   readonly auth: readonly string[];
   readonly result: xdr.ScVal | undefined;
   readonly latestLedger: number;
-  readonly needsRestore: boolean;
+  // The archived entries the call restores itself, which its transaction data marks among its
+  // read-write entries, in footprint order.
+  readonly archived: readonly xdr.LedgerKey[];
+  readonly restorePreamble: RestorePreamble | undefined;
   // The vault error code when the simulation failed in the contract.
   readonly contractError: number | undefined;
   readonly failed: boolean;
@@ -49,6 +60,8 @@ export interface TransactionStatus {
   // diagnostic events, without which it cannot show one.
   readonly conflict: boolean;
   readonly diagnosed: boolean;
+  // A failure whose result is that the call touched an archived entry it did not restore.
+  readonly archived: boolean;
 }
 
 export interface ContractEvent {
@@ -78,6 +91,67 @@ const closeTime = (f: Fields, key: string): number | undefined =>
   f.has(key) ? Number(f.amount(key)) : undefined;
 
 export const keyId = (key: xdr.LedgerKey): string => key.toXDR("base64");
+
+// An entry the network archives when its TTL runs out, and restores: contract code or persistent
+// contract data.
+export const isPersistent = (key: xdr.LedgerKey): boolean =>
+  key.switch().name === "contractCode" ||
+  (key.switch().name === "contractData" && key.contractData().durability().name === "persistent");
+
+function sorobanData(f: Fields, key: string): xdr.SorobanTransactionData {
+  let data: xdr.SorobanTransactionData;
+  try {
+    data = xdr.SorobanTransactionData.fromXDR(f.string(key), "base64");
+  } catch (err) {
+    if (err instanceof CyphrasError) throw err;
+    return f.fault(`${key} is not SorobanTransactionData XDR`);
+  }
+  if (BigInt(data.resourceFee().toString()) < 0n) f.fault(`${key} has a negative resource fee`);
+  return data;
+}
+
+function fee(f: Fields, key: string): bigint {
+  const value = f.amount(key);
+  if (value < 0n) f.fault(`${key} is negative`);
+  return value;
+}
+
+// The read-write entries the data marks as archived. The network refuses data whose marks are not
+// ascending, fall outside the read-write entries or name an entry that is not persistent.
+function archivedEntries(f: Fields, data: xdr.SorobanTransactionData): xdr.LedgerKey[] {
+  const ext = data.ext();
+  if (ext.switch() !== 1) return [];
+  const readWrite = data.resources().footprint().readWrite();
+  let last = -1;
+  return ext
+    .resourceExt()
+    .archivedSorobanEntries()
+    .map((i) => {
+      const key = readWrite[i];
+      if (i <= last || key === undefined || !isPersistent(key)) {
+        f.fault("the archived entries are not ascending persistent read-write entries");
+      }
+      last = i;
+      return key;
+    });
+}
+
+// Whether a transaction's result is that its call touched an archived entry it did not restore.
+function entryArchived(result: xdr.TransactionResult): boolean {
+  const outer = result.result();
+  const results =
+    outer.switch().name === "txFeeBumpInnerFailed"
+      ? outer.innerResultPair().result().result().results()
+      : outer.switch().name === "txFailed"
+        ? outer.results()
+        : [];
+  return results.some(
+    (op) =>
+      op.switch().name === "opInner" &&
+      op.tr().switch().name === "invokeHostFunction" &&
+      op.tr().invokeHostFunctionResult().switch().name === "invokeHostFunctionEntryArchived",
+  );
+}
 
 // A Soroban RPC client over JSON-RPC 2.0. Failures carry the method and the RPC error code only.
 export class SorobanRpc {
@@ -160,32 +234,47 @@ export class SorobanRpc {
         auth: [],
         result: undefined,
         latestLedger,
-        needsRestore: false,
+        archived: [],
+        restorePreamble: undefined,
         contractError: match ? Number(match[1]) : undefined,
         failed: true,
       };
     }
     const results = r.has("results") ? r.array("results") : [];
     const first = results.length > 0 ? r.item(results[0], 0, "results") : undefined;
+    const preamble = r.has("restorePreamble") ? r.object("restorePreamble") : undefined;
     return {
       transactionData: r.string("transactionData"),
-      minResourceFee: r.amount("minResourceFee"),
+      minResourceFee: fee(r, "minResourceFee"),
       auth: first?.has("auth") ? first.array("auth").map(String) : [],
       result: first?.has("xdr") ? xdr.ScVal.fromXDR(first.string("xdr"), "base64") : undefined,
       latestLedger,
-      needsRestore: r.has("restorePreamble"),
+      archived: archivedEntries(r, sorobanData(r, "transactionData")),
+      restorePreamble:
+        preamble === undefined
+          ? undefined
+          : {
+              transactionData: sorobanData(preamble, "transactionData"),
+              minResourceFee: fee(preamble, "minResourceFee"),
+            },
       contractError: undefined,
       failed: false,
     };
   }
 
-  async sendTransaction(envelope: string): Promise<{ status: SendStatus; hash: string }> {
+  async sendTransaction(
+    envelope: string,
+  ): Promise<{ status: SendStatus; hash: string; latestLedger: number | undefined }> {
     const r: Fields = await this.call("sendTransaction", { transaction: envelope });
     const status = r.string("status");
     if (!["PENDING", "DUPLICATE", "TRY_AGAIN_LATER", "ERROR"].includes(status)) {
       r.fault("unknown send status");
     }
-    return { status: status as SendStatus, hash: r.hash("hash") };
+    return {
+      status: status as SendStatus,
+      hash: r.hash("hash"),
+      latestLedger: r.has("latestLedger") ? r.integer("latestLedger", 1) : undefined,
+    };
   }
 
   async getTransaction(hash: string, timeoutMs?: number): Promise<TransactionStatus> {
@@ -196,6 +285,15 @@ export class SorobanRpc {
     }
     let returnValue: xdr.ScVal | undefined;
     let events: MetaEvent[] = [];
+    let archived = false;
+    if (status === "FAILED" && r.has("resultXdr")) {
+      try {
+        archived = entryArchived(xdr.TransactionResult.fromXDR(r.string("resultXdr"), "base64"));
+      } catch (err) {
+        if (err instanceof CyphrasError) throw err;
+        r.fault("the result is not TransactionResult XDR");
+      }
+    }
     const diagnostics: xdr.DiagnosticEvent[] = [];
     if (status === "FAILED" && r.has("diagnosticEventsXdr")) {
       for (const raw of r.array("diagnosticEventsXdr")) {
@@ -235,6 +333,7 @@ export class SorobanRpc {
           .topics()
           .some((t) => t.switch().name === "scvError" && t.error().switch().name === "sceStorage"),
       ),
+      archived,
     };
   }
 
