@@ -853,7 +853,7 @@ async function selfRelay(
         },
       },
     );
-    // The hash the vault's events carry, that of a fee bump that held the transaction.
+    // The hash the vault's events carry: its own, or that of the fee bump that held it.
     plan.txHash = hash;
     await core.save();
   } catch (err) {

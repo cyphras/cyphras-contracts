@@ -263,7 +263,7 @@ export async function shield(
         },
       },
     );
-    // The hash the vault's events carry, that of a fee bump that held the transaction.
+    // The hash the vault's events carry: its own, or that of the fee bump that held it.
     deposit.txHash = result.hash;
     // The deposit's ID counts once every RPC provider reports its transaction alike; until then the
     // deposit stays submitting, and a sync takes its ID from the chain.

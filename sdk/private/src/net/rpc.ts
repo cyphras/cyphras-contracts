@@ -337,7 +337,9 @@ export class SorobanRpc {
           .some((t) => t.switch().name === "scvError" && t.error().switch().name === "sceStorage"),
       ),
       archived,
-      envelope: r.has("envelopeXdr") ? r.string("envelopeXdr") : undefined,
+      // Optional to the SDK, so a reply that holds no readable envelope is not refused for it.
+      envelope:
+        typeof r.raw("envelopeXdr") === "string" ? (r.raw("envelopeXdr") as string) : undefined,
     };
   }
 

@@ -697,11 +697,19 @@ function priced(
 }
 
 async function sequenceOf(rpc: SorobanRpc, account: string): Promise<string> {
+  return (await sequenceRead(rpc, account)).sequence;
+}
+
+// An account's sequence number, and the ledger the RPC read it at.
+async function sequenceRead(
+  rpc: SorobanRpc,
+  account: string,
+): Promise<{ readonly sequence: string; readonly ledger: number }> {
   const sourceKey = accountKey(account);
-  const { entries } = await rpc.getLedgerEntries([sourceKey]);
+  const { entries, latestLedger } = await rpc.getLedgerEntries([sourceKey]);
   const source = entries.get(keyId(sourceKey));
   if (source === undefined) fail("invalid_argument", "the signer's account does not exist");
-  return source.data.account().seqNum().toString();
+  return { sequence: source.data.account().seqNum().toString(), ledger: latestLedger };
 }
 
 async function inclusionFee(rpc: SorobanRpc): Promise<bigint> {
@@ -811,7 +819,7 @@ export async function invokeVault(
     // second provider, the first one's word alone does not send it again.
     if (outcome.kind === "dropped" || outcome.archived) {
       if (outcome.hash !== undefined && ctx.second !== undefined) {
-        const [status] = await askTransaction(ctx, [ctx.second], outcome.hash);
+        const [status] = await askTransaction(ctx, [ctx.second], outcome.hash, outcome.also);
         const confirmed =
           outcome.kind === "dropped"
             ? status?.status === "NOT_FOUND" && status.latestLedger + 1 >= outcome.maxLedger
@@ -862,7 +870,7 @@ export async function invokeVault(
     if (conflicts === (call.attempts ?? ATTEMPTS)) {
       throw failed("the transaction failed on chain", { conflict: true });
     }
-    const doubt = await secondDoubt(ctx, hash);
+    const doubt = await secondDoubt(ctx, hash, outcome.also);
     if (doubt !== undefined) throw failed(DOUBTS[doubt], { secondProvider: doubt });
   }
 }
@@ -880,20 +888,26 @@ const DOUBTS: Readonly<Record<Doubt, string>> = {
 
 // Why the second provider, when one is set, does not report the transaction failed on the host's
 // storage as well; undefined when it does.
-async function secondDoubt(ctx: InvokeContext, hash: string): Promise<Doubt | undefined> {
+async function secondDoubt(
+  ctx: InvokeContext,
+  hash: string,
+  also: string | undefined,
+): Promise<Doubt | undefined> {
   if (ctx.second === undefined) return undefined;
-  const [status] = await askTransaction(ctx, [ctx.second], hash);
+  const [status] = await askTransaction(ctx, [ctx.second], hash, also);
   if (status === undefined || status.status === "NOT_FOUND") return "no_answer";
   if (status.status === "FAILED" && status.conflict) return undefined;
   return status.status === "FAILED" && !status.diagnosed ? "no_diagnostics" : "other_outcome";
 }
 
-// Asks every one of `providers` about a transaction, again while some do not hold it yet, within
-// ASK_POLLS requests and ASK_MS in all: each one's status, undefined where it never answered.
+// Asks every one of `providers` about a transaction, by its hash and, where it went in a fee bump,
+// by that bump's hash `also`, again while some do not hold it yet, within ASK_POLLS requests and
+// ASK_MS in all: each one's status, undefined where it never answered.
 export async function askTransaction(
   ctx: Pick<InvokeContext, "now" | "sleep">,
   providers: readonly SorobanRpc[],
   hash: string,
+  also?: string,
 ): Promise<(TransactionStatus | undefined)[]> {
   const deadline = ctx.now() + ASK_MS;
   const statuses: (TransactionStatus | undefined)[] = providers.map(() => undefined);
@@ -902,7 +916,7 @@ export async function askTransaction(
   for (let poll = 1; ; poll++) {
     for (const [i, provider] of providers.entries()) {
       if (held(statuses[i])) continue;
-      statuses[i] = await provider.getTransaction(hash, ASK_REQUEST_MS).catch((err: unknown) => {
+      statuses[i] = await lookUp(provider, hash, also, ASK_REQUEST_MS).catch((err: unknown) => {
         if (err instanceof CyphrasError) return undefined;
         throw err;
       });
@@ -912,20 +926,41 @@ export async function askTransaction(
   }
 }
 
+// A provider's report of a transaction by its hash, and by the hash of the fee bump it went in
+// where the provider does not hold it by the first: not every RPC finds a fee bump by the
+// transaction inside it.
+async function lookUp(
+  rpc: SorobanRpc,
+  hash: string,
+  also: string | undefined,
+  timeoutMs?: number,
+): Promise<TransactionStatus> {
+  const status = await rpc.getTransaction(hash, timeoutMs);
+  if (status.status !== "NOT_FOUND" || also === undefined) return status;
+  return rpc.getTransaction(also, timeoutMs);
+}
+
 // What became of one attempt of a call: its landed transaction's result; the hash of one that
 // failed on chain, and whether it failed on the host's storage or on an archived entry; one the
 // network can no longer take, past the ledger bound an archival edge set, with its hash once it was
-// sent; or the RestoreFootprint transaction the RPC asks to land first.
+// sent, and the hash of the fee bump it went in; or the RestoreFootprint transaction the RPC asks to
+// land first.
 type Attempt =
   | { readonly kind: "landed"; readonly result: InvokeResult }
   | {
       readonly kind: "failed";
       readonly hash: string;
+      readonly also: string | undefined;
       readonly conflict: boolean;
       readonly archived: boolean;
     }
-  | { readonly kind: "dropped"; readonly hash: undefined }
-  | { readonly kind: "dropped"; readonly hash: string; readonly maxLedger: number }
+  | { readonly kind: "dropped"; readonly hash: undefined; readonly also: undefined }
+  | {
+      readonly kind: "dropped";
+      readonly hash: string;
+      readonly also: string | undefined;
+      readonly maxLedger: number;
+    }
   | { readonly kind: "restore"; readonly data: xdr.SorobanTransactionData };
 
 async function attemptCall(
@@ -1028,7 +1063,9 @@ async function attemptCall(
   // A call that would land after an entry it reads archives is bound to the ledgers before that,
   // so that the network drops it unpaid rather than fail it on the entry.
   const low = live.length === 0 ? undefined : Math.min(...live.map((l) => l.until));
-  if (low !== undefined && low <= lives.latestLedger) return { kind: "dropped", hash: undefined };
+  if (low !== undefined && low <= lives.latestLedger) {
+    return { kind: "dropped", hash: undefined, also: undefined };
+  }
   const maxLedger =
     low !== undefined && low <= lives.latestLedger + BOUND_LEDGERS ? low + 1 : undefined;
   const renewed = live
@@ -1050,11 +1087,12 @@ async function attemptCall(
   );
   const tx = priced(fee, data, ctx.networkPassphrase, (bid, d) => build(bid, d, auth, maxLedger));
   const sent = await submit(ctx, signer, tx, fee, hooks, maxLedger);
-  if (sent.kind === "dropped")
-    return { kind: "dropped", hash: sent.hash, maxLedger: maxLedger ?? 0 };
-  const { hash, status } = sent;
+  if (sent.kind === "dropped") {
+    return { kind: "dropped", hash: sent.hash, also: sent.also, maxLedger: maxLedger ?? 0 };
+  }
+  const { hash, also, status } = sent;
   if (sent.kind === "failed") {
-    return { kind: "failed", hash, conflict: status.conflict, archived: status.archived };
+    return { kind: "failed", hash, also, conflict: status.conflict, archived: status.archived };
   }
   const ledger = status.ledger ?? status.latestLedger;
   return {
@@ -1069,15 +1107,18 @@ type Sent =
   | {
       readonly kind: "landed" | "failed";
       readonly hash: string;
+      readonly also: string | undefined;
       readonly landedAs: string;
       readonly status: TransactionStatus;
     }
-  | { readonly kind: "dropped"; readonly hash: string };
+  | { readonly kind: "dropped"; readonly hash: string; readonly also: string | undefined };
 
 // Shows the fee to the signer, has it sign the transaction, and for a fee bump then the fee bump
 // that holds it signed, sends the signed envelope and waits until the transaction is final.
 async function submit(
-  ctx: Pick<InvokeContext, "rpc" | "networkPassphrase" | "now" | "sleep">,
+  ctx: Pick<InvokeContext, "rpc" | "networkPassphrase" | "now" | "sleep"> & {
+    readonly second?: SorobanRpc | undefined;
+  },
   signer: TransactionSigner,
   tx: Transaction,
   fee: NetworkFee,
@@ -1134,7 +1175,7 @@ async function submit(
         bumpRefused = true;
         break;
       }
-      if (past(sent.latestLedger)) return { kind: "dropped", hash };
+      if (past(sent.latestLedger)) return { kind: "dropped", hash, also: undefined };
       refusal();
     }
     // TRY_AGAIN_LATER: the same signed envelope goes again until its time bound passes.
@@ -1148,21 +1189,44 @@ async function submit(
     backoff = Math.min(backoff * 2, 30_000);
   }
   if (!bumpRefused) await hooks.onSubmitted?.(hash);
+  // The fee bump sent here is asked about by its own hash too, once the network took it.
+  const also = fee.feeBump && !bumpRefused ? sentHash : undefined;
   const sequence = BigInt((first.signed as Transaction).sequence);
-  for (let taken = false; ; ) {
-    const status = await ctx.rpc.getTransaction(hash);
-    if (status.status === "SUCCESS" || status.status === "FAILED") {
-      if (bumpRefused) await hooks.onSubmitted?.(hash);
-      const landedAs = landedHash(status, hash, ctx.networkPassphrase);
-      return { kind: status.status === "SUCCESS" ? "landed" : "failed", hash, landedAs, status };
+  const final = (s: TransactionStatus | undefined): boolean =>
+    s?.status === "SUCCESS" || s?.status === "FAILED";
+  const landed = async (status: TransactionStatus): Promise<Sent> => {
+    if (bumpRefused) await hooks.onSubmitted?.(hash);
+    const landedAs = fee.feeBump ? await landedHash(ctx, status, hash, sentHash) : hash;
+    const kind = status.status === "SUCCESS" ? "landed" : "failed";
+    return { kind, hash, also, landedAs, status };
+  };
+  // A sequence number taken while nothing is found under these hashes may have gone to this
+  // transaction inside another fee bump, which a lagging reply does not show yet: the RPC is asked
+  // again, after a pause, until its reply covers the ledger it read the sequence at, and then the
+  // second provider.
+  const afterTaken = async (ledger: number): Promise<TransactionStatus | undefined> => {
+    const until = ctx.now() + ASK_MS;
+    for (let poll = 1; poll <= ASK_POLLS; poll++) {
+      await ctx.sleep(POLL_MS);
+      const status = await lookUp(ctx.rpc, hash, also);
+      if (final(status)) return status;
+      if (status.latestLedger >= ledger || ctx.now() >= until) break;
     }
-    if (past(status.latestLedger)) return { kind: "dropped", hash };
+    if (ctx.second === undefined) return undefined;
+    const [second] = await askTransaction(ctx, [ctx.second], hash, also);
+    return second !== undefined && final(second) ? second : undefined;
+  };
+  for (;;) {
+    const status = await lookUp(ctx.rpc, hash, also);
+    if (final(status)) return landed(status);
+    if (past(status.latestLedger)) return { kind: "dropped", hash, also };
     if (bumpRefused) {
-      // A sequence number taken with no transaction found under this hash went to another one;
-      // the RPC is asked once more after it saw the sequence taken.
-      if (taken) refusal();
-      taken = BigInt(await sequenceOf(ctx.rpc, signer.publicKey)) >= sequence;
-      if (taken) continue;
+      const read = await sequenceRead(ctx.rpc, signer.publicKey);
+      if (BigInt(read.sequence) >= sequence) {
+        const found = await afterTaken(read.ledger);
+        if (found !== undefined) return landed(found);
+        refusal();
+      }
       if (ctx.now() > deadline) refusal();
     } else if (ctx.now() > deadline) {
       throw new CyphrasError("transaction_failed", "the transaction expired unconfirmed", ids);
@@ -1171,20 +1235,43 @@ async function submit(
   }
 }
 
-// The hash the vault's events carry for a transaction that landed: that of the fee bump that held
-// it, as the RPC's reply shows it, where it was in one; else its own.
-function landedHash(status: TransactionStatus, hash: string, networkPassphrase: string): string {
-  if (status.envelope === undefined) return hash;
+// The hash the vault's events carry for a fee-bumped transaction that landed: that of the fee bump
+// the reply shows holding it, once that is the one sent here or, with a second provider, that
+// provider reports the same bump final in the same ledger; else the transaction's own, by which RPC
+// finds it inside any fee bump.
+async function landedHash(
+  ctx: Pick<InvokeContext, "networkPassphrase" | "now" | "sleep"> & {
+    readonly second?: SorobanRpc | undefined;
+  },
+  status: TransactionStatus,
+  hash: string,
+  sent: string,
+): Promise<string> {
+  const claimed = bumpHolding(status, hash, ctx.networkPassphrase);
+  if (claimed === undefined || claimed === sent || ctx.second === undefined) {
+    return claimed ?? hash;
+  }
+  const [other] = await askTransaction(ctx, [ctx.second], claimed);
+  return other?.status === status.status && other.ledger === status.ledger ? claimed : hash;
+}
+
+// The hash of the fee bump a reply's envelope is, when it holds the transaction of hash `hash`.
+function bumpHolding(
+  status: TransactionStatus,
+  hash: string,
+  networkPassphrase: string,
+): string | undefined {
+  if (status.envelope === undefined) return undefined;
   let landed: Transaction | FeeBumpTransaction;
   try {
     landed = TransactionBuilder.fromXDR(status.envelope, networkPassphrase);
   } catch {
-    return hash;
+    return undefined;
   }
   return landed instanceof FeeBumpTransaction &&
     bytesToHex(Uint8Array.from(landed.innerTransaction.hash())) === hash
     ? bytesToHex(Uint8Array.from(landed.hash()))
-    : hash;
+    : undefined;
 }
 
 type RestoreContext = Omit<InvokeContext, "second">;
