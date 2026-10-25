@@ -108,7 +108,7 @@ function payer(
       shown.push(fee);
       return options.agree?.(fee) ?? true;
     },
-    ...(options.signsFeeBumps === undefined ? {} : { signsFeeBumps: options.signsFeeBumps }),
+    signsFeeBumps: options.signsFeeBumps ?? true,
   };
   return { signer, shown, asked, envelopes, account };
 }
@@ -290,10 +290,12 @@ describe("restores above what one transaction carries", () => {
         throw new Error("unsupported envelope type");
       },
     });
-    await assert.rejects(
+    const err = await caught(
       PrivateWallet.restoreVault(donor.signer, restoreOptions(world, { restore: 2_000n * XLM })),
-      /unsupported envelope type/,
     );
+    assert.ok(isError("signer_mismatch")(err), String(err));
+    assert.equal(details(err)["feeBump"], true);
+    assert.match(String((err as Error).cause), /unsupported envelope type/);
     assert.equal(sends(world), 0);
   });
 

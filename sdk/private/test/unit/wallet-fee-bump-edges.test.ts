@@ -79,7 +79,7 @@ function payer(
       shown.push(fee);
       return options.agree?.(fee) ?? true;
     },
-    ...(options.signsFeeBumps === undefined ? {} : { signsFeeBumps: options.signsFeeBumps }),
+    signsFeeBumps: options.signsFeeBumps ?? true,
   };
   return { signer, shown, asked, account };
 }

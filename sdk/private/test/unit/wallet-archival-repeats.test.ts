@@ -288,7 +288,7 @@ describe("the fee one transaction carries", () => {
   async function cancelAt(resource: bigint) {
     const world = await createWorld();
     const alice = await openWallet(world, 0);
-    const depositor = world.signer("alice depositor");
+    const depositor = { ...world.signer("alice depositor"), signsFeeBumps: true };
     const { depositId } = await alice.shield({ amount: 10n * XLM, signer: depositor });
     world.rpc.sent = [];
     world.rpc.sentFees = [];

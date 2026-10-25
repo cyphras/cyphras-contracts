@@ -196,6 +196,8 @@ export class MockRpc {
   // by the hash of the transaction inside it.
   bumps: FeeBumpTransaction[] = [];
   readonly #inner = new Map<string, string>();
+  // The envelope taken under each hash, which getTransaction returns as envelopeXdr.
+  readonly #envelopes = new Map<string, string>();
   maxFootprintEntries = 400;
   maxWriteEntries = 200;
   maxDiskReadEntries = 200;
@@ -898,6 +900,7 @@ export class MockRpc {
         }
         account.sequence++;
         this.sent.push(tx);
+        this.#envelopes.set(hash, params["transaction"] as string);
         if (bump !== undefined) {
           this.bumps.push(bump);
           this.#inner.set(bytesToHex(Uint8Array.from(tx.hash())), hash);
@@ -991,7 +994,9 @@ export class MockRpc {
       case "getTransaction": {
         // RPC finds a fee bump by its own hash and by the one of the transaction inside it.
         const asked = params["hash"] as string;
-        const record = this.records.get(this.#inner.get(asked) ?? asked);
+        const found = this.#inner.get(asked) ?? asked;
+        const record = this.records.get(found);
+        const envelope = this.#envelopes.get(found);
         const base = { latestLedger: this.vault.ledger, oldestLedger: this.oldestLedger };
         if (record === undefined) return { ...base, status: "NOT_FOUND" };
         return {
@@ -1003,6 +1008,7 @@ export class MockRpc {
             ? {}
             : { diagnosticEventsXdr: record.diagnostics }),
           ...(record.result === undefined ? {} : { resultXdr: record.result }),
+          ...(envelope === undefined ? {} : { envelopeXdr: envelope }),
         };
       }
       case "getEvents":

@@ -285,7 +285,8 @@ describe("network fee caps a caller gives", () => {
     // One stroop above the 2^50 stroops of resource fee stellar-core takes.
     simulate(world, [vaultData(world, "instance"), vaultData(world, "Roots")], 2 ** 50 + 1);
     const shown: NetworkFee[] = [];
-    const err = await unshield(world, alice, payer(world, shown), { restore: 2n ** 51n }).catch(
+    const signer = { ...payer(world, shown), signsFeeBumps: true };
+    const err = await unshield(world, alice, signer, { restore: 2n ** 51n }).catch(
       (e: unknown) => e,
     );
     assert.ok(isError("fee_above_limit")(err), String(err));
