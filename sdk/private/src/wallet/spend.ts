@@ -116,6 +116,12 @@ function checkQuote(core: Core, quote: Quote, feeAddress: string, cap: bigint): 
     bad("is off the fee tier");
   if (quote.marginBps < 0 || quote.marginBps > 1_000) bad("takes a margin above 10 percent");
   if (quote.fee < 0n) bad("is negative");
+  if (
+    quote.queuedFee !== undefined &&
+    (quote.queuedFee < quote.fee || quote.queuedFee % deployment.feeTier !== 0n)
+  ) {
+    bad("names a queued fee under its fee or off the fee tier");
+  }
   if (quote.validUntil * 1000 < core.now()) bad("has expired");
   if (quote.fee > cap) {
     fail("fee_above_cap", "the relayer's fee is above the cap", {
@@ -189,6 +195,9 @@ export interface SpendQuote {
   // self-relayed unshield, which pays no fee from the notes.
   readonly relayer: string | undefined;
   readonly fee: bigint;
+  // What the relayer charges instead for a payment the vault would queue, an exit beyond today's
+  // outflow window or behind a queued one; undefined when it gives none.
+  readonly queuedFee: bigint | undefined;
   readonly validUntil: number | undefined;
   // The largest amount one transaction can pay after the fee: from the two largest spendable
   // notes, and for an unshield within the vault's cap for one exit. Undefined until the wallet has
@@ -219,7 +228,13 @@ export async function quoteSpend(
   const cap = maxFee !== undefined && maxFee < limits.maxFee ? maxFee : limits.maxFee;
   const relay = relayers === undefined ? undefined : await chooseRelay(core, relayers, cap, held);
   const fee = relay?.quote.fee ?? 0n;
-  const quoted = { kind, relayer: relay?.client.url, fee, validUntil: relay?.quote.validUntil };
+  const quoted = {
+    kind,
+    relayer: relay?.client.url,
+    fee,
+    queuedFee: relay?.quote.queuedFee,
+    validUntil: relay?.quote.validUntil,
+  };
   if (reads === undefined) return { ...quoted, maxAmount: undefined, spendable: undefined };
   const values = spendableNotes(core.state)
     .map((n) => n.value)
@@ -480,15 +495,32 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
   let saved: Plan | undefined;
   try {
     for (;;) {
-      const fee = relay?.quote.fee ?? 0n;
+      let fee = relay?.quote.fee ?? 0n;
+      const payout = intent.kind === "send" ? 0n : intent.amount;
+      let willQueue = checkOutflow(instance, payout + fee, core.now());
+      // A payment the vault queues writes an exit entry, which the relayer's queued fee covers.
+      const queuedFee = relay?.quote.queuedFee;
+      if (willQueue && queuedFee !== undefined && queuedFee > fee) {
+        if (queuedFee > cap) {
+          fail(
+            "fee_above_cap",
+            "the relayer's fee for a payment the vault queues is above the cap",
+            {
+              fee: queuedFee.toString(),
+              cap: cap.toString(),
+              queued: true,
+            },
+          );
+        }
+        fee = queuedFee;
+        willQueue = checkOutflow(instance, payout + fee, core.now());
+      }
       const route: Route =
         relay === undefined
           ? { kind: "self", account: (intent.selfRelay as TransactionSigner).publicKey }
           : { kind: "relayer", url: relay.client.url };
       const relayerAddress =
         relay === undefined ? (intent.selfRelay as TransactionSigner).publicKey : relay.feeAddress;
-      const outflow = intent.kind === "send" ? fee : intent.amount + fee;
-      const willQueue = checkOutflow(instance, outflow, core.now());
 
       const inputs = intent.inputs ?? selectNotes(spendableNotes(core.state), intent.amount + fee);
       const total = inputs.reduce((s, n) => s + n.value, 0n);

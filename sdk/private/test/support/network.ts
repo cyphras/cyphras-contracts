@@ -338,6 +338,9 @@ export class MockRelayer {
   pace: number | undefined;
   // Test hook: a fee address the quote names instead of the one the health reports.
   quoteFeeAddress: string | undefined;
+  // Test hook: the fee of a payment the vault queues, quoted as queued_fee and required of one;
+  // the quote's fee is that too while every payment queues.
+  queuedFee: bigint | undefined;
   // Test hooks: errors to answer submissions with, in order, and how many of the next
   // transactions sent fail on the host's storage, which the relayer reports as failed with the
   // code "unavailable" and rests nothing for, or fail on chain otherwise, which it reports as
@@ -402,8 +405,11 @@ export class MockRelayer {
     }
     if (url.pathname === "/v1/quote") {
       if (this.fee > v.limits.maxFee) return json(503, { error: "unavailable" });
+      const queued = this.queuedFee;
+      const fee = queued !== undefined && v.queues(0n, this.fee) ? queued : this.fee;
       return json(200, {
-        fee: this.fee.toString(),
+        fee: fee.toString(),
+        ...(queued === undefined ? {} : { queued_fee: queued.toString() }),
         asset: this.asset,
         tier: this.tier.toString(),
         margin_bps: 500,
@@ -487,6 +493,13 @@ export class MockRelayer {
     if (ext.extAmount > 0n || ext.relayer !== this.feeAddress)
       return json(400, { error: "bad_request" });
     if (ext.fee < this.fee) return json(400, { error: "fee_too_low" });
+    if (
+      this.queuedFee !== undefined &&
+      this.vault.queues(-ext.extAmount, ext.fee) &&
+      ext.fee < this.queuedFee
+    ) {
+      return json(400, { error: "fee_too_low" });
+    }
     if (ext.fee > this.vault.limits.maxFee) return json(400, { error: "fee_above_cap" });
     const key = proof.inputNullifiers.map(String).join(":");
     if (proof.inputNullifiers.some((nf) => this.inFlight.has(nf.toString()))) {

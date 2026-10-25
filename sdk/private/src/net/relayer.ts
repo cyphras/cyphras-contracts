@@ -14,6 +14,9 @@ export interface RelayerHealth extends ServiceIdentity {
 
 export interface Quote {
   readonly fee: bigint;
+  // The fee of a payment the vault queues, which writes an exit entry: one beyond what is left of
+  // today's outflow window, or any while an exit waits. Undefined when the relayer relays none.
+  readonly queuedFee: bigint | undefined;
   readonly asset: string;
   readonly tier: bigint;
   readonly marginBps: number;
@@ -132,6 +135,7 @@ export class RelayerClient {
     const f = Fields.of(body, "quote_invalid", "relayer quote");
     return {
       fee: f.amount("fee"),
+      queuedFee: f.has("queued_fee") ? f.amount("queued_fee") : undefined,
       asset: f.string("asset"),
       tier: f.amount("tier"),
       marginBps: f.integer("margin_bps"),
