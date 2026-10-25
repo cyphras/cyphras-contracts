@@ -709,6 +709,12 @@ function relayerFailed(
   plan.errorMessage = relayerRefusal(plan.kind, code, reason, networkFee).message;
 }
 
+// A relayer took the plan's request again, so an earlier refusal no longer says where it stands.
+function relayerTook(plan: Plan): void {
+  plan.error = undefined;
+  delete plan.errorMessage;
+}
+
 // What the relayer reports of a held request. One that was sent, failed or was cancelled is not
 // followed by its ID any more.
 function takeHeld(plan: Plan, held: HeldRequest): void {
@@ -776,6 +782,7 @@ export async function followHeld(
     plan.txHash = result.hash;
     plan.heldId = result.heldId;
     plan.relayerStatus = result.hash === undefined ? "held" : "pending";
+    relayerTook(plan);
   } else if (result.error === "duplicate") {
     // The relayer still holds the request after all.
     plan.relayerStatus = "held";
@@ -804,6 +811,7 @@ export async function resendConflicted(
     plan.txHash = result.hash;
     plan.heldId = result.heldId;
     plan.relayerStatus = result.hash === undefined ? "held" : "pending";
+    relayerTook(plan);
   } else if (!["duplicate", "unavailable", "rate_limited"].includes(result.error)) {
     plan.relayerStatus = "failed";
     relayerFailed(plan, result.error, result.reason, result.networkFee);
@@ -823,7 +831,7 @@ async function selfRelay(
 ): Promise<Submission> {
   const ext: ExtData = extDataFromJson(plan.ext);
   try {
-    await invokeVault(
+    const { hash } = await invokeVault(
       invokeContext(core, caps),
       signer,
       {
@@ -845,6 +853,9 @@ async function selfRelay(
         },
       },
     );
+    // The hash the vault's events carry, that of a fee bump that held the transaction.
+    plan.txHash = hash;
+    await core.save();
   } catch (err) {
     plan.error = err instanceof CyphrasError ? err.code : "unexpected_error";
     // A message the SDK did not write is not kept: it could carry anything.

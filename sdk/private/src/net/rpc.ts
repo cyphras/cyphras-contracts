@@ -62,6 +62,9 @@ export interface TransactionStatus {
   readonly diagnosed: boolean;
   // A failure whose result is that the call touched an archived entry it did not restore.
   readonly archived: boolean;
+  // The envelope that landed, as base64 XDR, which for a transaction asked for by the hash of the
+  // one inside a fee bump is that fee bump.
+  readonly envelope: string | undefined;
 }
 
 export interface ContractEvent {
@@ -334,6 +337,7 @@ export class SorobanRpc {
           .some((t) => t.switch().name === "scvError" && t.error().switch().name === "sceStorage"),
       ),
       archived,
+      envelope: r.has("envelopeXdr") ? r.string("envelopeXdr") : undefined,
     };
   }
 

@@ -58,7 +58,11 @@ export interface NetworkFee {
   readonly feeBump: boolean;
 }
 
-/** The most the SDK lets a transaction it builds pay, in stroops. */
+/**
+ * The most the SDK lets a transaction it builds pay, in stroops. For a signer that takes fee bumps
+ * (TransactionSigner.signsFeeBumps), these caps and its confirmFee are the whole bound up to 2^50
+ * stroops; for any other one a transaction also pays at most 4,294,967,295.
+ */
 export interface NetworkFeeCaps {
   readonly inclusion: bigint;
   readonly resource: bigint;
@@ -114,14 +118,16 @@ export interface VaultRestore {
  * signer that can ask its user implements confirmFee: every transaction the SDK builds shows it the
  * network fee before signing, and goes ahead only on true.
  *
- * A transaction whose fee is above what one envelope's fee field holds, 4,294,967,295 stroops, goes
- * inside a fee bump that the same account pays (NetworkFee.feeBump). After one confirmFee for the
- * whole fee, signTransaction is called twice: first with the transaction, whose fee field is 0, and
- * then with the fee-bump envelope (ENVELOPE_TYPE_TX_FEE_BUMP) that holds it signed; each result must
- * be the envelope it was given with signatures added. A signer that cannot sign a fee-bump envelope
- * sets signsFeeBumps to false: such a fee then fails with fee_above_limit before anything is signed.
- * A reply to the fee bump that declines fails with signer_rejected, and one that is not the fee bump
- * signed with signer_mismatch, both with details.feeBump; nothing is sent then.
+ * One envelope's fee field holds at most 4,294,967,295 stroops; a fee above that fails with
+ * fee_above_limit before anything is signed, unless the signer sets signsFeeBumps to true. Such a
+ * signer takes fees up to 2^50 stroops, bounded only by the caps and confirmFee: the transaction
+ * goes inside a fee bump that the same account pays (NetworkFee.feeBump), and after one confirmFee
+ * for the whole fee, signTransaction is called twice, first with the transaction, whose fee field
+ * is 0, then with the fee-bump envelope (ENVELOPE_TYPE_TX_FEE_BUMP) that holds it signed; each
+ * result must be the envelope it was given with signatures added. Anyone who sees the signed
+ * transaction can land it by paying its fee, so it binds once signed, whatever the second answer. A
+ * reply to the fee bump that declines fails with signer_rejected, and a throw or a reply that is
+ * not the fee bump signed with signer_mismatch, all with details.feeBump; nothing is sent then.
  */
 export interface TransactionSigner {
   readonly publicKey: string;
@@ -628,7 +634,7 @@ function checkFee(
   signer: TransactionSigner,
 ): NetworkFee {
   const entries = entryNames(keys, o);
-  const bumps = signer.signsFeeBumps !== false;
+  const bumps = signer.signsFeeBumps === true;
   const feeBump = bumps && bid + resource > MAX_ENVELOPE_FEE;
   const inclusion = feeBump ? bid * 2n : bid;
   const details = {
@@ -648,7 +654,7 @@ function checkFee(
     }
     fail(
       "fee_above_limit",
-      "the network fee is above what one transaction carries, and the signer does not sign fee bumps",
+      "the network fee is above what one transaction carries, and the signer does not take fee bumps (signsFeeBumps)",
       { ...details, limit: MAX_ENVELOPE_FEE.toString(), feeBump: "unsupported" },
     );
   }
@@ -725,10 +731,17 @@ async function signedBy(
   const bump = tx instanceof FeeBumpTransaction;
   const what = bump ? "fee bump" : "transaction";
   const details: ErrorDetails = bump ? { feeBump: true } : {};
-  const envelope = signedEnvelope(
-    await signer.signTransaction(tx.toXDR(), networkPassphrase),
-    details,
-  );
+  let reply: unknown;
+  try {
+    reply = await signer.signTransaction(tx.toXDR(), networkPassphrase);
+  } catch (err) {
+    if (!bump || err instanceof CyphrasError) throw err;
+    // A signer that knows only plain transactions may throw on a fee bump; nothing is sent then.
+    throw new CyphrasError("signer_mismatch", "the signer could not sign the fee bump", details, {
+      cause: err,
+    });
+  }
+  const envelope = signedEnvelope(reply, details);
   let signed: Transaction | FeeBumpTransaction;
   try {
     signed = TransactionBuilder.fromXDR(envelope, networkPassphrase);
@@ -766,7 +779,9 @@ export interface SubmitHooks {
 // Builds, simulates, signs and submits one vault call with the signer's account as source, inside
 // a fee bump the same account pays when its fee is above what one envelope holds, then waits until
 // the transaction is final. A transaction the RPC reports the network refused, or did
-// not take before its time bound passed, fails with details.refused. The call restores the
+// not take before its time bound passed, fails with details.refused; in a fee bump, only once no
+// fee bump that holds it can land any more. It is followed by its own hash, which RPC finds inside
+// any fee bump, and its result names the hash the vault's events carry. The call restores the
 // archived entries its simulation marks, within the caps' room for a restore; when the RPC asks
 // for a RestoreFootprint transaction first, the signer sends that one before the call, and a
 // failed one fails with restore_failed.
@@ -1044,16 +1059,17 @@ async function attemptCall(
   const ledger = status.ledger ?? status.latestLedger;
   return {
     kind: "landed",
-    result: { hash, ledger, returnValue: status.returnValue, events: status.events },
+    result: { hash: sent.landedAs, ledger, returnValue: status.returnValue, events: status.events },
   };
 }
 
 // A signed transaction the network took and that is final, or that it can no longer take, past its
-// ledger bound.
+// ledger bound, by its own hash, inside a fee bump too, and as the hash the vault's events carry.
 type Sent =
   | {
       readonly kind: "landed" | "failed";
       readonly hash: string;
+      readonly landedAs: string;
       readonly status: TransactionStatus;
     }
   | { readonly kind: "dropped"; readonly hash: string };
@@ -1076,57 +1092,99 @@ async function submit(
   if (BigInt(tx.fee) !== (fee.feeBump ? 0n : fee.total)) {
     fail("rpc_error", "the transaction's fee is not the one shown");
   }
-  let { envelope: signedXdr, signed } = await signedBy(signer, tx, ctx.networkPassphrase);
+  const first = await signedBy(signer, tx, ctx.networkPassphrase);
+  let signedXdr = first.envelope;
+  // The transaction that changes the ledger, which RPC finds whatever fee bump holds it: anyone
+  // who sees the signed transaction can land it inside a fee bump of their own, under another hash.
+  const hash = bytesToHex(Uint8Array.from(first.signed.hash()));
+  let sentHash = hash;
   if (fee.feeBump) {
     const bump = TransactionBuilder.buildFeeBumpTransaction(
       signer.publicKey,
       (fee.inclusion / 2n).toString(),
-      signed as Transaction,
+      first.signed as Transaction,
       ctx.networkPassphrase,
     );
-    if (BigInt(bump.fee) !== fee.total)
+    if (BigInt(bump.fee) !== fee.total) {
       fail("rpc_error", "the fee bump's fee is not the one shown");
-    ({ envelope: signedXdr, signed } = await signedBy(signer, bump, ctx.networkPassphrase));
+    }
+    const outer = await signedBy(signer, bump, ctx.networkPassphrase);
+    signedXdr = outer.envelope;
+    sentHash = bytesToHex(Uint8Array.from(outer.signed.hash()));
   }
-  // A fee bump is sent, found and followed by its own hash, which commits to the signed transaction
-  // inside it; the RPC finds it by either.
-  const hash = bytesToHex(Uint8Array.from(signed.hash()));
+  const ids = fee.feeBump ? { hash, feeBumpHash: sentHash } : { hash };
 
   const deadline = ctx.now() + (TIMEOUT_SECONDS + 30) * 1000;
   // Once the RPC holds the last ledger a bound transaction could land in, it can land no more.
   const past = (latest: number | undefined): boolean =>
     maxLedger !== undefined && latest !== undefined && latest + 1 >= maxLedger;
+  const refusal = (): never =>
+    fail("transaction_failed", "the network refused the transaction", { ...ids, refused: true });
+  // The network refused this fee bump, but another one may hold the same transaction, which can
+  // still land until its bounds pass or its sequence number is taken.
+  let bumpRefused = false;
   let backoff = POLL_MS;
   await hooks.onSending?.(hash);
   for (;;) {
     const sent = await ctx.rpc.sendTransaction(signedXdr);
-    if (sent.hash !== hash) fail("rpc_error", "the RPC reports a different transaction hash");
+    if (sent.hash !== sentHash) fail("rpc_error", "the RPC reports a different transaction hash");
     if (sent.status === "PENDING" || sent.status === "DUPLICATE") break;
     if (sent.status === "ERROR") {
+      if (fee.feeBump) {
+        bumpRefused = true;
+        break;
+      }
       if (past(sent.latestLedger)) return { kind: "dropped", hash };
-      fail("transaction_failed", "the network refused the transaction", { hash, refused: true });
+      refusal();
     }
     // TRY_AGAIN_LATER: the same signed envelope goes again until its time bound passes.
     if (ctx.now() > deadline) {
       fail("transaction_failed", "the network did not take the transaction", {
-        hash,
+        ...ids,
         refused: true,
       });
     }
     await ctx.sleep(backoff);
     backoff = Math.min(backoff * 2, 30_000);
   }
-  await hooks.onSubmitted?.(hash);
-  for (;;) {
+  if (!bumpRefused) await hooks.onSubmitted?.(hash);
+  const sequence = BigInt((first.signed as Transaction).sequence);
+  for (let taken = false; ; ) {
     const status = await ctx.rpc.getTransaction(hash);
-    if (status.status === "SUCCESS") return { kind: "landed", hash, status };
-    if (status.status === "FAILED") return { kind: "failed", hash, status };
+    if (status.status === "SUCCESS" || status.status === "FAILED") {
+      if (bumpRefused) await hooks.onSubmitted?.(hash);
+      const landedAs = landedHash(status, hash, ctx.networkPassphrase);
+      return { kind: status.status === "SUCCESS" ? "landed" : "failed", hash, landedAs, status };
+    }
     if (past(status.latestLedger)) return { kind: "dropped", hash };
-    if (ctx.now() > deadline) {
-      throw new CyphrasError("transaction_failed", "the transaction expired unconfirmed", { hash });
+    if (bumpRefused) {
+      // A sequence number taken with no transaction found under this hash went to another one;
+      // the RPC is asked once more after it saw the sequence taken.
+      if (taken) refusal();
+      taken = BigInt(await sequenceOf(ctx.rpc, signer.publicKey)) >= sequence;
+      if (taken) continue;
+      if (ctx.now() > deadline) refusal();
+    } else if (ctx.now() > deadline) {
+      throw new CyphrasError("transaction_failed", "the transaction expired unconfirmed", ids);
     }
     await ctx.sleep(POLL_MS);
   }
+}
+
+// The hash the vault's events carry for a transaction that landed: that of the fee bump that held
+// it, as the RPC's reply shows it, where it was in one; else its own.
+function landedHash(status: TransactionStatus, hash: string, networkPassphrase: string): string {
+  if (status.envelope === undefined) return hash;
+  let landed: Transaction | FeeBumpTransaction;
+  try {
+    landed = TransactionBuilder.fromXDR(status.envelope, networkPassphrase);
+  } catch {
+    return hash;
+  }
+  return landed instanceof FeeBumpTransaction &&
+    bytesToHex(Uint8Array.from(landed.innerTransaction.hash())) === hash
+    ? bytesToHex(Uint8Array.from(landed.hash()))
+    : hash;
 }
 
 type RestoreContext = Omit<InvokeContext, "second">;
@@ -1177,7 +1235,7 @@ async function restoreSent(
   if (sent.kind !== "landed") {
     fail("restore_failed", "the restore failed on chain", { hash: sent.hash });
   }
-  return { hash: sent.hash, resource };
+  return { hash: sent.landedAs, resource };
 }
 
 // Restores those of `keys` that are archived with one RestoreFootprint transaction the signer sends

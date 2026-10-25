@@ -319,7 +319,8 @@ export interface PlanView extends Submission {
   // The relayer's code for its last refusal or failure of a relayed plan's request, as
   // restore_needed or network_fee_high, a held or resent one's too; undefined for a self-relayed
   // plan. The last error that stopped the plan's submission, by the SDK's code and message:
-  // service_rejected for a relayer's refusal.
+  // service_rejected for a relayer's refusal. Neither is set once the plan landed, nor after the
+  // relayer took a resend of it.
   readonly relayerCode: string | undefined;
   readonly lastError: { readonly code: ErrorCode; readonly message: string } | undefined;
   // The payment may still land, or failed by the wallet's last reading of the chain only: paying
@@ -424,7 +425,7 @@ const relayed = (p: Plan): boolean => p.route.kind === "relayer";
 // The last error that stopped a plan's submission, with its message, which a plan saved by an
 // earlier release lacks: a relayer's refusal says it again from its code.
 function lastErrorOf(p: Plan): PlanView["lastError"] {
-  if (p.error === undefined) return undefined;
+  if (p.error === undefined || LANDED_STATES.includes(p.state)) return undefined;
   if (relayed(p)) {
     return {
       code: "service_rejected",
@@ -1168,7 +1169,7 @@ export class PrivateWallet {
           p.exit === undefined ? undefined : p.exit.confirmed && p.exit.account === undefined,
         operationId: p.operationId,
         relayerStatus: p.relayerStatus,
-        relayerCode: relayed(p) ? p.error : undefined,
+        relayerCode: relayed(p) && !LANDED_STATES.includes(p.state) ? p.error : undefined,
         lastError: lastErrorOf(p),
         mustRetry: isActive(p) || p.state === "dead",
         needsUserDecision: isActive(p) && (state.rootCheck?.ledger ?? 0) >= p.deadline,
