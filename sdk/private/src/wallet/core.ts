@@ -289,12 +289,49 @@ export function suspectNotes(state: WalletState): OwnedNote[] {
   return spendableNotes(state).filter((n) => marked.has(n.pos));
 }
 
+// How many sets of notes a refusing provider may see for one payment, by destination and amount,
+// and in one hour, before self-relayed spends stop with notes_refused.
+const REFUSED_PER_PAYMENT = 3;
+const REFUSED_PER_HOUR = 6;
+const HOUR_MS = 3_600_000;
+
+const notesRefused = (why: string): never =>
+  fail(
+    "notes_refused",
+    `${why}; a later sync that shows which note is spent, or a rescan, may clear it`,
+  );
+
+// Each self-relayed try after a refusal shows the RPC providers the nullifiers of other notes, tied
+// to the paying account, so the tries are capped: after REFUSED_PER_PAYMENT refused sets for the
+// same destination and amount, or REFUSED_PER_HOUR in the last hour, the spend stops before it is
+// proved, though the payment might still go with notes not tried yet.
+function checkTries(
+  state: WalletState,
+  payment: { readonly to: string; readonly amount: bigint; readonly now: number },
+): void {
+  const ids = new Set(state.suspects.flatMap((s) => s.plans));
+  const refused = state.plans.filter((p) => ids.has(p.id));
+  const same = refused.filter((p) => p.to === payment.to && p.amount === payment.amount);
+  const recent = refused.filter((p) => p.createdAt > payment.now - HOUR_MS);
+  if (same.length >= REFUSED_PER_PAYMENT || recent.length >= REFUSED_PER_HOUR) {
+    notesRefused(
+      "this payment, or this wallet in the last hour, had too many sets of notes refused",
+    );
+  }
+}
+
 // Notes for a total, as selectNotes chooses among the notes no refused plan held; else the single
 // note or pair that is not a set of notes a refused plan held, whose most refused note was refused
-// least, then with the fewest notes refused and the fewest refusals of them. A refusal happens at simulation, so going on to another
-// set costs no fee. When every set that covers the total was refused, it fails with notes_refused
-// and nothing is proved.
-export function chooseNotes(state: WalletState, total: bigint): OwnedNote[] {
+// least, then with the fewest notes refused and the fewest refusals of them. A refusal happens at
+// simulation, so going on to another set costs no fee. When every set that covers the total was
+// refused, it fails with notes_refused and nothing is proved. With `payment`, for a self-relayed
+// spend, the tries after refusals are capped as checkTries says.
+export function chooseNotes(
+  state: WalletState,
+  total: bigint,
+  payment?: { readonly to: string; readonly amount: bigint; readonly now: number },
+): OwnedNote[] {
+  if (payment !== undefined) checkTries(state, payment);
   const notes = spendableNotes(state);
   const refusals = new Map(state.suspects.map((s) => [s.pos, s.plans.length]));
   const clean = notes.filter((n) => !refusals.has(n.pos));
@@ -303,32 +340,45 @@ export function chooseNotes(state: WalletState, total: bigint): OwnedNote[] {
   } catch (err) {
     if (!(err instanceof CyphrasError) || clean.length === notes.length) throw err;
   }
+  // No clean note or pair covers the total, so every set that does holds a marked note: only those
+  // are looked at, one at a time.
   const refused = refusedSets(state);
-  const sets = [
-    ...notes.map((n) => [n]),
-    ...notes.flatMap((a, i) => notes.slice(i + 1).map((b) => [a, b])),
-  ].filter((set) => set.reduce((s, n) => s + n.value, 0n) >= total);
-  const rank = (set: readonly OwnedNote[]): number[] => [
-    Math.max(...set.map((n) => refusals.get(n.pos) ?? 0)),
-    set.filter((n) => refusals.has(n.pos)).length,
-    set.reduce((s, n) => s + (refusals.get(n.pos) ?? 0), 0),
-    set.length,
+  const marked = notes.filter((n) => refusals.has(n.pos));
+  const order = new Map(marked.map((n, i) => [n.pos, i]));
+  const rank = (set: readonly OwnedNote[]): bigint[] => [
+    BigInt(Math.max(...set.map((n) => refusals.get(n.pos) ?? 0))),
+    BigInt(set.filter((n) => refusals.has(n.pos)).length),
+    BigInt(set.reduce((s, n) => s + (refusals.get(n.pos) ?? 0), 0)),
+    BigInt(set.length),
+    set.reduce((s, n) => s + n.value, 0n),
   ];
-  const order = (a: readonly OwnedNote[], b: readonly OwnedNote[]): number => {
-    const [ra, rb] = [rank(a), rank(b)];
-    for (let i = 0; i < ra.length; i++) {
-      if (ra[i] !== rb[i]) return (ra[i] as number) - (rb[i] as number);
+  const before = (a: readonly bigint[], b: readonly bigint[]): boolean => {
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return (a[i] as bigint) < (b[i] as bigint);
     }
-    const [sa, sb] = [a, b].map((set) => set.reduce((s, n) => s + n.value, 0n));
-    return sa === sb ? 0 : (sa as bigint) < (sb as bigint) ? -1 : 1;
+    return false;
   };
-  const allowed = sets.filter((set) => !refused.has(keyOf(set.map((n) => n.pos)))).sort(order);
-  const first = allowed[0];
-  if (first !== undefined) return first;
-  if (sets.length > 0) {
-    fail(
-      "notes_refused",
-      "every set of notes that covers the amount was refused before as spending a note already spent; a later sync that shows which note is spent, or a rescan, may clear it",
+  let best: { readonly set: OwnedNote[]; readonly rank: bigint[] } | undefined;
+  let covered = false;
+  const consider = (set: OwnedNote[]): void => {
+    if (set.reduce((s, n) => s + n.value, 0n) < total) return;
+    covered = true;
+    if (refused.has(keyOf(set.map((n) => n.pos)))) return;
+    const r = rank(set);
+    if (best === undefined || before(r, best.rank)) best = { set, rank: r };
+  };
+  for (const [i, a] of marked.entries()) {
+    consider([a]);
+    for (const b of notes) {
+      // A pair of two marked notes is looked at once, from the first of them.
+      if (b === a || (order.get(b.pos) ?? marked.length) < i) continue;
+      consider([a, b]);
+    }
+  }
+  if (best !== undefined) return best.set;
+  if (covered) {
+    notesRefused(
+      "every set of notes that covers the amount was refused before as spending a note already spent",
     );
   }
   return selectNotes(notes, total);

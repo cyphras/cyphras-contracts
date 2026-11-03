@@ -3,7 +3,10 @@ import { payoutLeft } from "./exits.ts";
 import type { ExitEvent } from "./sources.ts";
 import type { WalletState } from "./state.ts";
 
-/** Spendable value, value in pending deposits, value locked in unconfirmed submissions. */
+/**
+ * Spendable value, value in pending deposits, value locked in unconfirmed submissions, and the part
+ * of spendable that may already be spent elsewhere.
+ */
 export interface Balance {
   readonly spendable: bigint;
   readonly pendingDeposits: bigint;
@@ -12,11 +15,12 @@ export interface Balance {
   readonly awaitingPayout: bigint;
   // True for a wallet with only an incoming viewing key, which cannot see spends.
   readonly spendsUnknown: boolean;
-  // Of spendable, the notes of this wallet's self-relayed payments the vault refused as spending a
-  // note already spent, as every RPC provider showed: they may already be spent elsewhere, in a
-  // transaction no source of the wallet showed; included in spendable. Spends take them after other
-  // notes. A sync that shows them spent, or a rescan, clears them.
-  readonly unconfirmed: bigint;
+  // Of spendable, the value of the notes of this wallet's self-relayed payments the vault
+  // refused as spending a note already spent, as every RPC provider showed: they may already be
+  // spent elsewhere, in a transaction no source of the wallet showed; included in spendable, so not
+  // to be added to it. Spends take them after other notes. A sync that shows them spent, or a
+  // rescan, clears them.
+  readonly maybeSpent: bigint;
 }
 
 export function balanceOf(state: WalletState, spendsVisible: boolean): Balance {
@@ -32,7 +36,7 @@ export function balanceOf(state: WalletState, spendsVisible: boolean): Balance {
       .filter((p) => p.state === "queued" || p.state === "stranded")
       .reduce((s, p) => s + (p.exit === undefined ? p.amount : payoutLeft(p.exit)), 0n),
     spendsUnknown: !spendsVisible,
-    unconfirmed: suspectNotes(state).reduce((s, n) => s + n.value, 0n),
+    maybeSpent: suspectNotes(state).reduce((s, n) => s + n.value, 0n),
   };
 }
 

@@ -139,7 +139,7 @@ const counted = (err: unknown): boolean =>
   details(err)["vaultError"] === "NullifierSpent" && details(err)["everyProvider"] === true;
 
 describe("refusals that name no single note", () => {
-  it("keeps the honest note of a pair spendable after the same payment is refused twice", async () => {
+  it("keeps the honest note of a pair spendable when the same payment is asked for again", async () => {
     const { world, bob, store } = await twoNotes();
     await spentElsewhere(world, store, 5n * XLM);
     assert.ok(counted(await selfUnshield(world, bob, 12n * XLM)));
@@ -191,7 +191,7 @@ describe("refusals that name no single note", () => {
     assert.equal(paid, undefined, `honest notes stay out: ${String(paid)}`);
     await bob.sync();
     assert.equal(owedTo(world, world.signer("carol").publicKey), 12n * XLM);
-    assert.equal((await bob.balance()).unconfirmed, 0n);
+    assert.equal((await bob.balance()).maybeSpent, 0n);
   });
 
   it("does not prove a refused split part again with the same notes", async () => {
@@ -241,21 +241,21 @@ describe("refusals across a restart", () => {
     const { world, bob } = await twoNotes(undefined, store);
     await spentElsewhere(world, store, 5n * XLM);
     assert.ok(counted(await selfUnshield(world, bob, 4n * XLM)));
-    // While the refused plan is prepared, its note counts as locked, not as unconfirmed.
+    // While the refused plan is prepared, its note counts as locked, not as maybeSpent.
     let balance = await bob.balance();
     assert.deepEqual(
-      [balance.spendable, balance.locked, balance.unconfirmed],
+      [balance.spendable, balance.locked, balance.maybeSpent],
       [10n * XLM, 5n * XLM, 0n],
     );
     const reopened = await openWallet(world, 1, store);
     await pastDeadlines(world, reopened);
     balance = await reopened.balance();
     assert.deepEqual(
-      [balance.spendable, balance.locked, balance.unconfirmed],
+      [balance.spendable, balance.locked, balance.maybeSpent],
       [15n * XLM, 0n, 5n * XLM],
     );
     const again = await openWallet(world, 1, store);
-    assert.equal((await again.balance()).unconfirmed, 5n * XLM);
+    assert.equal((await again.balance()).maybeSpent, 5n * XLM);
   });
 });
 
@@ -346,7 +346,7 @@ describe("a relayed-only wallet with a note spent elsewhere", () => {
     }
     assert.equal((await suspects(store, world)).size, 0);
     const balance = await bob.balance();
-    assert.deepEqual([balance.spendable, balance.unconfirmed], [15n * XLM, 0n]);
+    assert.deepEqual([balance.spendable, balance.maybeSpent], [15n * XLM, 0n]);
     assert.equal(owedTo(world, world.signer("carol").publicKey), 0n);
   });
 

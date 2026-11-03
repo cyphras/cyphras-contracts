@@ -1266,7 +1266,10 @@ export class PrivateWallet {
     return this.#run(() => this.#sync(true));
   }
 
-  /** Spendable value, value in pending deposits and value locked in unconfirmed submissions. */
+  /**
+   * Spendable value, value in pending deposits, value locked in unconfirmed submissions, and the
+   * part of spendable that may already be spent elsewhere.
+   */
   async balance(): Promise<Balance> {
     return balanceOf(this.#core.state, this.#core.scan.nkFold !== undefined);
   }

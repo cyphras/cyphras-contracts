@@ -532,7 +532,15 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       const relayerAddress =
         relay === undefined ? (intent.selfRelay as TransactionSigner).publicKey : relay.feeAddress;
 
-      const inputs = intent.inputs ?? chooseNotes(core.state, intent.amount + fee);
+      const inputs =
+        intent.inputs ??
+        chooseNotes(
+          core.state,
+          intent.amount + fee,
+          relay === undefined
+            ? { to: intent.to, amount: intent.amount, now: core.now() }
+            : undefined,
+        );
       const total = inputs.reduce((s, n) => s + n.value, 0n);
       if (total < intent.amount + fee) {
         fail("insufficient_funds", "the notes of the stalled payment no longer cover the new fee");

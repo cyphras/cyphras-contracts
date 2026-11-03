@@ -4,7 +4,14 @@ import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
 import { type KeyValueStore, MemoryStore } from "../../src/storage.ts";
 import { nullifierKey } from "../../src/vault/state.ts";
-import { type WalletState, loadState } from "../../src/wallet/state.ts";
+import { chooseNotes } from "../../src/wallet/core.ts";
+import {
+  type OwnedNote,
+  type Plan,
+  type WalletState,
+  emptyState,
+  loadState,
+} from "../../src/wallet/state.ts";
 import type { OpenOptions, PrivateWallet } from "../../src/wallet/wallet.ts";
 import { RPC, XLM, type World, createWorld } from "../support/network.ts";
 import { isError, openWallet, sealedState } from "../support/wallets.ts";
@@ -163,7 +170,7 @@ describe("a spend the vault refuses as spending a note already spent", () => {
     assert.equal((await suspects(store, world)).size, 0);
     await pastDeadlines(world, bob);
     assert.equal((await bob.balance()).spendable, 15n * XLM);
-    assert.equal((await bob.balance()).unconfirmed, 0n);
+    assert.equal((await bob.balance()).maybeSpent, 0n);
   });
 
   it("pays with another note next time, once", async () => {
@@ -199,10 +206,10 @@ describe("a spend the vault refuses as spending a note already spent", () => {
       [13n * XLM, 15n * XLM],
     );
     assert.equal((await suspects(store, world)).get(ten), 2);
-    // Nothing leaves spendable; the refused notes are counted in unconfirmed for information.
+    // Nothing leaves spendable; the refused notes are counted in maybeSpent for information.
     const balance = await bob.balance();
     assert.deepEqual(
-      [balance.spendable, balance.locked, balance.unconfirmed],
+      [balance.spendable, balance.locked, balance.maybeSpent],
       [18n * XLM, 0n, 18n * XLM],
     );
     assert.equal((await bob.history()).filter((h) => h.kind === "unshield").length, 0);
@@ -219,7 +226,7 @@ describe("a spend the vault refuses as spending a note already spent", () => {
     await selfUnshield(world, bob, 4n * XLM);
     await pastDeadlines(world, bob);
     const balance = await bob.balance();
-    assert.deepEqual([balance.spendable, balance.unconfirmed], [15n * XLM, 5n * XLM]);
+    assert.deepEqual([balance.spendable, balance.maybeSpent], [15n * XLM, 5n * XLM]);
   });
 
   it("fails with notes_refused when only refused sets cover the payment, sending nothing", async () => {
@@ -238,7 +245,7 @@ describe("a spend the vault refuses as spending a note already spent", () => {
     assert.ok(!sent.includes("simulateTransaction") && !sent.includes("sendTransaction"));
     assert.equal((await bob.plans()).length, 1);
     const balance = await bob.balance();
-    assert.deepEqual([balance.spendable, balance.unconfirmed], [15n * XLM, 15n * XLM]);
+    assert.deepEqual([balance.spendable, balance.maybeSpent], [15n * XLM, 15n * XLM]);
     // A payment the 10 XLM note alone covers goes.
     assert.equal(await selfUnshield(world, bob, 8n * XLM), undefined);
     await bob.sync();
@@ -269,7 +276,7 @@ describe("a spend the vault refuses as spending a note already spent", () => {
     await pastDeadlines(world, bob);
     const balance = await bob.balance();
     assert.equal(balance.spendable, 10n * XLM + (1n * XLM - elsewhere.fee));
-    assert.equal(balance.unconfirmed, 0n);
+    assert.equal(balance.maybeSpent, 0n);
   });
 
   it("lets no lying single provider reduce spendable", async () => {
@@ -306,14 +313,14 @@ describe("a spend the vault refuses as spending a note already spent", () => {
     await pastDeadlines(world, bob);
     await selfUnshield(world, bob, 12n * XLM);
     await pastDeadlines(world, bob);
-    assert.equal((await bob.balance()).unconfirmed, 15n * XLM);
+    assert.equal((await bob.balance()).maybeSpent, 15n * XLM);
     // The made-up spend has no event, which a rescan's cross-check would refuse; it is taken back.
     const note = (await stateOf(store, world)).notes.find((n) => n.pos === pos);
     world.vault.nullifiers.delete(note?.nf ?? 0n);
     await bob.rescan();
     assert.equal((await suspects(store, world)).size, 0);
     assert.equal((await bob.balance()).spendable, 15n * XLM);
-    assert.equal((await bob.balance()).unconfirmed, 0n);
+    assert.equal((await bob.balance()).maybeSpent, 0n);
   });
 
   it("sends no provider a request that names the plan's nullifiers", async () => {
@@ -336,5 +343,119 @@ describe("a spend the vault refuses as spending a note already spent", () => {
     for (const b of after.filter((b) => b.method === "getLedgerEntries")) {
       for (const key of keys) assert.ok(!b.text.includes(key), "a read names a plan's key");
     }
+  });
+});
+
+describe("the choice of notes after refusals", () => {
+  const note = (pos: number, value: bigint): OwnedNote => ({
+    pos,
+    cm: BigInt(pos + 1),
+    value,
+    d: new Uint8Array(11),
+    rcm: 1n,
+    nf: BigInt(pos + 1000),
+    ledger: 20,
+    txHash: "a".repeat(64),
+    pagePath: undefined,
+    spent: undefined,
+    built: false,
+  });
+
+  it("looks only at sets with a marked note among thousands of notes", () => {
+    const state = emptyState(10);
+    for (let i = 0; i < 5000; i++) state.notes.push(note(i, 1n));
+    state.notes.push(note(5000, 100n), note(5001, 100n));
+    // A dead plan of the first large note and a dust note was refused.
+    state.plans.push({
+      id: "refused",
+      state: "dead",
+      to: "G",
+      amount: 1n,
+      createdAt: 0,
+      inputs: [
+        { pos: 5000, nf: 6000n, value: 100n },
+        { pos: 0, nf: 1000n, value: 1n },
+      ],
+    } as unknown as Plan);
+    state.suspects.push({ pos: 5000, plans: ["refused"] }, { pos: 0, plans: ["refused"] });
+    state.notes[5001] = { ...note(5001, 100n) };
+    state.suspects.push({ pos: 5001, plans: ["refused"] });
+    const started = performance.now();
+    const chosen = chooseNotes(state, 150n);
+    const ms = performance.now() - started;
+    assert.deepEqual(
+      chosen.map((n) => n.pos),
+      [5000, 5001],
+    );
+    assert.ok(ms < 100, `${ms} ms`);
+  });
+});
+
+describe("tries after refusals", () => {
+  // Bob holds eight 5 XLM notes, and his only RPC provider refuses every simulation.
+  async function eightNotes() {
+    const lying = { on: false };
+    const { world, alice, bob, store } = await twoNotes((world) => ({
+      fetch: (input, init) => {
+        const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
+        if (lying.on && body?.method === "simulateTransaction") {
+          return Promise.resolve(contractError(123)(body));
+        }
+        return world.fetch(input, init);
+      },
+    }));
+    for (let i = 0; i < 8; i++) {
+      await alice.send({ to: bob.generateAddress(), amount: 5n * XLM, maxFee: 2n * XLM });
+    }
+    await bob.sync();
+    lying.on = true;
+    return { world, bob, store };
+  }
+
+  it("stops one payment after three refused sets", async () => {
+    const { world, bob, store } = await eightNotes();
+    const codes: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const err = await selfUnshield(world, bob, 4n * XLM);
+      codes.push(err instanceof CyphrasError ? err.code : "none");
+      await pastDeadlines(world, bob);
+    }
+    assert.deepEqual(codes, [
+      "transaction_failed",
+      "transaction_failed",
+      "transaction_failed",
+      "notes_refused",
+      "notes_refused",
+      "notes_refused",
+    ]);
+    assert.equal((await stateOf(store, world)).plans.length, 3);
+    assert.equal((await bob.balance()).spendable + (await bob.balance()).locked, 55n * XLM);
+  });
+
+  it("stops every self-relayed payment after six refused sets in an hour", async () => {
+    const { world, bob, store } = await eightNotes();
+    const codes: string[] = [];
+    // Each payment goes to another destination, so none waits for the one before.
+    const pay = (i: number, amount: bigint) =>
+      caught(
+        bob.unshield({
+          to: world.signer(`payee ${i}`).publicKey,
+          amount,
+          selfRelay: world.signer("bob account"),
+          confirm: () => true,
+        }),
+      );
+    for (let i = 1; i <= 8; i++) {
+      const err = await pay(i, 1n * XLM);
+      codes.push(err instanceof CyphrasError ? err.code : "none");
+    }
+    assert.equal(codes.filter((c) => c === "transaction_failed").length, 6);
+    assert.deepEqual(codes.slice(6), ["notes_refused", "notes_refused"]);
+    assert.equal((await stateOf(store, world)).plans.length, 6);
+    // An hour on, the next payment may try again.
+    world.advance(3_601);
+    await bob.sync();
+    const later = await pay(9, 1n * XLM);
+    assert.ok(isError("transaction_failed")(later), String(later));
   });
 });
