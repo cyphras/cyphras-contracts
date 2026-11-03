@@ -229,6 +229,8 @@ export interface Staging {
   readonly unchecked:
     | { readonly first: number; readonly ledger: number; readonly chunks: readonly LeafChunk[] }
     | undefined;
+  // The end of the staged leaves an archive supplied, which nothing but the root checks.
+  readonly archived?: number;
 }
 
 // A digest of the leaves from the previous chunk's end, or the range's first leaf, up to `end`:

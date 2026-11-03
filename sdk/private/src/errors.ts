@@ -22,6 +22,7 @@ export type ErrorCode =
   | "service_unavailable"
   | "service_rejected"
   | "indexer_fault"
+  | "archive_fault"
   | "rpc_error"
   | "tree_unverified"
   | "vault_unavailable"

@@ -10,7 +10,7 @@ import type { SorobanRpc } from "../net/rpc.ts";
 import { nullifier } from "../notes.ts";
 import type { ChainView, RootHistory, VaultReader } from "../vault/state.ts";
 import { recordCloseTimes } from "./pace.ts";
-import { type ChainSource, RpcEventSource, type VaultEvents } from "./sources.ts";
+import { type ArchivePart, type ChainSource, RpcEventSource, type VaultEvents } from "./sources.ts";
 import {
   ACTIVE_STATES,
   type Evidence,
@@ -48,6 +48,8 @@ export interface Download {
   // The local tree extended by those leaves, and the pages they completed.
   readonly tree: CommitmentTree;
   readonly pages: readonly { readonly page: number; readonly leaves: readonly bigint[] }[];
+  // What of it an archive supplied, for a download from one.
+  readonly archive?: ArchivePart;
 }
 
 // Downloads the nullifiers spent since the last sync, then reads the vault from each RPC provider,
@@ -114,6 +116,22 @@ export async function downloadChain(
   };
 }
 
+// The part of an archive's download that RPC's events after the archive supplied, to cross-check
+// as any download from RPC; undefined when it read no events.
+export function tailOf(data: Download): Download | undefined {
+  const part = data.archive;
+  if (part?.tailFrom === undefined) return undefined;
+  const since = Math.max(data.since, part.tailFrom);
+  const { archive: _archive, ...rest } = data;
+  return {
+    ...rest,
+    since,
+    firstIndex: Math.max(data.firstIndex, part.end),
+    leaves: data.leaves.filter((l) => l.index >= part.end),
+    nullifiers: data.nullifiers.filter((n) => n.ledger >= since),
+  };
+}
+
 export interface CrossCheck {
   // RPC covered the range and agreed with the indexer.
   readonly verified: boolean;
@@ -149,7 +167,13 @@ const CHUNK_LEAVES = 1024;
 const digestOf = (leaves: readonly Leaf[]): string =>
   bytesToHex(sha256(utf8(leaves.map(leafKey).join("\n"))));
 
-function chunksOf(leaves: readonly Leaf[]): LeafChunk[] {
+function chunksOf(leaves: readonly Leaf[], split?: number): LeafChunk[] {
+  if (split !== undefined) {
+    return [
+      ...chunksOf(leaves.filter((l) => l.index < split)),
+      ...chunksOf(leaves.filter((l) => l.index >= split)),
+    ];
+  }
   const chunks: LeafChunk[] = [];
   for (let i = 0; i < leaves.length; i += CHUNK_LEAVES) {
     const run = leaves.slice(i, i + CHUNK_LEAVES);
@@ -368,6 +392,9 @@ function scanDownload(
   const planLeaves = data.leaves
     .filter((l) => commitments.has(l.commitment))
     .map((l) => ({ index: l.index, commitment: l.commitment, ledger: l.ledger, txHash: l.txHash }));
+  // Leaves an archive supplied are never checked, so their digests are kept apart from the rest.
+  const archived = data.archive !== undefined && data.archive.end > data.firstIndex;
+  const split = archived ? data.archive?.end : undefined;
   const paths = [...(staged?.paths ?? [])];
   for (const page of data.pages) {
     const start = page.page * PAGE_SIZE;
@@ -396,14 +423,22 @@ function scanDownload(
       found: [...(staged?.found ?? []), ...planLeaves],
       unchecked:
         staged?.unchecked === undefined
-          ? checked || data.leaves[0] === undefined
+          ? (checked && !archived) || data.leaves[0] === undefined
             ? undefined
             : {
                 first: data.leaves[0].index,
                 ledger: data.leaves[0].ledger,
-                chunks: chunksOf(data.leaves),
+                chunks: chunksOf(data.leaves, split),
               }
-          : { ...staged.unchecked, chunks: [...staged.unchecked.chunks, ...chunksOf(data.leaves)] },
+          : {
+              ...staged.unchecked,
+              chunks: [...staged.unchecked.chunks, ...chunksOf(data.leaves, split)],
+            },
+      ...(split === undefined
+        ? staged?.archived === undefined
+          ? {}
+          : { archived: staged.archived }
+        : { archived: Math.max(split, staged?.archived ?? 0) }),
     },
     newNotes,
   };
@@ -457,18 +492,66 @@ export function applyDownload(
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
   recordOutputs(state.plans, staging.found, providers);
-  const leaves =
+  const { lost, rest } = splitArchived(
     staging.unchecked === undefined
       ? undefined
-      : { ...staging.unchecked, end: staging.tree.leafCount };
-  const to = checked ? data.since - 1 : data.horizon;
-  if (to >= data.since || leaves !== undefined) {
-    addUnchecked(state, { from: data.since, to, leaves, status: "open", askedAt: undefined });
+      : { ...staging.unchecked, end: staging.tree.leafCount },
+    staging.archived,
+    data,
+    checked,
+  );
+  // Spends of the ledgers an archive supplied, and its leaves, cannot be checked by anything.
+  const lostTo = Math.max(data.since - 1, Math.min(data.archive?.to ?? 0, data.horizon));
+  if (lostTo >= data.since || lost !== undefined) {
+    addUnchecked(state, {
+      from: data.since,
+      to: lostTo,
+      leaves: lost,
+      status: "lost",
+      askedAt: undefined,
+    });
+  }
+  const from = lostTo + 1;
+  const to = checked ? from - 1 : data.horizon;
+  if (to >= from || rest !== undefined) {
+    addUnchecked(state, { from, to, leaves: rest, status: "open", askedAt: undefined });
   }
   state.nullifierSince = data.horizon + 1;
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
   state.nullifierBuffer = buffer.filter((n) => n.ledger >= state.lastLeafLedger);
   return newNotes;
+}
+
+// The unchecked leaves an apply keeps: those before `archived`, which an archive supplied, as lost,
+// and the rest as before. When the rest were staged by an earlier sync, which kept no ledger of
+// their first, they go with the lost ones.
+function splitArchived(
+  leaves: UncheckedRange["leaves"],
+  archived: number | undefined,
+  data: Download,
+  checked: boolean,
+): { readonly lost: UncheckedRange["leaves"]; readonly rest: UncheckedRange["leaves"] } {
+  if (leaves === undefined || archived === undefined || archived <= leaves.first) {
+    return { lost: undefined, rest: leaves };
+  }
+  const after = data.leaves.find((l) => l.index === archived);
+  if (archived >= leaves.end || after === undefined) return { lost: leaves, rest: undefined };
+  return {
+    lost: {
+      first: leaves.first,
+      end: archived,
+      ledger: leaves.ledger,
+      chunks: leaves.chunks.filter((c) => c.end <= archived),
+    },
+    rest: checked
+      ? undefined
+      : {
+          first: archived,
+          end: leaves.end,
+          ledger: after.ledger,
+          chunks: leaves.chunks.filter((c) => c.end > archived),
+        },
+  };
 }
 
 // Joins a range to the last one when their ledgers touch and their leaves follow one another, so a

@@ -634,6 +634,10 @@ export class MockRpc {
         const val = this.vault.exitEntry(Number(scValToBigInt(rest[0] as xdr.ScVal)));
         return val === undefined ? undefined : entry(val);
       }
+      case "Nullifier":
+        return this.vault.nullifiers.has(scValToBigInt(rest[0] as xdr.ScVal))
+          ? entry(xdr.ScVal.scvVoid())
+          : undefined;
       case "DepositorDay": {
         const total = this.vault.dayTotals.get(
           `${addressOf(rest[0])}/${scValToBigInt(rest[1] as xdr.ScVal)}`,

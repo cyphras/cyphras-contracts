@@ -1,4 +1,12 @@
-import { Address, Asset, MuxedAccount, StrKey, scValToBigInt, xdr } from "@stellar/stellar-base";
+import {
+  Address,
+  Asset,
+  MuxedAccount,
+  StrKey,
+  nativeToScVal,
+  scValToBigInt,
+  xdr,
+} from "@stellar/stellar-base";
 import { bytesToHex, hexToBytes } from "../bytes.ts";
 import { fail } from "../errors.ts";
 import { isMuxedAccountId } from "../extdata.ts";
@@ -67,6 +75,10 @@ export const strandedKey = (vault: string, id: bigint): xdr.LedgerKey =>
   contractDataKey(vault, dataKey("Stranded", u64(id)));
 export const pendingKey = (vault: string, id: bigint): xdr.LedgerKey =>
   contractDataKey(vault, dataKey("Pending", u64(id)));
+
+// The entry the vault writes for a spent nullifier, which stays readable once archived.
+export const nullifierKey = (vault: string, nf: bigint): xdr.LedgerKey =>
+  contractDataKey(vault, dataKey("Nullifier", nativeToScVal(nf, { type: "u256" })));
 
 // The asset contract's entry of a contract's balance.
 export const balanceKey = (token: string, holder: string): xdr.LedgerKey =>

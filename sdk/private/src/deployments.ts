@@ -104,6 +104,20 @@ export const PINNED_DEPLOYMENTS: Readonly<Record<DeploymentName, Deployment | nu
   },
 });
 
+// Copies of each pinned vault's published event archive, which a sync falls back to once no
+// indexer answers and RPC no longer holds where it starts. Every copy is checked against the
+// chain, so any of them, or a mirror of them, serves alike.
+export const PINNED_ARCHIVES: Readonly<Record<DeploymentName, readonly string[]>> = deepFreeze({
+  "mainnet/xlm": [
+    "https://raw.githubusercontent.com/cyphras/cyphras-vault-archive/main/mainnet/xlm",
+    "https://private.cyphras.com/mainnet/xlm/archive",
+  ],
+  "testnet/xlm": [
+    "https://raw.githubusercontent.com/cyphras/cyphras-vault-archive/main/testnet/xlm",
+    "https://private.cyphras.com/testnet/xlm/archive",
+  ],
+});
+
 const HEX64 = /^[0-9a-f]{64}$/;
 const ASSET_NAME = /^(native|[A-Za-z0-9]{1,12}:G[A-Z2-7]{55})$/;
 
@@ -172,4 +186,35 @@ export function resolveDeployment(
   }
   checkDeployment(deployment, false);
   return deployment;
+}
+
+// The archive URLs a wallet of the deployment uses: those given, or those pinned for a pinned
+// deployment, none for an unpinned one. A URL given for a pinned deployment is https, or http to
+// this machine; tests may point an unpinned one at a mock. None carries credentials.
+export function archiveUrls(
+  deployment: Deployment,
+  given: readonly string[] | undefined,
+): readonly string[] {
+  const name = (Object.keys(PINNED_DEPLOYMENTS) as DeploymentName[]).find(
+    (n) => PINNED_DEPLOYMENTS[n] === deployment,
+  );
+  if (given === undefined) return name === undefined ? [] : PINNED_ARCHIVES[name];
+  for (const url of given) {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return fail("invalid_argument", "an archive URL is not a URL");
+    }
+    const local =
+      name === undefined || parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+    if (
+      !(parsed.protocol === "https:" || (parsed.protocol === "http:" && local)) ||
+      parsed.username !== "" ||
+      parsed.password !== ""
+    ) {
+      fail("invalid_argument", "an archive URL must be https, or http to this machine");
+    }
+  }
+  return [...given];
 }

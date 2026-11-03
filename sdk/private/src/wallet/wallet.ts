@@ -15,6 +15,7 @@ import {
   type Deployment,
   type DeploymentName,
   PINNED_DEPLOYMENTS,
+  archiveUrls,
   resolveDeployment,
 } from "../deployments.ts";
 import { CyphrasError, type ErrorCode, fail } from "../errors.ts";
@@ -78,6 +79,7 @@ import { type ExitPosition, applyExits, exitPosition, payoutLeft, shownParts } f
 import { type Balance, type HistoryEntry, balanceOf, historyOf, recordPayouts } from "./history.ts";
 import { type VaultLimitsView, vaultLimits } from "./limits.ts";
 import { closedBy, readCloseTimes, recordCloseTimes, updatePace } from "./pace.ts";
+import { ArchiveSource } from "./archive.ts";
 import { type Verification, createServices, recheckIndexers, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
@@ -131,6 +133,7 @@ import {
   resetEvidence,
   sameRecords,
   stageDownload,
+  tailOf,
 } from "./sync.ts";
 
 /** Options shared by full and view-only wallets. */
@@ -148,6 +151,11 @@ export interface ConnectionOptions {
   // Service URLs other than the pinned ones; each must report the pinned vault and network.
   readonly indexers?: readonly string[];
   readonly relayers?: readonly string[];
+  // Base URLs of copies of the vault's published archive other than the pinned ones, asked in
+  // order once RPC no longer holds where a sync starts and no indexer answers: https, or http on
+  // localhost or 127.0.0.1 only. Nothing an archive says counts until the chain confirms it, so a
+  // wrong one can stop a sync but not change what it keeps.
+  readonly archives?: readonly string[];
   // The most a transaction the SDK builds may pay the network; defaults to 0.01 XLM for inclusion,
   // 1 XLM for resources and nothing more for a restore or a renewal of entries.
   readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
@@ -204,7 +212,7 @@ export interface SyncSummary {
   // Leaves taken past leafCount that the vault has yet to confirm; the next sync continues.
   readonly staged: number;
   readonly newNotes: number;
-  readonly source: "indexer" | "rpc";
+  readonly source: "indexer" | "rpc" | "archive";
   readonly rootVerified: boolean;
   // The new data matched the vault's events from every RPC provider other than the one it came
   // from, for the same ledgers.
@@ -216,9 +224,9 @@ export interface SyncSummary {
   // Of those leaves, the ones some RPC provider no longer holds while every other one confirmed
   // them: syncs ask every provider about them again each hour.
   readonly partialLeaves: number;
-  // Of those leaves, the ones no RPC provider holds any more, so that nothing can check them: an
-  // incoming payment an indexer hid among them stays hidden until a rescan through an indexer the
-  // user trusts.
+  // Of those leaves, the ones no RPC provider holds any more, so that nothing can check them, and
+  // those an archive supplied: an incoming payment a source hid among them stays hidden until a
+  // rescan through a source the user trusts.
   readonly lostLeaves: number;
 }
 
@@ -386,6 +394,8 @@ function randomGap(): number {
   return SPLIT_GAP_MS.min + Math.floor(r * (SPLIT_GAP_MS.max - SPLIT_GAP_MS.min));
 }
 
+type SyncSource = IndexerSource | RpcEventSource | ArchiveSource;
+
 const leavesOf = (range: UncheckedRange): number =>
   range.leaves === undefined ? 0 : range.leaves.end - range.leaves.first;
 
@@ -552,6 +562,7 @@ export class PrivateWallet {
   readonly #states: StateStore;
   readonly #lock: AccountLock;
   readonly #limits: SyncLimits;
+  readonly #archives: readonly string[];
   #verification: Verification;
   readonly #reset: StateReset | undefined;
   #queue: Promise<unknown> = Promise.resolve();
@@ -565,6 +576,7 @@ export class PrivateWallet {
     states: StateStore,
     lock: AccountLock,
     limits: SyncLimits,
+    archives: readonly string[],
     verification: Verification,
     reset: StateReset | undefined,
   ) {
@@ -573,6 +585,7 @@ export class PrivateWallet {
     this.#states = states;
     this.#lock = lock;
     this.#limits = limits;
+    this.#archives = archives;
     this.#verification = verification;
     this.#reset = reset;
   }
@@ -661,6 +674,7 @@ export class PrivateWallet {
     artifacts: PinnedArtifacts | undefined,
   ): Promise<PrivateWallet> {
     const fetchFn = options.fetch ?? defaultFetch;
+    const archives = archiveUrls(deployment, options.archives);
     const services = createServices(
       deployment,
       options.rpcUrl,
@@ -703,7 +717,7 @@ export class PrivateWallet {
     };
     const verification = await verify(services, CHECK_MS);
     const limits = { ...DEFAULT_SYNC_LIMITS, ...options.syncLimits };
-    return new PrivateWallet(core, fetchFn, states, lock, limits, verification, reset);
+    return new PrivateWallet(core, fetchFn, states, lock, limits, archives, verification, reset);
   }
 
   /**
@@ -875,6 +889,46 @@ export class PrivateWallet {
     );
   }
 
+  #archiveSource(core: Core): ArchiveSource {
+    const { state, deployment, services } = core;
+    const second = services.second;
+    return new ArchiveSource({
+      urls: this.#archives,
+      fetch: this.#fetch,
+      pin: {
+        vault: deployment.vault,
+        networkPassphrase: deployment.networkPassphrase,
+        deployLedger: deployment.deployLedger,
+      },
+      rpcs: second === undefined ? [services.rpc] : [services.rpc, second.rpc],
+      vaults: second === undefined ? [services.vault] : [services.vault, second.vault],
+      since: state.nullifierSince,
+      leafCount: (state.staging?.tree ?? state.tree).leafCount,
+      leafWindows: this.#limits.leafPages,
+      nullifierWindows: this.#limits.nullifierPages,
+      eventPages: this.#limits.eventPages,
+    });
+  }
+
+  // The source a sync goes on with after `source` failed: RPC's events for an indexer that became
+  // unreachable, and the vault's archive with RPC's events after it once RPC no longer holds where
+  // the sync starts. Data that contradicts the chain is a fault the caller must see.
+  #fallback(core: Core, source: SyncSource, err: unknown): SyncSource {
+    if (err instanceof CyphrasError) {
+      if (source.kind === "indexer" && err.code === "service_unavailable") {
+        return this.#rpcSource(core);
+      }
+      if (
+        source.kind === "rpc" &&
+        err.code === "history_unavailable" &&
+        err.details["reason"] === "rpc_retention"
+      ) {
+        return this.#archiveSource(core);
+      }
+    }
+    throw err;
+  }
+
   // A sync works on a copy of the state and keeps it only when every check passed, so data that
   // contradicts the chain never reaches the store, nor survives into a later sync.
   async #sync(full: boolean): Promise<SyncSummary> {
@@ -904,7 +958,9 @@ export class PrivateWallet {
     } catch (err) {
       this.#fault =
         err instanceof CyphrasError &&
-        (err.code === "indexer_fault" || err.code === "tree_unverified");
+        (err.code === "indexer_fault" ||
+          err.code === "tree_unverified" ||
+          err.code === "archive_fault");
       // Staged leaves were never confirmed and may be what contradicts the vault; the next sync
       // takes them again from the confirmed tree.
       if (this.#fault && core.state.staging !== undefined) {
@@ -922,7 +978,7 @@ export class PrivateWallet {
   async #syncInto(core: Core, onReads: (reads: ChainReads) => void): Promise<SyncSummary> {
     const indexer = this.#indexer();
     const limits = this.#limits;
-    let source: IndexerSource | RpcEventSource =
+    let source: SyncSource =
       indexer === undefined
         ? this.#rpcSource(core)
         : new IndexerSource(indexer, limits.nullifierPages);
@@ -930,22 +986,19 @@ export class PrivateWallet {
     const vaults =
       second === undefined ? [core.services.vault] : [core.services.vault, second.vault];
     let download;
-    try {
-      download = await downloadChain(core.state, source, vaults, limits.leafPages);
-    } catch (err) {
-      // An indexer that becomes unreachable is passed over for the vault's RPC events; one that
-      // served inconsistent data is a fault the caller must see.
-      if (
-        !(err instanceof CyphrasError) ||
-        source.kind === "rpc" ||
-        err.code !== "service_unavailable"
-      ) {
-        throw err;
+    for (;;) {
+      try {
+        download = await downloadChain(core.state, source, vaults, limits.leafPages);
+        break;
+      } catch (err) {
+        source = this.#fallback(core, source, err);
       }
-      source = this.#rpcSource(core);
-      download = await downloadChain(core.state, source, vaults, limits.leafPages);
     }
-    const { views, data } = download;
+    const { views } = download;
+    const data =
+      source.kind === "archive"
+        ? { ...download.data, archive: await source.part() }
+        : download.data;
     const view = views[0] as ChainView;
     const vault = core.deployment.vault;
     const rpcs = second === undefined ? [core.services.rpc] : [core.services.rpc, second.rpc];
@@ -973,7 +1026,7 @@ export class PrivateWallet {
         core.state.closeTimesUntil = Math.max(core.state.closeTimesUntil, data.horizon);
       }
       others = matches.slice(1).flatMap((m) => (m.events === undefined ? [] : [m.events]));
-    } else {
+    } else if (source.kind === "rpc") {
       events = await source.events();
       const match =
         second === undefined
@@ -981,6 +1034,17 @@ export class PrivateWallet {
           : await crossCheck(second.rpc, vault, data, limits.eventPages);
       crossChecked = match?.verified === true;
       checked = second === undefined || crossChecked;
+      others = match?.events === undefined ? [] : [match.events];
+    } else {
+      // Only RPC's events after the archive can be checked, as a download from RPC is.
+      events = await source.events();
+      const tail = tailOf(data);
+      const match =
+        second === undefined || tail === undefined
+          ? undefined
+          : await crossCheck(second.rpc, vault, tail, limits.eventPages);
+      crossChecked = match?.verified === true;
+      checked = tail !== undefined && (second === undefined || crossChecked);
       others = match?.events === undefined ? [] : [match.events];
     }
     // The vault's exits and deposits of this sync's ledgers count only where its data counts as
@@ -1051,7 +1115,13 @@ export class PrivateWallet {
           : [{ from: rechecked.from, to: rechecked.latest, events: rechecked.exits }]),
         ...(shown === undefined
           ? []
-          : [{ from: data.since, to: data.horizon, events: within(shown.exits) }]),
+          : [
+              {
+                from: Math.max(data.since, data.archive?.tailFrom ?? data.since),
+                to: data.horizon,
+                events: within(shown.exits),
+              },
+            ]),
       ],
       await live?.exits().catch(() => undefined),
       view.ledger,
