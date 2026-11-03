@@ -262,27 +262,54 @@ export function confirmedInputs(state: WalletState): Set<number> {
   return spent;
 }
 
-// Notes two or more refused plans held: one of them may be spent elsewhere, so no spend takes them
-// until the chain settles them.
-export function leftOutPositions(state: WalletState): Set<number> {
-  return new Set(state.suspects.filter((s) => s.plans.length >= 2).map((s) => s.pos));
+// The sets of note positions of the distinct plans the vault refused as spending a note already
+// spent, as every RPC provider showed.
+function refusedSets(state: WalletState): number[][] {
+  const ids = new Set(state.suspects.flatMap((s) => s.plans));
+  const sets = new Map<string, number[]>();
+  for (const plan of state.plans) {
+    if (!ids.has(plan.id)) continue;
+    const set = plan.inputs.map((i) => i.pos).sort((a, b) => a - b);
+    sets.set(set.join(","), set);
+  }
+  return [...sets.values()];
+}
+
+// The notes the refusals single out as spent: the only note of a refused plan, whose other
+// nullifier was a fresh dummy, or the one note two refused plans of different notes share. No spend
+// takes them until the chain settles them.
+export function culpritPositions(state: WalletState): Set<number> {
+  const sets = refusedSets(state);
+  const out = new Set<number>();
+  for (const [i, a] of sets.entries()) {
+    if (a.length === 1) out.add(a[0] as number);
+    for (const b of sets.slice(i + 1)) {
+      const common = a.filter((pos) => b.includes(pos));
+      if (common.length === 1) out.add(common[0] as number);
+    }
+  }
+  return out;
 }
 
 export function spendableNotes(state: WalletState): OwnedNote[] {
   const locked = lockedPositions(state);
   const spent = confirmedInputs(state);
-  const left = leftOutPositions(state);
+  const out = culpritPositions(state);
   return state.notes.filter(
     (n) =>
       n.spent === undefined &&
       n.value > 0n &&
       !locked.has(n.pos) &&
       !spent.has(n.pos) &&
-      !left.has(n.pos),
+      !out.has(n.pos),
   );
 }
 
-// Notes for a total from the spendable ones that no refused plan held, else from all of them.
+const sumOf = (notes: readonly OwnedNote[]): bigint => notes.reduce((s, n) => s + n.value, 0n);
+
+// Notes for a total: from those no refused plan held, as selectNotes chooses; else the smallest
+// single note, or pair, that is not a set of notes a refused plan held; else, when only such a set
+// covers the total, that set again, since notes refused only together may both be unspent.
 export function chooseNotes(state: WalletState, total: bigint): OwnedNote[] {
   const notes = spendableNotes(state);
   const suspect = new Set(state.suspects.map((s) => s.pos));
@@ -291,31 +318,79 @@ export function chooseNotes(state: WalletState, total: bigint): OwnedNote[] {
     return selectNotes(clean, total);
   } catch (err) {
     if (!(err instanceof CyphrasError) || clean.length === notes.length) throw err;
-    return selectNotes(notes, total);
   }
+  const refused = new Set(refusedSets(state).map((set) => set.join(",")));
+  const allowed = (set: readonly OwnedNote[]): boolean =>
+    !refused.has(
+      set
+        .map((n) => n.pos)
+        .sort((a, b) => a - b)
+        .join(","),
+    );
+  const sorted = [...notes].sort((a, b) => (a.value < b.value ? -1 : a.value > b.value ? 1 : 0));
+  const single = sorted.find((n) => n.value >= total && allowed([n]));
+  if (single !== undefined) return [single];
+  let best: OwnedNote[] | undefined;
+  for (const [i, a] of sorted.entries()) {
+    for (const b of sorted.slice(i + 1)) {
+      const sum = a.value + b.value;
+      if (sum >= total && allowed([a, b]) && (best === undefined || sum < sumOf(best))) {
+        best = [a, b];
+      }
+    }
+  }
+  return best ?? selectNotes(notes, total);
 }
 
-// The vault refused the plan as spending a note already spent, as every RPC provider showed:
-// each of its notes is suspect, once more for each plan refused so.
-export function markSuspects(state: WalletState, plan: Plan): void {
+// The vault refused the plan as spending a note already spent, as every RPC provider showed: each
+// of its notes is suspect. A refusal of the same notes as an earlier one tells nothing more and is
+// not counted; returns whether it was.
+export function markSuspects(state: WalletState, plan: Plan): boolean {
+  const set = plan.inputs
+    .map((i) => i.pos)
+    .sort((a, b) => a - b)
+    .join(",");
+  if (refusedSets(state).some((s) => s.join(",") === set)) return false;
   for (const input of plan.inputs) {
     const at = state.suspects.findIndex((s) => s.pos === input.pos);
-    const plans = state.suspects[at]?.plans ?? [];
-    if (plans.includes(plan.id)) continue;
-    const mark = { pos: input.pos, plans: [...plans, plan.id] };
+    const mark = { pos: input.pos, plans: [...(state.suspects[at]?.plans ?? []), plan.id] };
     if (at < 0) state.suspects.push(mark);
     else state.suspects[at] = mark;
   }
+  clearPartners(state);
+  return true;
 }
 
-// Drops the marks of notes the chain settled: shown spent, or held by a plan of this wallet that
-// landed.
+// A refusal that holds a note the refusals single out is explained by it: the other notes of that
+// plan are no longer suspect for it.
+function clearPartners(state: WalletState): void {
+  const culprits = culpritPositions(state);
+  const explained = state.plans.filter((p) => p.inputs.some((i) => culprits.has(i.pos)));
+  state.suspects = state.suspects
+    .map((s) =>
+      culprits.has(s.pos)
+        ? s
+        : { pos: s.pos, plans: s.plans.filter((id) => !explained.some((p) => p.id === id)) },
+    )
+    .filter((s) => s.plans.length > 0);
+}
+
+// Drops what the chain settled: a refusal one of whose notes a sync shows spent, or a plan of this
+// wallet that landed holds, is explained, and a note so settled is no longer suspect.
 export function pruneSuspects(state: WalletState): void {
   const landed = confirmedInputs(state);
-  state.suspects = state.suspects.filter((s) => {
-    const note = state.notes.find((n) => n.pos === s.pos);
-    return note !== undefined && note.spent === undefined && !landed.has(s.pos);
-  });
+  const settled = (pos: number): boolean => {
+    const note = state.notes.find((n) => n.pos === pos);
+    return note === undefined || note.spent !== undefined || landed.has(pos);
+  };
+  const explained = new Set(
+    state.plans.filter((p) => p.inputs.some((i) => settled(i.pos))).map((p) => p.id),
+  );
+  state.suspects = state.suspects
+    .filter((s) => !settled(s.pos))
+    .map((s) => ({ pos: s.pos, plans: s.plans.filter((id) => !explained.has(id)) }))
+    .filter((s) => s.plans.length > 0);
+  clearPartners(state);
 }
 
 // The smallest single note that covers the total, else the pair with the smallest sufficient

@@ -237,12 +237,13 @@ describe("refusals across a restart", () => {
     const store = new MemoryStore();
     const { world, bob } = await twoNotes(undefined, store);
     await spentElsewhere(world, store, 5n * XLM);
-    await selfUnshield(world, bob, 4n * XLM);
-    await pastDeadlines(world, bob);
-    assert.ok(counted(await selfUnshield(world, bob, 12n * XLM)));
-    // While the refused plan is prepared, its notes count as locked, not as unconfirmed.
+    assert.ok(counted(await selfUnshield(world, bob, 4n * XLM)));
+    // While the refused plan is prepared, its note counts as locked, not as unconfirmed.
     let balance = await bob.balance();
-    assert.deepEqual([balance.spendable, balance.locked, balance.unconfirmed], [0n, 15n * XLM, 0n]);
+    assert.deepEqual(
+      [balance.spendable, balance.locked, balance.unconfirmed],
+      [10n * XLM, 5n * XLM, 0n],
+    );
     const reopened = await openWallet(world, 1, store);
     await pastDeadlines(world, reopened);
     balance = await reopened.balance();
@@ -302,7 +303,8 @@ describe("the second provider's simulation of a refusal", () => {
     const before = net?.bodies.length ?? 0;
     assert.ok(counted(await selfUnshield(world, bob, 4n * XLM)));
     await pastDeadlines(world, bob);
-    assert.ok(counted(await selfUnshield(world, bob, 12n * XLM)));
+    await spentElsewhere(world, store, 10n * XLM);
+    assert.ok(counted(await selfUnshield(world, bob, 8n * XLM)));
     // A relayed refusal asks the second provider nothing.
     await pastDeadlines(world, bob);
     await relayedUnshield(world, bob, 3n * XLM);

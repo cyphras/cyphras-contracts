@@ -869,7 +869,15 @@ async function selfRelay(
       err.details["contractError"] === NULLIFIER_SPENT &&
       err.details["everyProvider"] === true
     ) {
-      markSuspects(core.state, plan);
+      // A refusal of the same notes as an earlier one adds nothing, and the error says so.
+      if (!markSuspects(core.state, plan)) {
+        err = new CyphrasError(
+          err.code,
+          err.message,
+          { ...err.details, refusedBefore: true },
+          { cause: err.cause },
+        );
+      }
     }
     plan.error = err instanceof CyphrasError ? err.code : "unexpected_error";
     // A message the SDK did not write is not kept: it could carry anything.

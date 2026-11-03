@@ -184,22 +184,51 @@ describe("a spend the vault refuses as spending a note already spent", () => {
     assert.equal(plans[1]?.inputValue, 10n * XLM);
   });
 
-  it("leaves out a note two refused plans held, and counts it as unconfirmed", async () => {
+  it("leaves out the one note two refused plans of different notes share", async () => {
+    const { world, alice, bob, store } = await twoNotes();
+    await alice.send({ to: bob.generateAddress(), amount: 3n * XLM, maxFee: 2n * XLM });
+    await bob.sync();
+    const ten = await spentElsewhere(world, store, 10n * XLM);
+    // The 10 and 3 XLM notes are refused, then the 10 and 5 XLM notes: only the 10 XLM note is
+    // in both.
+    assert.equal(details(await selfUnshield(world, bob, 12n * XLM))["everyProvider"], true);
+    await pastDeadlines(world, bob);
+    assert.equal(details(await selfUnshield(world, bob, 12n * XLM))["everyProvider"], true);
+    await pastDeadlines(world, bob);
+    const inputs = (await bob.plans()).map((p) => p.inputValue);
+    assert.deepEqual(inputs, [13n * XLM, 15n * XLM]);
+    assert.deepEqual([...(await suspects(store, world)).keys()], [ten]);
+    const balance = await bob.balance();
+    assert.equal(balance.spendable, 8n * XLM);
+    assert.equal(balance.unconfirmed, 10n * XLM);
+    assert.equal(balance.locked, 0n);
+    assert.equal((await bob.history()).filter((h) => h.kind === "unshield").length, 0);
+  });
+
+  it("leaves out the only note of a refused plan, and keeps the other one", async () => {
     const { world, bob, store } = await twoNotes();
-    const five = await spentElsewhere(world, store, 5n * XLM);
+    await spentElsewhere(world, store, 5n * XLM);
     await selfUnshield(world, bob, 4n * XLM);
     await pastDeadlines(world, bob);
-    // Both notes are needed, so the suspect one goes again and is refused again.
-    const err = await selfUnshield(world, bob, 12n * XLM);
-    assert.equal(details(err)["vaultError"], "NullifierSpent");
-    await pastDeadlines(world, bob);
-    assert.equal((await suspects(store, world)).get(five), 2);
     const balance = await bob.balance();
-    assert.equal(balance.spendable, 10n * XLM);
-    assert.equal(balance.unconfirmed, 5n * XLM);
-    assert.equal(balance.locked, 0n);
-    // History is unchanged by the marks.
-    assert.equal((await bob.history()).filter((h) => h.kind === "unshield").length, 0);
+    assert.deepEqual([balance.spendable, balance.unconfirmed], [10n * XLM, 5n * XLM]);
+  });
+
+  it("never leaves spendable at 0 for notes refused only together", async () => {
+    const { world, bob, store } = await twoNotes();
+    await spentElsewhere(world, store, 5n * XLM);
+    await selfUnshield(world, bob, 12n * XLM);
+    await pastDeadlines(world, bob);
+    const again = await selfUnshield(world, bob, 12n * XLM);
+    assert.equal(details(again)["refusedBefore"], true);
+    await pastDeadlines(world, bob);
+    assert.deepEqual([...(await suspects(store, world)).values()], [1, 1]);
+    const balance = await bob.balance();
+    assert.deepEqual([balance.spendable, balance.unconfirmed], [15n * XLM, 0n]);
+    // The pair is not proposed again while the 10 XLM note alone covers the payment.
+    assert.equal(await selfUnshield(world, bob, 8n * XLM), undefined);
+    await bob.sync();
+    assert.equal(owedTo(world, world.signer("carol").publicKey), 8n * XLM);
   });
 
   it("drops the mark once a sync shows the note spent", async () => {
@@ -241,10 +270,10 @@ describe("a spend the vault refuses as spending a note already spent", () => {
         return world.fetch(input, init);
       },
     }));
-    // The only provider fails the simulation with a made-up refusal.
+    // The only provider fails the simulation of a payment of both notes with a made-up refusal.
     faking = 1;
-    await selfUnshield(world, bob, 4n * XLM);
-    assert.equal((await suspects(store, world)).size, 1);
+    await selfUnshield(world, bob, 12n * XLM);
+    assert.equal((await suspects(store, world)).size, 2);
     await pastDeadlines(world, bob);
     assert.equal(await selfUnshield(world, bob, 12n * XLM), undefined);
     await bob.sync();

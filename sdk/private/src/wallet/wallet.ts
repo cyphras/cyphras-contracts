@@ -56,7 +56,7 @@ import {
   claimPayees,
   claimRoom,
   invokeContext,
-  leftOutPositions,
+  culpritPositions,
   newId,
   pruneSuspects,
   releasePayees,
@@ -147,7 +147,10 @@ export interface ConnectionOptions {
   readonly storage: KeyValueStore;
   readonly rpcUrl: string;
   // A second RPC provider, read on every sync: a payment is declared dead only when both show it,
-  // and a tree it contradicts is not taken. Recommended on mainnet.
+  // and a tree it contradicts is not taken. When the vault refuses a self-relayed call as spending
+  // a note already spent, the second provider simulates the same transaction too, so it gets the
+  // envelope the first one got: the account, the destination and amount, and the proof. Recommended
+  // on mainnet.
   readonly secondRpcUrl?: string;
   // Every request goes through it, so the caller can route private-payment traffic via a proxy.
   readonly fetch?: FetchLike;
@@ -434,9 +437,12 @@ function partFate(
   const free = part.inputs.every((i) =>
     state.notes.some((n) => n.pos === i.pos && n.spent === undefined),
   );
-  // A part whose notes two refused plans held may have had one spent elsewhere.
-  const left = leftOutPositions(state);
-  if (part.state === "dead" && free && !part.inputs.some((i) => left.has(i.pos))) return "again";
+  // A part the vault refused as spending a note already spent goes no further with its notes.
+  const refused = state.suspects.some((s) => s.plans.includes(part.id));
+  const out = culpritPositions(state);
+  if (part.state === "dead" && free && !refused && !part.inputs.some((i) => out.has(i.pos))) {
+    return "again";
+  }
   const ours = state.plans.some(
     (q) =>
       !parts.includes(q) &&

@@ -344,10 +344,10 @@ export interface WalletState {
   closeTimesUntil: number;
   payouts: Payout[];
   // Notes of plans the vault refused as spending a note already spent, as every RPC provider's
-  // simulation showed, with the plans refused: one of the plan's notes may have been spent
-  // elsewhere, in a transaction no source of the wallet showed. Spends choose other notes first,
-  // and a note two refused plans held is not spendable until a sync shows it spent or a plan of
-  // this wallet that spends it lands. A rescan starts them anew.
+  // simulation showed, with the plans refused: one of each plan's notes may have been spent
+  // elsewhere, in a transaction no source of the wallet showed. Spends choose other notes first and
+  // do not take a set of notes refused before while another set covers them; a note the refusals
+  // single out is not spendable until the chain settles it. A rescan starts them anew.
   suspects: Suspect[];
 }
 

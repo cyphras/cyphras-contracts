@@ -171,7 +171,8 @@ export interface VaultCall {
 export interface InvokeContext {
   readonly rpc: SorobanRpc;
   // A second provider, which must report a failure on the host's storage too before a call goes
-  // again.
+  // again, and which simulates the same transaction after the vault refused it as spending a note
+  // already spent.
   readonly second: SorobanRpc | undefined;
   readonly networkPassphrase: string;
   readonly vault: string;

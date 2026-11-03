@@ -1,4 +1,4 @@
-import { confirmedInputs, leftOutPositions, lockedPositions, spendableNotes } from "./core.ts";
+import { confirmedInputs, culpritPositions, lockedPositions, spendableNotes } from "./core.ts";
 import { payoutLeft } from "./exits.ts";
 import type { ExitEvent } from "./sources.ts";
 import type { WalletState } from "./state.ts";
@@ -12,17 +12,19 @@ export interface Balance {
   readonly awaitingPayout: bigint;
   // True for a wallet with only an incoming viewing key, which cannot see spends.
   readonly spendsUnknown: boolean;
-  // Notes left out of spendable because the vault refused two payments with them as spending a
-  // note already spent, as every RPC provider showed: they may already be spent elsewhere, in a
-  // transaction no source of the wallet showed. They drop out once a sync shows them spent, and
-  // count again once a payment with them lands or after a rescan.
+  // Notes left out of spendable because the vault's refusals of this wallet's self-relayed
+  // payments, as every RPC provider showed them, single them out as spent: the only note of a
+  // refused payment, or the one note two refused payments of different notes share. They may be
+  // spent elsewhere, in a transaction no source of the wallet showed. They leave unconfirmed once a
+  // sync shows them spent, by another transaction or by a payment of this wallet that lands, and
+  // are spendable again after a rescan. Notes refused only together stay spendable.
   readonly unconfirmed: bigint;
 }
 
 export function balanceOf(state: WalletState, spendsVisible: boolean): Balance {
   const spendable = spendableNotes(state).reduce((s, n) => s + n.value, 0n);
   const locked = lockedPositions(state);
-  const left = leftOutPositions(state);
+  const left = culpritPositions(state);
   return {
     spendable,
     pendingDeposits: state.deposits
