@@ -155,7 +155,14 @@ export interface ConnectionOptions {
   // Base URLs of copies of the vault's published archive other than the pinned ones, asked in
   // order once RPC no longer holds where a sync starts and no indexer answers: https, or http on
   // localhost or 127.0.0.1 only. Nothing an archive says counts until the chain confirms it, so a
-  // wrong one can stop a sync but not change what it keeps.
+  // wrong one can stop a sync but not change what it keeps. With more than one copy, a window is
+  // used only when every copy that can be read and lists it holds the same bytes: copies that
+  // differ in its counts fail with archive_fault naming both; copies that differ only in what the
+  // chain cannot check, such as ciphertexts, are decided by RPC's events while RPC still holds the
+  // window's ledgers, and the copy they contradict is passed over; otherwise nothing of those
+  // windows is taken and the sync fails with archive_conflict, whose details name the windows and
+  // the copies' URLs. A copy that could not be read in time or broke a rule is passed over for an
+  // hour, and the copy the last archive sync took is tried first.
   readonly archives?: readonly string[];
   // The most a transaction the SDK builds may pay the network; defaults to 0.01 XLM for inclusion,
   // 1 XLM for resources and nothing more for a restore or a renewal of entries.
@@ -383,6 +390,10 @@ const VIEWING_KEY_WARNING =
   "A viewing key reveals the whole history and future of this private account to whoever holds " +
   "it, and cannot be revoked. To prove a single payment, use disclosePayment instead.";
 
+// How long a copy of the archive that could not be read in time or broke a rule is passed over, in
+// milliseconds.
+const HOLD_MS = 3_600_000;
+
 // How long one request of the checks of the services may take when a wallet opens, and when an
 // indexer that did not answer is asked again: a service slower than that is passed over for now.
 const CHECK_MS = 5_000;
@@ -569,8 +580,12 @@ export class PrivateWallet {
   #queue: Promise<unknown> = Promise.resolve();
   // The last sync found data that contradicts the chain; nothing of it was kept.
   #fault = false;
-  // The copy of the archive the running sync took its data from.
+  // The copy of the archive the running sync took its data from, the one the last sync that read
+  // the archive took, which the next one tries first, and, by copy, until when one that could not
+  // be read in time or broke a rule is passed over.
   #archiveCopy: number | undefined;
+  #archiveTaken: number | undefined;
+  readonly #held = new Map<number, number>();
   readonly #quotes: HeldQuotes = new Map();
 
   private constructor(
@@ -896,6 +911,13 @@ export class PrivateWallet {
     );
   }
 
+  // The copies a sync passes over: those given, and those held back, unless that leaves none.
+  #skipped(core: Core, skip: readonly number[]): number[] {
+    const held = [...this.#held].filter(([, until]) => until > core.now()).map(([copy]) => copy);
+    const all = [...new Set([...skip, ...held])];
+    return all.length >= this.#archives.length ? [...skip] : all;
+  }
+
   #archiveSource(core: Core, skip: readonly number[]): ArchiveSource {
     const { state, deployment, services } = core;
     const second = services.second;
@@ -914,8 +936,10 @@ export class PrivateWallet {
       lastLeafLedger: state.staging?.lastLeafLedger ?? state.lastLeafLedger,
       windows: this.#limits.leafPages,
       eventPages: this.#limits.eventPages,
-      skip,
-      staged: state.staging?.spends?.nullifiers.map((n) => n.nullifier) ?? [],
+      skip: this.#skipped(core, skip),
+      staged: state.staging?.spends?.nullifiers ?? [],
+      ...(this.#archiveTaken === undefined ? {} : { prefer: this.#archiveTaken }),
+      onFailed: (copy) => this.#held.set(copy, core.now() + HOLD_MS),
       now: core.now,
     });
   }
@@ -1041,7 +1065,10 @@ export class PrivateWallet {
       }
     }
     const { views } = download;
-    if (source.kind === "archive") this.#archiveCopy = await source.copy();
+    if (source.kind === "archive") {
+      this.#archiveCopy = await source.copy();
+      this.#archiveTaken = this.#archiveCopy;
+    }
     const data =
       source.kind === "archive"
         ? { ...download.data, archive: await source.part() }

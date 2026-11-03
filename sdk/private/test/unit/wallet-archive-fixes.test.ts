@@ -144,7 +144,7 @@ describe("archive sync: the root at the tree's own leaf count", () => {
 });
 
 describe("archive sync: copies of the archive", () => {
-  it("refuses copies that disagree on a window, naming both", async () => {
+  it("refuses copies that differ in a ciphertext RPC no longer shows, naming them", async () => {
     const world = await history(1);
     const archive = buildArchive(world, WINDOW_LEDGERS - 1);
     const other = structuredClone(archive);
@@ -159,8 +159,64 @@ describe("archive sync: copies of the archive", () => {
     await assert.rejects(
       bob.sync(),
       (err: unknown) =>
-        isError("archive_fault")(err) && (err as CyphrasError).details["copies"] === "0,1",
+        isError("archive_conflict")(err) &&
+        (err as CyphrasError).details["windows"] === "0" &&
+        (err as CyphrasError).details["copies"] === `${ARCHIVE} ${MIRROR}`,
     );
+    assert.equal(bob.treeStatus().leafCount, 0);
+    assert.equal(bob.treeStatus().fault, false);
+  });
+
+  it("lets RPC's events decide between copies while RPC holds the window", async () => {
+    const world = await history(2);
+    world.rpc.oldestLedger = WINDOW_LEDGERS;
+    const honest = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
+    const altered = structuredClone(honest);
+    rewriteWindow(altered, WINDOW_LEDGERS, (lines) => {
+      const at = lines.findIndex((l) => topicOf(l) === "new_commitment");
+      return lines.map((l, i) =>
+        i === at ? withField(l, "encrypted_output", xdr.ScVal.scvBytes(Buffer.alloc(181, 7))) : l,
+      );
+    });
+    for (const urls of [
+      [ARCHIVE, MIRROR],
+      [MIRROR, ARCHIVE],
+    ]) {
+      const server = serveArchive(world.fetch, { [ARCHIVE]: altered, [MIRROR]: honest });
+      const bob = await bobWith(world, server.fetch, { archives: urls });
+      const summary = await bob.sync();
+      assert.equal(summary.source, "archive");
+      assert.equal((await bob.balance()).spendable, 20n * XLM);
+      assert.ok(!server.requests.some((r) => r === `${ARCHIVE}/${fileOf(0)}`));
+    }
+  });
+
+  it("uses the one copy that can be read as a single copy", async () => {
+    const world = await history(1);
+    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+    const bob = await bobWith(world, server.fetch, { archives: [MIRROR, ARCHIVE] });
+    assert.equal((await bob.sync()).source, "archive");
+    assert.equal((await bob.balance()).spendable, 15n * XLM);
+  });
+
+  it("passes over a copy it could not read for the next syncs", async () => {
+    const world = await history(1);
+    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+    const asked: string[] = [];
+    const fetchFn: FetchLike = async (input, init) => {
+      if (input.startsWith(MIRROR)) {
+        asked.push(input);
+        return new Response("", { status: 503 });
+      }
+      return server.fetch(input, init);
+    };
+    const bob = await bobWith(world, fetchFn, { archives: [MIRROR, ARCHIVE] });
+    await bob.sync();
+    assert.equal(asked.length, 1);
+    assert.equal((await bob.rescan()).source, "archive");
+    assert.equal(asked.length, 1);
   });
 
   it("takes the tree from the next copy when the vault refuses the first one's", async () => {
@@ -295,6 +351,46 @@ describe("archive sync: what the archive and RPC's events after it hold together
     const bob = await bobWith(world, server.fetch);
     await assert.rejects(bob.sync(), isError("archive_fault"));
     assert.equal(bob.treeStatus().leafCount, 0);
+  });
+});
+
+describe("archive sync: the provider whose events carry the tree", () => {
+  it("takes nothing when its own view is past its events and the tail has no leaf", async () => {
+    const world = await history(1);
+    world.advance(5 * (2 * WINDOW_LEDGERS + 50 - world.vault.ledger));
+    world.rpc.oldestLedger = 2 * WINDOW_LEDGERS;
+    const archive = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
+    const w = archive.manifest.windows?.[1];
+    rewriteWindow(
+      archive,
+      WINDOW_LEDGERS,
+      (lines) => {
+        const last = lines.map(topicOf).lastIndexOf("new_commitment");
+        return lines.filter((_, i) => i !== last && i !== last - 1);
+      },
+      { leaves: [w?.leaves[0] ?? 0, (w?.leaves[1] ?? 2) - 2] },
+    );
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+    const options = sourceOver(world, server.fetch);
+    const real = options.vaults[0] as VaultReader;
+    const ahead = {
+      view: async () => ({ ...(await real.view()), ledger: world.vault.ledger + 500 }),
+    };
+    const lying = {
+      view: async () => {
+        const v = await real.view();
+        return { ...v, roots: { ...v.roots, nextLeaf: v.roots.nextLeaf - 2 } };
+      },
+    };
+    const source = new ArchiveSource({
+      ...options,
+      rpcs: [options.rpcs[0] as SorobanRpc, options.rpcs[0] as SorobanRpc],
+      vaults: [ahead, lying] as unknown as VaultReader[],
+    });
+    await assert.rejects(
+      source.nullifiers(world.deployment.deployLedger),
+      (err: unknown) => err instanceof CyphrasError && err.details["reason"] === "rpc_tail_short",
+    );
   });
 });
 

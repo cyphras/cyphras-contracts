@@ -23,6 +23,7 @@ export type ErrorCode =
   | "service_rejected"
   | "indexer_fault"
   | "archive_fault"
+  | "archive_conflict"
   | "rpc_error"
   | "tree_unverified"
   | "vault_unavailable"

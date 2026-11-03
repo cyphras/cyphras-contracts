@@ -207,22 +207,16 @@ describe("archive sync: leaf counts against providers at different ledgers", () 
 });
 
 describe("archive sync: RPC's events after the archive over more than one sync", () => {
-  it(
-    "completes a restore whose ledgers after the archive take more pages than one sync reads",
-    {
-      todo: "a tail stopped at its page cap is refused, so the next sync starts at the same ledger",
-    },
-    async () => {
-      const { world } = await history(1);
-      // RPC scans at most 10 000 ledgers per request, so two pages reach 20 000 past the archive.
-      world.advance(5 * (WINDOW_LEDGERS + 30_000 - world.vault.ledger));
-      const archive = buildArchive(world, WINDOW_LEDGERS - 1);
-      const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
-      const bob = await bobWith(world, server.fetch, { syncLimits: { eventPages: 2 } });
-      await restore(world, bob, 6);
-      assert.equal((await bob.balance()).spendable, 15n * XLM);
-    },
-  );
+  it("completes a restore whose ledgers after the archive take more pages than one sync reads", async () => {
+    const { world } = await history(1);
+    // RPC scans at most 10 000 ledgers per request, so two pages reach 20 000 past the archive.
+    world.advance(5 * (WINDOW_LEDGERS + 30_000 - world.vault.ledger));
+    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+    const bob = await bobWith(world, server.fetch, { syncLimits: { eventPages: 2 } });
+    await restore(world, bob, 6);
+    assert.equal((await bob.balance()).spendable, 15n * XLM);
+  });
 });
 
 describe("archive sync: copies when the first leaves out its last pair", () => {
@@ -319,34 +313,30 @@ describe("archive sync: spends a staged restore took already", () => {
     assert.equal(bob.treeStatus().leafCount, 0);
   });
 
-  it(
-    "takes a newer window that holds the ledgers whose spends a staged sync read from RPC",
-    { todo: "staged spends are refused when a later read of their own ledgers lists them again" },
-    async () => {
-      const { world } = await history(1);
-      const archives: Record<string, Archive> = {
-        [ARCHIVE]: buildArchive(world, WINDOW_LEDGERS - 1),
-      };
-      const server = serveArchive(world.fetch, archives);
-      const at = { down: true };
-      const bob = await bobWith(world, withSecond(server.fetch, at), { secondRpcUrl: SECOND });
-      const first = await bob.sync();
-      assert.equal(first.source, "archive");
-      assert.equal(first.staged, world.vault.tree.leafCount);
-      // Days later the archive holds the window those ledgers are in, and RPC no longer holds them.
-      world.advance(5 * (2 * WINDOW_LEDGERS + 50 - world.vault.ledger));
-      world.rpc.oldestLedger = 2 * WINDOW_LEDGERS;
-      archives[ARCHIVE] = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
-      at.down = false;
-      const second = await bob.sync().catch((err: unknown) => err);
-      assert.ok(
-        !(second instanceof Error),
-        `the restore failed: ${second instanceof CyphrasError ? `${second.code} ${second.message}` : second}`,
-      );
-      assert.equal(bob.treeStatus().fault, false);
-      assert.equal((await bob.balance()).spendable, 15n * XLM);
-    },
-  );
+  it("takes a newer window that holds the ledgers whose spends a staged sync read from RPC", async () => {
+    const { world } = await history(1);
+    const archives: Record<string, Archive> = {
+      [ARCHIVE]: buildArchive(world, WINDOW_LEDGERS - 1),
+    };
+    const server = serveArchive(world.fetch, archives);
+    const at = { down: true };
+    const bob = await bobWith(world, withSecond(server.fetch, at), { secondRpcUrl: SECOND });
+    const first = await bob.sync();
+    assert.equal(first.source, "archive");
+    assert.equal(first.staged, world.vault.tree.leafCount);
+    // Days later the archive holds the window those ledgers are in, and RPC no longer holds them.
+    world.advance(5 * (2 * WINDOW_LEDGERS + 50 - world.vault.ledger));
+    world.rpc.oldestLedger = 2 * WINDOW_LEDGERS;
+    archives[ARCHIVE] = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
+    at.down = false;
+    const second = await bob.sync().catch((err: unknown) => err);
+    assert.ok(
+      !(second instanceof Error),
+      `the restore failed: ${second instanceof CyphrasError ? `${second.code} ${second.message}` : second}`,
+    );
+    assert.equal(bob.treeStatus().fault, false);
+    assert.equal((await bob.balance()).spendable, 15n * XLM);
+  });
 });
 
 describe("archive sync: a restore staged from the archive, then from the indexer", () => {
