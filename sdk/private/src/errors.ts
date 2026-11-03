@@ -42,6 +42,7 @@ export type ErrorCode =
   | "restore_failed"
   | "deposit_submitting"
   | "operation_open"
+  | "notes_refused"
   | "view_only"
   | "not_found"
   | "history_unavailable"

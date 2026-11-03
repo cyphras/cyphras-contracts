@@ -144,9 +144,10 @@ describe("refusals that name no single note", () => {
     await spentElsewhere(world, store, 5n * XLM);
     assert.ok(counted(await selfUnshield(world, bob, 12n * XLM)));
     await pastDeadlines(world, bob);
-    assert.ok(counted(await selfUnshield(world, bob, 12n * XLM)));
+    // Only the refused pair covers the payment again, so nothing is proved.
+    assert.ok(isError("notes_refused")(await selfUnshield(world, bob, 12n * XLM)));
     await pastDeadlines(world, bob);
-    // Both refusals held the same two notes, so they do not tell which one is spent.
+    // The refusal held two notes, so it does not tell which one is spent.
     const paid = await selfUnshield(world, bob, 8n * XLM);
     assert.equal(paid, undefined, `the 10 XLM note no longer pays: ${String(paid)}`);
     await bob.sync();
@@ -167,7 +168,7 @@ describe("refusals that name no single note", () => {
     assert.ok(counted(again), String(again));
     await pastDeadlines(world, bob);
     const balance = await bob.balance();
-    assert.equal(balance.spendable + balance.unconfirmed, 15n * XLM);
+    assert.equal(balance.spendable, 15n * XLM);
     assert.ok(balance.spendable >= 10n * XLM, `spendable ${balance.spendable}`);
   });
 
@@ -178,12 +179,14 @@ describe("refusals that name no single note", () => {
       rpc.push(lying);
       return { fetch: lying.fetchFn };
     });
-    rpc[0]?.lie(2);
+    rpc[0]?.lie(1);
     assert.ok(counted(await selfUnshield(world, bob, 12n * XLM)));
     await pastDeadlines(world, bob);
-    assert.ok(counted(await selfUnshield(world, bob, 12n * XLM)));
-    await pastDeadlines(world, bob);
-    // Nothing is spent: an ordinary payment must be able to land and clear the marks.
+    // The refused pair is not proposed again; the spendable balance stays whole.
+    assert.ok(isError("notes_refused")(await selfUnshield(world, bob, 12n * XLM)));
+    assert.equal((await bob.balance()).spendable, 15n * XLM);
+    // Nothing is spent: once a rescan drops the marks, an ordinary payment lands.
+    await bob.rescan();
     const paid = await selfUnshield(world, bob, 12n * XLM);
     assert.equal(paid, undefined, `honest notes stay out: ${String(paid)}`);
     await bob.sync();
@@ -233,7 +236,7 @@ describe("refusals across a restart", () => {
     assert.equal(owedTo(world, world.signer("carol").publicKey), 4n * XLM);
   });
 
-  it("keeps the only note of a refused payment out of spendable across restarts", async () => {
+  it("keeps the only note of a refused payment marked across restarts", async () => {
     const store = new MemoryStore();
     const { world, bob } = await twoNotes(undefined, store);
     await spentElsewhere(world, store, 5n * XLM);
@@ -249,7 +252,7 @@ describe("refusals across a restart", () => {
     balance = await reopened.balance();
     assert.deepEqual(
       [balance.spendable, balance.locked, balance.unconfirmed],
-      [10n * XLM, 0n, 5n * XLM],
+      [15n * XLM, 0n, 5n * XLM],
     );
     const again = await openWallet(world, 1, store);
     assert.equal((await again.balance()).unconfirmed, 5n * XLM);

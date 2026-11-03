@@ -102,14 +102,14 @@ describe("refusals explained by more than one spent note", () => {
     await pastDeadlines(world, bob);
     const inputs = (await bob.plans()).map((p) => p.inputValue);
     assert.deepEqual(inputs, [13n * XLM, 15n * XLM, 5n * XLM, 3n * XLM]);
-    const left = [...(await suspects(store, world)).keys()].sort((a, b) => a - b);
-    assert.deepEqual(
-      left,
-      [five, three].sort((a, b) => a - b),
-      "only the refused-alone notes",
+    const marked = [...(await suspects(store, world)).keys()].sort((a, b) => a - b);
+    assert.ok(
+      marked.includes(five) && marked.includes(three),
+      "the refused-alone notes are marked",
     );
+    // Nothing leaves spendable; every refused note is counted in unconfirmed, for information.
     const balance = await bob.balance();
-    assert.deepEqual([balance.spendable, balance.unconfirmed], [10n * XLM, 8n * XLM]);
+    assert.deepEqual([balance.spendable, balance.unconfirmed], [18n * XLM, 18n * XLM]);
     assert.equal(await selfUnshield(world, bob, 8n * XLM), undefined);
     await bob.sync();
     assert.equal(owedTo(world, world.signer("carol").publicKey), 8n * XLM);
@@ -130,7 +130,10 @@ describe("a payment of this wallet that lands with a refused note's partners", (
     assert.equal(owedTo(world, world.signer("carol").publicKey), 9n * XLM);
     const balance = await bob.balance();
     assert.equal(balance.unconfirmed, 5n * XLM, "the 5 XLM note is the one the refusal named");
-    assert.ok(balance.spendable < 5n * XLM, `spendable ${balance.spendable}`);
+    assert.ok(balance.spendable >= 5n * XLM, `spendable ${balance.spendable}`);
+    // The marked note goes after the others: a payment the 3 XLM note covers takes that one.
+    assert.equal(await selfUnshield(world, bob, 2n * XLM), undefined);
+    assert.equal((await bob.plans()).at(-1)?.inputValue, 3n * XLM);
   });
 
   it("keeps the note the refusals share out of spendable", async () => {
@@ -141,18 +144,20 @@ describe("a payment of this wallet that lands with a refused note's partners", (
     await pastDeadlines(world, bob);
     assert.ok(counted(await selfUnshield(world, bob, 12n * XLM)));
     await pastDeadlines(world, bob);
-    assert.equal((await bob.balance()).unconfirmed, 10n * XLM);
+    assert.equal((await bob.balance()).unconfirmed, 18n * XLM);
     // The 5 and 3 XLM notes land, so they were unspent: the 10 XLM note is the spent one.
     assert.equal(await selfUnshield(world, bob, 7n * XLM), undefined);
     await bob.sync();
     assert.equal(owedTo(world, world.signer("carol").publicKey), 7n * XLM);
     assert.deepEqual([...(await suspects(store, world)).keys()], [ten]);
     const balance = await bob.balance();
-    assert.equal(balance.unconfirmed, 10n * XLM, "the spent note is spendable again");
-    assert.ok(balance.spendable < 10n * XLM, `spendable ${balance.spendable}`);
-    // So a payment the 10 XLM note alone would cover is not refused once more.
+    assert.equal(balance.unconfirmed, 10n * XLM, "the spent note stays marked");
+    assert.ok(balance.spendable >= 10n * XLM, `spendable ${balance.spendable}`);
+    // A payment only the 10 XLM note covers tries it, refused at simulation with no fee, and pays
+    // nothing.
     const err = await selfUnshield(world, bob, 9n * XLM);
-    assert.ok(!counted(err), "the spent note went again");
+    assert.ok(counted(err), String(err));
+    assert.equal(owedTo(world, world.signer("carol").publicKey), 7n * XLM);
   });
 });
 
@@ -184,8 +189,8 @@ describe("a split part refused again with notes refused before", () => {
         confirm: () => true,
       }),
     );
-    assert.ok(counted(err), String(err));
-    assert.equal(details(err)["refusedBefore"], true);
+    // Only the pair refused above covers the first part, so nothing is proved.
+    assert.ok(isError("notes_refused")(err), String(err));
     const operationId = String(details(err)["operationId"]);
     await caught(bob.continueOperations(signer));
     await pastDeadlines(world, bob);
@@ -193,7 +198,7 @@ describe("a split part refused again with notes refused before", () => {
     const parts = (await stateOf(store, world)).plans.filter(
       (p) => p.operationId === operationId && p.inputs.some((i) => i.pos === five),
     );
-    assert.equal(parts.length, 1, "the refused part went again with the same notes");
+    assert.equal(parts.length, 0, "the refused pair went again");
     assert.equal(owedTo(world, world.signer("carol").publicKey), 0n);
   });
 });
@@ -235,7 +240,7 @@ describe("refusals: what holds", () => {
     assert.equal((await bob.balance()).unconfirmed, 10n * XLM);
   });
 
-  it("keeps a shared note out and its partners' marks dropped across a restart", async () => {
+  it("keeps the marks across a restart, and pays with the less refused notes", async () => {
     const store = new MemoryStore();
     const { world, bob } = await threeNotes(store);
     const ten = await spentElsewhere(world, store, 10n * XLM);
@@ -244,12 +249,13 @@ describe("refusals: what holds", () => {
     assert.ok(counted(await selfUnshield(world, bob, 12n * XLM)));
     const reopened = await openWallet(world, 1, store);
     await pastDeadlines(world, reopened);
-    assert.deepEqual([...(await suspects(store, world))], [[ten, 2]]);
+    assert.equal((await suspects(store, world)).get(ten), 2);
     const balance = await reopened.balance();
-    // The shared note counts once in unconfirmed, though two refused plans held it.
+    // Each refused note counts once in unconfirmed, and in spendable, though two refusals held the
+    // shared one.
     assert.deepEqual(
       [balance.spendable, balance.locked, balance.unconfirmed],
-      [8n * XLM, 0n, 10n * XLM],
+      [18n * XLM, 0n, 18n * XLM],
     );
     // The partners go first again and pay.
     assert.equal(await selfUnshield(world, reopened, 7n * XLM), undefined);
@@ -283,7 +289,7 @@ describe("refusals: what holds", () => {
     await pastDeadlines(world, bob);
     assert.deepEqual(
       [(await bob.balance()).spendable, (await bob.balance()).unconfirmed],
-      [13n * XLM, 5n * XLM],
+      [18n * XLM, 5n * XLM],
     );
     assert.equal(owedTo(world, world.signer("carol").publicKey), 0n);
   });
@@ -353,7 +359,7 @@ describe("a restore from an archive that leaves a spend out", () => {
     const balance = await bob.balance();
     assert.deepEqual(
       [balance.spendable, balance.locked, balance.unconfirmed],
-      [honest, 0n, 10n * XLM],
+      [honest + 10n * XLM, 0n, 10n * XLM],
     );
     assert.equal(await unshield(), undefined);
     await bob.sync();

@@ -870,7 +870,7 @@ async function selfRelay(
       err.details["everyProvider"] === true
     ) {
       // A refusal of the same notes as an earlier one adds nothing, and the error says so.
-      if (!markSuspects(core.state, plan)) {
+      if (markSuspects(core.state, plan)) {
         err = new CyphrasError(
           err.code,
           err.message,

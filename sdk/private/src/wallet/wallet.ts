@@ -56,9 +56,9 @@ import {
   claimPayees,
   claimRoom,
   invokeContext,
-  culpritPositions,
   newId,
   pruneSuspects,
+  refusedNotes,
   releasePayees,
   releaseRoom,
 } from "./core.ts";
@@ -438,11 +438,8 @@ function partFate(
     state.notes.some((n) => n.pos === i.pos && n.spent === undefined),
   );
   // A part the vault refused as spending a note already spent goes no further with its notes.
-  const refused = state.suspects.some((s) => s.plans.includes(part.id));
-  const out = culpritPositions(state);
-  if (part.state === "dead" && free && !refused && !part.inputs.some((i) => out.has(i.pos))) {
-    return "again";
-  }
+  const refused = refusedNotes(state, part);
+  if (part.state === "dead" && free && !refused) return "again";
   const ours = state.plans.some(
     (q) =>
       !parts.includes(q) &&
@@ -1684,7 +1681,7 @@ export class PrivateWallet {
         p.state === "prepared" &&
         p.txHash === undefined &&
         p.error !== undefined &&
-        !state.suspects.some((s) => s.plans.includes(p.id)),
+        !refusedNotes(state, p),
     );
     if (stalled !== undefined && op.route.kind === "self") {
       const notes = stalled.inputs.map((i) =>

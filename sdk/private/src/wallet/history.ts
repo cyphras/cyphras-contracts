@@ -1,4 +1,4 @@
-import { confirmedInputs, culpritPositions, lockedPositions, spendableNotes } from "./core.ts";
+import { confirmedInputs, lockedPositions, spendableNotes, suspectNotes } from "./core.ts";
 import { payoutLeft } from "./exits.ts";
 import type { ExitEvent } from "./sources.ts";
 import type { WalletState } from "./state.ts";
@@ -12,19 +12,16 @@ export interface Balance {
   readonly awaitingPayout: bigint;
   // True for a wallet with only an incoming viewing key, which cannot see spends.
   readonly spendsUnknown: boolean;
-  // Notes left out of spendable because the vault's refusals of this wallet's self-relayed
-  // payments, as every RPC provider showed them, single them out as spent: the only note of a
-  // refused payment, or the one note two refused payments of different notes share. They may be
-  // spent elsewhere, in a transaction no source of the wallet showed. They leave unconfirmed once a
-  // sync shows them spent, by another transaction or by a payment of this wallet that lands, and
-  // are spendable again after a rescan. Notes refused only together stay spendable.
+  // Of spendable, the notes of this wallet's self-relayed payments the vault refused as spending a
+  // note already spent, as every RPC provider showed: they may already be spent elsewhere, in a
+  // transaction no source of the wallet showed; included in spendable. Spends take them after other
+  // notes. A sync that shows them spent, or a rescan, clears them.
   readonly unconfirmed: bigint;
 }
 
 export function balanceOf(state: WalletState, spendsVisible: boolean): Balance {
   const spendable = spendableNotes(state).reduce((s, n) => s + n.value, 0n);
   const locked = lockedPositions(state);
-  const left = culpritPositions(state);
   return {
     spendable,
     pendingDeposits: state.deposits
@@ -35,9 +32,7 @@ export function balanceOf(state: WalletState, spendsVisible: boolean): Balance {
       .filter((p) => p.state === "queued" || p.state === "stranded")
       .reduce((s, p) => s + (p.exit === undefined ? p.amount : payoutLeft(p.exit)), 0n),
     spendsUnknown: !spendsVisible,
-    unconfirmed: state.notes
-      .filter((n) => left.has(n.pos) && n.spent === undefined && !locked.has(n.pos))
-      .reduce((s, n) => s + n.value, 0n),
+    unconfirmed: suspectNotes(state).reduce((s, n) => s + n.value, 0n),
   };
 }
 
