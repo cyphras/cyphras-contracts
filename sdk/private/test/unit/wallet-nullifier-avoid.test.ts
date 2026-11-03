@@ -233,7 +233,7 @@ describe("refusals across a restart", () => {
     assert.equal(owedTo(world, world.signer("carol").publicKey), 4n * XLM);
   });
 
-  it("keeps a note two refusals held out of spendable, counted once", async () => {
+  it("keeps the only note of a refused payment out of spendable across restarts", async () => {
     const store = new MemoryStore();
     const { world, bob } = await twoNotes(undefined, store);
     await spentElsewhere(world, store, 5n * XLM);
