@@ -347,6 +347,9 @@ export interface WalletState {
   closeTimesTo: number;
   closeTimesUntil: number;
   payouts: Payout[];
+  // Nullifiers the vault's public spends named, none of this wallet's notes, newest last: a read of
+  // a plan's nullifier entries hides them among these.
+  publicNullifiers: bigint[];
 }
 
 export function emptyState(deployLedger: number): WalletState {
@@ -371,6 +374,7 @@ export function emptyState(deployLedger: number): WalletState {
     closeTimesTo: 0,
     closeTimesUntil: 0,
     payouts: [],
+    publicNullifiers: [],
   };
 }
 
@@ -424,6 +428,7 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   state.closeTimesTo ??= 0;
   state.closeTimesUntil ??= 0;
   state.payouts ??= [];
+  state.publicNullifiers ??= [];
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {
     const { lost: _lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };

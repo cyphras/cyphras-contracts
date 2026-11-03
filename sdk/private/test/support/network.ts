@@ -582,6 +582,8 @@ export interface World {
   admitAll(): void;
   // Other users' transactions adding `pairs` pairs of leaves, in one ledger.
   fill(pairs: number): void;
+  // Other users' transactions, each spending two notes and adding a pair of leaves.
+  spends(count: number): void;
 }
 
 // The pool asset is native unless `asset` names an issued one as CODE:ISSUER.
@@ -687,6 +689,13 @@ export async function createWorld(
       rpc.run(createHash("sha256").update(`fill ${vault.ledger}`).digest("hex"), () =>
         vault.insertFiller(pairs),
       );
+    },
+    spends(count: number) {
+      for (let i = 0; i < count; i++) {
+        rpc.run(createHash("sha256").update(`spend ${vault.ledger} ${i}`).digest("hex"), () =>
+          vault.spendFiller(),
+        );
+      }
     },
     admitAll() {
       const ids = [...vault.pending.keys()].sort((a, b) => a - b);

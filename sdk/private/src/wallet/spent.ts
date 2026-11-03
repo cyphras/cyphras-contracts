@@ -1,3 +1,4 @@
+import { randomBytes } from "../bytes.ts";
 import { CyphrasError } from "../errors.ts";
 import { type LedgerEntries, type SorobanRpc, keyId } from "../net/rpc.ts";
 import { nullifierKey } from "../vault/state.ts";
@@ -15,22 +16,59 @@ const NULLIFIER_SPENT = 123;
 // writes both, nor land any more, and is superseded; with both shown spent it may have landed
 // itself, and the sync settles it. "disputed": the providers differ on a nullifier, or the vault's
 // refusal named a nullifier none of them shows spent. "unspent": none shows one spent.
-// "unconfirmed": not every configured provider answered.
-export type SpentCheck = "spent" | "disputed" | "unspent" | "unconfirmed";
+// "unconfirmed": not every configured provider answered. "unread": the wallet knows too few public
+// spends to hide the read among, so it made none.
+export type SpentCheck = "spent" | "disputed" | "unspent" | "unconfirmed" | "unread";
 
-// Reads the entries of the plan's nullifiers from every RPC provider. An entry, live or archived,
-// is the vault's record of a spend, which it never removes. With one provider configured its word
-// alone counts, as it does for the sync's spends; with two, both must answer and agree.
+// Each of a plan's nullifiers is read among at least this many nullifiers of other users' spends.
+export const DECOYS_PER_KEY = 31;
+
+const randomBelow = (n: number): number =>
+  Math.floor((new DataView(randomBytes(4).buffer).getUint32(0) / 2 ** 32) * n);
+
+function shuffle<T>(xs: readonly T[]): T[] {
+  const out = [...xs];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = randomBelow(i + 1);
+    [out[i], out[j]] = [out[j] as T, out[i] as T];
+  }
+  return out;
+}
+
+// The plan's nullifiers among nullifiers of public spends that are none of this wallet's, drawn at
+// random from those the syncs kept, in random order; undefined when too few are known.
+function batchOf(core: Core, plan: Plan): bigint[] | undefined {
+  const { state } = core;
+  const own = new Set([
+    ...state.notes.flatMap((n) => (n.nf === undefined ? [] : [n.nf])),
+    ...state.plans.flatMap((p) => p.nullifiers),
+  ]);
+  const pool = [...new Set(state.publicNullifiers)].filter((nf) => !own.has(nf));
+  const wanted = DECOYS_PER_KEY * plan.nullifiers.length;
+  if (pool.length < wanted) return undefined;
+  return shuffle([...plan.nullifiers, ...shuffle(pool).slice(0, wanted)]);
+}
+
+// Reads the entries of the plan's nullifiers from every RPC provider, in one request each that
+// holds the same batch of keys, so no provider sees the plan's keys alone or a batch another did
+// not. An entry, live or archived, is the vault's record of a spend, which it never removes; only
+// the plan's own keys are looked at. With one provider configured its word alone counts, as it does
+// for the sync's spends; with two, both must answer and agree.
 async function readSpends(
   core: Core,
   plan: Plan,
-): Promise<{ readonly spent: readonly ("yes" | "no" | "disputed")[]; readonly ledger: number }> {
+): Promise<
+  { readonly spent: readonly ("yes" | "no" | "disputed")[]; readonly ledger: number } | "unread"
+> {
   const { services, deployment } = core;
   const rpcs: SorobanRpc[] = [services.rpc, ...(services.second ? [services.second.rpc] : [])];
+  const batch = batchOf(core, plan);
+  if (batch === undefined) return "unread";
   const keys = plan.nullifiers.map((nf) => nullifierKey(deployment.vault, nf));
+  const asked = batch.map((nf) => nullifierKey(deployment.vault, nf));
   const replies = await Promise.all(
     rpcs.map((rpc) =>
-      rpc.getLedgerEntries(keys).catch((err: unknown): LedgerEntries | undefined => {
+      rpc.getLedgerEntries(asked).catch((err: unknown): LedgerEntries | undefined => {
         if (err instanceof CyphrasError) return undefined;
         throw err;
       }),
@@ -52,12 +90,25 @@ async function readSpends(
   };
 }
 
-// Reads whether the notes of a plan that has not landed were spent, after its submission failed in
-// a way a spent note explains, and marks those every provider shows spent. `named`: the vault's
-// refusal named a spent nullifier. Only a plan the wallet still follows is looked at.
+/**
+ * Reads whether the notes of a plan that has not landed were spent, after its submission failed in
+ * a way a spent note explains, and marks those every provider shows spent. `named`: the vault's
+ * refusal named a spent nullifier. Only a plan the wallet still follows is looked at.
+ *
+ * Privacy: the read tells each RPC provider that the wallet asks about these keys just after a
+ * payment failed, which could tie the provider's view of the wallet, as its IP address, to the
+ * notes. The plan's two keys are therefore asked only inside one batch with at least 31 times as
+ * many keys of other users' spends, taken from the public spends the wallet's syncs read, in random
+ * order, and every provider gets the same batch. This hides which keys are the plan's only as far
+ * as their entries look alike: the decoys are all spent, so a key of the plan the vault shows
+ * unspent stands out, while one it shows spent, as a note spent elsewhere, does not. A wallet that
+ * knows too few public spends reads nothing, and the sync settles the plan as before.
+ */
 export async function checkSpent(core: Core, plan: Plan, named: boolean): Promise<SpentCheck> {
   if (!isActive(plan)) return "unspent";
-  const { spent, ledger } = await readSpends(core, plan);
+  const read = await readSpends(core, plan);
+  if (read === "unread") return read;
+  const { spent, ledger } = read;
   if (spent.length === 0) return "unconfirmed";
   if (spent.includes("disputed") || (named && !spent.includes("yes"))) return "disputed";
   if (!spent.includes("yes")) return "unspent";
@@ -104,6 +155,7 @@ export async function afterFailure(
   const sign = spentSign(err, relayed);
   if (sign === undefined || !(err instanceof CyphrasError)) return err;
   const check = await checkSpent(core, plan, sign.named);
+  if (check === "unread") return err;
   if (check === "disputed") {
     const disputed = new CyphrasError(
       "nullifier_disputed",

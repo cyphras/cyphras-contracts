@@ -537,6 +537,10 @@ export function applyDownload(
     const hit = spent.get(note.nf);
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
+  keepPublic(
+    state,
+    data.nullifiers.map((n) => n.nullifier),
+  );
   recordOutputs(state.plans, staging.found, providers);
   const { lost, rest } = splitArchived(
     staging.unchecked === undefined
@@ -567,6 +571,17 @@ export function applyDownload(
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
   state.nullifierBuffer = buffer.filter((n) => n.ledger >= state.lastLeafLedger);
   return newNotes;
+}
+
+// How many of the vault's public spends a wallet keeps to hide its reads among.
+const PUBLIC_NULLIFIERS = 1024;
+
+// Keeps the newest nullifiers of spends that are not this wallet's.
+function keepPublic(state: WalletState, nullifiers: readonly bigint[]): void {
+  const own = new Set(state.notes.flatMap((n) => (n.nf === undefined ? [] : [n.nf])));
+  const kept = new Set(state.publicNullifiers);
+  for (const nf of nullifiers) if (!own.has(nf)) kept.add(nf);
+  state.publicNullifiers = [...kept].slice(-PUBLIC_NULLIFIERS);
 }
 
 // The unchecked leaves an apply keeps: those before `archived`, which an archive supplied, as lost,

@@ -155,6 +155,8 @@ describe("archive sync: a spend the archive leaves out", () => {
     await alice.shield({ amount: 100n * XLM, signer: world.signer("alice depositor") });
     world.advance(3_601);
     world.admitAll();
+    // Other users' spends, which a read of Bob's nullifiers hides among.
+    world.spends(40);
     await alice.sync();
     const first = await openWallet(world, 1);
     await alice.send({ to: first.generateAddress(), amount: 10n * XLM, maxFee: 2n * XLM });
