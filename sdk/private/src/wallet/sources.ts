@@ -32,10 +32,10 @@ export const DEFAULT_SYNC_LIMITS: SyncLimits = {
   eventPages: 100,
 };
 
-// Where a sync reads the vault's leaves and spent nullifiers from. Both kinds download whole
-// pages or ranges, so no request names a note.
+// Where a sync reads the vault's leaves and spent nullifiers from. Every kind downloads whole
+// pages, ranges or windows, so no request names a note.
 export interface ChainSource {
-  readonly kind: "indexer" | "rpc";
+  readonly kind: "indexer" | "rpc" | "archive";
   nextLeaves(tree: CommitmentTree): Promise<LeafBatch>;
   nullifiers(sinceLedger: number): Promise<NullifierSet>;
 }
@@ -218,12 +218,16 @@ export class RpcEventSource implements ChainSource {
       } catch (err) {
         // RPC refuses a start ledger outside the range it holds as an invalid request.
         if (err instanceof CyphrasError && cursor === undefined && err.details["code"] === -32600) {
-          fail("history_unavailable", "RPC no longer holds the vault events this wallet needs");
+          fail("history_unavailable", "RPC no longer holds the vault events this wallet needs", {
+            reason: "rpc_retention",
+          });
         }
         throw err;
       }
       if (cursor === undefined && page.oldestLedger > this.#startLedger) {
-        fail("history_unavailable", "RPC no longer holds the vault events this wallet needs");
+        fail("history_unavailable", "RPC no longer holds the vault events this wallet needs", {
+          reason: "rpc_retention",
+        });
       }
       if (cursor === undefined) {
         time(page.oldestLedger, page.oldestCloseTime);
@@ -315,11 +319,22 @@ export class RpcEventSource implements ChainSource {
   async nullifiers(sinceLedger: number): Promise<NullifierSet> {
     const { nullifiers, latest } = await this.events();
     if (sinceLedger < this.#startLedger) {
-      fail("history_unavailable", "RPC no longer holds the nullifiers this wallet needs");
+      fail("history_unavailable", "RPC no longer holds the nullifiers this wallet needs", {
+        reason: "rpc_retention",
+      });
     }
     return {
       nullifiers: nullifiers.filter((n) => n.ledger >= sinceLedger),
       completeToLedger: latest,
     };
   }
+}
+
+// What an archive supplied of a download: the spends of the ledgers up to `to` and the leaves
+// before `end`, which nothing but the root check confirms; and the first ledger of RPC's events
+// that carried the tree on from the archive, when the download read them.
+export interface ArchivePart {
+  readonly to: number;
+  readonly end: number;
+  readonly tailFrom: number | undefined;
 }

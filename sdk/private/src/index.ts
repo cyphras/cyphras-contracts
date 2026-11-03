@@ -56,7 +56,7 @@ export type {
   TransactionWitness,
 } from "./prover.ts";
 
-export { PINNED_DEPLOYMENTS } from "./deployments.ts";
+export { PINNED_ARCHIVES, PINNED_DEPLOYMENTS } from "./deployments.ts";
 export type { Deployment, DeploymentName, RelayerEndpoint } from "./deployments.ts";
 
 export { decodeAddress, decodeViewingKey } from "./address.ts";

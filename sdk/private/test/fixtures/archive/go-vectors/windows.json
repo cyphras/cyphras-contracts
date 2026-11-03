@@ -1,0 +1,410 @@
+[
+  {
+    "name": "default",
+    "file": "default.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "name",
+    "file": "name.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "comment",
+    "file": "comment.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "extra",
+    "file": "extra.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "stored",
+    "file": "stored.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "huffman-only",
+    "file": "huffman-only.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "best-speed",
+    "file": "best-speed.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "reserved-flag",
+    "file": "reserved-flag.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "mtime-and-os",
+    "file": "mtime-and-os.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "flushed-blocks",
+    "file": "flushed-blocks.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "junk-before-trailer",
+    "file": "junk-before-trailer.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": "window 0: vault archive: invalid: window is not gzip: gzip: invalid checksum"
+  },
+  {
+    "name": "trailing-zero",
+    "file": "trailing-zero.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": "window 0: vault archive: invalid: window has 1 bytes after its gzip member"
+  },
+  {
+    "name": "second-member",
+    "file": "second-member.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": "window 0: vault archive: invalid: window has 20 bytes after its gzip member"
+  },
+  {
+    "name": "crc",
+    "file": "crc.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": "window 0: vault archive: invalid: window is not gzip: gzip: invalid checksum"
+  },
+  {
+    "name": "isize",
+    "file": "isize.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": "window 0: vault archive: invalid: window is not gzip: gzip: invalid checksum"
+  },
+  {
+    "name": "extra-past-end",
+    "file": "extra-past-end.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": "window 0: vault archive: invalid: window is not gzip: unexpected EOF"
+  },
+  {
+    "name": "name-511",
+    "file": "name-511.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "name-512",
+    "file": "name-512.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": "window 0: vault archive: invalid: window is not gzip: gzip: invalid header"
+  },
+  {
+    "name": "comment-511",
+    "file": "comment-511.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    "goError": ""
+  },
+  {
+    "name": "commitment-extra-field",
+    "file": "commitment-extra-field.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6606,
+      "sha256": "53b3fb0c7d676bb6b17e04b73b1e0db5bf03fdf4f75f656a4774002cada98400"
+    },
+    "goError": "window 0: vault archive: invalid: line 8: new_commitment: vault: malformed value: want 3 fields, got 4"
+  },
+  {
+    "name": "commitment-not-a-field-element",
+    "file": "commitment-not-a-field-element.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "47b006c7a11fe073e0c99aaf5c0ffdfc6533099e33af27afb04ad7cb9e0ce3bd"
+    },
+    "goError": "window 0: vault archive: invalid: line 8: new_commitment: vault: malformed value: non-canonical field element"
+  },
+  {
+    "name": "ciphertext-180-bytes",
+    "file": "ciphertext-180-bytes.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6578,
+      "sha256": "80483264a2393f4a343e7738670ce569b273d076d5b758ca40b914fa74e685d5"
+    },
+    "goError": "window 0: vault archive: invalid: line 8: new_commitment: vault: malformed value: ciphertext of 180 bytes"
+  },
+  {
+    "name": "nullifier-not-a-field-element",
+    "file": "nullifier-not-a-field-element.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "f27632081c3a8e198e0beced87ea751cd6da104e216200a7427fcfaf55623a7c"
+    },
+    "goError": "window 0: vault archive: invalid: line 1: new_nullifier: vault: malformed value: non-canonical field element"
+  },
+  {
+    "name": "deposit-of-zero",
+    "file": "deposit-of-zero.gz",
+    "window": {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "9fb7888e0b972b4b8e3bddbb5cbbc7c60a418053483278d3439704d047aca549"
+    },
+    "goError": "window 0: vault archive: invalid: line 3: deposit_pending: vault: malformed value: deposit of 0"
+  }
+]

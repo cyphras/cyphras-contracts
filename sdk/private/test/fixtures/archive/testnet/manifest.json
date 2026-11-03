@@ -1,0 +1,351 @@
+{
+  "format": "cyphras-vault-archive/1",
+  "network": "testnet",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "vault": "CDV4V6W4MGMEVYYXENX2QXZCID7NT2UGAH2EWEBO3JUHO47Q27J7NTLL",
+  "deployLedger": 5012547,
+  "windowLedgers": 17280,
+  "coveredTo": 5529599,
+  "windows": [
+    {
+      "start": 5011200,
+      "end": 5028479,
+      "events": 241,
+      "leaves": [
+        0,
+        88
+      ],
+      "nullifiers": 92,
+      "bytes": 125828,
+      "sha256": "02dd8f8ce4ea522720039ef8e1c8032a89e6ae1d31d9fa27458832d519d43699"
+    },
+    {
+      "start": 5028480,
+      "end": 5045759,
+      "events": 204,
+      "leaves": [
+        88,
+        168
+      ],
+      "nullifiers": 78,
+      "bytes": 108142,
+      "sha256": "9b39936ca57686d23ab091c8670a844620a134c41bce6e58cbecc894c04d4823"
+    },
+    {
+      "start": 5045760,
+      "end": 5063039,
+      "events": 47,
+      "leaves": [
+        168,
+        186
+      ],
+      "nullifiers": 18,
+      "bytes": 24836,
+      "sha256": "ce1432bc675e156f4594de3f75d70bc47d329efce29f9330101385055ff03c30"
+    },
+    {
+      "start": 5063040,
+      "end": 5080319,
+      "events": 0,
+      "leaves": [
+        186,
+        186
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5080320,
+      "end": 5097599,
+      "events": 7,
+      "leaves": [
+        186,
+        188
+      ],
+      "nullifiers": 2,
+      "bytes": 3510,
+      "sha256": "28587015e5d4b9dff33ea776ad407114f1eb4d184b5fd7c7d0e6bee6da4db20c"
+    },
+    {
+      "start": 5097600,
+      "end": 5114879,
+      "events": 12,
+      "leaves": [
+        188,
+        192
+      ],
+      "nullifiers": 4,
+      "bytes": 6173,
+      "sha256": "d2f1494a134a721719153ca7fde1c62c856e89a49c628623d5bb2d3f3f5d1aae"
+    },
+    {
+      "start": 5114880,
+      "end": 5132159,
+      "events": 0,
+      "leaves": [
+        192,
+        192
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5132160,
+      "end": 5149439,
+      "events": 0,
+      "leaves": [
+        192,
+        192
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5149440,
+      "end": 5166719,
+      "events": 0,
+      "leaves": [
+        192,
+        192
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5166720,
+      "end": 5183999,
+      "events": 0,
+      "leaves": [
+        192,
+        192
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5184000,
+      "end": 5201279,
+      "events": 0,
+      "leaves": [
+        192,
+        192
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5201280,
+      "end": 5218559,
+      "events": 29,
+      "leaves": [
+        192,
+        202
+      ],
+      "nullifiers": 10,
+      "bytes": 14966,
+      "sha256": "6963f76399d280248d1def58bfa51c9be17146a278f765dca535778ae92e72b4"
+    },
+    {
+      "start": 5218560,
+      "end": 5235839,
+      "events": 0,
+      "leaves": [
+        202,
+        202
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5235840,
+      "end": 5253119,
+      "events": 0,
+      "leaves": [
+        202,
+        202
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5253120,
+      "end": 5270399,
+      "events": 150,
+      "leaves": [
+        202,
+        254
+      ],
+      "nullifiers": 52,
+      "bytes": 77407,
+      "sha256": "9bfde6d52ebc051df64783c26bd4c160f0884a2890b610242a027185bb75900b"
+    },
+    {
+      "start": 5270400,
+      "end": 5287679,
+      "events": 0,
+      "leaves": [
+        254,
+        254
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5287680,
+      "end": 5304959,
+      "events": 61,
+      "leaves": [
+        254,
+        272
+      ],
+      "nullifiers": 18,
+      "bytes": 30635,
+      "sha256": "58b2771f7ef472ef81e3844f816280aa9235320546144e20192e28a887ed9e1e"
+    },
+    {
+      "start": 5304960,
+      "end": 5322239,
+      "events": 0,
+      "leaves": [
+        272,
+        272
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5322240,
+      "end": 5339519,
+      "events": 0,
+      "leaves": [
+        272,
+        272
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5339520,
+      "end": 5356799,
+      "events": 0,
+      "leaves": [
+        272,
+        272
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5356800,
+      "end": 5374079,
+      "events": 7,
+      "leaves": [
+        272,
+        274
+      ],
+      "nullifiers": 2,
+      "bytes": 3513,
+      "sha256": "851b30db600b49aebccef10b3ee2eb82450e466cb502c3337b69e59afe3f7f4a"
+    },
+    {
+      "start": 5374080,
+      "end": 5391359,
+      "events": 0,
+      "leaves": [
+        274,
+        274
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5391360,
+      "end": 5408639,
+      "events": 0,
+      "leaves": [
+        274,
+        274
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5408640,
+      "end": 5425919,
+      "events": 0,
+      "leaves": [
+        274,
+        274
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5425920,
+      "end": 5443199,
+      "events": 0,
+      "leaves": [
+        274,
+        274
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5443200,
+      "end": 5460479,
+      "events": 0,
+      "leaves": [
+        274,
+        274
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5460480,
+      "end": 5477759,
+      "events": 0,
+      "leaves": [
+        274,
+        274
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5477760,
+      "end": 5495039,
+      "events": 0,
+      "leaves": [
+        274,
+        274
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5495040,
+      "end": 5512319,
+      "events": 0,
+      "leaves": [
+        274,
+        274
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 5512320,
+      "end": 5529599,
+      "events": 0,
+      "leaves": [
+        274,
+        274
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    }
+  ],
+  "producer": "cyphras-archive/services-v1.1.0"
+}
