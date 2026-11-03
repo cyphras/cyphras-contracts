@@ -78,7 +78,7 @@ const entry = (
 // out nothing.
 export function recordPayouts(state: WalletState, checked: readonly ExitEvent[]): void {
   const spends = new Set(
-    state.notes.flatMap((n) => (n.spent === undefined ? [] : [n.spent.txHash])),
+    state.notes.flatMap((n) => (n.spent?.txHash === undefined ? [] : [n.spent.txHash])),
   );
   const kept = new Map(state.payouts.map((p) => [p.txHash, p]));
   for (const e of checked) {
@@ -146,7 +146,8 @@ export function historyOf(state: WalletState): HistoryEntry[] {
   const txs = new Set<string>();
   for (const n of state.notes) {
     if (!depositCommitments.has(n.cm)) txs.add(n.txHash);
-    if (n.spent !== undefined && !planned.has(n.pos)) txs.add(n.spent.txHash);
+    // A spend that names no transaction shows in the history once a sync names it.
+    if (n.spent?.txHash !== undefined && !planned.has(n.pos)) txs.add(n.spent.txHash);
   }
   for (const s of state.sent) txs.add(s.txHash);
   for (const tx of txs) {

@@ -77,7 +77,9 @@ function historyLedgers(state: WalletState): Set<number> {
   const notes = [...state.notes, ...(state.staging?.notes ?? [])];
   const sent = [...state.sent, ...(state.staging?.sent ?? [])];
   return new Set([
-    ...notes.flatMap((n) => (n.spent === undefined ? [n.ledger] : [n.ledger, n.spent.ledger])),
+    ...notes.flatMap((n) =>
+      n.spent?.txHash === undefined ? [n.ledger] : [n.ledger, n.spent.ledger],
+    ),
     ...sent.map((s) => s.ledger),
     ...(state.staging?.found ?? []).map((f) => f.ledger),
     ...state.plans.flatMap((p) => p.evidence.map((e) => e.ledger)),

@@ -32,6 +32,7 @@ import {
   transactRoom,
 } from "./core.ts";
 import { type Warning, unshieldWarnings } from "./nudges.ts";
+import { afterFailure } from "./spent.ts";
 import type { OwnedNote, Plan, PlanState, RootCheck, Route } from "./state.ts";
 
 /** What the user is asked to confirm before a spend is proved. */
@@ -630,7 +631,11 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       await core.save();
 
       if (relay === undefined) {
-        return await selfRelay(core, plan, intent.selfRelay as TransactionSigner, intent.feeCaps);
+        try {
+          return await selfRelay(core, plan, intent.selfRelay as TransactionSigner, intent.feeCaps);
+        } catch (err) {
+          throw await afterFailure(core, plan, err, false);
+        }
       }
       const result = await relay.client.submit(plan.proof, plan.ext, intent.notBefore);
       if (result.accepted) {
@@ -654,7 +659,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
         retryOf = plan.id;
         continue;
       }
-      throw refused;
+      throw await afterFailure(core, plan, refused, true);
     }
   } catch (err) {
     throw naming(err, saved);

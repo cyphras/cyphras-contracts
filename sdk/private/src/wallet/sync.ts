@@ -529,8 +529,11 @@ export function applyDownload(
   // The first record of a spend stands.
   const spent = new Map<bigint, (typeof buffer)[number]>();
   for (const n of buffer) if (!spent.has(n.nf)) spent.set(n.nf, n);
+  // A spend that only the vault's nullifier entry showed takes the transaction a source names.
   for (const note of state.notes) {
-    if (note.nf === undefined || note.spent !== undefined) continue;
+    if (note.nf === undefined || (note.spent !== undefined && note.spent.external !== true)) {
+      continue;
+    }
     const hit = spent.get(note.nf);
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
@@ -713,6 +716,9 @@ export async function recheck(
       ? []
       : e.leaves.filter((l) => l.index >= taken.first && l.index < taken.end);
   const confirmed: number[] = [];
+  // A spend that only the vault's nullifier entry showed names no transaction for the range to
+  // contradict; it takes the one every provider names.
+  const named = new Map<bigint, SpentNullifier | undefined | false>();
   for (const e of held) {
     if (taken !== undefined) confirmed.push(confirmedRuns(taken, shownBy(e), differ));
     const to = Math.min(range.to, e.latest);
@@ -720,6 +726,15 @@ export async function recheck(
     for (const note of state.notes) {
       if (note.nf === undefined) continue;
       const chain = spends.get(note.nf);
+      if (note.spent?.external === true) {
+        const before = named.get(note.nf);
+        const same = before !== false && before?.txHash === chain?.txHash;
+        named.set(
+          note.nf,
+          !named.has(note.nf) || (same && before?.ledger === chain?.ledger) ? chain : false,
+        );
+        continue;
+      }
       const kept =
         note.spent !== undefined && note.spent.ledger >= range.from && note.spent.ledger <= to;
       if (chain === undefined ? kept : chain.txHash !== note.spent?.txHash) differ();
@@ -783,6 +798,12 @@ export async function recheck(
     return undefined;
   }
   sameRecords(held, range.from, to);
+  for (const note of state.notes) {
+    const chain = note.nf === undefined ? undefined : named.get(note.nf);
+    if (note.spent?.external === true && chain) {
+      note.spent = { txHash: chain.txHash, ledger: chain.ledger };
+    }
+  }
   state.unchecked.splice(at, 1, ...kept);
   return {
     ...events,
@@ -848,7 +869,11 @@ function landingRefuted(state: WalletState, plan: Plan): boolean {
   return plan.inputs.some((input) => {
     const note = state.notes.find((n) => n.pos === input.pos);
     const spent = note?.spent;
-    return note !== undefined && (spent?.txHash !== plan.txHash || spent?.ledger !== at);
+    return (
+      note !== undefined &&
+      spent?.external !== true &&
+      (spent?.txHash !== plan.txHash || spent?.ledger !== at)
+    );
   });
 }
 
@@ -863,9 +888,10 @@ function missedDeadline(state: WalletState, plan: Plan): boolean {
   if (!checkedBetween(state, plan.builtAt, plan.deadline)) return false;
   return plan.inputs.every((input) => {
     const spent = state.notes.find((n) => n.pos === input.pos)?.spent;
+    // A spend only the vault's nullifier entry showed may lie at any ledger before it was read.
     return (
       state.notes.some((n) => n.pos === input.pos) &&
-      (spent === undefined || spent.ledger > plan.deadline)
+      (spent === undefined || (spent.external !== true && spent.ledger > plan.deadline))
     );
   });
 }

@@ -5,10 +5,14 @@ import type { ExtDataJson, TxProofJson } from "../extdata.ts";
 import type { TreeSnapshot } from "../merkle.ts";
 import type { SealedStore } from "../storage.ts";
 
-export interface SpentBy {
-  readonly txHash: string;
-  readonly ledger: number;
-}
+// The transaction that spent a note, as the vault's events name it; or, `external`, a spend the
+// wallet knows only from the vault's entry of the note's nullifier, which every RPC provider showed
+// once the vault refused a payment of the note: it names no transaction, and `ledger` is the
+// earliest ledger a provider read the entry at. A later sync that names the transaction takes its
+// place.
+export type SpentBy =
+  | { readonly txHash: string; readonly ledger: number; readonly external?: undefined }
+  | { readonly txHash: undefined; readonly ledger: number; readonly external: true };
 
 // What one transaction showed of a plan: the leaf positions at which it added the plan's two output
 // commitments, which of the plan's two nullifiers it spent, and whether it added a leaf that is not

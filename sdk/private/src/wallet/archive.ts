@@ -466,7 +466,7 @@ async function present(
   }
 }
 
-function ownKey(data: xdr.LedgerEntryData): string | undefined {
+export function ownKey(data: xdr.LedgerEntryData): string | undefined {
   if (data.switch().name !== "contractData") return undefined;
   const d = data.contractData();
   return keyId(

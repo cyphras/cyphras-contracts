@@ -177,7 +177,7 @@ describe("archive sync: a spend the archive leaves out", () => {
     assert.equal((await bob.balance()).spendable, honest);
   });
 
-  it("fails spends of a note whose nullifier it left out and loses no note", async () => {
+  it("marks a note whose nullifier it left out spent once the vault refuses it, and loses no note", async () => {
     const { world, alice, archive, honest } = await bobSpent();
     const lines = archive.lines.get(0) as RawLine[];
     const nfs = lines.filter((l) => topicOf(l) === "new_nullifier");
@@ -196,15 +196,18 @@ describe("archive sync: a spend the archive leaves out", () => {
     const shown = (await bob.balance()).spendable;
     assert.equal(shown, honest + 10n * XLM, "the spent note shows as spendable");
     const events = world.vault.events.length;
-    // Both need the spent note and one other.
+    // It needs the spent note and one other.
     const amount = honest + 4n * XLM;
     await assert.rejects(
       bob.send({ to: alice.generateAddress(), amount, maxFee: 2n * XLM }),
-      isError("service_rejected"),
+      (err: unknown) =>
+        isError("service_rejected")(err) &&
+        (err as { details: Record<string, unknown> }).details["spentCheck"] === "spent",
     );
-    world.advance(5 * 400);
-    await bob.sync();
-    assert.equal((await bob.balance()).spendable, shown);
+    // The vault's nullifier entry, on the only RPC provider, shows the note spent: it no longer
+    // counts, and the other note is free again.
+    assert.equal((await bob.balance()).spendable, honest);
+    assert.equal((await bob.balance()).locked, 0n);
     const account = world.signer("bob account");
     await assert.rejects(
       bob.unshield({
@@ -214,17 +217,16 @@ describe("archive sync: a spend the archive leaves out", () => {
         selfRelay: account,
         confirm: () => true,
       }),
-      (err: unknown) => isError("transaction_failed")(err) && /NullifierSpent/.test(String(err)),
+      isError("insufficient_funds"),
     );
     world.advance(5 * 400);
     for (let i = 0; i < 2; i++) await bob.sync();
     assert.equal(world.vault.events.length, events, "nothing reached the vault");
-    const plans = await bob.plans();
     assert.deepEqual(
-      plans.map((p) => p.state),
-      ["dead", "dead"],
+      (await bob.plans()).map((p) => p.state),
+      ["superseded"],
     );
-    assert.equal((await bob.balance()).spendable, shown);
+    assert.equal((await bob.balance()).spendable, honest);
     assert.equal((await bob.balance()).locked, 0n);
   });
 });

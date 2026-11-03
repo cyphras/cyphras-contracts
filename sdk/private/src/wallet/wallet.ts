@@ -80,6 +80,7 @@ import { type Balance, type HistoryEntry, balanceOf, historyOf, recordPayouts } 
 import { type VaultLimitsView, vaultLimits } from "./limits.ts";
 import { closedBy, readCloseTimes, recordCloseTimes, updatePace } from "./pace.ts";
 import { ArchiveSource } from "./archive.ts";
+import { checkSpent } from "./spent.ts";
 import { type Verification, createServices, recheckIndexers, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
@@ -261,11 +262,12 @@ export interface UnshieldRequest {
   // to the fee a fee_above_cap error reported. An unshield that failed so keeps its plan and notes,
   // and no other unshield to its destination goes while it may still land: one fails with
   // operation_open, naming the planId of a single unshield or the operationId of a split one. A
-  // single one goes again through retry with these caps; it stops blocking once it lands, or is
-  // dead after its deadline with its nullifiers unspent. A split one goes on when the same split
-  // request, same amount and route, is made again, with these caps for the parts that call sends,
-  // and blocks until it is done, or abandoned with its sent parts settled. Later parts take the
-  // caps continueOperations is given.
+  // single one goes again through retry with these caps; it stops blocking once it lands, is dead
+  // after its deadline with its nullifiers unspent, or can land no more, as when the vault refused
+  // it and every RPC provider shows one of its nullifiers spent and the other not. A split one goes
+  // on when the same split request, same amount and route, is made again, with these caps for the
+  // parts that call sends, and blocks until it is done, or abandoned with its sent parts settled.
+  // Later parts take the caps continueOperations is given.
   readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   readonly confirm?: ConfirmSpend;
   readonly notBefore?: number;
@@ -1232,9 +1234,11 @@ export class PrivateWallet {
       if (plan.state !== "submitted" || route.kind !== "relayer") continue;
       const client = this.#relayerClients(route.url)[0] as RelayerClient;
       const { txHash, heldId } = plan;
+      let rejected = false;
       if (txHash !== undefined) {
         const tx = await client.tx(txHash).catch(() => undefined);
         plan.relayerStatus = tx?.status ?? "unknown";
+        rejected = tx?.status === "failed" && tx.code === "rejected";
         if (tx?.status === "failed" && tx.code === "unavailable") {
           await resendConflicted(plan, client, latest).catch(() => {
             plan.relayerStatus = "unknown";
@@ -1244,6 +1248,15 @@ export class PrivateWallet {
         await followHeld(core, plan, heldId, client, latest, pace).catch(() => {
           plan.relayerStatus = "unknown";
         });
+        rejected = plan.relayerStatus === "failed" && plan.error === "rejected";
+      }
+      // A relayer fails a request whose notes were spent first with "rejected", and the sync's
+      // sources may not show that spend.
+      if (
+        rejected &&
+        plan.inputs.some((i) => core.state.notes.find((n) => n.pos === i.pos)?.spent === undefined)
+      ) {
+        await checkSpent(core, plan, false).catch(() => undefined);
       }
     }
   }
