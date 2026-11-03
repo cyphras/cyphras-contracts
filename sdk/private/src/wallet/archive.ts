@@ -416,10 +416,10 @@ function agree(manifests: readonly (ArchiveManifest | undefined)[]): void {
   });
 }
 
-// The manifest up to the last window that ends before `ledger`, as if published then: RPC's events
-// give the windows from there on.
+// The manifest up to the window that holds the ledger before `ledger`, as if published then:
+// RPC's events, which it holds from `ledger` on, give the windows after it.
 function beforeLedger(m: ArchiveManifest, ledger: number): ArchiveManifest {
-  const windows = m.windows.filter((w) => w.end < ledger);
+  const windows = m.windows.filter((w) => w.start < ledger);
   return { ...m, windows, coveredTo: windows[windows.length - 1]?.end ?? 0 };
 }
 
