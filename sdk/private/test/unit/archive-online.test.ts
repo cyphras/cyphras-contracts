@@ -37,8 +37,8 @@ for (const name of ["testnet/xlm", "mainnet/xlm"] as const) {
           vaults: [vault],
           since: deployment.deployLedger,
           leafCount: 0,
-          leafWindows: 1_000,
-          nullifierWindows: 1_000,
+          lastLeafLedger: 0,
+          windows: 1_000,
           eventPages: 100,
         });
         const { nullifiers } = await source.nullifiers(deployment.deployLedger);

@@ -36,12 +36,23 @@ export interface ArchiveSourceOptions {
   // The first ledger whose spends the sync asks for, and the leaves the tree it extends holds.
   readonly since: number;
   readonly leafCount: number;
-  // How many windows with leaves, and with nullifiers, one sync reads at most, and the event pages
-  // of RPC.
-  readonly leafWindows: number;
-  readonly nullifierWindows: number;
+  // The ledger of the tree's last leaf, from which RPC's events carry on a tree staged past the
+  // archive.
+  readonly lastLeafLedger: number;
+  // How many windows one sync reads at most, and the event pages of RPC.
+  readonly windows: number;
   readonly eventPages: number;
+  // Copies, by index, to pass over in this sync.
+  readonly skip?: readonly number[];
+  // The most the windows of one sync may hold decompressed, and the time the archive's files of
+  // one sync may take, in milliseconds of `now`.
+  readonly byteBudget?: number;
+  readonly deadlineMs?: number;
+  readonly now?: () => number;
 }
+
+const ARCHIVE_BYTE_BUDGET = 256 << 20;
+const ARCHIVE_DEADLINE_MS = 600_000;
 
 interface Loaded {
   readonly leaves: readonly Leaf[];
@@ -49,6 +60,7 @@ interface Loaded {
   readonly completeTo: number;
   readonly part: ArchivePart;
   readonly tail: VaultEvents | undefined;
+  readonly copy: number;
 }
 
 const reason = (err: CyphrasError): unknown => err.details["reason"];
@@ -74,11 +86,13 @@ export class ArchiveSource implements ChainSource {
     return this.#loaded;
   }
 
-  // The first copy that passes. A copy that breaks a rule is passed over for the next one, and so
-  // is one that cannot be reached or that ends before RPC's history begins; when none passes, the
-  // first refusal is raised, else the first gap, else that none could be reached.
+  // Every copy's manifest is read first, and copies that list the same window must agree on it;
+  // then the first copy that passes is taken. A copy that breaks a rule is passed over for the
+  // next one, and so is one that cannot be reached or that ends before RPC's history begins; when
+  // none passes, the first refusal is raised, else the first gap, else that none could be reached.
   async #first(): Promise<Loaded> {
-    const { urls, vaults } = this.#o;
+    const { urls, vaults, fetch, pin } = this.#o;
+    const skip = this.#o.skip ?? [];
     if (urls.length === 0) {
       fail("history_unavailable", "RPC no longer holds the vault events this wallet needs", {
         reason: "archive_unconfigured",
@@ -94,20 +108,39 @@ export class ArchiveSource implements ChainSource {
             }),
       ),
     );
+    const deadline = this.#now() + (this.#o.deadlineMs ?? ARCHIVE_DEADLINE_MS);
     let refused: CyphrasError | undefined;
     let gap: CyphrasError | undefined;
+    const sort = (err: unknown, i: number): void => {
+      if (!(err instanceof CyphrasError)) throw err;
+      if (err.code === "archive_fault") {
+        refused ??= new CyphrasError(err.code, err.message, { ...err.details, archive: i });
+      } else if (
+        err.code === "history_unavailable" &&
+        ["archive_gap", "rpc_behind"].includes(`${reason(err)}`)
+      ) {
+        gap ??= err;
+      } else if (!(err.code === "history_unavailable" && reason(err) === "archive_unreachable")) {
+        throw err;
+      }
+    };
+    const manifests: (ArchiveManifest | undefined)[] = [];
     for (const [i, url] of urls.entries()) {
+      if (skip.includes(i)) continue;
       try {
-        return await this.#from(url, views);
+        manifests[i] = await fetchManifest(fetch, url, pin, this.#timeout(deadline));
       } catch (err) {
-        if (!(err instanceof CyphrasError)) throw err;
-        if (err.code === "archive_fault") {
-          refused ??= new CyphrasError(err.code, err.message, { ...err.details, archive: i });
-        } else if (err.code === "history_unavailable" && reason(err) === "archive_gap") {
-          gap ??= err;
-        } else if (!(err.code === "history_unavailable" && reason(err) === "archive_unreachable")) {
-          throw err;
-        }
+        sort(err, i);
+      }
+    }
+    agree(manifests);
+    for (const [i, url] of urls.entries()) {
+      const manifest = manifests[i];
+      if (manifest === undefined) continue;
+      try {
+        return { ...(await this.#from(url, manifest, views, deadline)), copy: i };
+      } catch (err) {
+        sort(err, i);
       }
     }
     throw (
@@ -119,40 +152,66 @@ export class ArchiveSource implements ChainSource {
     );
   }
 
-  async #from(url: string, views: readonly (ChainView | undefined)[]): Promise<Loaded> {
+  #now(): number {
+    return (this.#o.now ?? Date.now)();
+  }
+
+  // How long the next file may take: its own limit, within what is left of the sync's time for
+  // the archive.
+  #timeout(deadline: number): number {
+    const left = deadline - this.#now();
+    if (left <= 0) {
+      fail("history_unavailable", "the vault's archive took too long to read", {
+        reason: "archive_unreachable",
+      });
+    }
+    return left;
+  }
+
+  async #from(
+    url: string,
+    manifest: ArchiveManifest,
+    views: readonly (ChainView | undefined)[],
+    deadline: number,
+  ): Promise<Omit<Loaded, "copy">> {
     const { fetch, pin, since, leafCount, rpcs } = this.#o;
-    const manifest = await fetchManifest(fetch, url, pin);
-    for (const view of views) if (view !== undefined) admits(manifest, view);
+    admits(manifest, views);
     const { windows } = manifest;
     const archiveEnd = windows[windows.length - 1]?.leaves[1] ?? 0;
-    const leafNeed = windows.filter((w) => w.leaves[1] > Math.max(w.leaves[0], leafCount));
-    const nfNeed = windows.filter((w) => w.nullifiers > 0 && w.end >= since);
-    const leafTake = leafNeed.slice(0, this.#o.leafWindows);
-    const nfTake = nfNeed.slice(0, this.#o.nullifierWindows);
-    const leafCut = leafNeed.length > leafTake.length ? lastEnd(leafTake) : undefined;
-    const nfCut = nfNeed.length > nfTake.length ? lastEnd(nfTake) : undefined;
-    // Every leaf and spend of the ledgers up to the cut comes from the windows read.
-    const cut = Math.min(leafCut ?? manifest.coveredTo, nfCut ?? manifest.coveredTo);
-    const reads = windows.filter(
-      (w) => w.start <= cut && (leafTake.includes(w) || nfTake.includes(w)),
+    // One cut for leaves and spends alike: the windows read are the first ones that hold either,
+    // within the window cap and the byte budget, so everything up to the last one read is in.
+    const need = windows.filter(
+      (w) => w.leaves[1] > Math.max(w.leaves[0], leafCount) || (w.nullifiers > 0 && w.end >= since),
     );
+    const budget = this.#o.byteBudget ?? ARCHIVE_BYTE_BUDGET;
+    const take: ArchiveWindow[] = [];
+    let bytes = 0;
+    for (const w of need) {
+      if (take.length === this.#o.windows || (take.length > 0 && bytes + w.bytes > budget)) break;
+      take.push(w);
+      bytes += w.bytes;
+    }
+    const cut = take.length < need.length ? lastEnd(take) : manifest.coveredTo;
     const leaves: Leaf[] = [];
     const nullifiers: SpentNullifier[] = [];
     const spent = new Set<bigint>();
-    for (const w of reads) {
-      const content = await fetchWindow(fetch, url, w, pin);
+    for (const w of take) {
+      const content = await fetchWindow(fetch, url, w, pin, this.#timeout(deadline));
+      const taken: SpentNullifier[] = [];
       for (const n of content.nullifiers) {
         if (spent.has(n.nullifier)) fail("archive_fault", "the archive spends a nullifier twice");
         spent.add(n.nullifier);
-        if (n.ledger >= since) nullifiers.push(n);
+        if (n.ledger >= since) taken.push(n);
       }
+      // A window of made-up nullifiers is refused before the next one is read.
+      for (const [i, rpc] of rpcs.entries()) {
+        if (views[i] !== undefined) await present(rpc, pin.vault, taken);
+      }
+      nullifiers.push(...taken);
       leaves.push(...content.leaves.filter((l) => l.index >= leafCount));
     }
-    for (const [i, rpc] of rpcs.entries()) {
-      if (views[i] !== undefined) await present(rpc, pin.vault, nullifiers);
-    }
     const supplied = (leaves[leaves.length - 1]?.index ?? leafCount - 1) + 1;
-    if (leafCut !== undefined) {
+    if (cut < manifest.coveredTo) {
       return {
         leaves,
         nullifiers,
@@ -161,7 +220,10 @@ export class ArchiveSource implements ChainSource {
         tail: undefined,
       };
     }
-    const tailFrom = Math.max(pin.deployLedger, manifest.coveredTo + 1);
+    // RPC's events go on from the ledger after the archive's last, or, for a tree staged past the
+    // archive, from where its spends and its last leaf left off.
+    const after = Math.max(pin.deployLedger, manifest.coveredTo + 1);
+    const tailFrom = Math.max(after, Math.min(since, this.#o.lastLeafLedger));
     let tail: VaultEvents;
     try {
       tail = await new RpcEventSource(
@@ -179,21 +241,29 @@ export class ArchiveSource implements ChainSource {
       }
       throw err;
     }
-    // RPC's leaves after the archive's last ledger begin where the archive's end, one after another.
-    if (tail.leaves.some((l, i) => l.index !== archiveEnd + i)) {
+    // RPC's leaves follow one another, from where the archive's end when they start right after
+    // it, or from no later than the tree's next leaf.
+    const first = tail.leaves[0]?.index;
+    if (
+      first !== undefined &&
+      (tail.leaves.some((l, i) => l.index !== first + i) ||
+        (tailFrom === after ? first !== archiveEnd : first > Math.max(leafCount, archiveEnd)))
+    ) {
       fail("archive_fault", "the archive's leaves and RPC's events after it do not join");
     }
-    const first = Math.max(leafCount, archiveEnd);
+    const next = Math.max(leafCount, archiveEnd);
     return {
-      leaves: [...leaves, ...tail.leaves.filter((l) => l.index >= first)],
-      nullifiers:
-        nfCut === undefined
-          ? [...nullifiers, ...tail.nullifiers.filter((n) => n.ledger >= since)]
-          : nullifiers,
-      completeTo: nfCut ?? tail.latest,
+      leaves: [...leaves, ...tail.leaves.filter((l) => l.index >= next)],
+      nullifiers: [...nullifiers, ...tail.nullifiers.filter((n) => n.ledger >= since)],
+      completeTo: tail.latest,
       part: { to: cut, end: supplied, tailFrom },
       tail,
     };
+  }
+
+  // The copy the sync took its data from.
+  async copy(): Promise<number> {
+    return (await this.#load()).copy;
   }
 
   async nextLeaves(_tree: CommitmentTree): Promise<LeafBatch> {
@@ -219,21 +289,49 @@ const lastEnd = (windows: readonly ArchiveWindow[]): number =>
   (windows[windows.length - 1] as ArchiveWindow).end;
 
 // A manifest may not claim more than the vault has: more leaves than it holds, or ledgers past the
-// one the provider read it at.
-function admits(m: ArchiveManifest, view: ChainView): void {
+// one the provider read it at. A claim past every provider's view is the archive's lie; one past a
+// provider that lags behind another is that provider's lag, and the sync waits for it.
+function admits(m: ArchiveManifest, views: readonly (ChainView | undefined)[]): void {
+  const answered = views.filter((v): v is ChainView => v !== undefined);
   const leaves = m.windows[m.windows.length - 1]?.leaves[1] ?? 0;
-  if (leaves > view.roots.nextLeaf) {
+  const most = Math.max(...answered.map((v) => v.roots.nextLeaf));
+  const latest = Math.max(...answered.map((v) => v.ledger));
+  if (leaves > most) {
     fail("archive_fault", "the archive lists more leaves than the vault holds", {
       leaves,
-      vaultLeaves: view.roots.nextLeaf,
+      vaultLeaves: most,
     });
   }
-  if (m.coveredTo > view.ledger) {
+  if (m.coveredTo > latest) {
     fail("archive_fault", "the archive covers ledgers the chain has not closed", {
       coveredTo: m.coveredTo,
-      latestLedger: view.ledger,
+      latestLedger: latest,
     });
   }
+  if (answered.some((v) => leaves > v.roots.nextLeaf || m.coveredTo > v.ledger)) {
+    fail("history_unavailable", "an RPC provider is behind the vault's archive", {
+      reason: "rpc_behind",
+    });
+  }
+}
+
+// Copies that list the same window must hold the same one: what the chain cannot check of it, its
+// ciphertexts and transactions, then rests on more than one copy.
+function agree(manifests: readonly (ArchiveManifest | undefined)[]): void {
+  const seen = new Map<number, { readonly key: string; readonly copy: number }>();
+  manifests.forEach((m, copy) => {
+    for (const w of m?.windows ?? []) {
+      const key = JSON.stringify([w.sha256, w.events, w.leaves, w.nullifiers, w.bytes]);
+      const other = seen.get(w.start);
+      if (other === undefined) seen.set(w.start, { key, copy });
+      else if (other.key !== key) {
+        fail("archive_fault", "copies of the vault's archive disagree on a window", {
+          copies: `${other.copy},${copy}`,
+          window: w.start,
+        });
+      }
+    }
+  });
 }
 
 // Every nullifier must have an entry in the vault, live or archived, and each entry the RPC returns

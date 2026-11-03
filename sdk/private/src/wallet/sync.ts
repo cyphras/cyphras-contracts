@@ -66,7 +66,8 @@ export async function downloadChain(
   maxPages: number,
 ): Promise<{ readonly views: readonly (ChainView | undefined)[]; readonly data: Download }> {
   const since = state.nullifierSince;
-  const served = await source.nullifiers(since);
+  const staged = state.staging?.spends;
+  const served = await source.nullifiers(nullifierCursor(state));
   const views = await Promise.all(
     vaults.map((vault, i) =>
       i === 0
@@ -107,11 +108,17 @@ export async function downloadChain(
       since,
       completeTo: served.completeToLedger,
       horizon,
-      nullifiers: served.nullifiers.filter((n) => n.ledger <= horizon),
+      nullifiers: [...(staged?.nullifiers ?? []), ...served.nullifiers].filter(
+        (n) => n.ledger <= horizon,
+      ),
       firstIndex,
       leaves,
       tree,
       pages,
+      // Spends an archive gave a staged sync are its part of this download too.
+      ...(staged === undefined
+        ? {}
+        : { archive: { to: staged.to, end: firstIndex, tailFrom: staged.to + 1 } }),
     },
   };
 }
@@ -233,11 +240,16 @@ export function checkRoot(tree: CommitmentTree, history: RootHistory): RootCheck
     const current = history.roots[history.newest];
     return { ...base, state: current === root ? "verified" : "mismatch" };
   }
-  if (known.includes(root)) return { ...base, state: "verified" };
   // More than 255 pairs behind: the root has left the history, which says nothing about its
   // correctness. The wallet syncs further before it spends.
   const pairsBehind = (history.nextLeaf - tree.leafCount) / 2;
-  return { ...base, state: pairsBehind >= history.roots.length ? "behind" : "mismatch" };
+  const size = history.roots.length;
+  if (pairsBehind >= size) return { ...base, state: "behind" };
+  // The ring holds one root per pair inserted: the root at this leaf count sits as many slots
+  // before the newest as the tree is pairs behind, and only that root is the tree's. A tree whose
+  // last pairs are empty leaves has the root of a shorter one.
+  const slot = (((history.newest - pairsBehind) % size) + size) % size;
+  return { ...base, state: history.roots[slot] === root ? "verified" : "mismatch" };
 }
 
 function scanLeaf(state: WalletState, leaf: Leaf, keys: ScanKeys, cache: AddressCache): boolean {
@@ -317,7 +329,11 @@ function recordOutputs(
     for (const leaf of found) {
       const slot = plan.commitments.indexOf(leaf.commitment);
       if (slot < 0) continue;
-      const e = evidenceOf(plan, leaf.txHash, leaf.ledger);
+      // An archive's leaves show where the plan landed, not in which transaction.
+      const e =
+        leaf.archived === true
+          ? evidenceOf(plan, plan.txHash ?? leaf.txHash, plan.ledger ?? leaf.ledger)
+          : evidenceOf(plan, leaf.txHash, leaf.ledger);
       e.outputs[slot] = leaf.index;
       e.providers = providers;
     }
@@ -389,12 +405,24 @@ function scanDownload(
     if (scanLeaf(found, leaf, keys, cache)) newNotes++;
   }
   const commitments = new Set(state.plans.filter((p) => !landed(p)).flatMap((p) => p.commitments));
-  const planLeaves = data.leaves
-    .filter((l) => commitments.has(l.commitment))
-    .map((l) => ({ index: l.index, commitment: l.commitment, ledger: l.ledger, txHash: l.txHash }));
+
   // Leaves an archive supplied are never checked, so their digests are kept apart from the rest.
   const archived = data.archive !== undefined && data.archive.end > data.firstIndex;
   const split = archived ? data.archive?.end : undefined;
+  const planLeaves = data.leaves
+    .filter((l) => commitments.has(l.commitment))
+    .map((l) => ({
+      index: l.index,
+      commitment: l.commitment,
+      ledger: l.ledger,
+      txHash: l.txHash,
+      ...(split !== undefined && l.index < split ? { archived: true } : {}),
+    }));
+  const end = split ?? staged?.archived;
+  const ledgerAt = (index: number | undefined): number | undefined =>
+    data.leaves.find((l) => l.index === index)?.ledger;
+  const afterArchived =
+    split !== undefined ? ledgerAt(split) : (staged?.afterArchived ?? ledgerAt(end));
   const paths = [...(staged?.paths ?? [])];
   for (const page of data.pages) {
     const start = page.page * PAGE_SIZE;
@@ -434,11 +462,8 @@ function scanDownload(
               ...staged.unchecked,
               chunks: [...staged.unchecked.chunks, ...chunksOf(data.leaves, split)],
             },
-      ...(split === undefined
-        ? staged?.archived === undefined
-          ? {}
-          : { archived: staged.archived }
-        : { archived: Math.max(split, staged?.archived ?? 0) }),
+      ...(end === undefined ? {} : { archived: end }),
+      ...(afterArchived === undefined ? {} : { afterArchived }),
     },
     newNotes,
   };
@@ -452,7 +477,21 @@ export function stageDownload(
   data: Download,
   checked: boolean,
 ): void {
-  if (data.leaves.length > 0) state.staging = scanDownload(state, keys, data, checked).staging;
+  if (data.leaves.length === 0 && data.archive === undefined) return;
+  const { staging } = scanDownload(state, keys, data, checked);
+  // An archive's spends of the staged ledgers are kept too, so the next sync goes on after them.
+  const spends =
+    data.archive === undefined
+      ? state.staging?.spends
+      : { to: data.horizon, nullifiers: [...data.nullifiers] };
+  state.staging = spends === undefined ? staging : { ...staging, spends };
+}
+
+// The first ledger whose spends a sync asks for: after those an archive gave a staged sync, or
+// the first one not yet applied.
+export function nullifierCursor(state: WalletState): number {
+  const spends = state.staging?.spends;
+  return spends === undefined ? state.nullifierSince : spends.to + 1;
 }
 
 // Applies a download whose tree the root history of each of `providers` RPC providers has
@@ -497,6 +536,7 @@ export function applyDownload(
       ? undefined
       : { ...staging.unchecked, end: staging.tree.leafCount },
     staging.archived,
+    staging.afterArchived,
     data,
     checked,
   );
@@ -528,14 +568,14 @@ export function applyDownload(
 function splitArchived(
   leaves: UncheckedRange["leaves"],
   archived: number | undefined,
+  afterLedger: number | undefined,
   data: Download,
   checked: boolean,
 ): { readonly lost: UncheckedRange["leaves"]; readonly rest: UncheckedRange["leaves"] } {
   if (leaves === undefined || archived === undefined || archived <= leaves.first) {
     return { lost: undefined, rest: leaves };
   }
-  const after = data.leaves.find((l) => l.index === archived);
-  if (archived >= leaves.end || after === undefined) return { lost: leaves, rest: undefined };
+  if (archived >= leaves.end || afterLedger === undefined) return { lost: leaves, rest: undefined };
   return {
     lost: {
       first: leaves.first,
@@ -543,14 +583,16 @@ function splitArchived(
       ledger: leaves.ledger,
       chunks: leaves.chunks.filter((c) => c.end <= archived),
     },
-    rest: checked
-      ? undefined
-      : {
-          first: archived,
-          end: leaves.end,
-          ledger: after.ledger,
-          chunks: leaves.chunks.filter((c) => c.end > archived),
-        },
+    // Leaves after the archive's that an earlier sync staged were not checked by this one.
+    rest:
+      checked && data.firstIndex <= archived
+        ? undefined
+        : {
+            first: archived,
+            end: leaves.end,
+            ledger: afterLedger,
+            chunks: leaves.chunks.filter((c) => c.end > archived),
+          },
   };
 }
 

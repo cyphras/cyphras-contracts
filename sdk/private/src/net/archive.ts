@@ -1,7 +1,8 @@
 import { sha256 } from "@noble/hashes/sha2";
-import { StrKey, xdr } from "@stellar/stellar-base";
+import { StrKey, scValToBigInt, xdr } from "@stellar/stellar-base";
 import { bytesToHex } from "../bytes.ts";
 import { CyphrasError, fail } from "../errors.ts";
+import { P } from "../field.ts";
 import { decodeVaultEvent } from "../vault/events.ts";
 import type { FetchLike } from "./http.ts";
 import type { Leaf, SpentNullifier } from "./indexer.ts";
@@ -23,29 +24,43 @@ const UINT32_MAX = 0xffffffff;
 const MANIFEST_TIMEOUT_MS = 30_000;
 const WINDOW_TIMEOUT_MS = 120_000;
 
-// Every topic the vault emits. A window may hold only these, as the archive tool's decoder knows
-// no others.
-const VAULT_TOPICS = new Set([
-  "deposit_pending",
-  "deposit_flagged",
-  "deposit_unflagged",
-  "attested",
-  "deposit_admitted",
-  "deposit_refunded",
-  "new_commitment",
-  "new_nullifier",
-  "settled",
-  "exit_queued",
-  "exit_paid",
-  "exit_requeued",
-  "exit_stranded",
-  "paused",
-  "halted",
-  "resumed",
-  "limits_queued",
-  "limits_applied",
-  "limits_cancelled",
+// Every topic the vault emits, with the fields of its data, as the archive tool's decoder reads
+// them. A window may hold only these, each with exactly these fields.
+const VAULT_TOPICS: ReadonlyMap<string, readonly string[]> = new Map([
+  ["deposit_pending", ["id", "depositor", "amount", "commitment0", "commitment1", "created_at"]],
+  ["deposit_flagged", ["id", "reason"]],
+  ["deposit_unflagged", ["id", "reason"]],
+  ["attested", ["up_to"]],
+  ["deposit_admitted", ["id", "leaf_index0", "leaf_index1"]],
+  ["deposit_refunded", ["id", "reason"]],
+  ["new_commitment", ["index", "commitment", "encrypted_output"]],
+  ["new_nullifier", ["nullifier"]],
+  ["settled", ["ext_amount", "fee", "recipient", "relayer", "exit_id"]],
+  ["exit_queued", ["id", "ext_amount", "fee", "recipient", "relayer"]],
+  ["exit_paid", ["id", "payout_paid", "fee_paid", "payout_left", "fee_left"]],
+  ["exit_requeued", ["id", "new_id", "payout", "fee"]],
+  ["exit_stranded", ["id", "payout", "fee"]],
+  ["paused", ["deposits", "transfers"]],
+  ["halted", ["until"]],
+  ["resumed", ["next_halt_at"]],
+  ["limits_queued", ["limits", "ready_at"]],
+  ["limits_applied", ["limits", "ready_at"]],
+  ["limits_cancelled", ["limits", "ready_at"]],
 ]);
+
+// The length of a note's ciphertext in a new_commitment event.
+const CIPHERTEXT_BYTES = 181;
+
+// The names of a map's symbol keys, or undefined for data that is not such a map.
+function fieldNames(value: xdr.ScVal): string[] | undefined {
+  if (value.switch().name !== "scvMap") return undefined;
+  const names: string[] = [];
+  for (const entry of value.map() ?? []) {
+    if (entry.key().switch().name !== "scvSymbol") return undefined;
+    names.push(entry.key().sym().toString());
+  }
+  return names;
+}
 
 /** What a reader requires of an archive: the vault, its network and its deploy ledger. */
 export interface ArchivePin {
@@ -455,7 +470,30 @@ export async function checkWindow(
       if (!(err instanceof CyphrasError)) throw err;
       return at(n, "not a vault event");
     }
-    if (decoded.kind === "other" && !VAULT_TOPICS.has(decoded.topic)) at(n, "an unknown topic");
+    const name = decoded.kind === "other" ? decoded.topic : decoded.kind;
+    const fields = VAULT_TOPICS.get(name);
+    if (fields === undefined) return at(n, "an unknown topic");
+    const names = fieldNames(value as xdr.ScVal);
+    if (
+      names === undefined ||
+      names.length !== fields.length ||
+      !fields.every((f) => names.includes(f))
+    ) {
+      at(n, `${name} data without exactly its fields`);
+    }
+    if (
+      (decoded.kind === "new_commitment" &&
+        (decoded.commitment === 0n ||
+          decoded.commitment >= P ||
+          decoded.ciphertext.length !== CIPHERTEXT_BYTES)) ||
+      (decoded.kind === "new_nullifier" && decoded.nullifier >= P) ||
+      (decoded.kind === "deposit_pending" && decoded.commitments.some((c) => c >= P))
+    ) {
+      at(n, `${name} data the vault never emits`);
+    }
+    if (decoded.kind === "deposit_pending" && depositAmount(value as xdr.ScVal) <= 0n) {
+      at(n, "a deposit of nothing");
+    }
     events++;
     if (decoded.kind === "new_nullifier") {
       if (spent.has(decoded.nullifier)) at(n, "a nullifier spent twice");
@@ -490,6 +528,12 @@ export async function checkWindow(
     invalid(`window ${w.start} holds other counts than its manifest states`);
   }
   return { leaves, nullifiers };
+}
+
+function depositAmount(value: xdr.ScVal): bigint {
+  const entry = value.map()?.find((e) => e.key().sym().toString() === "amount");
+  const v = entry?.val();
+  return v?.switch().name === "scvI128" ? scValToBigInt(v) : 0n;
 }
 
 function follows(
@@ -564,13 +608,14 @@ export async function fetchManifest(
   fetchFn: FetchLike,
   base: string,
   pin: ArchivePin,
+  timeoutMs = MANIFEST_TIMEOUT_MS,
 ): Promise<ArchiveManifest> {
   const raw = await getFile(
     fetchFn,
     base,
     "manifest.json",
     MAX_MANIFEST_BYTES,
-    MANIFEST_TIMEOUT_MS,
+    Math.min(timeoutMs, MANIFEST_TIMEOUT_MS),
   );
   if (raw === undefined) unreachable("the archive has no manifest");
   return parseManifest(raw, pin);
@@ -582,13 +627,14 @@ export async function fetchWindow(
   base: string,
   w: ArchiveWindow,
   pin: ArchivePin,
+  timeoutMs = WINDOW_TIMEOUT_MS,
 ): Promise<WindowContent> {
   const compressed = await getFile(
     fetchFn,
     base,
     windowFile(w),
     maxCompressed(w),
-    WINDOW_TIMEOUT_MS,
+    Math.min(timeoutMs, WINDOW_TIMEOUT_MS),
   );
   if (compressed === undefined) invalid(`lists window ${w.start} but has no file for it`);
   return checkWindow(w, compressed, pin);

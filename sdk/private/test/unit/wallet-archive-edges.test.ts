@@ -122,30 +122,26 @@ describe("archive sync: copies that disagree", () => {
 });
 
 describe("archive sync: commitments the chain cannot tell apart", () => {
-  it(
-    "refuses a commitment written as itself plus the field's modulus",
-    { todo: "the event decoder takes a U256 at or past the field's modulus" },
-    async () => {
-      const { world } = await history(1);
-      const archive = buildArchive(world, WINDOW_LEDGERS - 1);
-      // The root of the tree is the same with either spelling of the leaf.
-      rewriteWindow(archive, 0, (lines) => {
-        const at = lines.findIndex((l) => topicOf(l) === "new_commitment");
-        const parts = fieldOf(lines[at] as RawLine, "commitment").u256();
-        const n =
-          (parts.hiHi().toBigInt() << 192n) |
-          (parts.hiLo().toBigInt() << 128n) |
-          (parts.loHi().toBigInt() << 64n) |
-          parts.loLo().toBigInt();
-        return lines.map((l, i) =>
-          i === at ? withField(l, "commitment", nativeToScVal(n + P, { type: "u256" })) : l,
-        );
-      });
-      const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
-      const bob = await bobWith(world, server.fetch);
-      await assert.rejects(bob.sync(), isError("archive_fault"));
-    },
-  );
+  it("refuses a commitment written as itself plus the field's modulus", async () => {
+    const { world } = await history(1);
+    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
+    // The root of the tree is the same with either spelling of the leaf.
+    rewriteWindow(archive, 0, (lines) => {
+      const at = lines.findIndex((l) => topicOf(l) === "new_commitment");
+      const parts = fieldOf(lines[at] as RawLine, "commitment").u256();
+      const n =
+        (parts.hiHi().toBigInt() << 192n) |
+        (parts.hiLo().toBigInt() << 128n) |
+        (parts.loHi().toBigInt() << 64n) |
+        parts.loLo().toBigInt();
+      return lines.map((l, i) =>
+        i === at ? withField(l, "commitment", nativeToScVal(n + P, { type: "u256" })) : l,
+      );
+    });
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+    const bob = await bobWith(world, server.fetch);
+    await assert.rejects(bob.sync(), isError("archive_fault"));
+  });
 });
 
 describe("archive sync: a spend the archive leaves out", () => {
@@ -255,7 +251,6 @@ describe("archive sync: a second provider that cannot answer", () => {
 
   it(
     "keeps RPC's leaves after the archive open for a recheck when they were staged",
-    { todo: "staged leaves after the archive's are kept as lost" },
     async () => {
       const { world } = await history(1);
       const archive = buildArchive(world, WINDOW_LEDGERS - 1);

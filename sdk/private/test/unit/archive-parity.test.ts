@@ -32,15 +32,6 @@ interface ManifestVector {
 
 const goPin = json<ArchivePin>("go-vectors/pin.json");
 
-// Event data the tool's decoder refuses field by field and the reader here does not check yet.
-const DATA_CHECKS = new Set([
-  "commitment-extra-field",
-  "commitment-not-a-field-element",
-  "ciphertext-180-bytes",
-  "nullifier-not-a-field-element",
-  "deposit-of-zero",
-]);
-
 async function verdict(run: () => unknown): Promise<string> {
   try {
     await run();
@@ -53,8 +44,7 @@ async function verdict(run: () => unknown): Promise<string> {
 
 describe("archive format: the same verdict as the archive tool's reader", () => {
   for (const v of json<WindowVector[]>("go-vectors/windows.json")) {
-    const todo = DATA_CHECKS.has(v.name) ? "the event decoder does not check this" : undefined;
-    it(`window file: ${v.name}`, { todo }, async () => {
+    it(`window file: ${v.name}`, async () => {
       const w: ArchiveWindow = { ...v.window, sha256: v.window.sha256 };
       const got = await verdict(() => checkWindow(w, read(`go-vectors/${v.file}`), goPin));
       assert.equal(got === "", v.goError === "", `here: "${got}", the tool: "${v.goError}"`);

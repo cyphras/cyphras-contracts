@@ -229,8 +229,20 @@ export interface Staging {
   readonly unchecked:
     | { readonly first: number; readonly ledger: number; readonly chunks: readonly LeafChunk[] }
     | undefined;
-  // The end of the staged leaves an archive supplied, which nothing but the root checks.
+  // The end of the staged leaves an archive supplied, which nothing but the root checks, and the
+  // ledger of the staged leaf at that end.
   readonly archived?: number;
+  readonly afterArchived?: number;
+  // An archive's spends of the ledgers up to `to`, from nullifierSince on, which the staged sync
+  // read and the next ones go on from.
+  readonly spends?: {
+    readonly to: number;
+    readonly nullifiers: readonly {
+      readonly nullifier: bigint;
+      readonly ledger: number;
+      readonly txHash: string;
+    }[];
+  };
 }
 
 // A digest of the leaves from the previous chunk's end, or the range's first leaf, up to `end`:
@@ -245,6 +257,8 @@ export interface FoundLeaf {
   readonly commitment: bigint;
   readonly ledger: number;
   readonly txHash: string;
+  // An archive supplied it, so its ledger and transaction are the archive's word only.
+  readonly archived?: boolean;
 }
 
 // What syncs took from the indexer while not every RPC provider could confirm it: the spends of
