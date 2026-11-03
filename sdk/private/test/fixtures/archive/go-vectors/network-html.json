@@ -1,0 +1,47 @@
+{
+  "format": "cyphras-vault-archive/1",
+  "network": "a\u003cb\u003e\u0026c",
+  "networkPassphrase": "Test SDF Network ; September 2015",
+  "vault": "CBYJTWEOBJL52FA7J7JNDVM65TW64PXO2EIQBF5YVEE3OROZSBVMP2N5",
+  "deployLedger": 10,
+  "windowLedgers": 17280,
+  "coveredTo": 51839,
+  "windows": [
+    {
+      "start": 0,
+      "end": 17279,
+      "events": 13,
+      "leaves": [
+        0,
+        4
+      ],
+      "nullifiers": 4,
+      "bytes": 6582,
+      "sha256": "d8f760d33a83e541510d0226940a5d6016db978135206518f3fdd63df1781d0e"
+    },
+    {
+      "start": 17280,
+      "end": 34559,
+      "events": 12,
+      "leaves": [
+        4,
+        8
+      ],
+      "nullifiers": 4,
+      "bytes": 6141,
+      "sha256": "0cd082d230eca082a4616c9d00baef77ef2d5585a4d5bcdae2c8e0d093cd9944"
+    },
+    {
+      "start": 34560,
+      "end": 51839,
+      "events": 0,
+      "leaves": [
+        8,
+        8
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    }
+  ],
+  "producer": "test"
+}

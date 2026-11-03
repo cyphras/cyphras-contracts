@@ -1,0 +1,57 @@
+[
+  {
+    "name": "network-plain",
+    "file": "network-plain.json",
+    "goError": ""
+  },
+  {
+    "name": "network-backspace",
+    "file": "network-backspace.json",
+    "goError": ""
+  },
+  {
+    "name": "network-formfeed",
+    "file": "network-formfeed.json",
+    "goError": ""
+  },
+  {
+    "name": "network-carriage-return",
+    "file": "network-carriage-return.json",
+    "goError": ""
+  },
+  {
+    "name": "network-nul",
+    "file": "network-nul.json",
+    "goError": ""
+  },
+  {
+    "name": "network-unit-separator",
+    "file": "network-unit-separator.json",
+    "goError": ""
+  },
+  {
+    "name": "network-delete",
+    "file": "network-delete.json",
+    "goError": ""
+  },
+  {
+    "name": "network-accent",
+    "file": "network-accent.json",
+    "goError": ""
+  },
+  {
+    "name": "network-line-separator",
+    "file": "network-line-separator.json",
+    "goError": ""
+  },
+  {
+    "name": "network-html",
+    "file": "network-html.json",
+    "goError": ""
+  },
+  {
+    "name": "network-quote-backslash",
+    "file": "network-quote-backslash.json",
+    "goError": ""
+  }
+]

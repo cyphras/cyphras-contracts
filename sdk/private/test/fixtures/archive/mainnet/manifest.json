@@ -1,0 +1,236 @@
+{
+  "format": "cyphras-vault-archive/1",
+  "network": "mainnet",
+  "networkPassphrase": "Public Global Stellar Network ; September 2015",
+  "vault": "CDE6MIQAS4P3YXAH6SFFYUP5XPPVPXXAVCTO5ATEUUTJW376KUTKQK7Z",
+  "deployLedger": 64939550,
+  "windowLedgers": 17280,
+  "coveredTo": 65283839,
+  "windows": [
+    {
+      "start": 64938240,
+      "end": 64955519,
+      "events": 46,
+      "leaves": [
+        0,
+        16
+      ],
+      "nullifiers": 16,
+      "bytes": 23889,
+      "sha256": "7b47b1feb301b2082c9e84eb86e25a27d81576ce157796fe3a8c3b8411c4d0fe"
+    },
+    {
+      "start": 64955520,
+      "end": 64972799,
+      "events": 0,
+      "leaves": [
+        16,
+        16
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 64972800,
+      "end": 64990079,
+      "events": 12,
+      "leaves": [
+        16,
+        20
+      ],
+      "nullifiers": 4,
+      "bytes": 6207,
+      "sha256": "95a2b7463b661bdc7c423934fdd0e2d594493d62e055c32b37e8cd7a1984fc76"
+    },
+    {
+      "start": 64990080,
+      "end": 65007359,
+      "events": 0,
+      "leaves": [
+        20,
+        20
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65007360,
+      "end": 65024639,
+      "events": 0,
+      "leaves": [
+        20,
+        20
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65024640,
+      "end": 65041919,
+      "events": 0,
+      "leaves": [
+        20,
+        20
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65041920,
+      "end": 65059199,
+      "events": 17,
+      "leaves": [
+        20,
+        26
+      ],
+      "nullifiers": 6,
+      "bytes": 8884,
+      "sha256": "b6db363ef8804d39f66bef9036f06efc6fad166e4bf3b5c9dbc18ab71592709d"
+    },
+    {
+      "start": 65059200,
+      "end": 65076479,
+      "events": 0,
+      "leaves": [
+        26,
+        26
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65076480,
+      "end": 65093759,
+      "events": 0,
+      "leaves": [
+        26,
+        26
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65093760,
+      "end": 65111039,
+      "events": 0,
+      "leaves": [
+        26,
+        26
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65111040,
+      "end": 65128319,
+      "events": 5,
+      "leaves": [
+        26,
+        28
+      ],
+      "nullifiers": 2,
+      "bytes": 2719,
+      "sha256": "435ca54204017026f5605143bd3bfe53cfe4a00560dba456e60af964d5567681"
+    },
+    {
+      "start": 65128320,
+      "end": 65145599,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65145600,
+      "end": 65162879,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65162880,
+      "end": 65180159,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65180160,
+      "end": 65197439,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65197440,
+      "end": 65214719,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65214720,
+      "end": 65231999,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65232000,
+      "end": 65249279,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65249280,
+      "end": 65266559,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65266560,
+      "end": 65283839,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    }
+  ],
+  "producer": "cyphras-archive/services-v1.3.0"
+}
