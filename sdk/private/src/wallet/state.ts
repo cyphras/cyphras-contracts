@@ -23,6 +23,8 @@ export interface Evidence {
   nullifiers: [boolean, boolean];
   foreign: boolean;
   checked: boolean;
+  // Only an archive showed the positions, so the transaction it names is its word alone.
+  archived?: boolean;
 }
 
 // A note of this wallet that is in the tree.

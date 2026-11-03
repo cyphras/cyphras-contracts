@@ -42,10 +42,11 @@ export interface ArchiveSourceOptions {
   // How many windows one sync reads at most, and the event pages of RPC.
   readonly windows: number;
   readonly eventPages: number;
-  // Copies, by index, to pass over in this sync.
+  // Copies, by index, to pass over in this sync, and the nullifiers staged syncs took already.
   readonly skip?: readonly number[];
-  // The most the windows of one sync may hold decompressed, and the time the archive's files of
-  // one sync may take, in milliseconds of `now`.
+  readonly staged?: readonly bigint[];
+  // The most the windows of one sync may hold decompressed, and the time the files of one copy
+  // may take in one sync, in milliseconds of `now`.
   readonly byteBudget?: number;
   readonly deadlineMs?: number;
   readonly now?: () => number;
@@ -108,7 +109,8 @@ export class ArchiveSource implements ChainSource {
             }),
       ),
     );
-    const deadline = this.#now() + (this.#o.deadlineMs ?? ARCHIVE_DEADLINE_MS);
+    // Every copy has its own time, so a slow one cannot use up another's.
+    const budget = this.#o.deadlineMs ?? ARCHIVE_DEADLINE_MS;
     let refused: CyphrasError | undefined;
     let gap: CyphrasError | undefined;
     const sort = (err: unknown, i: number): void => {
@@ -128,7 +130,7 @@ export class ArchiveSource implements ChainSource {
     for (const [i, url] of urls.entries()) {
       if (skip.includes(i)) continue;
       try {
-        manifests[i] = await fetchManifest(fetch, url, pin, this.#timeout(deadline));
+        manifests[i] = await fetchManifest(fetch, url, pin, budget);
       } catch (err) {
         sort(err, i);
       }
@@ -138,7 +140,7 @@ export class ArchiveSource implements ChainSource {
       const manifest = manifests[i];
       if (manifest === undefined) continue;
       try {
-        return { ...(await this.#from(url, manifest, views, deadline)), copy: i };
+        return { ...(await this.#from(url, manifest, views, this.#now() + budget)), copy: i };
       } catch (err) {
         sort(err, i);
       }
@@ -194,7 +196,8 @@ export class ArchiveSource implements ChainSource {
     const cut = take.length < need.length ? lastEnd(take) : manifest.coveredTo;
     const leaves: Leaf[] = [];
     const nullifiers: SpentNullifier[] = [];
-    const spent = new Set<bigint>();
+    // An honest archive spends a nullifier once, and never one a staged sync took already.
+    const spent = new Set<bigint>(this.#o.staged ?? []);
     for (const w of take) {
       const content = await fetchWindow(fetch, url, w, pin, this.#timeout(deadline));
       const taken: SpentNullifier[] = [];
@@ -252,6 +255,32 @@ export class ArchiveSource implements ChainSource {
       fail("archive_fault", "the archive's leaves and RPC's events after it do not join");
     }
     const next = Math.max(leafCount, archiveEnd);
+    if (tail.nullifiers.some((n) => spent.has(n.nullifier))) {
+      fail("archive_fault", "the archive spends a nullifier RPC's events after it spend");
+    }
+    // The archive and RPC's events after it must hold every leaf each provider shows the vault
+    // has: a copy that leaves out its last pairs has a shorter tree whose root the ring still
+    // holds. Each provider the tail reaches is asked; a tail that reaches none, as one stopped at
+    // its page cap, cannot show it, and nothing is taken.
+    const reached = views.filter((v): v is ChainView => v !== undefined && v.ledger <= tail.latest);
+    if (reached.length === 0) {
+      fail("history_unavailable", "RPC's events after the archive stop short of the vault", {
+        reason: "rpc_tail_short",
+      });
+    }
+    for (const view of reached) {
+      const after = tail.leaves.filter((l) => l.index >= next && l.ledger <= view.ledger).length;
+      if (next + after !== view.roots.nextLeaf) {
+        fail(
+          "archive_fault",
+          "the archive and RPC's events after it hold fewer leaves than the vault",
+          {
+            leaves: next + after,
+            vaultLeaves: view.roots.nextLeaf,
+          },
+        );
+      }
+    }
     return {
       leaves: [...leaves, ...tail.leaves.filter((l) => l.index >= next)],
       nullifiers: [...nullifiers, ...tail.nullifiers.filter((n) => n.ledger >= since)],

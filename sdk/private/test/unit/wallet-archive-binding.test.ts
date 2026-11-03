@@ -553,22 +553,18 @@ describe("archive sync: archive URLs", () => {
 });
 
 describe("archive sync: sync limits", () => {
-  it(
-    "raises a wallet error, not a crash, for a leaf page limit of 0",
-    { todo: "a window cap of 0 reads no window and cuts at the end of none" },
-    async () => {
-      const { world } = await history(1);
-      const archive = buildArchive(world, WINDOW_LEDGERS - 1);
-      const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
-      const opened = bobWith(world, server.fetch, {
-        syncLimits: { leafPages: 0, nullifierPages: 1 },
-      });
-      await assert.rejects(
-        opened.then((bob) => bob.sync()),
-        (err: unknown) => err instanceof CyphrasError,
-      );
-    },
-  );
+  it("raises a wallet error, not a crash, for a leaf page limit of 0", async () => {
+    const { world } = await history(1);
+    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+    const opened = bobWith(world, server.fetch, {
+      syncLimits: { leafPages: 0, nullifierPages: 1 },
+    });
+    await assert.rejects(
+      opened.then((bob) => bob.sync()),
+      (err: unknown) => err instanceof CyphrasError,
+    );
+  });
 });
 
 describe("archive sync: a restore across reopenings", () => {

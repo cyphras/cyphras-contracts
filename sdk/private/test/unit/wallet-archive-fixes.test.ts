@@ -11,6 +11,7 @@ import { MemoryStore } from "../../src/storage.ts";
 import { type ChainView, VaultReader } from "../../src/vault/state.ts";
 import { SorobanRpc as Rpc } from "../../src/net/rpc.ts";
 import { ArchiveSource, type ArchiveSourceOptions } from "../../src/wallet/archive.ts";
+import { fetchManifest, fetchWindow } from "../../src/net/archive.ts";
 import { checkRoot } from "../../src/wallet/sync.ts";
 import type { OpenOptions, PrivateWallet } from "../../src/wallet/wallet.ts";
 import {
@@ -20,6 +21,7 @@ import {
   WINDOW_LEDGERS,
   buildArchive,
   fileOf,
+  rawEvents,
   rewriteWindow,
   serveArchive,
 } from "../support/archive.ts";
@@ -236,12 +238,12 @@ describe("archive sync: what one sync may cost", () => {
   });
 
   it("gives up on an archive that takes longer than the sync allows", async () => {
-    const world = await history(1);
-    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
+    const world = await history(2);
+    const archive = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
     const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
     let clock = 0;
-    server.answer = () => {
-      clock += 700_000;
+    server.answer = (path) => {
+      if (path.startsWith("windows/")) clock += 700_000;
       return undefined;
     };
     const source = new ArchiveSource({ ...sourceOver(world, server.fetch), now: () => clock });
@@ -250,6 +252,70 @@ describe("archive sync: what one sync may cost", () => {
       (err: unknown) =>
         err instanceof CyphrasError && err.details["reason"] === "archive_unreachable",
     );
+  });
+});
+
+describe("archive sync: what the archive and RPC's events after it hold together", () => {
+  it("refuses a copy that leaves out its last pair while RPC shows no later leaf", async () => {
+    const world = await history(1);
+    world.advance(5 * (2 * WINDOW_LEDGERS + 50 - world.vault.ledger));
+    world.rpc.oldestLedger = 2 * WINDOW_LEDGERS;
+    const archive = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
+    const w = archive.manifest.windows?.[1];
+    rewriteWindow(
+      archive,
+      WINDOW_LEDGERS,
+      (lines) => {
+        const last = lines.map(topicOf).lastIndexOf("new_commitment");
+        return lines.filter((_, i) => i !== last && i !== last - 1);
+      },
+      { leaves: [w?.leaves[0] ?? 0, (w?.leaves[1] ?? 2) - 2] },
+    );
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+    const bob = await bobWith(world, server.fetch);
+    await assert.rejects(bob.sync(), isError("archive_fault"));
+    assert.equal(bob.treeStatus().leafCount, 0);
+    assert.equal((await bob.balance()).spendable, 0n);
+  });
+
+  it("refuses an archive nullifier that RPC's events after it spend", async () => {
+    const world = await history(1);
+    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
+    const later = rawEvents(world).find(
+      (l) => l.ledger >= WINDOW_LEDGERS && topicOf(l) === "new_nullifier",
+    ) as RawLine;
+    const w = archive.manifest.windows?.[0];
+    rewriteWindow(
+      archive,
+      0,
+      (lines) => [...lines, { ...later, ledger: WINDOW_LEDGERS - 1, tx: 1, index: 0 }],
+      { nullifiers: (w?.nullifiers ?? 0) + 1 },
+    );
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+    const bob = await bobWith(world, server.fetch);
+    await assert.rejects(bob.sync(), isError("archive_fault"));
+    assert.equal(bob.treeStatus().leafCount, 0);
+  });
+});
+
+describe("archive sync: a slow copy", () => {
+  it("leaves the next copy its own time", async () => {
+    const world = await history(2);
+    const archive = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive, [MIRROR]: archive });
+    let clock = 0;
+    const slow: FetchLike = (input, init) => {
+      if (input.startsWith(`${ARCHIVE}/windows/`)) clock += 610_000;
+      return server.fetch(input, init);
+    };
+    const source = new ArchiveSource({
+      ...sourceOver(world, slow),
+      urls: [ARCHIVE, MIRROR],
+      now: () => clock,
+    });
+    await source.nullifiers(world.deployment.deployLedger);
+    assert.equal(await source.copy(), 1);
+    assert.ok(server.requests.includes(`${MIRROR}/${fileOf(WINDOW_LEDGERS)}`));
   });
 });
 
@@ -320,36 +386,19 @@ describe("archive sync: the published archives, a few windows per sync", () => {
         coveredTo: number;
         windows: { events: number }[];
       };
-      // A first read with no cap gives the chain the leaves the archive holds.
+      // The chain holds the leaves the archive's windows hold.
+      const pin = {
+        vault: d.vault,
+        networkPassphrase: d.networkPassphrase,
+        deployLedger: d.deployLedger,
+      };
+      const parsed = await fetchManifest(fetchFn, ARCHIVE, pin);
       const chainLeaves: bigint[] = [];
+      for (const w of parsed.windows.filter((x) => x.events > 0)) {
+        const content = await fetchWindow(fetchFn, ARCHIVE, w, pin);
+        chainLeaves.push(...content.leaves.map((l) => l.commitment));
+      }
       const files = manifest.windows.filter((w) => w.events > 0).length;
-      const chain0 = chainOf([], manifest.coveredTo + 10);
-      const first = new ArchiveSource({
-        urls: [ARCHIVE],
-        fetch: fetchFn,
-        pin: {
-          vault: d.vault,
-          networkPassphrase: d.networkPassphrase,
-          deployLedger: d.deployLedger,
-        },
-        rpcs: [chain0.rpc],
-        vaults: [
-          {
-            view: async () => ({
-              ...chain0.view,
-              roots: { ...chain0.view.roots, nextLeaf: 1 << 30 },
-            }),
-          } as unknown as VaultReader,
-        ],
-        since: d.deployLedger,
-        leafCount: 0,
-        lastLeafLedger: 0,
-        windows: 1_000,
-        eventPages: 10,
-      });
-      chainLeaves.push(
-        ...(await first.nextLeaves(undefined as never)).leaves.map((l) => l.commitment),
-      );
       const chain = chainOf(chainLeaves, manifest.coveredTo + 10);
       let leafCount = 0;
       let since = d.deployLedger;

@@ -720,6 +720,9 @@ export class PrivateWallet {
     };
     const verification = await verify(services, CHECK_MS);
     const limits = { ...DEFAULT_SYNC_LIMITS, ...options.syncLimits };
+    if (!Object.values(limits).every((n) => Number.isSafeInteger(n) && n >= 1)) {
+      fail("invalid_argument", "a sync limit is a whole number of pages of at least 1");
+    }
     return new PrivateWallet(core, fetchFn, states, lock, limits, archives, verification, reset);
   }
 
@@ -912,6 +915,7 @@ export class PrivateWallet {
       windows: this.#limits.leafPages,
       eventPages: this.#limits.eventPages,
       skip,
+      staged: state.staging?.spends?.nullifiers.map((n) => n.nullifier) ?? [],
       now: core.now,
     });
   }
@@ -938,22 +942,27 @@ export class PrivateWallet {
   // A tree the vault refuses from one copy of the archive is tried once from the others.
   async #sync(full: boolean): Promise<SyncSummary> {
     await this.#ensureVerified();
-    const skip: number[] = [];
-    for (;;) {
+    try {
+      return await this.#syncOnce(full, []);
+    } catch (err) {
+      const copy = this.#archiveCopy;
+      if (
+        !(err instanceof CyphrasError) ||
+        err.code !== "tree_unverified" ||
+        copy === undefined ||
+        this.#archives.length < 2
+      ) {
+        throw err;
+      }
       try {
-        return await this.#syncOnce(full, skip);
-      } catch (err) {
-        const copy = this.#archiveCopy;
-        if (
-          !(err instanceof CyphrasError) ||
-          err.code !== "tree_unverified" ||
-          copy === undefined ||
-          skip.length > 0 ||
-          this.#archives.length < 2
-        ) {
+        return await this.#syncOnce(full, [copy]);
+      } catch (again) {
+        // When no other copy could be read, the refused tree is what the caller must see.
+        if (again instanceof CyphrasError && again.code === "history_unavailable") {
+          this.#fault = true;
           throw err;
         }
-        skip.push(copy);
+        throw again;
       }
     }
   }
@@ -1114,7 +1123,7 @@ export class PrivateWallet {
         recordEvents(core.state.plans, eventsUpTo(events, data.horizon));
       }
     } else {
-      stageDownload(core.state, core.scan, data, checked);
+      stageDownload(core.state, core.scan, data, checked, source.kind === "archive");
       core.state.rootCheck = checkRoot(CommitmentTree.fromSnapshot(core.state.tree), view.roots);
     }
     const rechecked = await recheck(core.state, rpcs, vault, limits.eventPages, core.now());

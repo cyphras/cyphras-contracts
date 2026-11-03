@@ -334,6 +334,7 @@ function recordOutputs(
         leaf.archived === true
           ? evidenceOf(plan, plan.txHash ?? leaf.txHash, plan.ledger ?? leaf.ledger)
           : evidenceOf(plan, leaf.txHash, leaf.ledger);
+      if (leaf.archived === true) e.archived = true;
       e.outputs[slot] = leaf.index;
       e.providers = providers;
     }
@@ -476,14 +477,15 @@ export function stageDownload(
   keys: ScanKeys,
   data: Download,
   checked: boolean,
+  fromArchive: boolean,
 ): void {
-  if (data.leaves.length === 0 && data.archive === undefined) return;
+  if (data.leaves.length === 0 && !fromArchive) return;
   const { staging } = scanDownload(state, keys, data, checked);
-  // An archive's spends of the staged ledgers are kept too, so the next sync goes on after them.
-  const spends =
-    data.archive === undefined
-      ? state.staging?.spends
-      : { to: data.horizon, nullifiers: [...data.nullifiers] };
+  // An archive's spends of the staged ledgers are kept too, so the next sync goes on after them;
+  // another source's are asked for again.
+  const spends = !fromArchive
+    ? state.staging?.spends
+    : { to: data.horizon, nullifiers: [...data.nullifiers] };
   state.staging = spends === undefined ? staging : { ...staging, spends };
 }
 
@@ -524,7 +526,9 @@ export function applyDownload(
     ...state.nullifierBuffer,
     ...data.nullifiers.map((n) => ({ nf: n.nullifier, ledger: n.ledger, txHash: n.txHash })),
   ];
-  const spent = new Map(buffer.map((n) => [n.nf, n]));
+  // The first record of a spend stands.
+  const spent = new Map<bigint, (typeof buffer)[number]>();
+  for (const n of buffer) if (!spent.has(n.nf)) spent.set(n.nf, n);
   for (const note of state.notes) {
     if (note.nf === undefined || note.spent !== undefined) continue;
     const hit = spent.get(note.nf);
@@ -885,7 +889,8 @@ export function advancePlans(
     if (!LANDED_STATES.includes(plan.state)) continue;
     if (landed(plan)) {
       const e = landing(plan);
-      if (e.txHash !== plan.txHash || e.ledger !== plan.ledger) {
+      // An archive does not say in which transaction a plan landed.
+      if (e.archived !== true && (e.txHash !== plan.txHash || e.ledger !== plan.ledger)) {
         // Its exit is followed again, from the transaction it landed in.
         plan.txHash = e.txHash;
         plan.ledger = e.ledger;
@@ -906,6 +911,7 @@ export function advancePlans(
     if (!landed(plan)) continue;
     const e = landing(plan);
     plan.state = "confirmed";
+    if (e.archived === true) continue;
     plan.txHash = e.txHash;
     plan.ledger = e.ledger;
   }
