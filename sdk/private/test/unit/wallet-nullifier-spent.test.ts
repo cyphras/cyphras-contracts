@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { xdr } from "@stellar/stellar-base";
+import { Address, scValToBigInt, xdr } from "@stellar/stellar-base";
+import { P } from "../../src/field.ts";
 import { CyphrasError } from "../../src/errors.ts";
 import type { FetchLike } from "../../src/net/http.ts";
 import { type KeyValueStore, MemoryStore } from "../../src/storage.ts";
@@ -350,7 +351,7 @@ describe("the read of a refused plan's nullifiers", () => {
     return [...(state?.plans[0]?.nullifiers ?? [])];
   }
 
-  it("asks every provider for the same batch, the plan's keys among at least 31 others each", async () => {
+  it("asks every provider for the same batch, the plan's keys among public and random ones", async () => {
     let asked: { origin: string; keys: string[] }[] = [];
     const { world, bob, store } = await twoNotes((world) => {
       const r = recorded(provider(world, {}));
@@ -368,17 +369,93 @@ describe("the read of a refused plan's nullifiers", () => {
     const reads = asked.filter((a) => a.keys.some((k) => real.includes(k)));
     assert.deepEqual(reads.map((a) => a.origin).sort(), [RPC, SECOND].sort());
     for (const read of reads) {
-      assert.ok(read.keys.length >= 32 * real.length, `${read.keys.length} keys`);
+      assert.ok(read.keys.length >= real.length * (1 + 2 * 31), `${read.keys.length} keys`);
       assert.equal(new Set(read.keys).size, read.keys.length);
       for (const key of real) assert.ok(read.keys.includes(key));
     }
     assert.deepEqual(reads[0]?.keys, reads[1]?.keys);
     const vault = new Set([...world.vault.nullifiers.keys()].map((nf) => keyOf(world, nf)));
     const decoys = (reads[0]?.keys ?? []).filter((k) => !real.includes(k));
-    assert.ok(
-      decoys.every((k) => vault.has(k)),
-      "every other key is a public spend's",
+    const spentDecoys = decoys.filter((k) => vault.has(k));
+    const randomDecoys = decoys.filter((k) => !vault.has(k));
+    assert.ok(spentDecoys.length >= 31 * real.length, `${spentDecoys.length} public spends`);
+    assert.ok(randomDecoys.length >= 31 * real.length, `${randomDecoys.length} random keys`);
+    // Every key is a persistent Nullifier entry of the vault with a field element, as the plan's are.
+    for (const key of reads[0]?.keys ?? []) {
+      const data = xdr.LedgerKey.fromXDR(key, "base64").contractData();
+      assert.equal(Address.fromScAddress(data.contract()).toString(), world.deployment.vault);
+      assert.equal(data.durability().name, "persistent");
+      const [name, value] = data.key().vec() ?? [];
+      assert.equal(name?.sym().toString(), "Nullifier");
+      assert.equal(value?.switch().name, "scvU256");
+      const nf = scValToBigInt(value as xdr.ScVal);
+      assert.ok(nf >= 0n && nf < P);
+      assert.equal(keyOf(world, nf), key);
+    }
+    // The plan's unspent key misses along with every random key, so it is not the only miss.
+    const misses = (reads[0]?.keys ?? []).filter((k) => !vault.has(k));
+    assert.ok(misses.length >= 31 * real.length + 1, `${misses.length} misses`);
+    assert.ok(real.some((k) => misses.includes(k)));
+  });
+
+  it("takes nothing from what a provider shows of the random keys", async () => {
+    const store = new MemoryStore();
+    const { world, bob } = await twoNotes(
+      (world) => ({
+        secondRpcUrl: SECOND,
+        // The first provider shows an entry for every key no spend wrote but the plan's own.
+        fetch: async (input, init) => {
+          const res = await provider(world, {})(input, init);
+          const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
+          if (new URL(input).origin !== RPC || body?.method !== "getLedgerEntries") return res;
+          const state = await loadState(sealedState(store, world, 1));
+          const own = new Set(
+            state?.plans.flatMap((p) => p.nullifiers.map((nf) => keyOf(world, nf))),
+          );
+          const reply = (await res.json()) as {
+            result: { entries?: { key: string }[]; latestLedger: number };
+          };
+          const entries = [...(reply.result.entries ?? [])];
+          for (const key of body.params.keys as string[]) {
+            if (own.has(key) || entries.some((e) => e.key === key)) continue;
+            const k = xdr.LedgerKey.fromXDR(key, "base64").contractData();
+            if (k.key().vec()?.[0]?.sym().toString() !== "Nullifier") continue;
+            const data = xdr.LedgerEntryData.contractData(
+              new xdr.ContractDataEntry({
+                ext: new xdr.ExtensionPoint(0),
+                contract: k.contract(),
+                key: k.key(),
+                durability: k.durability(),
+                val: xdr.ScVal.scvVoid(),
+              }),
+            );
+            const ledger = reply.result.latestLedger;
+            entries.push({
+              key,
+              xdr: data.toXDR("base64"),
+              lastModifiedLedgerSeq: ledger - 1,
+              liveUntilLedgerSeq: ledger + 1000,
+            } as { key: string });
+          }
+          return new Response(JSON.stringify({ ...reply, result: { ...reply.result, entries } }), {
+            status: 200,
+          });
+        },
+      }),
+      store,
     );
+    const x = await spentElsewhere(world, store, 10n * XLM);
+    const carol = world.signer("carol").publicKey;
+    const err = await caught(
+      bob.unshield({ to: carol, amount: 12n * XLM, maxFee: 2n * XLM, confirm: () => true }),
+    );
+    assert.equal(details(err)["spentCheck"], "spent");
+    assert.equal((await bob.plans())[0]?.state, "superseded");
+    assert.deepEqual(
+      (await notesOf(store, world)).filter((n) => n.spent !== undefined).map((n) => n.nf),
+      [x],
+    );
+    assert.equal((await bob.balance()).spendable, 5n * XLM);
   });
 
   it("reads nothing and changes nothing while too few public spends are known", async () => {

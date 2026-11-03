@@ -1,5 +1,6 @@
-import { randomBytes } from "../bytes.ts";
+import { bytesToBigIntBE, randomBytes } from "../bytes.ts";
 import { CyphrasError } from "../errors.ts";
+import { P } from "../field.ts";
 import { type LedgerEntries, type SorobanRpc, keyId } from "../net/rpc.ts";
 import { nullifierKey } from "../vault/state.ts";
 import { ownKey } from "./archive.ts";
@@ -20,7 +21,8 @@ const NULLIFIER_SPENT = 123;
 // spends to hide the read among, so it made none.
 export type SpentCheck = "spent" | "disputed" | "unspent" | "unconfirmed" | "unread";
 
-// Each of a plan's nullifiers is read among at least this many nullifiers of other users' spends.
+// Each of a plan's nullifiers is read among at least this many nullifiers of other users' spends,
+// and as many random ones.
 export const DECOYS_PER_KEY = 31;
 
 const randomBelow = (n: number): number =>
@@ -35,8 +37,19 @@ function shuffle<T>(xs: readonly T[]): T[] {
   return out;
 }
 
+// A field element drawn uniformly, as a nullifier no spend wrote looks.
+function randomNullifier(): bigint {
+  for (;;) {
+    const bytes = randomBytes(32);
+    bytes[0] = (bytes[0] as number) & 0x3f;
+    const x = bytesToBigIntBE(bytes);
+    if (x < P) return x;
+  }
+}
+
 // The plan's nullifiers among nullifiers of public spends that are none of this wallet's, drawn at
-// random from those the syncs kept, in random order; undefined when too few are known.
+// random from those the syncs kept, and as many random ones, in random order; undefined when too
+// few public spends are known.
 function batchOf(core: Core, plan: Plan): bigint[] | undefined {
   const { state } = core;
   const own = new Set([
@@ -46,7 +59,9 @@ function batchOf(core: Core, plan: Plan): bigint[] | undefined {
   const pool = [...new Set(state.publicNullifiers)].filter((nf) => !own.has(nf));
   const wanted = DECOYS_PER_KEY * plan.nullifiers.length;
   if (pool.length < wanted) return undefined;
-  return shuffle([...plan.nullifiers, ...shuffle(pool).slice(0, wanted)]);
+  const batch = new Set([...plan.nullifiers, ...shuffle(pool).slice(0, wanted)]);
+  for (const end = batch.size + wanted; batch.size < end; ) batch.add(randomNullifier());
+  return shuffle([...batch]);
 }
 
 // Reads the entries of the plan's nullifiers from every RPC provider, in one request each that
@@ -97,12 +112,14 @@ async function readSpends(
  *
  * Privacy: the read tells each RPC provider that the wallet asks about these keys just after a
  * payment failed, which could tie the provider's view of the wallet, as its IP address, to the
- * notes. The plan's two keys are therefore asked only inside one batch with at least 31 times as
- * many keys of other users' spends, taken from the public spends the wallet's syncs read, in random
- * order, and every provider gets the same batch. This hides which keys are the plan's only as far
- * as their entries look alike: the decoys are all spent, so a key of the plan the vault shows
- * unspent stands out, while one it shows spent, as a note spent elsewhere, does not. A wallet that
- * knows too few public spends reads nothing, and the sync settles the plan as before.
+ * notes. The plan's two keys are therefore asked only inside one batch that also holds, for each of
+ * them, at least 31 keys of other users' spends, taken from the public spends the wallet's syncs
+ * read, and as many uniformly random keys, which no spend wrote; the batch is in random order, and
+ * every provider gets the same one. A key of the plan the vault shows spent, as a note spent
+ * elsewhere, looks like one of the public spends, and one it shows unspent like one of the random
+ * keys. A provider still learns that one of the batch's keys is likely the wallet's, and can rule
+ * out public spends it saw in other wallets' batches. A wallet that knows too few public spends
+ * reads nothing, and the sync settles the plan as before.
  */
 export async function checkSpent(core: Core, plan: Plan, named: boolean): Promise<SpentCheck> {
   if (!isActive(plan)) return "unspent";
