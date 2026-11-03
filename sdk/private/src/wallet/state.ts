@@ -144,7 +144,10 @@ export interface Plan {
   evidence: Evidence[];
   relayerStatus: string | undefined;
   exit: PlanExit | undefined;
+  // The code of the last error that stopped its submission, the relayer's for a relayed plan, and
+  // that error's message, which plans saved by earlier releases lack.
   error: string | undefined;
+  errorMessage?: string;
 }
 
 // "unresolved": past its proof's deadline, no RPC provider holds the ledgers the deposit could have

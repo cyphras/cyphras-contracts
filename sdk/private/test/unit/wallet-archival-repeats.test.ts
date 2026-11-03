@@ -288,7 +288,7 @@ describe("the fee one transaction carries", () => {
   async function cancelAt(resource: bigint) {
     const world = await createWorld();
     const alice = await openWallet(world, 0);
-    const depositor = world.signer("alice depositor");
+    const depositor = { ...world.signer("alice depositor"), signsFeeBumps: true };
     const { depositId } = await alice.shield({ amount: 10n * XLM, signer: depositor });
     world.rpc.sent = [];
     world.rpc.sentFees = [];
@@ -307,14 +307,17 @@ describe("the fee one transaction carries", () => {
     return { world, err };
   }
 
-  it("sends a fee of exactly 2^32 - 1 stroops and refuses one stroop more", async () => {
-    // The network quotes 150 stroops for inclusion.
+  it("sends a fee of exactly 2^32 - 1 stroops alone and one stroop more in a fee bump", async () => {
+    // The network quotes 150 stroops for inclusion, which a fee bump bids for both its operations.
     let r = await cancelAt(4_294_967_295n - 150n);
     assert.equal(r.err, undefined, String(r.err));
     assert.deepEqual(r.world.rpc.sentFees, [4_294_967_295n]);
+    assert.equal(r.world.rpc.bumps.length, 0);
     r = await cancelAt(4_294_967_296n - 150n);
-    assert.ok(isError("fee_above_limit")(r.err), String(r.err));
-    assert.deepEqual(r.world.rpc.sentFees, []);
+    assert.equal(r.err, undefined, String(r.err));
+    assert.deepEqual(r.world.rpc.sentFees, [4_294_967_296n + 150n]);
+    assert.equal(r.world.rpc.bumps.length, 1);
+    assert.equal(r.world.rpc.sent[0]?.fee, "0");
   });
 });
 

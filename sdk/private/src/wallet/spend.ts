@@ -45,6 +45,10 @@ export interface SpendReview {
   readonly warnings: readonly Warning[];
   // More than 1 for an unshield split across transactions.
   readonly parts: number;
+  // The vault will queue the payment's payout or fee in its exit queue, as its state at the last
+  // sync shows, so a relayed one pays the relayer's queued fee, which `fee` then holds. False for the
+  // review of a whole split unshield; each part's own review tells.
+  readonly queued: boolean;
 }
 
 /**
@@ -556,6 +560,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
         relayer: relay?.client.url,
         warnings,
         parts: intent.parts,
+        queued: willQueue,
       };
       const confirmed =
         intent.confirm === undefined ? warnings.length === 0 : await intent.confirm(review);
@@ -635,7 +640,9 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
         await core.save();
         return view(plan);
       }
+      const refused = relayerRefusal(intent.kind, result.error, result.reason, result.networkFee);
       plan.error = result.error;
+      plan.errorMessage = refused.message;
       await core.save();
       // The relayer saw the proof and could still submit it, so the plan keeps its notes until
       // its deadline; a new proof spends the same notes.
@@ -647,42 +654,65 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
         retryOf = plan.id;
         continue;
       }
-      if (result.error === "restore_needed") {
-        const way =
-          intent.kind === "unshield"
-            ? "retry the payment with selfRelay, whose account pays the restore within a networkFeeCaps.restore the user agreed to, or restore them with restoreVault and retry it"
-            : "restore them with restoreVault, then retry the payment";
-        throw new CyphrasError(
-          "service_rejected",
-          `the vault's entries are archived and the relayer does not pay to restore them: ${way}`,
-          { code: result.error },
-        );
-      }
-      if (result.error === "network_fee_high") {
-        const fee = result.networkFee === undefined ? "" : ` (${result.networkFee} stroops)`;
-        const way =
-          intent.kind === "unshield"
-            ? "retry the payment with selfRelay, whose account pays the network fee within a networkFeeCaps.resource the user agreed to for this payment, or retry it later"
-            : "retry the payment later";
-        throw new CyphrasError(
-          "service_rejected",
-          `the network fee is high now${fee}, more than the relayer's fee covers: ${way}`,
-          {
-            code: result.error,
-            ...(result.networkFee === undefined
-              ? {}
-              : { networkFee: result.networkFee.toString() }),
-          },
-        );
-      }
-      throw new CyphrasError("service_rejected", "the relayer refused the submission", {
-        code: result.error,
-        ...(result.reason === undefined ? {} : { reason: result.reason }),
-      });
+      throw refused;
     }
   } catch (err) {
     throw naming(err, saved);
   }
+}
+
+// What a relayer's refusal or failure of a payment's request means to its caller: the way on
+// where the relayer does not pay a restore or a network fee above what its fee covers.
+export function relayerRefusal(
+  kind: "send" | "unshield",
+  code: string,
+  reason: number | undefined,
+  networkFee: bigint | undefined,
+): CyphrasError {
+  if (code === "restore_needed") {
+    const way =
+      kind === "unshield"
+        ? "retry the payment with selfRelay, whose account pays the restore within a networkFeeCaps.restore the user agreed to, or restore them with restoreVault and retry it"
+        : "restore them with restoreVault, then retry the payment";
+    return new CyphrasError(
+      "service_rejected",
+      `the vault's entries are archived and the relayer does not pay to restore them: ${way}`,
+      { code },
+    );
+  }
+  if (code === "network_fee_high") {
+    const fee = networkFee === undefined ? "" : ` (${networkFee} stroops)`;
+    const way =
+      kind === "unshield"
+        ? "retry the payment with selfRelay, whose account pays the network fee within a networkFeeCaps.resource the user agreed to for this payment, or retry it later"
+        : "retry the payment later";
+    return new CyphrasError(
+      "service_rejected",
+      `the network fee is high now${fee}, more than the relayer's fee covers: ${way}`,
+      { code, ...(networkFee === undefined ? {} : { networkFee: networkFee.toString() }) },
+    );
+  }
+  return new CyphrasError("service_rejected", "the relayer refused the submission", {
+    code,
+    ...(reason === undefined ? {} : { reason }),
+  });
+}
+
+// Records a relayer's refusal or failure of the plan's request.
+function relayerFailed(
+  plan: Plan,
+  code: string,
+  reason: number | undefined,
+  networkFee: bigint | undefined,
+): void {
+  plan.error = code;
+  plan.errorMessage = relayerRefusal(plan.kind, code, reason, networkFee).message;
+}
+
+// A relayer took the plan's request again, so an earlier refusal no longer says where it stands.
+function relayerTook(plan: Plan): void {
+  plan.error = undefined;
+  delete plan.errorMessage;
 }
 
 // What the relayer reports of a held request. One that was sent, failed or was cancelled is not
@@ -690,7 +720,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
 function takeHeld(plan: Plan, held: HeldRequest): void {
   plan.relayerStatus = held.status;
   if (held.hash !== undefined) plan.txHash = held.hash;
-  if (held.status === "failed") plan.error = held.code ?? "unknown";
+  if (held.status === "failed") relayerFailed(plan, held.code ?? "unknown", held.reason, undefined);
   if (held.hash !== undefined || held.status === "failed" || held.status === "cancelled") {
     plan.heldId = undefined;
   }
@@ -752,6 +782,7 @@ export async function followHeld(
     plan.txHash = result.hash;
     plan.heldId = result.heldId;
     plan.relayerStatus = result.hash === undefined ? "held" : "pending";
+    relayerTook(plan);
   } else if (result.error === "duplicate") {
     // The relayer still holds the request after all.
     plan.relayerStatus = "held";
@@ -760,7 +791,7 @@ export async function followHeld(
     plan.relayerStatus = "unknown";
   } else {
     plan.relayerStatus = "failed";
-    plan.error = result.error;
+    relayerFailed(plan, result.error, result.reason, result.networkFee);
     plan.heldId = undefined;
   }
 }
@@ -780,9 +811,10 @@ export async function resendConflicted(
     plan.txHash = result.hash;
     plan.heldId = result.heldId;
     plan.relayerStatus = result.hash === undefined ? "held" : "pending";
+    relayerTook(plan);
   } else if (!["duplicate", "unavailable", "rate_limited"].includes(result.error)) {
     plan.relayerStatus = "failed";
-    plan.error = result.error;
+    relayerFailed(plan, result.error, result.reason, result.networkFee);
   }
 }
 
@@ -799,7 +831,7 @@ async function selfRelay(
 ): Promise<Submission> {
   const ext: ExtData = extDataFromJson(plan.ext);
   try {
-    await invokeVault(
+    const { hash } = await invokeVault(
       invokeContext(core, caps),
       signer,
       {
@@ -821,8 +853,14 @@ async function selfRelay(
         },
       },
     );
+    // The hash the vault's events carry: its own, or that of the fee bump that held it.
+    plan.txHash = hash;
+    await core.save();
   } catch (err) {
     plan.error = err instanceof CyphrasError ? err.code : "unexpected_error";
+    // A message the SDK did not write is not kept: it could carry anything.
+    plan.errorMessage =
+      err instanceof CyphrasError ? err.message : "the submission stopped on an unexpected error";
     await core.save();
     throw err;
   }
