@@ -6,6 +6,12 @@ import { SorobanRpc } from "../../src/net/rpc.ts";
 import { VaultReader } from "../../src/vault/state.ts";
 import { ArchiveSource } from "../../src/wallet/archive.ts";
 import { checkRoot } from "../../src/wallet/sync.ts";
+import { generateMnemonic } from "@scure/bip39";
+import { wordlist } from "@scure/bip39/wordlists/english";
+import { keySource } from "../../src/keysource.ts";
+import { MemoryStore } from "../../src/storage.ts";
+import { PrivateWallet } from "../../src/wallet/wallet.ts";
+import { TrapdoorProver, trapdoorArtifacts } from "../support/trapdoor.ts";
 
 // Reads the published archives and a public RPC of each network, which only answer reads; set
 // CYPHRAS_ONLINE=1 to run it.
@@ -51,5 +57,50 @@ for (const name of ["testnet/xlm", "mainnet/xlm"] as const) {
         assert.equal((await source.part()).tailFrom !== undefined, true);
       });
     }
+  });
+}
+
+// A wallet restored from a new mnemonic, with no indexer, reaches the vault's root through RPC's
+// retention error, a pinned archive and RPC's events after it. Requests go only to the RPC and the
+// archive's hosts.
+for (const name of ["testnet/xlm", "mainnet/xlm"] as const) {
+  describe(`archive sync: a new wallet on ${name} without an indexer`, { skip: !online }, () => {
+    it("restores to the vault's current root in a few syncs", async () => {
+      const allowed = new Set([
+        new URL(RPC_URLS[name]).host,
+        ...PINNED_ARCHIVES[name].map((u) => new URL(u).host),
+      ]);
+      const asked = new Set<string>();
+      const fetchFn = (input: string, init?: RequestInit) => {
+        const host = new URL(input).host;
+        asked.add(host);
+        if (!allowed.has(host)) return Promise.reject(new TypeError("Failed to fetch"));
+        return globalThis.fetch(input, init);
+      };
+      const wallet = await PrivateWallet.open({
+        deployment: name,
+        keys: keySource.mnemonic(generateMnemonic(wordlist), { account: 0 }),
+        prover: new TrapdoorProver(),
+        artifacts: trapdoorArtifacts,
+        storage: new MemoryStore(),
+        rpcUrl: RPC_URLS[name],
+        indexers: [],
+        relayers: [],
+        fetch: fetchFn,
+      });
+      let summary;
+      for (let n = 0; n < 3; n++) {
+        summary = await wallet.sync();
+        if (summary.rootVerified && summary.staged === 0) break;
+      }
+      assert.equal(summary?.source, "archive");
+      assert.equal(summary?.rootVerified, true);
+      assert.equal(summary?.staged, 0);
+      assert.equal((await wallet.balance()).spendable, 0n);
+      assert.deepEqual(
+        [...asked].filter((h) => !allowed.has(h)),
+        [],
+      );
+    });
   });
 }
