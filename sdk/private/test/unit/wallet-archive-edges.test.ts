@@ -249,24 +249,21 @@ describe("archive sync: a second provider that cannot answer", () => {
     assert.equal((await bob.balance()).spendable, 15n * XLM);
   });
 
-  it(
-    "keeps RPC's leaves after the archive open for a recheck when they were staged",
-    async () => {
-      const { world } = await history(1);
-      const archive = buildArchive(world, WINDOW_LEDGERS - 1);
-      const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
-      let down = true;
-      const routed: FetchLike = (input, init) => {
-        if (!input.startsWith(SECOND)) return server.fetch(input, init);
-        if (down) return Promise.reject(new TypeError("Failed to fetch"));
-        return server.fetch(RPC + input.slice(SECOND.length), init);
-      };
-      const bob = await bobWith(world, routed, { secondRpcUrl: SECOND });
-      await bob.sync();
-      down = false;
-      assert.equal((await bob.sync()).lostLeaves, 4);
-    },
-  );
+  it("keeps RPC's leaves after the archive open for a recheck when they were staged", async () => {
+    const { world } = await history(1);
+    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+    let down = true;
+    const routed: FetchLike = (input, init) => {
+      if (!input.startsWith(SECOND)) return server.fetch(input, init);
+      if (down) return Promise.reject(new TypeError("Failed to fetch"));
+      return server.fetch(RPC + input.slice(SECOND.length), init);
+    };
+    const bob = await bobWith(world, routed, { secondRpcUrl: SECOND });
+    await bob.sync();
+    down = false;
+    assert.equal((await bob.sync()).lostLeaves, 4);
+  });
 });
 
 describe("archive sync: the vault far ahead of the archive", () => {

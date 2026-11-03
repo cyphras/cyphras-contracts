@@ -211,9 +211,13 @@ export function archiveUrls(
     if (
       !(parsed.protocol === "https:" || (parsed.protocol === "http:" && local)) ||
       parsed.username !== "" ||
-      parsed.password !== ""
+      parsed.password !== "" ||
+      /[?#]/.test(url)
     ) {
-      fail("invalid_argument", "an archive URL must be https, or http to this machine");
+      fail(
+        "invalid_argument",
+        "an archive URL must be https, or http to this machine, with no query or fragment",
+      );
     }
   }
   return [...given];
