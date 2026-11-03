@@ -451,7 +451,7 @@ function naming(err: unknown, plan: Plan | undefined): unknown {
     );
   }
   if ("planId" in err.details) return err;
-  return new CyphrasError(err.code, err.message, { ...err.details, ...ids });
+  return new CyphrasError(err.code, err.message, { ...err.details, ...ids }, { cause: err.cause });
 }
 
 // One spend from the review to the submission, with a write-ahead plan saved before anything
