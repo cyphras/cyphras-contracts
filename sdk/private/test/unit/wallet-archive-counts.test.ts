@@ -259,7 +259,13 @@ describe("archive sync: a hanging copy", () => {
     it(`leaves the next copy its own time when the first copy's ${hang} never answers`, async () => {
       const { world } = await history(2);
       const archive = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
-      const server = serveArchive(world.fetch, { [ARCHIVE]: archive, [MIRROR]: archive });
+      // A third copy confirms the second one's windows while the first does not answer.
+      const third = "http://third.test";
+      const server = serveArchive(world.fetch, {
+        [ARCHIVE]: archive,
+        [MIRROR]: archive,
+        [third]: archive,
+      });
       const stuck: FetchLike = (input, init) => {
         const path = hang === "manifest" ? `${ARCHIVE}/manifest.json` : `${ARCHIVE}/windows/`;
         if (!input.startsWith(path)) return server.fetch(input, init);
@@ -270,7 +276,7 @@ describe("archive sync: a hanging copy", () => {
       const rpc = new Rpc(RPC, stuck);
       const { vault, networkPassphrase, deployLedger } = world.deployment;
       const source = new ArchiveSource({
-        urls: [ARCHIVE, MIRROR],
+        urls: [ARCHIVE, MIRROR, third],
         fetch: stuck,
         pin: { vault, networkPassphrase, deployLedger },
         rpcs: [rpc],

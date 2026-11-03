@@ -187,36 +187,119 @@ describe("archive sync: copies of the archive", () => {
       const summary = await bob.sync();
       assert.equal(summary.source, "archive");
       assert.equal((await bob.balance()).spendable, 20n * XLM);
-      assert.ok(!server.requests.some((r) => r === `${ARCHIVE}/${fileOf(0)}`));
+      assert.ok(!server.requests.some((r) => r === `${ARCHIVE}/${fileOf(WINDOW_LEDGERS)}`));
     }
   });
 
-  it("uses the one copy that can be read as a single copy", async () => {
+  it("takes no window that only one of two configured copies serves", async () => {
     const world = await history(1);
     const archive = buildArchive(world, WINDOW_LEDGERS - 1);
     const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
     const bob = await bobWith(world, server.fetch, { archives: [MIRROR, ARCHIVE] });
-    assert.equal((await bob.sync()).source, "archive");
-    assert.equal((await bob.balance()).spendable, 15n * XLM);
+    await assert.rejects(
+      bob.sync(),
+      (err: unknown) =>
+        isError("archive_conflict")(err) && (err as CyphrasError).details["windows"] === "0",
+    );
+    assert.equal(bob.treeStatus().leafCount, 0);
   });
 
-  it("passes over a copy it could not read for the next syncs", async () => {
-    const world = await history(1);
-    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
-    const server = serveArchive(world.fetch, { [ARCHIVE]: archive });
+  // Both copies honest; the first answers 503 once, as a busy host does.
+  async function recovering(world: World, archive: ReturnType<typeof buildArchive>) {
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive, [MIRROR]: archive });
+    let down = 1;
     const asked: string[] = [];
     const fetchFn: FetchLike = async (input, init) => {
-      if (input.startsWith(MIRROR)) {
+      if (input.startsWith(ARCHIVE)) {
+        asked.push(input.slice(ARCHIVE.length));
+        if (down > 0) {
+          down--;
+          return new Response("", { status: 503 });
+        }
+      }
+      return server.fetch(input, init);
+    };
+    return { asked, bob: await bobWith(world, fetchFn, { archives: [ARCHIVE, MIRROR] }) };
+  }
+
+  it("asks a copy that failed once for its manifest again and uses it once it agrees", async () => {
+    const world = await history(1);
+    const { asked, bob } = await recovering(world, buildArchive(world, WINDOW_LEDGERS - 1));
+    await assert.rejects(bob.sync(), isError("archive_conflict"));
+    const summary = await bob.sync();
+    assert.equal(summary.source, "archive");
+    assert.equal((await bob.balance()).spendable, 15n * XLM);
+    assert.equal(asked.filter((a) => a === "/manifest.json").length, 2);
+  });
+
+  it("asks a copy that failed a window last for its windows in the next syncs", async () => {
+    const world = await history(1);
+    const archive = buildArchive(world, WINDOW_LEDGERS - 1);
+    const server = serveArchive(world.fetch, { [ARCHIVE]: archive, [MIRROR]: archive });
+    const asked: string[] = [];
+    const fetchFn: FetchLike = async (input, init) => {
+      if (input.startsWith(`${ARCHIVE}/windows/`)) {
         asked.push(input);
         return new Response("", { status: 503 });
       }
       return server.fetch(input, init);
     };
-    const bob = await bobWith(world, fetchFn, { archives: [MIRROR, ARCHIVE] });
-    await bob.sync();
+    const bob = await bobWith(world, fetchFn, { archives: [ARCHIVE, MIRROR] });
+    assert.equal((await bob.sync()).source, "archive");
     assert.equal(asked.length, 1);
     assert.equal((await bob.rescan()).source, "archive");
     assert.equal(asked.length, 1);
+    assert.equal((await bob.balance()).spendable, 15n * XLM);
+  });
+
+  it("shows nothing of a copy that blanks ciphertexts while the honest one failed once", async () => {
+    const world = await history(1);
+    const honest = buildArchive(world, WINDOW_LEDGERS - 1);
+    const blank = structuredClone(honest);
+    rewriteWindow(blank, 0, (lines) =>
+      lines.map((l) =>
+        topicOf(l) === "new_commitment"
+          ? withField(l, "encrypted_output", xdr.ScVal.scvBytes(Buffer.alloc(181, 0)))
+          : l,
+      ),
+    );
+    let down = 1;
+    const server = serveArchive(world.fetch, { [ARCHIVE]: honest, [MIRROR]: blank });
+    const fetchFn: FetchLike = async (input, init) => {
+      if (input.startsWith(ARCHIVE) && down > 0) {
+        down--;
+        return new Response("", { status: 503 });
+      }
+      return server.fetch(input, init);
+    };
+    const bob = await bobWith(world, fetchFn, { archives: [ARCHIVE, MIRROR] });
+    await assert.rejects(bob.sync(), isError("archive_conflict"));
+    await assert.rejects(bob.rescan(), isError("archive_conflict"));
+    assert.equal((await bob.balance()).spendable, 0n);
+  });
+
+  it("never takes an ahead copy's window that RPC still holds", async () => {
+    const world = await history(2);
+    world.rpc.oldestLedger = WINDOW_LEDGERS;
+    const stale = buildArchive(world, WINDOW_LEDGERS - 1);
+    const ahead = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
+    rewriteWindow(ahead, WINDOW_LEDGERS, (lines) =>
+      lines.map((l) =>
+        topicOf(l) === "new_commitment"
+          ? withField(l, "encrypted_output", xdr.ScVal.scvBytes(Buffer.alloc(181, 0)))
+          : l,
+      ),
+    );
+    for (const urls of [
+      [MIRROR, ARCHIVE],
+      [ARCHIVE, MIRROR],
+    ]) {
+      const server = serveArchive(world.fetch, { [ARCHIVE]: stale, [MIRROR]: ahead });
+      const bob = await bobWith(world, server.fetch, { archives: urls });
+      assert.equal((await bob.sync()).source, "archive");
+      assert.equal((await bob.balance()).spendable, 20n * XLM);
+      assert.ok(!server.requests.includes(`${MIRROR}/${fileOf(WINDOW_LEDGERS)}`));
+    }
   });
 
   it("takes the tree from the next copy when the vault refuses the first one's", async () => {
@@ -454,7 +537,7 @@ function chainOf(leaves: readonly bigint[], latest: number) {
         events: [],
         cursor: ledgerEnd(latest),
         latestLedger: latest,
-        oldestLedger: latest - 100,
+        oldestLedger: latest - 9,
         latestCloseTime: undefined,
         oldestCloseTime: undefined,
       };

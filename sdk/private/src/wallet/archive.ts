@@ -1,11 +1,9 @@
 import { xdr } from "@stellar/stellar-base";
-import { bytesToHex } from "../bytes.ts";
 import { CyphrasError, fail } from "../errors.ts";
 import {
   type ArchiveManifest,
   type ArchivePin,
   type ArchiveWindow,
-  WINDOW_LEDGERS,
   fetchManifest,
   fetchWindow,
 } from "../net/archive.ts";
@@ -44,10 +42,10 @@ export interface ArchiveSourceOptions {
   // How many windows one sync reads at most, and the event pages of RPC.
   readonly windows: number;
   readonly eventPages: number;
-  // Copies, by index, to pass over in this sync, the copy to try first, and what to tell of a copy
-  // that could not be read in time or broke a rule. The spends staged syncs took already.
+  // Copies, by index, not to take data from in this sync, copies to ask last, and what to tell of
+  // a copy that could not be read in time or broke a rule. The spends staged syncs took already.
   readonly skip?: readonly number[];
-  readonly prefer?: number;
+  readonly later?: readonly number[];
   readonly onFailed?: (copy: number) => void;
   readonly staged?: readonly SpentNullifier[];
   // The most the windows one copy gives one sync may hold decompressed, and the time the files of
@@ -92,13 +90,16 @@ export class ArchiveSource implements ChainSource {
     return this.#loaded;
   }
 
-  // Every copy's manifest is read first, and copies that list the same window must agree on it;
-  // then the first copy that passes is taken. A copy that breaks a rule is passed over for the
-  // next one, and so is one that cannot be reached or that ends before RPC's history begins; when
-  // none passes, the first refusal is raised, else the first gap, else that none could be reached.
+  // Every copy's manifest is read, whether the copy is held back or not, and windows RPC still
+  // holds are left to RPC's events. With more than one copy configured, every other window the
+  // sync needs must be listed with the same bytes by at least two copies and by every copy that
+  // lists it; else nothing is taken and the sync fails with archive_conflict. Then the copies are
+  // asked in order, those held back last, and the first that passes is taken. A copy that breaks a
+  // rule is passed over for the next one, and so is one that cannot be reached or that ends before
+  // RPC's history begins; when none passes, the first refusal is raised, else the first gap, else
+  // that none could be reached.
   async #first(): Promise<Loaded> {
-    const { urls, vaults, fetch, pin } = this.#o;
-    const skip = this.#o.skip ?? [];
+    const { urls, vaults, fetch, pin, since, leafCount } = this.#o;
     if (urls.length === 0) {
       fail("history_unavailable", "RPC no longer holds the vault events this wallet needs", {
         reason: "archive_unconfigured",
@@ -134,23 +135,40 @@ export class ArchiveSource implements ChainSource {
         throw err;
       }
     };
-    const manifests: (ArchiveManifest | undefined)[] = [];
+    const full: (ArchiveManifest | undefined)[] = [];
     for (const [i, url] of urls.entries()) {
-      if (skip.includes(i)) continue;
       try {
-        manifests[i] = await fetchManifest(fetch, url, pin, budget);
+        full[i] = await fetchManifest(fetch, url, pin, budget);
       } catch (err) {
         sort(err, i);
       }
     }
+    const held = await this.#rpcOldest(views[0] as ChainView);
+    const manifests = full.map((m) => (m === undefined ? undefined : beforeLedger(m, held)));
     agree(manifests);
-    const faulty = await this.#settle(conflicts(manifests), manifests, budget);
-    for (const i of order(urls.length, this.#o.prefer)) {
-      const url = urls[i] as string;
+    if (urls.length > 1) {
+      const disputed = unconfirmed(manifests, since, leafCount);
+      if (disputed.length > 0) {
+        fail("archive_conflict", "copies of the vault's archive do not confirm one another", {
+          windows: disputed.join(","),
+          copies: urls.filter((_, i) => manifests[i] !== undefined).join(" "),
+        });
+      }
+    }
+    const later = this.#o.later ?? [];
+    const exclude = this.#o.skip ?? [];
+    const indices = urls.map((_, i) => i);
+    const tried = [
+      ...indices.filter((i) => !later.includes(i)),
+      ...indices.filter((i) => later.includes(i)),
+    ].filter((i) => !exclude.includes(i));
+    for (const i of tried) {
       const manifest = manifests[i];
-      if (manifest === undefined || faulty.has(i)) continue;
+      if (manifest === undefined) continue;
       try {
-        return { ...(await this.#from(url, manifest, views, this.#now() + budget)), copy: i };
+        admits(full[i] as ArchiveManifest, views);
+        const data = await this.#from(urls[i] as string, manifest, views, this.#now() + budget);
+        return { ...data, copy: i };
       } catch (err) {
         sort(err, i);
       }
@@ -164,76 +182,20 @@ export class ArchiveSource implements ChainSource {
     );
   }
 
-  // Copies that agree on every count of a window but not on its bytes differ in what the chain
-  // cannot check, such as a note's ciphertext. While RPC still holds the window's ledgers, its
-  // events decide: a copy whose window holds other leaves or spends than them is passed over, and
-  // returned. Without them nothing tells the copies apart, and the sync refuses them all with
-  // archive_conflict.
-  async #settle(
-    disputed: ReadonlyMap<number, readonly number[]>,
-    manifests: readonly (ArchiveManifest | undefined)[],
-    budget: number,
-  ): Promise<Set<number>> {
-    const faulty = new Set<number>();
-    if (disputed.size === 0) return faulty;
-    const { urls, fetch, pin, rpcs } = this.#o;
-    const starts = [...disputed.keys()].sort((a, b) => a - b);
-    const copies = [...new Set([...disputed.values()].flat())].sort((a, b) => a - b);
-    const conflict = (): never =>
-      fail(
-        "archive_conflict",
-        "copies of the vault's archive disagree on what the chain cannot check",
-        {
-          windows: starts.join(","),
-          copies: copies.map((c) => urls[c]).join(" "),
-        },
-      );
-    const from = starts[0] as number;
-    const to = (starts[starts.length - 1] as number) + WINDOW_LEDGERS - 1;
-    let events: VaultEvents;
+  // The oldest ledger of the vault's events the first provider holds, which RPC's events then
+  // give instead of the archive; past every ledger when it cannot say.
+  async #rpcOldest(view: ChainView): Promise<number> {
     try {
-      events = await new RpcEventSource(
-        rpcs[0] as SorobanRpc,
-        pin.vault,
-        from,
-        this.#o.eventPages,
-        {
-          ledger: to,
-          leafEnd: undefined,
-        },
-      ).events();
+      const page = await (this.#o.rpcs[0] as SorobanRpc).getEvents({
+        contractId: this.#o.pin.vault,
+        startLedger: view.ledger,
+        limit: 1,
+      });
+      return page.oldestLedger;
     } catch (err) {
-      if (err instanceof CyphrasError && err.code === "history_unavailable") return conflict();
+      if (err instanceof CyphrasError) return Number.POSITIVE_INFINITY;
       throw err;
     }
-    if (events.latest < to) conflict();
-    for (const copy of copies) {
-      const deadline = this.#now() + budget;
-      for (const start of starts) {
-        const w = manifests[copy]?.windows.find((x) => x.start === start);
-        if (w === undefined || w.events === 0) continue;
-        let content;
-        try {
-          content = await fetchWindow(fetch, urls[copy] as string, w, pin, this.#timeout(deadline));
-        } catch (err) {
-          if (!(err instanceof CyphrasError)) throw err;
-          faulty.add(copy);
-          break;
-        }
-        const inside = <T extends { readonly ledger: number }>(xs: readonly T[]): T[] =>
-          xs.filter((x) => x.ledger >= w.start && x.ledger <= w.end);
-        if (
-          sameLeaves(content.leaves, inside(events.leaves)) &&
-          sameNullifiers(content.nullifiers, inside(events.nullifiers))
-        ) {
-          continue;
-        }
-        faulty.add(copy);
-        break;
-      }
-    }
-    for (const copy of faulty) this.#o.onFailed?.(copy);
-    return faulty;
   }
 
   #now(): number {
@@ -258,7 +220,6 @@ export class ArchiveSource implements ChainSource {
     deadline: number,
   ): Promise<Omit<Loaded, "copy">> {
     const { fetch, pin, since, leafCount, rpcs } = this.#o;
-    admits(manifest, views);
     const { windows } = manifest;
     const archiveEnd = windows[windows.length - 1]?.leaves[1] ?? 0;
     // One cut for leaves and spends alike: the windows read are the first ones that hold either,
@@ -455,50 +416,33 @@ function agree(manifests: readonly (ArchiveManifest | undefined)[]): void {
   });
 }
 
-// The windows, by start, whose bytes the copies that list them do not all hold alike, and those
-// copies.
-function conflicts(
+// The manifest up to the last window that ends before `ledger`, as if published then: RPC's events
+// give the windows from there on.
+function beforeLedger(m: ArchiveManifest, ledger: number): ArchiveManifest {
+  const windows = m.windows.filter((w) => w.end < ledger);
+  return { ...m, windows, coveredTo: windows[windows.length - 1]?.end ?? 0 };
+}
+
+// The windows, by start, that a sync from `since` and `leafCount` needs and that are not listed
+// with the same bytes by at least two copies and by every copy that lists them.
+function unconfirmed(
   manifests: readonly (ArchiveManifest | undefined)[],
-): Map<number, readonly number[]> {
-  const byStart = new Map<number, { sha: string | undefined; copy: number }[]>();
-  manifests.forEach((m, copy) => {
+  since: number,
+  leafCount: number,
+): number[] {
+  const byStart = new Map<number, (string | undefined)[]>();
+  for (const m of manifests) {
     for (const w of m?.windows ?? []) {
-      if (w.events === 0) continue;
-      const list = byStart.get(w.start) ?? [];
-      list.push({ sha: w.sha256, copy });
-      byStart.set(w.start, list);
+      const needed =
+        w.leaves[1] > Math.max(w.leaves[0], leafCount) || (w.nullifiers > 0 && w.end >= since);
+      if (w.events === 0 || !needed) continue;
+      byStart.set(w.start, [...(byStart.get(w.start) ?? []), w.sha256]);
     }
-  });
-  const out = new Map<number, readonly number[]>();
-  for (const [start, list] of byStart) {
-    if (new Set(list.map((x) => x.sha)).size > 1)
-      out.set(
-        start,
-        list.map((x) => x.copy),
-      );
   }
-  return out;
-}
-
-// The copies in the order they are tried: the preferred one first, then the others as listed.
-function order(count: number, prefer: number | undefined): number[] {
-  const all = Array.from({ length: count }, (_, i) => i);
-  return prefer === undefined || prefer >= count
-    ? all
-    : [prefer, ...all.filter((i) => i !== prefer)];
-}
-
-const leafKey = (l: Leaf): string =>
-  `${l.index}/${l.commitment}/${bytesToHex(l.ciphertext)}/${l.ledger}/${l.txHash}`;
-
-function sameLeaves(a: readonly Leaf[], b: readonly Leaf[]): boolean {
-  return a.length === b.length && a.every((l, i) => leafKey(l) === leafKey(b[i] as Leaf));
-}
-
-function sameNullifiers(a: readonly SpentNullifier[], b: readonly SpentNullifier[]): boolean {
-  const key = (n: SpentNullifier): string => `${n.nullifier}/${n.ledger}/${n.txHash}`;
-  const set = new Set(a.map(key));
-  return a.length === b.length && b.every((n) => set.has(key(n)));
+  return [...byStart]
+    .filter(([, shas]) => shas.length < 2 || new Set(shas).size > 1)
+    .map(([start]) => start)
+    .sort((a, b) => a - b);
 }
 
 // Every nullifier must have an entry in the vault, live or archived, and each entry the RPC returns

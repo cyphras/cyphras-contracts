@@ -92,8 +92,10 @@ describe("archive sync: copies that disagree", () => {
     const { world } = await history(2);
     const stale = buildArchive(world, WINDOW_LEDGERS - 1);
     const fresh = buildArchive(world, 2 * WINDOW_LEDGERS - 1);
-    const server = serveArchive(world.fetch, { [MIRROR]: stale, [ARCHIVE]: fresh });
-    const bob = await bobWith(world, server.fetch, { archives: [MIRROR, ARCHIVE] });
+    // A third copy confirms the fresh one's newer window, which two copies must list alike.
+    const third = "http://third.test";
+    const server = serveArchive(world.fetch, { [MIRROR]: stale, [ARCHIVE]: fresh, [third]: fresh });
+    const bob = await bobWith(world, server.fetch, { archives: [MIRROR, ARCHIVE, third] });
     const summary = await bob.sync();
     assert.equal(summary.source, "archive");
     assert.equal(summary.rootVerified, true);
