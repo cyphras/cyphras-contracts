@@ -5,14 +5,10 @@ import type { ExtDataJson, TxProofJson } from "../extdata.ts";
 import type { TreeSnapshot } from "../merkle.ts";
 import type { SealedStore } from "../storage.ts";
 
-// The transaction that spent a note, as the vault's events name it; or, `external`, a spend the
-// wallet knows only from the vault's entry of the note's nullifier, which every RPC provider showed
-// once the vault refused a payment of the note: it names no transaction, and `ledger` is the
-// earliest ledger a provider read the entry at. A later sync that names the transaction takes its
-// place.
-export type SpentBy =
-  | { readonly txHash: string; readonly ledger: number; readonly external?: undefined }
-  | { readonly txHash: undefined; readonly ledger: number; readonly external: true };
+export interface SpentBy {
+  readonly txHash: string;
+  readonly ledger: number;
+}
 
 // What one transaction showed of a plan: the leaf positions at which it added the plan's two output
 // commitments, which of the plan's two nullifiers it spent, and whether it added a leaf that is not
@@ -347,9 +343,17 @@ export interface WalletState {
   closeTimesTo: number;
   closeTimesUntil: number;
   payouts: Payout[];
-  // Nullifiers the vault's public spends named, none of this wallet's notes, newest last: a read of
-  // a plan's nullifier entries hides them among these.
-  publicNullifiers: bigint[];
+  // Notes of plans the vault refused as spending a note already spent, as every RPC provider's
+  // simulation showed, with the plans refused: one of the plan's notes may have been spent
+  // elsewhere, in a transaction no source of the wallet showed. Spends choose other notes first,
+  // and a note two refused plans held is not spendable until a sync shows it spent or a plan of
+  // this wallet that spends it lands. A rescan starts them anew.
+  suspects: Suspect[];
+}
+
+export interface Suspect {
+  readonly pos: number;
+  readonly plans: readonly string[];
 }
 
 export function emptyState(deployLedger: number): WalletState {
@@ -374,7 +378,7 @@ export function emptyState(deployLedger: number): WalletState {
     closeTimesTo: 0,
     closeTimesUntil: 0,
     payouts: [],
-    publicNullifiers: [],
+    suspects: [],
   };
 }
 
@@ -428,7 +432,7 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   state.closeTimesTo ??= 0;
   state.closeTimesUntil ??= 0;
   state.payouts ??= [];
-  state.publicNullifiers ??= [];
+  state.suspects ??= [];
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {
     const { lost: _lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };

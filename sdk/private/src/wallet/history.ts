@@ -1,4 +1,4 @@
-import { confirmedInputs, lockedPositions, spendableNotes } from "./core.ts";
+import { confirmedInputs, leftOutPositions, lockedPositions, spendableNotes } from "./core.ts";
 import { payoutLeft } from "./exits.ts";
 import type { ExitEvent } from "./sources.ts";
 import type { WalletState } from "./state.ts";
@@ -12,11 +12,17 @@ export interface Balance {
   readonly awaitingPayout: bigint;
   // True for a wallet with only an incoming viewing key, which cannot see spends.
   readonly spendsUnknown: boolean;
+  // Notes left out of spendable because the vault refused two payments with them as spending a
+  // note already spent, as every RPC provider showed: they may already be spent elsewhere, in a
+  // transaction no source of the wallet showed. They drop out once a sync shows them spent, and
+  // count again once a payment with them lands or after a rescan.
+  readonly unconfirmed: bigint;
 }
 
 export function balanceOf(state: WalletState, spendsVisible: boolean): Balance {
   const spendable = spendableNotes(state).reduce((s, n) => s + n.value, 0n);
   const locked = lockedPositions(state);
+  const left = leftOutPositions(state);
   return {
     spendable,
     pendingDeposits: state.deposits
@@ -27,6 +33,9 @@ export function balanceOf(state: WalletState, spendsVisible: boolean): Balance {
       .filter((p) => p.state === "queued" || p.state === "stranded")
       .reduce((s, p) => s + (p.exit === undefined ? p.amount : payoutLeft(p.exit)), 0n),
     spendsUnknown: !spendsVisible,
+    unconfirmed: state.notes
+      .filter((n) => left.has(n.pos) && n.spent === undefined && !locked.has(n.pos))
+      .reduce((s, n) => s + n.value, 0n),
   };
 }
 
@@ -78,7 +87,7 @@ const entry = (
 // out nothing.
 export function recordPayouts(state: WalletState, checked: readonly ExitEvent[]): void {
   const spends = new Set(
-    state.notes.flatMap((n) => (n.spent?.txHash === undefined ? [] : [n.spent.txHash])),
+    state.notes.flatMap((n) => (n.spent === undefined ? [] : [n.spent.txHash])),
   );
   const kept = new Map(state.payouts.map((p) => [p.txHash, p]));
   for (const e of checked) {
@@ -146,8 +155,7 @@ export function historyOf(state: WalletState): HistoryEntry[] {
   const txs = new Set<string>();
   for (const n of state.notes) {
     if (!depositCommitments.has(n.cm)) txs.add(n.txHash);
-    // A spend that names no transaction shows in the history once a sync names it.
-    if (n.spent?.txHash !== undefined && !planned.has(n.pos)) txs.add(n.spent.txHash);
+    if (n.spent !== undefined && !planned.has(n.pos)) txs.add(n.spent.txHash);
   }
   for (const s of state.sent) txs.add(s.txHash);
   for (const tx of txs) {

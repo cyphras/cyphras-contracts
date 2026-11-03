@@ -98,29 +98,7 @@ async function spentElsewhere(world: World, store: KeyValueStore, value: bigint)
   return note.nf;
 }
 
-// The keys every one of `reads` holds.
-function common(reads: readonly Read[]): Set<string> {
-  const [first, ...rest] = reads;
-  const out = new Set(first?.keys ?? []);
-  for (const r of rest) for (const k of [...out]) if (!r.keys.includes(k)) out.delete(k);
-  return out;
-}
-
 describe("repeated reads of a plan's nullifiers", () => {
-  // Whatever one provider was asked about a plan over several reads, the plan's keys still hide
-  // among as many public and random keys as in one read.
-  function assertHidden(world: World, reads: readonly Read[], real: readonly string[]): void {
-    assert.ok(reads.length >= 1, "the plan's keys were read");
-    const vault = new Set([...world.vault.nullifiers.keys()].map((nf) => keyOf(world, nf)));
-    const kept = common(reads);
-    for (const key of real) assert.ok(kept.has(key));
-    const decoys = [...kept].filter((k) => !real.includes(k));
-    const misses = decoys.filter((k) => !vault.has(k)).length;
-    const spends = decoys.filter((k) => vault.has(k)).length;
-    assert.ok(misses >= 31 * real.length, `${reads.length} reads leave ${misses} random keys`);
-    assert.ok(spends >= 31 * real.length, `${reads.length} reads leave ${spends} public spends`);
-  }
-
   it("keeps the keys of a request the relayer failed hidden across syncs", async () => {
     let net: ReturnType<typeof network> | undefined;
     const { world, bob, store } = await twoNotes((world) => {
@@ -140,7 +118,7 @@ describe("repeated reads of a plan's nullifiers", () => {
     const reads = (net?.asked ?? []).filter(
       (a) => a.origin === RPC && a.keys.some((k) => real.includes(k)),
     );
-    assertHidden(world, reads, real);
+    assert.equal(reads.length, 0, "no request holds the plan's keys");
   });
 
   it("keeps the keys of a payment refused again on retry hidden", async () => {
@@ -163,7 +141,7 @@ describe("repeated reads of a plan's nullifiers", () => {
       keyOf(world, nf),
     );
     const reads = (net?.asked ?? []).filter((a) => a.keys.some((k) => real.includes(k)));
-    assertHidden(world, reads, real);
+    assert.equal(reads.length, 0, "no request holds the plan's keys");
   });
 });
 
@@ -198,7 +176,6 @@ describe("a read of a plan's nullifiers that a provider does not answer", () => 
         bob.unshield({ to: carol, amount: 12n * XLM, maxFee: 2n * XLM, confirm: () => true }),
       );
       assert.ok(isError("service_rejected")(err), String(err));
-      assert.equal(details(err)["spentCheck"], "unconfirmed");
       assert.equal((await bob.plans())[0]?.state, "prepared");
       assert.equal((await notesOf(store, world)).filter((n) => n.spent !== undefined).length, 0);
       assert.equal((await bob.balance()).locked, 15n * XLM);
@@ -209,243 +186,6 @@ describe("a read of a plan's nullifiers that a provider does not answer", () => 
       assert.equal(owedTo(world, carol), 0n);
     });
   }
-});
-
-describe("a refused plan with one note and a dummy input", () => {
-  it("marks the note, frees the destination and pays once", async () => {
-    const { world, bob, store } = await twoNotes();
-    await spentElsewhere(world, store, 5n * XLM);
-    const carol = world.signer("carol").publicKey;
-    const err = await caught(
-      bob.unshield({ to: carol, amount: 4n * XLM, maxFee: 2n * XLM, confirm: () => true }),
-    );
-    assert.equal(details(err)["spentCheck"], "spent");
-    const [plan] = (await stateOf(store, world)).plans;
-    assert.equal(plan?.inputs.length, 1);
-    assert.equal(plan?.state, "superseded");
-    assert.equal((await bob.balance()).spendable, 10n * XLM);
-    await bob.unshield({ to: carol, amount: 4n * XLM, maxFee: 2n * XLM, confirm: () => true });
-    await bob.sync();
-    assert.equal(owedTo(world, carol), 4n * XLM);
-  });
-});
-
-describe("the read across a restart", () => {
-  it("reads among public spends kept in the stored state, and keeps the mark", async () => {
-    const store = new MemoryStore();
-    const { world } = await twoNotes(undefined, store);
-    const kept = (await stateOf(store, world)).publicNullifiers;
-    assert.ok(kept.length >= 62);
-    assert.ok(kept.every((nf) => typeof nf === "bigint"));
-    const reopened = await openWallet(world, 1, store);
-    await spentElsewhere(world, store, 10n * XLM);
-    const carol = world.signer("carol").publicKey;
-    const err = await caught(
-      reopened.unshield({ to: carol, amount: 12n * XLM, maxFee: 2n * XLM, confirm: () => true }),
-    );
-    assert.equal(details(err)["spentCheck"], "spent");
-    const again = await openWallet(world, 1, store);
-    assert.equal((await again.plans())[0]?.state, "superseded");
-    const spent = (await notesOf(store, world)).find((n) => n.value === 10n * XLM)?.spent;
-    assert.equal(spent?.external, true);
-    assert.equal((await again.balance()).spendable, 5n * XLM);
-  });
-});
-
-describe("the public spends a wallet keeps", () => {
-  it("keeps at most the newest 1024, none of the wallet's own", async () => {
-    const store = new MemoryStore();
-    const { world, bob } = await twoNotes(undefined, store, 600);
-    const carol = world.signer("carol").publicKey;
-    await bob.unshield({ to: carol, amount: 4n * XLM, maxFee: 2n * XLM, confirm: () => true });
-    world.advance(5);
-    await bob.sync();
-    const state = await stateOf(store, world);
-    assert.ok(state.publicNullifiers.length <= 1024, `${state.publicNullifiers.length} kept`);
-    const all = [...world.vault.nullifiers.keys()];
-    assert.ok(state.publicNullifiers.includes(all[all.length - 3] as bigint), "the newest is kept");
-    assert.ok(!state.publicNullifiers.includes(all[0] as bigint), "the oldest is dropped");
-    const own = state.notes.flatMap((n) => (n.nf === undefined ? [] : [n.nf]));
-    assert.ok(own.every((nf) => !state.publicNullifiers.includes(nf)));
-  });
-
-  it("never puts the wallet's own earlier spends among a read's decoys", async () => {
-    let net: ReturnType<typeof network> | undefined;
-    const store = new MemoryStore();
-    const { world, bob } = await twoNotes((world) => {
-      net = network(world);
-      return { fetch: net.fetchFn };
-    }, store);
-    const carol = world.signer("carol").publicKey;
-    await bob.unshield({ to: carol, amount: 4n * XLM, maxFee: 2n * XLM, confirm: () => true });
-    world.advance(5);
-    await bob.sync();
-    const before = await stateOf(store, world);
-    assert.equal(before.plans[0]?.state, "settled");
-    const landed = (before.plans[0]?.nullifiers ?? []).map((nf) => keyOf(world, nf));
-    await spentElsewhere(world, store, 10n * XLM);
-    const err = await caught(
-      bob.unshield({ to: carol, amount: 8n * XLM, maxFee: 2n * XLM, confirm: () => true }),
-    );
-    assert.equal(details(err)["spentCheck"], "spent");
-    const reads = (net?.asked ?? []).filter((a) => a.keys.length >= BATCH);
-    assert.equal(reads.length, 1);
-    for (const key of landed) assert.ok(!reads[0]?.keys.includes(key));
-  });
-});
-
-describe("a refusal after a fee retry", () => {
-  it("keeps the first proof's notes and destination until its fate is known", async () => {
-    const { world, bob, store } = await twoNotes();
-    await spentElsewhere(world, store, 10n * XLM);
-    const carol = world.signer("carol").publicKey;
-    world.relayer.failures.push({ error: "fee_too_low" }, { error: "rejected" });
-    const err = await caught(
-      bob.unshield({ to: carol, amount: 12n * XLM, maxFee: 2n * XLM, confirm: () => true }),
-    );
-    assert.equal(details(err)["spentCheck"], "spent");
-    assert.deepEqual(
-      (await bob.plans()).map((p) => p.state),
-      ["prepared", "superseded"],
-    );
-    // The relayer holds the first proof, which spends the same notes.
-    await assert.rejects(
-      bob.unshield({ to: carol, amount: 3n * XLM, maxFee: 2n * XLM, confirm: () => true }),
-      isError("operation_open"),
-    );
-    assert.equal((await bob.balance()).spendable, 0n);
-    world.advance(5 * 200);
-    await bob.sync();
-    assert.equal((await bob.plans())[0]?.state, "dead");
-    assert.equal((await bob.balance()).spendable, 5n * XLM);
-    assert.equal(owedTo(world, carol), 0n);
-  });
-});
-
-describe("a self-relayed simulation that names a spent nullifier", () => {
-  // Bob's self-relayed unshield, whose simulation the only RPC provider fails with the vault's
-  // NullifierSpent while no note of it is spent.
-  async function refused() {
-    let faking = false;
-    const { world, bob, store } = await twoNotes((world) => ({
-      fetch: async (input, init) => {
-        const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
-        if (faking && body?.method === "simulateTransaction") {
-          faking = false;
-          return new Response(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: body.id,
-              result: {
-                error: "HostError: Error(Contract, #123)",
-                latestLedger: world.vault.ledger,
-              },
-            }),
-            { status: 200 },
-          );
-        }
-        return world.fetch(input, init);
-      },
-    }));
-    faking = true;
-    const carol = world.signer("carol").publicKey;
-    const err = await caught(
-      bob.unshield({
-        to: carol,
-        amount: 12n * XLM,
-        selfRelay: world.signer("bob account"),
-        confirm: () => true,
-      }),
-    );
-    return { world, bob, store, err };
-  }
-
-  it("changes nothing when no provider shows one spent", async () => {
-    const { world, bob, store, err } = await refused();
-    assert.ok(isError("nullifier_disputed")(err), String(err));
-    assert.equal(typeof details(err)["planId"], "string");
-    assert.equal((await bob.plans())[0]?.state, "prepared");
-    assert.equal((await bob.plans())[0]?.lastError?.code, "nullifier_disputed");
-    assert.equal((await notesOf(store, world)).filter((n) => n.spent !== undefined).length, 0);
-    assert.equal((await bob.balance()).locked, 15n * XLM);
-  });
-
-  it("carries the vault's refusal as the cause of nullifier_disputed", async () => {
-    const { err } = await refused();
-    assert.ok(isError("nullifier_disputed")(err), String(err));
-    const cause = (err as Error).cause;
-    assert.ok(isError("transaction_failed")(cause), `cause ${String(cause)}`);
-  });
-});
-
-describe("a held request the relayer fails after a restart", () => {
-  it("marks the note spent elsewhere and pays nothing", async () => {
-    const { world, bob, store } = await twoNotes();
-    const carol = world.signer("carol").publicKey;
-    await bob.unshield({
-      to: carol,
-      amount: 12n * XLM,
-      maxFee: 2n * XLM,
-      notBefore: Number(world.vault.timestamp) + 60,
-      confirm: () => true,
-    });
-    assert.equal((await bob.plans())[0]?.relayerStatus, undefined);
-    world.relayer.restart();
-    await spentElsewhere(world, store, 10n * XLM);
-    world.relayer.failures.push({ error: "rejected" });
-    world.advance(5);
-    await bob.sync();
-    assert.equal((await bob.plans())[0]?.state, "superseded");
-    assert.equal((await bob.balance()).spendable, 5n * XLM);
-    world.relayer.releaseHeld();
-    world.advance(5 * 200);
-    await bob.sync();
-    assert.equal(owedTo(world, carol), 0n);
-  });
-});
-
-describe("a spend the vault's entry showed, named later by a recheck", () => {
-  it("takes the transaction the vault's events name, counted once", async () => {
-    const store = new MemoryStore();
-    const { world, bob } = await twoNotes(() => ({ syncLimits: { eventPages: 1 } }), store);
-    const other = await openWallet(world, 1);
-    await other.sync();
-    // Other users fill more events than one page of RPC's holds, then another instance of Bob's
-    // wallet spends the 10 XLM note, a spend the indexer leaves out.
-    world.advance(5);
-    world.fill(600);
-    world.advance(5);
-    const dave = world.signer("dave").publicKey;
-    const elsewhere = await other.unshield({
-      to: dave,
-      amount: 8n * XLM,
-      maxFee: 2n * XLM,
-      confirm: () => true,
-    });
-    world.indexer.hideNullifiers = true;
-    world.advance(5);
-    const carol = world.signer("carol").publicKey;
-    const err = await caught(
-      bob.unshield({ to: carol, amount: 12n * XLM, maxFee: 2n * XLM, confirm: () => true }),
-    );
-    assert.equal(details(err)["spentCheck"], "spent", String(err));
-    const state = await stateOf(store, world);
-    assert.ok(state.unchecked.some((r) => r.status === "open"));
-    assert.equal(state.notes.find((n) => n.value === 10n * XLM)?.spent?.external, true);
-    world.indexer.hideNullifiers = false;
-    const reopened = await openWallet(world, 1, store);
-    world.advance(5);
-    await reopened.sync();
-    const spent = (await notesOf(store, world)).find((n) => n.value === 10n * XLM)?.spent;
-    assert.equal(spent?.external, undefined);
-    assert.equal(spent?.txHash, elsewhere.txHash);
-    const change = 2n * XLM - elsewhere.fee;
-    assert.equal((await reopened.balance()).spendable, 5n * XLM + change);
-    const entries = (await reopened.history()).filter((h) => h.txHash === elsewhere.txHash);
-    assert.equal(entries.length, 1);
-    assert.equal(entries[0]?.kind, "unshield");
-    assert.equal(owedTo(world, carol), 0n);
-  });
 });
 
 describe("a shield that fails", () => {

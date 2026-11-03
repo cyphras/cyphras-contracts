@@ -2,7 +2,7 @@ import type { xdr } from "@stellar/stellar-base";
 import type { PinnedArtifacts } from "../artifacts.ts";
 import { bytesToHex, randomBytes } from "../bytes.ts";
 import type { Deployment } from "../deployments.ts";
-import { fail } from "../errors.ts";
+import { CyphrasError, fail } from "../errors.ts";
 import type { AddressKey, SpendingKeys } from "../keys.ts";
 import { CommitmentTree } from "../merkle.ts";
 import type { Prover } from "../prover.ts";
@@ -23,7 +23,7 @@ import {
 import type { Services } from "./services.ts";
 import type { ScanKeys } from "./sync.ts";
 import { isActive } from "./sync.ts";
-import type { OwnedNote, WalletState } from "./state.ts";
+import type { OwnedNote, Plan, WalletState } from "./state.ts";
 
 // What the last sync read of the vault and the pool. Spends use these reads instead of making
 // their own, so that the RPC and the indexer see the same requests whether or not a spend follows.
@@ -262,12 +262,60 @@ export function confirmedInputs(state: WalletState): Set<number> {
   return spent;
 }
 
+// Notes two or more refused plans held: one of them may be spent elsewhere, so no spend takes them
+// until the chain settles them.
+export function leftOutPositions(state: WalletState): Set<number> {
+  return new Set(state.suspects.filter((s) => s.plans.length >= 2).map((s) => s.pos));
+}
+
 export function spendableNotes(state: WalletState): OwnedNote[] {
   const locked = lockedPositions(state);
   const spent = confirmedInputs(state);
+  const left = leftOutPositions(state);
   return state.notes.filter(
-    (n) => n.spent === undefined && n.value > 0n && !locked.has(n.pos) && !spent.has(n.pos),
+    (n) =>
+      n.spent === undefined &&
+      n.value > 0n &&
+      !locked.has(n.pos) &&
+      !spent.has(n.pos) &&
+      !left.has(n.pos),
   );
+}
+
+// Notes for a total from the spendable ones that no refused plan held, else from all of them.
+export function chooseNotes(state: WalletState, total: bigint): OwnedNote[] {
+  const notes = spendableNotes(state);
+  const suspect = new Set(state.suspects.map((s) => s.pos));
+  const clean = notes.filter((n) => !suspect.has(n.pos));
+  try {
+    return selectNotes(clean, total);
+  } catch (err) {
+    if (!(err instanceof CyphrasError) || clean.length === notes.length) throw err;
+    return selectNotes(notes, total);
+  }
+}
+
+// The vault refused the plan as spending a note already spent, as every RPC provider showed:
+// each of its notes is suspect, once more for each plan refused so.
+export function markSuspects(state: WalletState, plan: Plan): void {
+  for (const input of plan.inputs) {
+    const at = state.suspects.findIndex((s) => s.pos === input.pos);
+    const plans = state.suspects[at]?.plans ?? [];
+    if (plans.includes(plan.id)) continue;
+    const mark = { pos: input.pos, plans: [...plans, plan.id] };
+    if (at < 0) state.suspects.push(mark);
+    else state.suspects[at] = mark;
+  }
+}
+
+// Drops the marks of notes the chain settled: shown spent, or held by a plan of this wallet that
+// landed.
+export function pruneSuspects(state: WalletState): void {
+  const landed = confirmedInputs(state);
+  state.suspects = state.suspects.filter((s) => {
+    const note = state.notes.find((n) => n.pos === s.pos);
+    return note !== undefined && note.spent === undefined && !landed.has(s.pos);
+  });
 }
 
 // The smallest single note that covers the total, else the pair with the smallest sufficient

@@ -766,12 +766,17 @@ async function signedBy(
   return { envelope, signed };
 }
 
-function simulationFailure(code: number | undefined): CyphrasError {
+// The vault's error for a proof one of whose nullifiers it holds an entry for.
+export const NULLIFIER_SPENT = 123;
+
+// `everyProvider`: every configured RPC provider's simulation showed the same contract error.
+function simulationFailure(code: number | undefined, everyProvider?: boolean): CyphrasError {
   const name = code === undefined ? undefined : vaultErrorName(code);
   const what = name === undefined ? "the call" : `the call (${name})`;
   return new CyphrasError("transaction_failed", `the vault refuses ${what}`, {
     ...(code === undefined ? {} : { contractError: code }),
     ...(name === undefined ? {} : { vaultError: name }),
+    ...(everyProvider === undefined ? {} : { everyProvider }),
   });
 }
 
@@ -995,8 +1000,25 @@ async function attemptCall(
   };
 
   const draft = build(MIN_INCLUSION_FEE);
-  const simulation = await ctx.rpc.simulateTransaction(draft.toEnvelope().toXDR("base64"));
-  if (simulation.failed) throw simulationFailure(simulation.contractError);
+  const envelope = draft.toEnvelope().toXDR("base64");
+  const simulation = await ctx.rpc.simulateTransaction(envelope);
+  if (simulation.failed) {
+    // A refusal for a spent note counts only once the second provider's simulation shows it too.
+    if (simulation.contractError !== NULLIFIER_SPENT) {
+      throw simulationFailure(simulation.contractError);
+    }
+    const second =
+      ctx.second === undefined
+        ? simulation
+        : await ctx.second.simulateTransaction(envelope).catch((err: unknown) => {
+            if (err instanceof CyphrasError) return undefined;
+            throw err;
+          });
+    throw simulationFailure(
+      simulation.contractError,
+      second?.failed === true && second.contractError === NULLIFIER_SPENT,
+    );
+  }
   let data = xdr.SorobanTransactionData.fromXDR(simulation.transactionData, "base64");
   const simulated = data.resources().footprint();
   const inFootprint = [...simulated.readOnly(), ...simulated.readWrite()];

@@ -56,7 +56,9 @@ import {
   claimPayees,
   claimRoom,
   invokeContext,
+  leftOutPositions,
   newId,
+  pruneSuspects,
   releasePayees,
   releaseRoom,
 } from "./core.ts";
@@ -80,7 +82,6 @@ import { type Balance, type HistoryEntry, balanceOf, historyOf, recordPayouts } 
 import { type VaultLimitsView, vaultLimits } from "./limits.ts";
 import { closedBy, readCloseTimes, recordCloseTimes, updatePace } from "./pace.ts";
 import { ArchiveSource } from "./archive.ts";
-import { checkSpent } from "./spent.ts";
 import { type Verification, createServices, recheckIndexers, verify } from "./services.ts";
 import {
   DEFAULT_SYNC_LIMITS,
@@ -262,12 +263,11 @@ export interface UnshieldRequest {
   // to the fee a fee_above_cap error reported. An unshield that failed so keeps its plan and notes,
   // and no other unshield to its destination goes while it may still land: one fails with
   // operation_open, naming the planId of a single unshield or the operationId of a split one. A
-  // single one goes again through retry with these caps; it stops blocking once it lands, is dead
-  // after its deadline with its nullifiers unspent, or can land no more, as when the vault refused
-  // it and every RPC provider shows one of its nullifiers spent and the other not. A split one goes
-  // on when the same split request, same amount and route, is made again, with these caps for the
-  // parts that call sends, and blocks until it is done, or abandoned with its sent parts settled.
-  // Later parts take the caps continueOperations is given.
+  // single one goes again through retry with these caps; it stops blocking once it lands, or is
+  // dead after its deadline with its nullifiers unspent. A split one goes on when the same split
+  // request, same amount and route, is made again, with these caps for the parts that call sends,
+  // and blocks until it is done, or abandoned with its sent parts settled. Later parts take the
+  // caps continueOperations is given.
   readonly networkFeeCaps?: Partial<NetworkFeeCaps>;
   readonly confirm?: ConfirmSpend;
   readonly notBefore?: number;
@@ -434,7 +434,9 @@ function partFate(
   const free = part.inputs.every((i) =>
     state.notes.some((n) => n.pos === i.pos && n.spent === undefined),
   );
-  if (part.state === "dead" && free) return "again";
+  // A part whose notes two refused plans held may have had one spent elsewhere.
+  const left = leftOutPositions(state);
+  if (part.state === "dead" && free && !part.inputs.some((i) => left.has(i.pos))) return "again";
   const ours = state.plans.some(
     (q) =>
       !parts.includes(q) &&
@@ -1146,6 +1148,7 @@ export class PrivateWallet {
     const rechecked = await recheck(core.state, rpcs, vault, limits.eventPages, core.now());
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
     if (verified) advancePlans(core.state, views as [ChainView, ...ChainView[]]);
+    pruneSuspects(core.state);
     const live = source.kind === "indexer" ? indexer : undefined;
     const pace = updatePace(core.state, events?.times ?? [], core.now() / 1000);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
@@ -1234,11 +1237,9 @@ export class PrivateWallet {
       if (plan.state !== "submitted" || route.kind !== "relayer") continue;
       const client = this.#relayerClients(route.url)[0] as RelayerClient;
       const { txHash, heldId } = plan;
-      let rejected = false;
       if (txHash !== undefined) {
         const tx = await client.tx(txHash).catch(() => undefined);
         plan.relayerStatus = tx?.status ?? "unknown";
-        rejected = tx?.status === "failed" && tx.code === "rejected";
         if (tx?.status === "failed" && tx.code === "unavailable") {
           await resendConflicted(plan, client, latest).catch(() => {
             plan.relayerStatus = "unknown";
@@ -1248,15 +1249,6 @@ export class PrivateWallet {
         await followHeld(core, plan, heldId, client, latest, pace).catch(() => {
           plan.relayerStatus = "unknown";
         });
-        rejected = plan.relayerStatus === "failed" && plan.error === "rejected";
-      }
-      // A relayer fails a request whose notes were spent first with "rejected", and the sync's
-      // sources may not show that spend.
-      if (
-        rejected &&
-        plan.inputs.some((i) => core.state.notes.find((n) => n.pos === i.pos)?.spent === undefined)
-      ) {
-        await checkSpent(core, plan, false).catch(() => undefined);
       }
     }
   }
@@ -1685,7 +1677,8 @@ export class PrivateWallet {
         p.id === op.awaiting &&
         p.state === "prepared" &&
         p.txHash === undefined &&
-        p.error !== undefined,
+        p.error !== undefined &&
+        !state.suspects.some((s) => s.plans.includes(p.id)),
     );
     if (stalled !== undefined && op.route.kind === "self") {
       const notes = stalled.inputs.map((i) =>

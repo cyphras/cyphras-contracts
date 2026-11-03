@@ -18,21 +18,26 @@ import { addressKeyFor, type AddressKey } from "../keys.ts";
 import type { HeldRequest, Quote, RelayerClient } from "../net/relayer.ts";
 import { proveTransaction } from "../proving.ts";
 import { buildTransaction, type BuiltTransaction, type ExtTerms } from "../transaction.ts";
-import { type NetworkFeeCaps, type TransactionSigner, invokeVault } from "../vault/invoke.ts";
+import {
+  NULLIFIER_SPENT,
+  type NetworkFeeCaps,
+  type TransactionSigner,
+  invokeVault,
+} from "../vault/invoke.ts";
 import type { VaultInstance } from "../vault/state.ts";
 import {
   type Core,
   chainReads,
+  chooseNotes,
   invokeContext,
+  markSuspects,
   newId,
-  selectNotes,
   spendNote,
   spendableNotes,
   spendingKeys,
   transactRoom,
 } from "./core.ts";
 import { type Warning, unshieldWarnings } from "./nudges.ts";
-import { afterFailure } from "./spent.ts";
 import type { OwnedNote, Plan, PlanState, RootCheck, Route } from "./state.ts";
 
 /** What the user is asked to confirm before a spend is proved. */
@@ -527,7 +532,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       const relayerAddress =
         relay === undefined ? (intent.selfRelay as TransactionSigner).publicKey : relay.feeAddress;
 
-      const inputs = intent.inputs ?? selectNotes(spendableNotes(core.state), intent.amount + fee);
+      const inputs = intent.inputs ?? chooseNotes(core.state, intent.amount + fee);
       const total = inputs.reduce((s, n) => s + n.value, 0n);
       if (total < intent.amount + fee) {
         fail("insufficient_funds", "the notes of the stalled payment no longer cover the new fee");
@@ -631,11 +636,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       await core.save();
 
       if (relay === undefined) {
-        try {
-          return await selfRelay(core, plan, intent.selfRelay as TransactionSigner, intent.feeCaps);
-        } catch (err) {
-          throw await afterFailure(core, plan, err, false);
-        }
+        return await selfRelay(core, plan, intent.selfRelay as TransactionSigner, intent.feeCaps);
       }
       const result = await relay.client.submit(plan.proof, plan.ext, intent.notBefore);
       if (result.accepted) {
@@ -659,7 +660,7 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
         retryOf = plan.id;
         continue;
       }
-      throw await afterFailure(core, plan, refused, true);
+      throw refused;
     }
   } catch (err) {
     throw naming(err, saved);
@@ -862,6 +863,14 @@ async function selfRelay(
     plan.txHash = hash;
     await core.save();
   } catch (err) {
+    // A relayer's word never counts here; only the vault's refusal every provider simulated.
+    if (
+      err instanceof CyphrasError &&
+      err.details["contractError"] === NULLIFIER_SPENT &&
+      err.details["everyProvider"] === true
+    ) {
+      markSuspects(core.state, plan);
+    }
     plan.error = err instanceof CyphrasError ? err.code : "unexpected_error";
     // A message the SDK did not write is not kept: it could carry anything.
     plan.errorMessage =

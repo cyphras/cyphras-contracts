@@ -735,7 +735,6 @@ export class MockVault {
     return BigInt(newId);
   }
 
-  // Other users' activity: pairs of random commitments, each pair its own insertion.
   // Another user's transaction: it spends two notes and adds a pair of leaves.
   spendFiller(): void {
     for (let i = 0; i < 2; i++) {
@@ -746,6 +745,7 @@ export class MockVault {
     this.insertFiller(1);
   }
 
+  // Other users' activity: pairs of random commitments, each pair its own insertion.
   insertFiller(pairs: number): void {
     for (let i = 0; i < pairs; i++) {
       const cms = [0, 1].map(() => BigInt("0x" + bytesToHex(randomFill(32))) % P);

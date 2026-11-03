@@ -42,7 +42,6 @@ export type ErrorCode =
   | "restore_failed"
   | "deposit_submitting"
   | "operation_open"
-  | "nullifier_disputed"
   | "view_only"
   | "not_found"
   | "history_unavailable"

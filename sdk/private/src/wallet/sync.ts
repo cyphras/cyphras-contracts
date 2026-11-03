@@ -529,18 +529,11 @@ export function applyDownload(
   // The first record of a spend stands.
   const spent = new Map<bigint, (typeof buffer)[number]>();
   for (const n of buffer) if (!spent.has(n.nf)) spent.set(n.nf, n);
-  // A spend that only the vault's nullifier entry showed takes the transaction a source names.
   for (const note of state.notes) {
-    if (note.nf === undefined || (note.spent !== undefined && note.spent.external !== true)) {
-      continue;
-    }
+    if (note.nf === undefined || note.spent !== undefined) continue;
     const hit = spent.get(note.nf);
     if (hit !== undefined) note.spent = { txHash: hit.txHash, ledger: hit.ledger };
   }
-  keepPublic(
-    state,
-    data.nullifiers.map((n) => n.nullifier),
-  );
   recordOutputs(state.plans, staging.found, providers);
   const { lost, rest } = splitArchived(
     staging.unchecked === undefined
@@ -571,17 +564,6 @@ export function applyDownload(
   // A leaf not yet scanned lies at or after the last scanned one, and so does any spend of it.
   state.nullifierBuffer = buffer.filter((n) => n.ledger >= state.lastLeafLedger);
   return newNotes;
-}
-
-// How many of the vault's public spends a wallet keeps to hide its reads among.
-const PUBLIC_NULLIFIERS = 1024;
-
-// Keeps the newest nullifiers of spends that are not this wallet's.
-function keepPublic(state: WalletState, nullifiers: readonly bigint[]): void {
-  const own = new Set(state.notes.flatMap((n) => (n.nf === undefined ? [] : [n.nf])));
-  const kept = new Set(state.publicNullifiers);
-  for (const nf of nullifiers) if (!own.has(nf)) kept.add(nf);
-  state.publicNullifiers = [...kept].slice(-PUBLIC_NULLIFIERS);
 }
 
 // The unchecked leaves an apply keeps: those before `archived`, which an archive supplied, as lost,
@@ -731,9 +713,6 @@ export async function recheck(
       ? []
       : e.leaves.filter((l) => l.index >= taken.first && l.index < taken.end);
   const confirmed: number[] = [];
-  // A spend that only the vault's nullifier entry showed names no transaction for the range to
-  // contradict; it takes the one every provider names.
-  const named = new Map<bigint, SpentNullifier | undefined | false>();
   for (const e of held) {
     if (taken !== undefined) confirmed.push(confirmedRuns(taken, shownBy(e), differ));
     const to = Math.min(range.to, e.latest);
@@ -741,15 +720,6 @@ export async function recheck(
     for (const note of state.notes) {
       if (note.nf === undefined) continue;
       const chain = spends.get(note.nf);
-      if (note.spent?.external === true) {
-        const before = named.get(note.nf);
-        const same = before !== false && before?.txHash === chain?.txHash;
-        named.set(
-          note.nf,
-          !named.has(note.nf) || (same && before?.ledger === chain?.ledger) ? chain : false,
-        );
-        continue;
-      }
       const kept =
         note.spent !== undefined && note.spent.ledger >= range.from && note.spent.ledger <= to;
       if (chain === undefined ? kept : chain.txHash !== note.spent?.txHash) differ();
@@ -813,12 +783,6 @@ export async function recheck(
     return undefined;
   }
   sameRecords(held, range.from, to);
-  for (const note of state.notes) {
-    const chain = note.nf === undefined ? undefined : named.get(note.nf);
-    if (note.spent?.external === true && chain) {
-      note.spent = { txHash: chain.txHash, ledger: chain.ledger };
-    }
-  }
   state.unchecked.splice(at, 1, ...kept);
   return {
     ...events,
@@ -884,11 +848,7 @@ function landingRefuted(state: WalletState, plan: Plan): boolean {
   return plan.inputs.some((input) => {
     const note = state.notes.find((n) => n.pos === input.pos);
     const spent = note?.spent;
-    return (
-      note !== undefined &&
-      spent?.external !== true &&
-      (spent?.txHash !== plan.txHash || spent?.ledger !== at)
-    );
+    return note !== undefined && (spent?.txHash !== plan.txHash || spent?.ledger !== at);
   });
 }
 
@@ -903,10 +863,9 @@ function missedDeadline(state: WalletState, plan: Plan): boolean {
   if (!checkedBetween(state, plan.builtAt, plan.deadline)) return false;
   return plan.inputs.every((input) => {
     const spent = state.notes.find((n) => n.pos === input.pos)?.spent;
-    // A spend only the vault's nullifier entry showed may lie at any ledger before it was read.
     return (
       state.notes.some((n) => n.pos === input.pos) &&
-      (spent === undefined || (spent.external !== true && spent.ledger > plan.deadline))
+      (spent === undefined || spent.ledger > plan.deadline)
     );
   });
 }
