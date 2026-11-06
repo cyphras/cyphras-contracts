@@ -735,6 +735,16 @@ export class MockVault {
     return BigInt(newId);
   }
 
+  // Another user's transaction: it spends two notes and adds a pair of leaves.
+  spendFiller(): void {
+    for (let i = 0; i < 2; i++) {
+      const nf = BigInt("0x" + bytesToHex(randomFill(32))) % P;
+      this.nullifiers.set(nf, { ledger: this.ledger, txHash: this.txHash });
+      this.#emit("new_nullifier", [["nullifier", u256(nf)]]);
+    }
+    this.insertFiller(1);
+  }
+
   // Other users' activity: pairs of random commitments, each pair its own insertion.
   insertFiller(pairs: number): void {
     for (let i = 0; i < pairs; i++) {

@@ -2,7 +2,7 @@ import type { xdr } from "@stellar/stellar-base";
 import type { PinnedArtifacts } from "../artifacts.ts";
 import { bytesToHex, randomBytes } from "../bytes.ts";
 import type { Deployment } from "../deployments.ts";
-import { fail } from "../errors.ts";
+import { CyphrasError, fail } from "../errors.ts";
 import type { AddressKey, SpendingKeys } from "../keys.ts";
 import { CommitmentTree } from "../merkle.ts";
 import type { Prover } from "../prover.ts";
@@ -23,7 +23,7 @@ import {
 import type { Services } from "./services.ts";
 import type { ScanKeys } from "./sync.ts";
 import { isActive } from "./sync.ts";
-import type { OwnedNote, WalletState } from "./state.ts";
+import { LANDED_STATES, type OwnedNote, type Plan, type WalletState } from "./state.ts";
 
 // What the last sync read of the vault and the pool. Spends use these reads instead of making
 // their own, so that the RPC and the indexer see the same requests whether or not a spend follows.
@@ -268,6 +268,170 @@ export function spendableNotes(state: WalletState): OwnedNote[] {
   return state.notes.filter(
     (n) => n.spent === undefined && n.value > 0n && !locked.has(n.pos) && !spent.has(n.pos),
   );
+}
+
+const keyOf = (positions: readonly number[]): string =>
+  [...positions].sort((a, b) => a - b).join(",");
+
+// The sets of note positions of the plans the vault refused as spending a note already spent, as
+// every RPC provider showed.
+function refusedSets(state: WalletState): Set<string> {
+  const ids = new Set(state.suspects.flatMap((s) => s.plans));
+  return new Set(
+    state.plans.filter((p) => ids.has(p.id)).map((p) => keyOf(p.inputs.map((i) => i.pos))),
+  );
+}
+
+// The spendable notes a refused plan held: one of each such plan's notes may be spent elsewhere.
+// They stay spendable and only go after other notes.
+export function suspectNotes(state: WalletState): OwnedNote[] {
+  const marked = new Set(state.suspects.map((s) => s.pos));
+  return spendableNotes(state).filter((n) => marked.has(n.pos));
+}
+
+// How many sets of notes a refusing provider may see for one payment, by destination and amount,
+// and in one hour, before self-relayed spends stop with notes_refused.
+const REFUSED_PER_PAYMENT = 3;
+const REFUSED_PER_HOUR = 6;
+const HOUR_MS = 3_600_000;
+
+const notesRefused = (why: string): never =>
+  fail(
+    "notes_refused",
+    `${why}; a later sync that shows which note is spent, or a rescan, may clear it`,
+  );
+
+// Each self-relayed try after a refusal shows the RPC providers the nullifiers of other notes, tied
+// to the paying account, so the tries are capped: after REFUSED_PER_PAYMENT refused sets for the
+// same destination and amount, or REFUSED_PER_HOUR in the last hour, the spend stops before it is
+// proved, though the payment might still go with notes not tried yet.
+function checkTries(
+  state: WalletState,
+  payment: { readonly to: string; readonly amount: bigint; readonly now: number },
+): void {
+  const ids = new Set(state.suspects.flatMap((s) => s.plans));
+  const refused = state.plans.filter((p) => ids.has(p.id));
+  const same = refused.filter((p) => p.to === payment.to && p.amount === payment.amount);
+  const recent = refused.filter((p) => p.createdAt > payment.now - HOUR_MS);
+  if (same.length >= REFUSED_PER_PAYMENT || recent.length >= REFUSED_PER_HOUR) {
+    notesRefused(
+      "this payment, or this wallet in the last hour, had too many sets of notes refused",
+    );
+  }
+}
+
+// Notes for a total, as selectNotes chooses among the notes no refused plan held; else the single
+// note or pair that is not a set of notes a refused plan held, whose most refused note was refused
+// least, then with the fewest notes refused and the fewest refusals of them. A refusal happens at
+// simulation, so going on to another set costs no fee. When every set that covers the total was
+// refused, it fails with notes_refused and nothing is proved. With `payment`, for a self-relayed
+// spend, the tries after refusals are capped as checkTries says.
+export function chooseNotes(
+  state: WalletState,
+  total: bigint,
+  payment?: { readonly to: string; readonly amount: bigint; readonly now: number },
+): OwnedNote[] {
+  if (payment !== undefined) checkTries(state, payment);
+  const notes = spendableNotes(state);
+  const refusals = new Map(state.suspects.map((s) => [s.pos, s.plans.length]));
+  const clean = notes.filter((n) => !refusals.has(n.pos));
+  try {
+    return selectNotes(clean, total);
+  } catch (err) {
+    if (!(err instanceof CyphrasError) || clean.length === notes.length) throw err;
+  }
+  // No clean note or pair covers the total, so every set that does holds a marked note: only those
+  // are looked at, one at a time.
+  const refused = refusedSets(state);
+  const marked = notes.filter((n) => refusals.has(n.pos));
+  const order = new Map(marked.map((n, i) => [n.pos, i]));
+  const rank = (set: readonly OwnedNote[]): bigint[] => [
+    BigInt(Math.max(...set.map((n) => refusals.get(n.pos) ?? 0))),
+    BigInt(set.filter((n) => refusals.has(n.pos)).length),
+    BigInt(set.reduce((s, n) => s + (refusals.get(n.pos) ?? 0), 0)),
+    BigInt(set.length),
+    set.reduce((s, n) => s + n.value, 0n),
+  ];
+  const before = (a: readonly bigint[], b: readonly bigint[]): boolean => {
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return (a[i] as bigint) < (b[i] as bigint);
+    }
+    return false;
+  };
+  let best: { readonly set: OwnedNote[]; readonly rank: bigint[] } | undefined;
+  let covered = false;
+  const consider = (set: OwnedNote[]): void => {
+    if (set.reduce((s, n) => s + n.value, 0n) < total) return;
+    covered = true;
+    if (refused.has(keyOf(set.map((n) => n.pos)))) return;
+    const r = rank(set);
+    if (best === undefined || before(r, best.rank)) best = { set, rank: r };
+  };
+  for (const [i, a] of marked.entries()) {
+    consider([a]);
+    for (const b of notes) {
+      // A pair of two marked notes is looked at once, from the first of them.
+      if (b === a || (order.get(b.pos) ?? marked.length) < i) continue;
+      consider([a, b]);
+    }
+  }
+  if (best !== undefined) return best.set;
+  if (covered) {
+    notesRefused(
+      "every set of notes that covers the amount was refused before as spending a note already spent",
+    );
+  }
+  return selectNotes(notes, total);
+}
+
+// Whether the vault refused a plan of the same notes as spending a note already spent.
+export function refusedNotes(state: WalletState, plan: Plan): boolean {
+  return refusedSets(state).has(keyOf(plan.inputs.map((i) => i.pos)));
+}
+
+// The vault refused the plan as spending a note already spent, as every RPC provider showed: its
+// notes are suspect, and the plan is named on each. A refusal of the same notes as an earlier one
+// adds nothing; returns whether there was one.
+export function markSuspects(state: WalletState, plan: Plan): boolean {
+  const before = refusedNotes(state, plan);
+  if (before) return true;
+  for (const input of plan.inputs) {
+    const at = state.suspects.findIndex((s) => s.pos === input.pos);
+    const plans = state.suspects[at]?.plans ?? [];
+    if (plans.includes(plan.id)) continue;
+    const mark = { pos: input.pos, plans: [...plans, plan.id] };
+    if (at < 0) state.suspects.push(mark);
+    else state.suspects[at] = mark;
+  }
+  return before;
+}
+
+// Drops what a sync settled: the mark of a note it shows spent, and every mark of a refused plan
+// that landed after all, or one of whose notes a transaction that is no landed plan of this wallet
+// spent, which explains the refusal. A note this wallet's own landed payment spent was unspent when
+// it was refused, so that explains nothing.
+export function pruneSuspects(state: WalletState): void {
+  const ours = new Set(
+    state.plans.filter((p) => LANDED_STATES.includes(p.state)).map((p) => p.txHash),
+  );
+  const ids = new Set(state.suspects.flatMap((s) => s.plans));
+  const explained = new Set(
+    state.plans
+      .filter((p) => ids.has(p.id))
+      .filter(
+        (p) =>
+          LANDED_STATES.includes(p.state) ||
+          p.inputs.some((i) => {
+            const spent = state.notes.find((n) => n.pos === i.pos)?.spent;
+            return spent !== undefined && !ours.has(spent.txHash);
+          }),
+      )
+      .map((p) => p.id),
+  );
+  state.suspects = state.suspects
+    .filter((s) => state.notes.some((n) => n.pos === s.pos && n.spent === undefined))
+    .map((s) => ({ pos: s.pos, plans: s.plans.filter((id) => !explained.has(id)) }))
+    .filter((s) => s.plans.length > 0);
 }
 
 // The smallest single note that covers the total, else the pair with the smallest sufficient

@@ -57,6 +57,8 @@ import {
   claimRoom,
   invokeContext,
   newId,
+  pruneSuspects,
+  refusedNotes,
   releasePayees,
   releaseRoom,
 } from "./core.ts";
@@ -145,7 +147,10 @@ export interface ConnectionOptions {
   readonly storage: KeyValueStore;
   readonly rpcUrl: string;
   // A second RPC provider, read on every sync: a payment is declared dead only when both show it,
-  // and a tree it contradicts is not taken. Recommended on mainnet.
+  // and a tree it contradicts is not taken. When the vault refuses a self-relayed call as spending
+  // a note already spent, the second provider simulates the same transaction too, so it gets the
+  // envelope the first one got: the account, the destination and amount, and the proof. Recommended
+  // on mainnet.
   readonly secondRpcUrl?: string;
   // Every request goes through it, so the caller can route private-payment traffic via a proxy.
   readonly fetch?: FetchLike;
@@ -432,7 +437,9 @@ function partFate(
   const free = part.inputs.every((i) =>
     state.notes.some((n) => n.pos === i.pos && n.spent === undefined),
   );
-  if (part.state === "dead" && free) return "again";
+  // A part the vault refused as spending a note already spent goes no further with its notes.
+  const refused = refusedNotes(state, part);
+  if (part.state === "dead" && free && !refused) return "again";
   const ours = state.plans.some(
     (q) =>
       !parts.includes(q) &&
@@ -1144,6 +1151,7 @@ export class PrivateWallet {
     const rechecked = await recheck(core.state, rpcs, vault, limits.eventPages, core.now());
     if (rechecked !== undefined) recordEvents(core.state.plans, rechecked);
     if (verified) advancePlans(core.state, views as [ChainView, ...ChainView[]]);
+    pruneSuspects(core.state);
     const live = source.kind === "indexer" ? indexer : undefined;
     const pace = updatePace(core.state, events?.times ?? [], core.now() / 1000);
     // Read on every sync, so that an unshield, whose warnings use it, adds no request of its own.
@@ -1258,7 +1266,10 @@ export class PrivateWallet {
     return this.#run(() => this.#sync(true));
   }
 
-  /** Spendable value, value in pending deposits and value locked in unconfirmed submissions. */
+  /**
+   * Spendable value, value in pending deposits, value locked in unconfirmed submissions, and the
+   * part of spendable that may already be spent elsewhere.
+   */
   async balance(): Promise<Balance> {
     return balanceOf(this.#core.state, this.#core.scan.nkFold !== undefined);
   }
@@ -1672,7 +1683,8 @@ export class PrivateWallet {
         p.id === op.awaiting &&
         p.state === "prepared" &&
         p.txHash === undefined &&
-        p.error !== undefined,
+        p.error !== undefined &&
+        !refusedNotes(state, p),
     );
     if (stalled !== undefined && op.route.kind === "self") {
       const notes = stalled.inputs.map((i) =>

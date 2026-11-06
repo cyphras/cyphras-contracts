@@ -343,6 +343,17 @@ export interface WalletState {
   closeTimesTo: number;
   closeTimesUntil: number;
   payouts: Payout[];
+  // Notes of plans the vault refused as spending a note already spent, as every RPC provider's
+  // simulation showed, with the plans refused: one of each plan's notes may have been spent
+  // elsewhere, in a transaction no source of the wallet showed. They stay spendable; spends take
+  // them after other notes, never a set of notes refused before, and a refused split part is not
+  // sent again with its notes. A sync that explains a refusal, or a rescan, clears them.
+  suspects: Suspect[];
+}
+
+export interface Suspect {
+  readonly pos: number;
+  readonly plans: readonly string[];
 }
 
 export function emptyState(deployLedger: number): WalletState {
@@ -367,6 +378,7 @@ export function emptyState(deployLedger: number): WalletState {
     closeTimesTo: 0,
     closeTimesUntil: 0,
     payouts: [],
+    suspects: [],
   };
 }
 
@@ -420,6 +432,7 @@ export async function loadState(store: SealedStore): Promise<WalletState | undef
   state.closeTimesTo ??= 0;
   state.closeTimesUntil ??= 0;
   state.payouts ??= [];
+  state.suspects ??= [];
   state.checkedLeafLedger ??= 0;
   state.unchecked = state.unchecked.map((stored) => {
     const { lost: _lost, ...range } = stored as UncheckedRange & { readonly lost?: boolean };

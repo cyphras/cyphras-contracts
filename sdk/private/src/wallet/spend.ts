@@ -18,14 +18,20 @@ import { addressKeyFor, type AddressKey } from "../keys.ts";
 import type { HeldRequest, Quote, RelayerClient } from "../net/relayer.ts";
 import { proveTransaction } from "../proving.ts";
 import { buildTransaction, type BuiltTransaction, type ExtTerms } from "../transaction.ts";
-import { type NetworkFeeCaps, type TransactionSigner, invokeVault } from "../vault/invoke.ts";
+import {
+  NULLIFIER_SPENT,
+  type NetworkFeeCaps,
+  type TransactionSigner,
+  invokeVault,
+} from "../vault/invoke.ts";
 import type { VaultInstance } from "../vault/state.ts";
 import {
   type Core,
   chainReads,
+  chooseNotes,
   invokeContext,
+  markSuspects,
   newId,
-  selectNotes,
   spendNote,
   spendableNotes,
   spendingKeys,
@@ -450,7 +456,7 @@ function naming(err: unknown, plan: Plan | undefined): unknown {
     );
   }
   if ("planId" in err.details) return err;
-  return new CyphrasError(err.code, err.message, { ...err.details, ...ids });
+  return new CyphrasError(err.code, err.message, { ...err.details, ...ids }, { cause: err.cause });
 }
 
 // One spend from the review to the submission, with a write-ahead plan saved before anything
@@ -526,7 +532,15 @@ export async function spend(core: Core, intent: SpendIntent): Promise<Submission
       const relayerAddress =
         relay === undefined ? (intent.selfRelay as TransactionSigner).publicKey : relay.feeAddress;
 
-      const inputs = intent.inputs ?? selectNotes(spendableNotes(core.state), intent.amount + fee);
+      const inputs =
+        intent.inputs ??
+        chooseNotes(
+          core.state,
+          intent.amount + fee,
+          relay === undefined
+            ? { to: intent.to, amount: intent.amount, now: core.now() }
+            : undefined,
+        );
       const total = inputs.reduce((s, n) => s + n.value, 0n);
       if (total < intent.amount + fee) {
         fail("insufficient_funds", "the notes of the stalled payment no longer cover the new fee");
@@ -857,6 +871,22 @@ async function selfRelay(
     plan.txHash = hash;
     await core.save();
   } catch (err) {
+    // A relayer's word never counts here; only the vault's refusal every provider simulated.
+    if (
+      err instanceof CyphrasError &&
+      err.details["contractError"] === NULLIFIER_SPENT &&
+      err.details["everyProvider"] === true
+    ) {
+      // A refusal of the same notes as an earlier one adds nothing, and the error says so.
+      if (markSuspects(core.state, plan)) {
+        err = new CyphrasError(
+          err.code,
+          err.message,
+          { ...err.details, refusedBefore: true },
+          { cause: err.cause },
+        );
+      }
+    }
     plan.error = err instanceof CyphrasError ? err.code : "unexpected_error";
     // A message the SDK did not write is not kept: it could carry anything.
     plan.errorMessage =
