@@ -20,7 +20,8 @@
     "test:proof": "npm run test:proof --workspace @cyphras/private",
     "format": "prettier --write \"*/src/**/*.ts\" \"*/test/**/*.ts\" \"*/scripts/**/*.ts\" \"scripts/**/*.ts\" \"examples/**/*.ts\"",
     "format:check": "prettier --check \"*/src/**/*.ts\" \"*/test/**/*.ts\" \"*/scripts/**/*.ts\" \"scripts/**/*.ts\" \"examples/**/*.ts\"",
-    "size": "node scripts/size.ts"
+    "size": "node scripts/size.ts",
+    "release:check": "node scripts/check-tarball.ts"
   },
   "devDependencies": {
     "@types/node": "24.19.1",
