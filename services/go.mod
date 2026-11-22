@@ -2,12 +2,12 @@ module github.com/cyphras/cyphras-contracts/services
 
 go 1.27.0
 
-toolchain go1.27.1
+toolchain go1.27.4
 
 require (
 	github.com/consensys/gnark-crypto v0.22.0
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/klauspost/compress v1.20.1
+	github.com/klauspost/compress v1.20.2
 	github.com/stellar/go-stellar-sdk v0.7.3
 	golang.org/x/crypto v0.57.0
 )
