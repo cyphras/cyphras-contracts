@@ -12,8 +12,8 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: wasm32v1-none
           components: rustfmt
@@ -31,8 +31,8 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: "1.96.0"
           targets: wasm32v1-none
@@ -49,7 +49,7 @@ jobs:
           test "$built" = "$deployed"
       # A proof made with the final ceremony zkey must verify under the key that build embeds.
       - run: cargo test -p verifier --features mainnet --test mainnet_proof
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: vault-mainnet-wasm
@@ -62,8 +62,8 @@ jobs:
       run:
         working-directory: circuits
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
@@ -85,14 +85,14 @@ jobs:
       - id: ptau
         run: |
           node --input-type=module -e 'import { PTAU_BLAKE2B } from "./scripts/ptau.mjs"; console.log(`blake2b=${PTAU_BLAKE2B}`)' >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: circuits/build/ptau
           key: ptau-${{ steps.ptau.outputs.blake2b }}
       - run: npm run ptau
       - run: npm test
       - run: npm run check:o2
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/bin/circomspect
           key: circomspect-0.9.0-${{ runner.os }}
@@ -105,8 +105,8 @@ jobs:
       run:
         working-directory: sdk
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
           cache: npm
@@ -138,7 +138,7 @@ jobs:
         working-directory: circuits
         run: |
           node --input-type=module -e 'import { PTAU_BLAKE2B } from "./scripts/ptau.mjs"; console.log(`blake2b=${PTAU_BLAKE2B}`)' >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: circuits/build/ptau
           key: ptau-${{ steps.ptau.outputs.blake2b }}
